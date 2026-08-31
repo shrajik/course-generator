@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  @apply bg-canvas text-ink antialiased;
+  font-feature-settings: "cv11", "ss01";
+}
+
+/* --- form primitives from the design ------------------------------------- */
+@layer components {
+  .field {
+    @apply w-full rounded-[10px] border border-line bg-white px-3.5 py-2.5 text-sm text-ink
+      placeholder:text-ink-300 outline-none transition
+      focus:border-brand-400 focus:ring-4 focus:ring-brand-100;
+  }
+
+  .panel {
+    @apply rounded-panel border border-line bg-white shadow-card;
+  }
+
+  .subtle-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #dedee6 transparent;
+  }
+  .subtle-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .subtle-scroll::-webkit-scrollbar-thumb {
+    background: #dedee6;
+    border-radius: 9999px;
+  }
+  .subtle-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* Editable text inside the canvas keeps the document's own typography. */
+[contenteditable="true"] {
+  outline: none;
+}
+[contenteditable="true"]:empty::before {
+  content: attr(data-placeholder);
+  color: #a9a9b2;
+}
+
+/* Native drag image is hidden; we render our own row states instead. */
+.dragging {
+  @apply opacity-40;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}

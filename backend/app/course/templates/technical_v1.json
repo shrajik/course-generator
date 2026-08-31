@@ -1,0 +1,171 @@
+{
+  "template_id": "technical_v1",
+  "kind": "technical",
+  "name": "Technical",
+  "description": "Programming, AI/ML, engineering, cloud, DevOps, cybersecurity and other hands-on technical subjects.",
+  "sections": [
+    {
+      "key": "introduction",
+      "label": "Introduction",
+      "required": true,
+      "block_types": ["heading", "paragraph"],
+      "guidance": "Open with why this chapter matters and what problem it solves. 2-3 short paragraphs, no fluff.",
+      "max_blocks": 3
+    },
+    {
+      "key": "learning_objectives",
+      "label": "Learning Objectives",
+      "required": true,
+      "block_types": ["learning_objectives"],
+      "guidance": "3-6 measurable objectives starting with an action verb (implement, configure, evaluate).",
+      "max_blocks": 1
+    },
+    {
+      "key": "concept",
+      "label": "Concept",
+      "required": true,
+      "block_types": ["heading", "paragraph", "callout", "quote"],
+      "guidance": "Define the core concepts precisely. Introduce terminology explicitly before using it.",
+      "max_blocks": 6
+    },
+    {
+      "key": "how_it_works",
+      "label": "How It Works",
+      "required": true,
+      "block_types": ["heading", "paragraph", "table", "callout"],
+      "guidance": "Explain the mechanism step by step: inputs, processing, outputs, failure modes.",
+      "max_blocks": 6
+    },
+    {
+      "key": "visual_explanation",
+      "label": "Visual Explanation",
+      "required": false,
+      "block_types": ["image"],
+      "guidance": "Add a diagram only when the structure or data flow is genuinely hard to describe in words.",
+      "max_blocks": 2
+    },
+    {
+      "key": "technical_example",
+      "label": "Technical Example",
+      "required": true,
+      "block_types": ["paragraph", "code", "table"],
+      "guidance": "A concrete worked example with realistic values. Explain the example before and after showing it.",
+      "max_blocks": 4
+    },
+    {
+      "key": "code_example",
+      "label": "Code Example",
+      "required": false,
+      "block_types": ["code", "paragraph"],
+      "guidance": "Only when the topic involves code. Runnable, idiomatic, commented, with the language set correctly.",
+      "max_blocks": 4
+    },
+    {
+      "key": "implementation",
+      "label": "Step-by-Step Implementation",
+      "required": false,
+      "block_types": ["heading", "paragraph", "code", "table"],
+      "guidance": "Ordered, reproducible steps a learner can follow on their own machine or cloud account.",
+      "max_blocks": 6
+    },
+    {
+      "key": "common_mistakes",
+      "label": "Common Mistakes",
+      "required": true,
+      "block_types": ["warning", "paragraph"],
+      "guidance": "Real mistakes practitioners make, each with the symptom and the fix.",
+      "max_blocks": 4
+    },
+    {
+      "key": "best_practices",
+      "label": "Best Practices",
+      "required": true,
+      "block_types": ["tip", "learning_objectives", "paragraph"],
+      "guidance": "Actionable, current practices. Avoid vague advice like 'follow best practices'.",
+      "max_blocks": 4
+    },
+    {
+      "key": "exercise",
+      "label": "Exercise",
+      "required": true,
+      "block_types": ["exercise"],
+      "guidance": "A hands-on task with clear instructions, hints and a verifiable expected outcome.",
+      "max_blocks": 2
+    },
+    {
+      "key": "challenge",
+      "label": "Challenge",
+      "required": false,
+      "block_types": ["challenge"],
+      "guidance": "A harder, open-ended extension for confident learners.",
+      "max_blocks": 1
+    },
+    {
+      "key": "quiz",
+      "label": "Quiz",
+      "required": true,
+      "block_types": ["quiz"],
+      "guidance": "3-5 questions that test understanding rather than recall. Include the answer and a short explanation.",
+      "max_blocks": 1
+    },
+    {
+      "key": "summary",
+      "label": "Summary",
+      "required": true,
+      "block_types": ["summary"],
+      "guidance": "Key takeaways plus what the next chapter builds on.",
+      "max_blocks": 1
+    }
+  ],
+  "allowed_block_types": [
+    "heading", "paragraph", "image", "quote", "callout", "code", "table", "quiz",
+    "exercise", "case_study", "story", "tip", "warning", "summary", "divider",
+    "learning_objectives", "challenge", "reflection"
+  ],
+  "required_block_types": [
+    "heading", "paragraph", "learning_objectives", "exercise", "quiz", "summary"
+  ],
+  "writer_guidance": "Write for practitioners. Be precise and concrete: name real tools, versions, commands and trade-offs. Prefer short paragraphs over walls of text. Never invent APIs, benchmark numbers, or citations. Use code blocks for anything a learner would type. Depth over breadth - it is better to explain three things properly than nine things vaguely.",
+  "research_guidance": "Prioritise authoritative and current sources: official documentation, specifications, well-known engineering blogs and papers. Capture exact terminology, version-specific behaviour, common failure modes and performance characteristics.",
+  "review_focus": [
+    "technical correctness of every claim, command and code sample",
+    "code quality: runnable, idiomatic, safe defaults, no deprecated APIs",
+    "correct and consistent terminology",
+    "no invented sources, statistics or benchmarks",
+    "progression from prerequisites to advanced material"
+  ],
+  "image_guidance": "Prefer clean architecture, data-flow or sequence diagrams on a light background. Minimal, legible labels. Flat vector style, no photorealism, no decorative clutter, no fake UI screenshots.",
+  "theme": {
+    "font_family": "Inter, Segoe UI, Helvetica, Arial, sans-serif",
+    "mono_font_family": "JetBrains Mono, Consolas, Menlo, monospace",
+    "text_color": "#0f172a",
+    "muted_color": "#475569",
+    "accent_color": "#2563eb",
+    "accent_soft": "#eff6ff",
+    "page_background": "#ffffff",
+    "surface_color": "#f8fafc",
+    "border_color": "#e2e8f0",
+    "base_font_size": 15.0,
+    "base_line_height": 1.6
+  },
+  "block_styles": {
+    "heading": { "font_size": 26, "font_weight": 700, "color": "#0f172a", "line_height": 1.25 },
+    "paragraph": { "font_size": 15, "font_weight": 400, "line_height": 1.65, "color": "#1f2937", "align": "left" },
+    "image": { "border_radius": 10, "border_color": "#e2e8f0", "border_width": 1, "align": "center" },
+    "quote": { "font_size": 16, "italic": true, "color": "#334155", "accent_color": "#2563eb", "padding": 16 },
+    "callout": { "font_size": 14.5, "background": "#eff6ff", "border_color": "#bfdbfe", "border_radius": 10, "padding": 16, "accent_color": "#2563eb" },
+    "code": { "font_size": 12.5, "font_family": "JetBrains Mono, Consolas, Menlo, monospace", "background": "#0f172a", "color": "#e2e8f0", "border_radius": 10, "padding": 16, "line_height": 1.5 },
+    "table": { "font_size": 13.5, "border_color": "#e2e8f0", "accent_color": "#f1f5f9" },
+    "quiz": { "font_size": 14.5, "background": "#f8fafc", "border_color": "#e2e8f0", "border_radius": 10, "padding": 18 },
+    "exercise": { "font_size": 14.5, "background": "#ecfdf5", "border_color": "#a7f3d0", "border_radius": 10, "padding": 18, "accent_color": "#059669" },
+    "challenge": { "font_size": 14.5, "background": "#fff7ed", "border_color": "#fed7aa", "border_radius": 10, "padding": 18, "accent_color": "#ea580c" },
+    "case_study": { "font_size": 14.5, "background": "#f8fafc", "border_color": "#e2e8f0", "border_radius": 10, "padding": 18 },
+    "story": { "font_size": 15, "italic": false, "color": "#1f2937", "line_height": 1.7 },
+    "tip": { "font_size": 14.5, "background": "#eff6ff", "border_color": "#bfdbfe", "border_radius": 10, "padding": 14, "accent_color": "#2563eb" },
+    "warning": { "font_size": 14.5, "background": "#fef2f2", "border_color": "#fecaca", "border_radius": 10, "padding": 14, "accent_color": "#dc2626" },
+    "summary": { "font_size": 14.5, "background": "#f1f5f9", "border_color": "#e2e8f0", "border_radius": 10, "padding": 18 },
+    "divider": { "border_color": "#e2e8f0" },
+    "learning_objectives": { "font_size": 14.5, "background": "#f8fafc", "border_color": "#e2e8f0", "border_radius": 10, "padding": 18 },
+    "reflection": { "font_size": 14.5, "background": "#faf5ff", "border_color": "#e9d5ff", "border_radius": 10, "padding": 18, "accent_color": "#7c3aed" }
+  }
+}

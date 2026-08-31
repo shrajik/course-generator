@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="{{ language }}">
+<head>
+<meta charset="utf-8">
+<title>{{ document.course_title }}</title>
+<style>
+  @page { size: {{ page_width }}px {{ page_height }}px; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: {{ theme.font_family }};
+    color: {{ theme.text_color }};
+    font-size: {{ theme.base_font_size }}px;
+    line-height: {{ theme.base_line_height }};
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .page {
+    position: relative;
+    overflow: hidden;
+    page-break-after: always;
+    break-after: page;
+  }
+  .page:last-child { page-break-after: auto; break-after: auto; }
+  .block { position: absolute; }
+  .block > :first-child { margin-top: 0; }
+  .block > :last-child { margin-bottom: 0; }
+
+  /* Headings inherit the block's font-size so the layout engine stays authoritative. */
+  h1, h2, h3, h4 { margin: 0; font-size: inherit; font-weight: inherit; letter-spacing: -0.01em; }
+  p { margin: 0 0 0.4em 0; }
+  ul, ol { margin: 0; padding-left: 20px; }
+  li { margin-bottom: 4px; }
+
+  .b-cover-accent { border-radius: 4px; }
+  .label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.09em;
+    text-transform: uppercase; margin-bottom: 8px;
+  }
+  .title { font-size: 1.05em; font-weight: 700; margin-bottom: 6px; }
+  .muted { color: {{ theme.muted_color }}; }
+  .caption { font-size: 12.5px; color: {{ theme.muted_color }}; margin-top: 6px; }
+
+  pre {
+    margin: 0; white-space: pre-wrap; word-break: break-word;
+    font-family: {{ theme.mono_font_family }};
+  }
+  code { font-family: {{ theme.mono_font_family }}; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 8px 10px; vertical-align: top;
+    border-bottom: 1px solid {{ theme.border_color }};
+  }
+  th { font-weight: 700; }
+
+  .quiz-q { margin-bottom: 12px; }
+  .quiz-q .q { font-weight: 600; }
+  .quiz-opts { margin: 4px 0 4px 0; }
+  .quiz-answer { font-size: 0.92em; color: {{ theme.muted_color }}; }
+
+  .divider-rule { height: 100%; min-height: 3px; border-radius: 3px; }
+  .footer {
+    position: absolute; left: {{ margin_x }}px; right: {{ margin_x }}px;
+    bottom: 34px; font-size: 11px; color: {{ theme.muted_color }};
+    display: flex; justify-content: space-between;
+    border-top: 1px solid {{ theme.border_color }}; padding-top: 8px;
+  }
+  .quote-bar { border-left: 4px solid {{ theme.accent_color }}; padding-left: 14px; }
+  .figure-box { display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  img.figure {
+    max-width: 100%; max-height: 100%; width: auto; height: auto;
+    display: block; border-radius: inherit;
+  }
+  .img-missing {
+    width: 100%; min-height: 220px; display: flex; align-items: center;
+    justify-content: center; text-align: center; font-size: 12.5px;
+    color: {{ theme.muted_color }}; background: {{ theme.surface_color }};
+    border: 1px dashed {{ theme.border_color }}; border-radius: 8px; padding: 16px;
+  }
+</style>
+</head>
+<body>
+{% for page in pages %}
+<div class="page" style="width:{{ page.width }}px; height:{{ page.height }}px; background:{{ page.background }};">
+  {% for b in page.blocks %}
+  <div class="block b-{{ b.type }}" style="{{ b.css }}">
+    {%- set c = b.content -%}
+
+    {%- if b.type == 'heading' -%}
+      {%- set level = c.get('level', 2) -%}
+      {%- if level <= 1 -%}<h1>{{ c.get('text', '') }}</h1>
+      {%- elif level == 2 -%}<h2>{{ c.get('text', '') }}</h2>
+      {%- elif level == 3 -%}<h3>{{ c.get('text', '') }}</h3>
+      {%- else -%}<h4>{{ c.get('text', '') }}</h4>{%- endif -%}
+
+    {%- elif b.type == 'paragraph' -%}
+      {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
+
+    {%- elif b.type == 'image' -%}
+      {% if b.image_src %}
+        <div class="figure-box" style="height:{{ b.image_box }}px">
+          <img class="figure" src="{{ b.image_src }}" alt="{{ c.get('alt', '') }}">
+        </div>
+      {% else %}
+        <div class="img-missing" style="min-height:{{ b.image_box }}px">
+          Image not generated yet<br>{{ c.get('purpose', '') or c.get('caption', '') }}
+          {% if c.get('error') %}<br><em>{{ c.get('error') }}</em>{% endif %}
+        </div>
+      {% endif %}
+      {% if c.get('caption') %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+
+    {%- elif b.type == 'quote' -%}
+      <div class="quote-bar">
+        {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
+        {% if c.get('attribution') %}<div class="caption">— {{ c.get('attribution') }}</div>{% endif %}
+      </div>
+
+    {%- elif b.type in ('callout', 'tip', 'warning') -%}
+      {% if c.get('title') %}<div class="label" style="color:{{ b.accent }}">{{ c.get('title') }}</div>{% endif %}
+      {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
+
+    {%- elif b.type == 'code' -%}
+      <div class="code-panel" style="{{ b.panel_css }}"><pre><code>{{ c.get('code', '') }}</code></pre></div>
+      {% if c.get('caption') %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+
+    {%- elif b.type == 'table' -%}
+      <table>
+        {% if c.get('columns') %}
+        <thead><tr>{% for col in c.get('columns') %}<th style="background:{{ b.accent_soft }}">{{ col }}</th>{% endfor %}</tr></thead>
+        {% endif %}
+        <tbody>
+        {% for row in c.get('rows', []) %}
+          <tr>{% for cell in row.get('cells', []) %}<td>{{ cell }}</td>{% endfor %}</tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if c.get('caption') %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+
+    {%- elif b.type == 'quiz' -%}
+      <div class="label" style="color:{{ b.accent }}">{{ c.get('title', 'Knowledge Check') }}</div>
+      {% for q in c.get('questions', []) %}
+      <div class="quiz-q">
+        <div class="q">{{ loop.index }}. {{ q.get('question', '') }}</div>
+        {% if q.get('options') %}
+        <ol class="quiz-opts" type="A">{% for opt in q.get('options') %}<li>{{ opt }}</li>{% endfor %}</ol>
+        {% endif %}
+        {% if q.get('answer') %}<div class="quiz-answer"><strong>Answer:</strong> {{ q.get('answer') }}{% if q.get('explanation') %} — {{ q.get('explanation') }}{% endif %}</div>{% endif %}
+      </div>
+      {% endfor %}
+
+    {%- elif b.type in ('exercise', 'challenge') -%}
+      <div class="label" style="color:{{ b.accent }}">{{ c.get('title', 'Exercise') }}{% if c.get('difficulty') %} · {{ c.get('difficulty') }}{% endif %}</div>
+      {% if c.get('instructions') %}<p>{{ c.get('instructions') }}</p>{% endif %}
+      {% if c.get('steps') %}<ol>{% for step in c.get('steps') %}<li>{{ step }}</li>{% endfor %}</ol>{% endif %}
+      {% if c.get('hints') %}<p class="muted"><strong>Hints:</strong></p><ul>{% for hint in c.get('hints') %}<li class="muted">{{ hint }}</li>{% endfor %}</ul>{% endif %}
+      {% if c.get('expected_outcome') %}<p class="caption"><strong>Expected outcome:</strong> {{ c.get('expected_outcome') }}</p>{% endif %}
+
+    {%- elif b.type == 'case_study' -%}
+      <div class="label" style="color:{{ b.accent }}">{{ c.get('title', 'Case Study') }}</div>
+      {% if c.get('context') %}<p><strong>Context.</strong> {{ c.get('context') }}</p>{% endif %}
+      {% if c.get('challenge') %}<p><strong>Challenge.</strong> {{ c.get('challenge') }}</p>{% endif %}
+      {% if c.get('actions') %}<p><strong>What they did</strong></p><ul>{% for a in c.get('actions') %}<li>{{ a }}</li>{% endfor %}</ul>{% endif %}
+      {% if c.get('outcome') %}<p><strong>Outcome.</strong> {{ c.get('outcome') }}</p>{% endif %}
+      {% if c.get('lessons') %}<p><strong>Lessons</strong></p><ul>{% for l in c.get('lessons') %}<li>{{ l }}</li>{% endfor %}</ul>{% endif %}
+
+    {%- elif b.type == 'story' -%}
+      {% if c.get('title') %}<div class="title">{{ c.get('title') }}</div>{% endif %}
+      {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
+      {% if c.get('takeaway') %}<p class="caption"><strong>Takeaway:</strong> {{ c.get('takeaway') }}</p>{% endif %}
+
+    {%- elif b.type == 'summary' -%}
+      <div class="label" style="color:{{ b.accent }}">{{ c.get('title', 'Summary') }}</div>
+      {% if c.get('key_takeaways') %}<ul>{% for item in c.get('key_takeaways') %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+      {% if c.get('next_steps') %}<p class="muted"><strong>Next</strong></p><ul>{% for item in c.get('next_steps') %}<li class="muted">{{ item }}</li>{% endfor %}</ul>{% endif %}
+
+    {%- elif b.type == 'divider' -%}
+      <div class="divider-rule" style="background:{{ b.divider_color }}"></div>
+
+    {%- elif b.type in ('learning_objectives', 'reflection') -%}
+      {% if c.get('title') %}<div class="label" style="color:{{ b.accent }}">{{ c.get('title') }}</div>{% endif %}
+      {% if c.get('intro') %}<p>{{ c.get('intro') }}</p>{% endif %}
+      {% if c.get('items') %}<ul>{% for item in c.get('items') %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+
+    {%- else -%}
+      {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
+    {%- endif -%}
+  </div>
+  {% endfor %}
+  {% if page.show_footer %}
+  <div class="footer"><span>{{ document.course_title }}</span><span>{{ page.number }} / {{ pages|length }}</span></div>
+  {% endif %}
+</div>
+{% endfor %}
+</body>
+</html>

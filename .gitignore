@@ -1,0 +1,13 @@
+.env
+node_modules/
+.next/
+next-env.d.ts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+backend/data/courses/
+backend/data/index/
+*.egg-info/
+.DS_Store

@@ -1,0 +1,171 @@
+{
+  "template_id": "non_technical_v1",
+  "kind": "non_technical",
+  "name": "Non-Technical",
+  "description": "Business, marketing, leadership, sales, communication, finance and management subjects.",
+  "sections": [
+    {
+      "key": "introduction",
+      "label": "Introduction",
+      "required": true,
+      "block_types": ["heading", "paragraph"],
+      "guidance": "Hook the reader with the stake: what changes for them once they master this chapter.",
+      "max_blocks": 3
+    },
+    {
+      "key": "learning_objectives",
+      "label": "Learning Objectives",
+      "required": true,
+      "block_types": ["learning_objectives"],
+      "guidance": "3-6 outcome-focused objectives written in plain business language.",
+      "max_blocks": 1
+    },
+    {
+      "key": "story",
+      "label": "Story / Scenario",
+      "required": true,
+      "block_types": ["story"],
+      "guidance": "A short, believable scenario with a named role and a concrete situation. End with the takeaway it sets up.",
+      "max_blocks": 2
+    },
+    {
+      "key": "core_concept",
+      "label": "Core Concept",
+      "required": true,
+      "block_types": ["heading", "paragraph", "callout", "quote"],
+      "guidance": "Explain the idea in plain language, then define any jargon you must introduce.",
+      "max_blocks": 6
+    },
+    {
+      "key": "real_world_example",
+      "label": "Real-World Example",
+      "required": true,
+      "block_types": ["paragraph", "callout", "table"],
+      "guidance": "A recognisable example. Only name real companies or figures when the research supports it.",
+      "max_blocks": 3
+    },
+    {
+      "key": "case_study",
+      "label": "Case Study",
+      "required": false,
+      "block_types": ["case_study"],
+      "guidance": "Context, challenge, actions taken, outcome, lessons. Keep it honest - include what did not work.",
+      "max_blocks": 2
+    },
+    {
+      "key": "framework",
+      "label": "Framework / Method",
+      "required": true,
+      "block_types": ["table", "learning_objectives", "paragraph", "image"],
+      "guidance": "Give the reader a repeatable model or checklist they can apply on Monday morning.",
+      "max_blocks": 4
+    },
+    {
+      "key": "practical_application",
+      "label": "Practical Application",
+      "required": true,
+      "block_types": ["paragraph", "table", "callout"],
+      "guidance": "Translate the framework into specific actions for the target audience's day-to-day work.",
+      "max_blocks": 4
+    },
+    {
+      "key": "common_mistakes",
+      "label": "Common Mistakes",
+      "required": true,
+      "block_types": ["warning", "paragraph"],
+      "guidance": "The traps people actually fall into, with the early warning sign for each.",
+      "max_blocks": 4
+    },
+    {
+      "key": "pro_tips",
+      "label": "Pro Tips",
+      "required": true,
+      "block_types": ["tip"],
+      "guidance": "Insider advice that is specific and immediately usable.",
+      "max_blocks": 4
+    },
+    {
+      "key": "reflection",
+      "label": "Reflection",
+      "required": false,
+      "block_types": ["reflection"],
+      "guidance": "2-4 questions that make the reader apply the chapter to their own context.",
+      "max_blocks": 1
+    },
+    {
+      "key": "exercise",
+      "label": "Exercise",
+      "required": true,
+      "block_types": ["exercise"],
+      "guidance": "A practical activity: a draft, a conversation plan, a worksheet, an audit of their own work.",
+      "max_blocks": 2
+    },
+    {
+      "key": "quiz",
+      "label": "Quiz",
+      "required": true,
+      "block_types": ["quiz"],
+      "guidance": "3-5 scenario-based questions with answers and short explanations.",
+      "max_blocks": 1
+    },
+    {
+      "key": "summary",
+      "label": "Summary",
+      "required": true,
+      "block_types": ["summary"],
+      "guidance": "Key takeaways plus the bridge into the next chapter.",
+      "max_blocks": 1
+    }
+  ],
+  "allowed_block_types": [
+    "heading", "paragraph", "image", "quote", "callout", "table", "quiz",
+    "exercise", "case_study", "story", "tip", "warning", "summary", "divider",
+    "learning_objectives", "challenge", "reflection", "code"
+  ],
+  "required_block_types": [
+    "heading", "paragraph", "learning_objectives", "story", "exercise", "quiz", "summary"
+  ],
+  "writer_guidance": "Write in warm, confident, plain business English. Short sentences. Prefer a concrete story or example over abstract theory. Avoid buzzword stacking and motivational filler. Never invent statistics, quotes or company outcomes - use only what the research supports, and say 'often' rather than fabricating a number. Code blocks are rarely appropriate; use tables and checklists instead.",
+  "research_guidance": "Prioritise reputable business sources: industry reports, established publications, documented company cases and peer-reviewed management research. Capture named examples, dated statistics with their source, and frameworks with their original author.",
+  "review_focus": [
+    "clarity for a non-specialist reader",
+    "practical relevance - can the reader act on this tomorrow",
+    "no fabricated statistics, quotes or company outcomes",
+    "story and example quality: specific rather than generic",
+    "jargon is defined before it is used"
+  ],
+  "image_guidance": "Prefer clean conceptual illustrations, framework diagrams or simple quadrant/matrix visuals on a light background. Flat modern vector style, minimal text, no stock-photo clichés, no photorealistic faces.",
+  "theme": {
+    "font_family": "Inter, Segoe UI, Helvetica, Arial, sans-serif",
+    "mono_font_family": "JetBrains Mono, Consolas, Menlo, monospace",
+    "text_color": "#1c1917",
+    "muted_color": "#57534e",
+    "accent_color": "#0f766e",
+    "accent_soft": "#f0fdfa",
+    "page_background": "#ffffff",
+    "surface_color": "#fafaf9",
+    "border_color": "#e7e5e4",
+    "base_font_size": 15.5,
+    "base_line_height": 1.7
+  },
+  "block_styles": {
+    "heading": { "font_size": 27, "font_weight": 700, "color": "#1c1917", "line_height": 1.25 },
+    "paragraph": { "font_size": 15.5, "font_weight": 400, "line_height": 1.7, "color": "#292524", "align": "left" },
+    "image": { "border_radius": 12, "border_color": "#e7e5e4", "border_width": 1, "align": "center" },
+    "quote": { "font_size": 17, "italic": true, "color": "#44403c", "accent_color": "#0f766e", "padding": 16 },
+    "callout": { "font_size": 15, "background": "#f0fdfa", "border_color": "#99f6e4", "border_radius": 12, "padding": 16, "accent_color": "#0f766e" },
+    "code": { "font_size": 12.5, "font_family": "JetBrains Mono, Consolas, Menlo, monospace", "background": "#1c1917", "color": "#e7e5e4", "border_radius": 10, "padding": 16, "line_height": 1.5 },
+    "table": { "font_size": 14, "border_color": "#e7e5e4", "accent_color": "#f5f5f4" },
+    "quiz": { "font_size": 15, "background": "#fafaf9", "border_color": "#e7e5e4", "border_radius": 12, "padding": 18 },
+    "exercise": { "font_size": 15, "background": "#f0fdf4", "border_color": "#bbf7d0", "border_radius": 12, "padding": 18, "accent_color": "#15803d" },
+    "challenge": { "font_size": 15, "background": "#fff7ed", "border_color": "#fed7aa", "border_radius": 12, "padding": 18, "accent_color": "#c2410c" },
+    "case_study": { "font_size": 15, "background": "#fafaf9", "border_color": "#e7e5e4", "border_radius": 12, "padding": 18, "accent_color": "#0f766e" },
+    "story": { "font_size": 15.5, "color": "#292524", "line_height": 1.75, "background": "#fffbeb", "border_color": "#fde68a", "border_radius": 12, "padding": 18 },
+    "tip": { "font_size": 15, "background": "#f0fdfa", "border_color": "#99f6e4", "border_radius": 12, "padding": 14, "accent_color": "#0f766e" },
+    "warning": { "font_size": 15, "background": "#fef2f2", "border_color": "#fecaca", "border_radius": 12, "padding": 14, "accent_color": "#dc2626" },
+    "summary": { "font_size": 15, "background": "#f5f5f4", "border_color": "#e7e5e4", "border_radius": 12, "padding": 18 },
+    "divider": { "border_color": "#e7e5e4" },
+    "learning_objectives": { "font_size": 15, "background": "#fafaf9", "border_color": "#e7e5e4", "border_radius": 12, "padding": 18 },
+    "reflection": { "font_size": 15, "background": "#faf5ff", "border_color": "#e9d5ff", "border_radius": 12, "padding": 18, "accent_color": "#7c3aed" }
+  }
+}
