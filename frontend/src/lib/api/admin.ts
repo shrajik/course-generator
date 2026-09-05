@@ -1,4 +1,5 @@
 import { request } from "./client";
+import type { Role } from "@/lib/types/auth";
 
 export interface AdminHealthResponse {
   status: string;
@@ -13,7 +14,7 @@ export interface AdminDashboardResponse {
 export interface AdminUser {
   id: string;
   email: string;
-  role: string;
+  role: Role;
   is_active: boolean;
   is_verified: boolean;
   created_at: string;
@@ -29,7 +30,7 @@ export interface AdminUserListResponse {
 
 export interface AdminUserListOptions {
   search?: string;
-  role?: "user" | "admin";
+  role?: Role;
   is_active?: boolean;
   is_verified?: boolean;
   limit?: number;
@@ -94,7 +95,7 @@ export function getAdminUser(userId: string): Promise<AdminUser> {
   return request<AdminUser>(`/admin/users/${userId}`);
 }
 
-export function updateAdminUserRole(userId: string, role: "user" | "admin"): Promise<AdminUser> {
+export function updateAdminUserRole(userId: string, role: Role): Promise<AdminUser> {
   return request<AdminUser>(`/admin/users/${userId}/role`, {
     method: "PATCH",
     body: { role },

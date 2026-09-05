@@ -1,7 +1,9 @@
+export type Role = "author" | "editor_reviewer" | "manager" | "admin";
+
 export interface User {
   id: string;
   email: string;
-  role: string;
+  role: Role;
   is_active: boolean;
   is_verified: boolean;
   created_at: string;

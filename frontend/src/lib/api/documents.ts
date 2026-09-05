@@ -13,6 +13,17 @@ export function getCourseDocument(courseId: string): Promise<CourseDocument> {
   return request<CourseDocument>(`/api/courses/${courseId}/document`);
 }
 
+/** Persist manual editor edits (move/resize/type/insert/delete/style). */
+export function saveDocument(
+  documentId: string,
+  document: CourseDocument,
+): Promise<CourseDocument> {
+  return request<CourseDocument>(`/api/documents/${documentId}`, {
+    method: "PUT",
+    body: document,
+  });
+}
+
 export function aiEdit(
   documentId: string,
   payload: AiEditRequest,

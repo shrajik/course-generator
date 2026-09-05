@@ -13,8 +13,9 @@ import { PageSidebar } from "./PageSidebar";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { UploadsPanel } from "./UploadsPanel";
 import { ApiError } from "@/lib/api/client";
-import { aiEdit, exportPdf, getDocument } from "@/lib/api/documents";
+import { aiEdit, exportPdf, getDocument, saveDocument } from "@/lib/api/documents";
 import { useEditor } from "@/lib/editor/store";
+import type { CourseDocument } from "@/lib/types/document";
 
 export function CourseEditor({ documentId }: { documentId: string }) {
   const router = useRouter();
@@ -24,6 +25,9 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloading, setReloading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [justSaved, setJustSaved] = useState(false);
 
   const [instruction, setInstruction] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -69,6 +73,39 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       setReloading(false);
     }
   }, [documentId, sync]);
+
+  // --- save manual edits ----------------------------------------------------
+  /** Persists the in-memory document as-is (no reflow - layout was already
+   *  computed client-side) and adopts the server's response as the new
+   *  baseline, so `dirty` clears and later saves version off the right base. */
+  const saveManualEdits = useCallback(
+    async (doc: CourseDocument) => {
+      const saved = await saveDocument(documentId, doc);
+      reconcile(saved);
+      return saved;
+    },
+    [documentId, reconcile],
+  );
+
+  const handleSave = useCallback(async () => {
+    if (!editor.document) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await saveManualEdits(editor.document);
+      setJustSaved(true);
+    } catch (caught) {
+      setSaveError(caught instanceof ApiError ? caught.message : "Save failed.");
+    } finally {
+      setSaving(false);
+    }
+  }, [editor.document, saveManualEdits]);
+
+  useEffect(() => {
+    if (!justSaved) return;
+    const timer = setTimeout(() => setJustSaved(false), 2500);
+    return () => clearTimeout(timer);
+  }, [justSaved]);
 
   // --- AI edit ------------------------------------------------------------
   /**
@@ -142,7 +179,14 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   // --- export -------------------------------------------------------------
   const handleExport = useCallback(async () => {
     setExporting(true);
+    setSaveError(null);
     try {
+      // The saved document is the single source of truth for both the editor
+      // and the PDF - export a stale backend copy while edits are only in
+      // the browser and the PDF wouldn't match what's on screen.
+      if (editor.dirty && editor.document) {
+        await saveManualEdits(editor.document);
+      }
       const blob = await exportPdf(documentId);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -160,7 +204,7 @@ export function CourseEditor({ documentId }: { documentId: string }) {
     } finally {
       setExporting(false);
     }
-  }, [documentId, editor.document?.course_title]);
+  }, [documentId, editor.dirty, editor.document, saveManualEdits]);
 
   // --- keyboard shortcuts --------------------------------------------------
   useEffect(() => {
@@ -226,8 +270,12 @@ export function CourseEditor({ documentId }: { documentId: string }) {
         onPreview={() => router.push(`/preview/${documentId}`)}
         onExport={handleExport}
         onReload={handleReload}
+        onSave={handleSave}
         exporting={exporting}
         reloading={reloading}
+        saving={saving}
+        saveError={saveError}
+        justSaved={justSaved}
       />
 
       <div className="flex min-h-0 flex-1">

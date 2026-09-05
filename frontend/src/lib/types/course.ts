@@ -77,6 +77,7 @@ export interface CourseRecord {
   status: CourseStatus;
   input: CourseInput;
   template_id: string;
+  owner_id: string | null;
   created_at: string;
   updated_at: string;
   chapters: ChapterProgress[];

@@ -24,8 +24,16 @@ import {
   type AdminUserListResponse,
 } from "@/lib/api/admin";
 import { useAuth } from "@/lib/auth/auth-provider";
+import type { Role } from "@/lib/types/auth";
 
 const PAGE_SIZE = 25;
+const ROLE_LABELS: Record<Role, string> = {
+  author: "Author",
+  editor_reviewer: "Editor/Reviewer",
+  manager: "Manager",
+  admin: "Admin",
+};
+const ROLE_OPTIONS: Role[] = ["author", "editor_reviewer", "manager", "admin"];
 const selectClass =
   "h-9 rounded-[8px] border border-[#34312D] bg-[#181614] px-3 text-[13px] text-[#E8DED3] outline-none transition-colors focus:border-[#D88445]";
 const inputClass =
@@ -38,7 +46,7 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
-function RoleBadge({ role }: { role: string }) {
+function RoleBadge({ role }: { role: Role }) {
   const isAdmin = role === "admin";
   return (
     <span
@@ -48,7 +56,7 @@ function RoleBadge({ role }: { role: string }) {
           : "inline-flex h-7 items-center rounded-[8px] border border-[#34312D] bg-[#24211E] px-2.5 text-[12px] font-medium text-[#C9C0B7]"
       }
     >
-      {role}
+      {ROLE_LABELS[role] ?? role}
     </span>
   );
 }
@@ -85,7 +93,7 @@ export default function AdminUsersPage() {
   const [page, setPage] = useState(0);
   const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
-  const [role, setRole] = useState<"all" | "user" | "admin">("all");
+  const [role, setRole] = useState<"all" | Role>("all");
   const [status, setStatus] = useState<"all" | "active" | "inactive">("all");
   const [verification, setVerification] = useState<"all" | "verified" | "unverified">("all");
   const [data, setData] = useState<AdminUserListResponse | null>(null);
@@ -156,7 +164,7 @@ export default function AdminUsersPage() {
     setSelectedUser((current) => (current?.id === updated.id ? updated : current));
   };
 
-  const changeRole = async (target: AdminUser, roleValue: "user" | "admin") => {
+  const changeRole = async (target: AdminUser, roleValue: Role) => {
     if (target.role === roleValue) return;
     setUpdatingUserId(target.id);
     try {
@@ -250,15 +258,18 @@ export default function AdminUsersPage() {
           <select
             value={role}
             onChange={(event) => {
-              setRole(event.target.value as "all" | "user" | "admin");
+              setRole(event.target.value as "all" | Role);
               setPage(0);
             }}
             className={selectClass}
             aria-label="Role filter"
           >
             <option value="all">All roles</option>
-            <option value="user">User</option>
-            <option value="admin">Admin</option>
+            {ROLE_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {ROLE_LABELS[option]}
+              </option>
+            ))}
           </select>
           <select
             value={status}
@@ -398,15 +409,18 @@ export default function AdminUsersPage() {
                             )}
                           </Button>
                           <select
-                            value={item.role === "admin" ? "admin" : "user"}
+                            value={item.role}
                             disabled={isSelf || busy}
-                            onChange={(event) => changeRole(item, event.target.value as "user" | "admin")}
+                            onChange={(event) => changeRole(item, event.target.value as Role)}
                             className="h-8 rounded-[8px] border border-[#34312D] bg-[#181614] px-2 text-[12px] text-[#E8DED3] outline-none disabled:cursor-not-allowed disabled:opacity-50"
                             aria-label={`Role for ${item.email}`}
-                            title={isSelf ? "Current admin role cannot be changed here" : "Change role"}
+                            title={isSelf ? "Your own role cannot be changed here" : "Change role"}
                           >
-                            <option value="user">User</option>
-                            <option value="admin">Admin</option>
+                            {ROLE_OPTIONS.map((option) => (
+                              <option key={option} value={option}>
+                                {ROLE_LABELS[option]}
+                              </option>
+                            ))}
                           </select>
                           <Button
                             type="button"

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 
 from app.agents.planner import PlannerAgent
 from app.agents.prompts import ContinuityContext
@@ -101,11 +102,18 @@ class CourseService:
                 return await db.load_course_record(course_id)
         return self.storage.load_course(course_id)
 
-    async def _list_courses(self, limit: int = 100, offset: int = 0) -> list[CourseRecord]:
+    async def _list_courses(
+        self, limit: int = 100, offset: int = 0, *, owner_id: str | None = None
+    ) -> list[CourseRecord]:
         if self.use_db:
             async with get_database_service() as db:
-                return await db.list_course_records(limit, offset)
-        return [self.storage.load_course(cid) for cid in self.storage.list_course_ids()]
+                return await db.list_course_records(
+                    limit, offset, owner_id=uuid.UUID(owner_id) if owner_id else None
+                )
+        records = [self.storage.load_course(cid) for cid in self.storage.list_course_ids()]
+        if owner_id is not None:
+            records = [r for r in records if r.owner_id == owner_id]
+        return records
 
     async def _save_blueprint(self, course_id: str, blueprint: CourseBlueprint) -> None:
         if self.use_db:
@@ -146,8 +154,10 @@ class CourseService:
         return self.storage.has_document(course_id)
 
     # --- public reads, used by the API routes -------------------------------
-    async def list_courses(self, limit: int = 100, offset: int = 0) -> list[CourseRecord]:
-        return await self._list_courses(limit, offset)
+    async def list_courses(
+        self, limit: int = 100, offset: int = 0, *, owner_id: str | None = None
+    ) -> list[CourseRecord]:
+        return await self._list_courses(limit, offset, owner_id=owner_id)
 
     async def get_course_record(self, course_id: str) -> CourseRecord:
         return await self._load_course(course_id)
@@ -166,7 +176,7 @@ class CourseService:
 
     # --- phase 0: create ---------------------------------------------------
     async def create_course(
-        self, course_input: CourseInput, *, run_planner: bool = True
+        self, course_input: CourseInput, *, run_planner: bool = True, owner_id: str | None = None
     ) -> CourseRecord:
         course_id = new_course_id()
         record = CourseRecord(
@@ -175,6 +185,7 @@ class CourseService:
             status="created",
             input=course_input,
             template_id=course_input.template_id,
+            owner_id=owner_id,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
         )

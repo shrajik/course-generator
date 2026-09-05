@@ -8,8 +8,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.core.roles import Role
 
-UserRole = Literal["user", "admin"]
+
+UserRole = Literal[Role.AUTHOR.value, Role.EDITOR_REVIEWER.value, Role.MANAGER.value, Role.ADMIN.value]
 
 
 class AdminDashboardResponse(BaseModel):

@@ -184,7 +184,7 @@ def test_public_registration_cannot_choose_admin_role(admin_client):
     response = _register(admin_client, _email("selfpromote"), role="admin")
     body = response.json()
 
-    assert body["user"]["role"] == "user"
+    assert body["user"]["role"] == "author"
     assert "password_hash" not in body["user"]
 
 
@@ -265,7 +265,7 @@ def test_admin_dashboard_users_courses_and_role_update(admin_client, monkeypatch
 
     self_update = admin_client.patch(
         f"/admin/users/{admin_user['id']}/role",
-        json={"role": "user"},
+        json={"role": "author"},
     )
     assert self_update.status_code == 403
 
@@ -337,7 +337,7 @@ def test_admin_users_search_filter_detail_and_status(admin_client, monkeypatch):
     detail = admin_client.get(f"/admin/users/{target_user['id']}")
     assert detail.status_code == 200, detail.text
     assert detail.json()["email"] == target_email
-    assert detail.json()["role"] == "user"
+    assert detail.json()["role"] == "author"
     assert detail.json()["is_active"] is True
     assert "password_hash" not in detail.json()
 
@@ -362,7 +362,7 @@ def test_admin_user_self_protection_and_validation(admin_client, monkeypatch):
 
     self_role = admin_client.patch(
         f"/admin/users/{admin_user['id']}/role",
-        json={"role": "user"},
+        json={"role": "author"},
     )
     assert self_role.status_code == 403
 

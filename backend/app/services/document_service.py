@@ -6,7 +6,8 @@ from pathlib import Path
 
 from app.agents.editor import EditorAgent
 from app.core.config import Settings, get_settings
-from app.core.ids import course_id_for_document
+from app.core.errors import NotFoundError, ValidationFailedError
+from app.core.ids import course_id_for_document, utc_now_iso
 from app.core.logging import get_logger
 from app.course.document.builder import reflow_document
 from app.course.document.patcher import apply_patch
@@ -78,6 +79,49 @@ class DocumentService:
                 return await db.load_document(document_id)
         course_id = self.storage.resolve_course_id_for_document(document_id)
         return self.storage.load_document(course_id)
+
+    # --- manual editor saves ------------------------------------------------
+    async def save(self, document_id: str, incoming: CourseDocument) -> CourseDocument:
+        """Persist the editor's full document state as the new source of truth.
+
+        Unlike `ai_edit`, this never reflows pagination: the editor already
+        computed every block's absolute layout client-side (the same A4
+        coordinate system the PDF renderer uses), so re-flowing here would
+        discard the very edit being saved. `document_id`/`course_id` are
+        always taken from the server, never the request body, so a client
+        can't redirect a save onto a different document/course by editing
+        the JSON it sends.
+        """
+        if not incoming.pages:
+            raise ValidationFailedError("A document must have at least one page")
+
+        # Re-validates the template exists; a document can only ever have
+        # been created against a real template, so a bad id here means a
+        # corrupt or tampered payload.
+        try:
+            load_template(incoming.template_id)
+        except NotFoundError as exc:
+            raise ValidationFailedError(f"Unknown template '{incoming.template_id}'") from exc
+
+        try:
+            existing = await self.load(document_id)
+        except NotFoundError:
+            existing = None
+
+        document = incoming.model_copy(deep=True)
+        document.document_id = document_id
+        if existing is not None:
+            document.course_id = existing.course_id
+            document.created_at = existing.created_at
+            document.version = existing.version + 1
+        else:
+            document.course_id = self.resolve_course_id(document_id)
+            document.version = 1
+        document.updated_at = utc_now_iso()
+
+        await self._save_document(document)
+        log.info("Saved manual edits to %s (v%s)", document_id, document.version)
+        return document
 
     # --- AI editing -------------------------------------------------------
     async def ai_edit(self, document_id: str, request: AiEditRequest) -> AiEditResponse:

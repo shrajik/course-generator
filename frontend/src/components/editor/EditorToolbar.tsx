@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import {
+  Check,
   ChevronDown,
   Download,
   Eye,
@@ -9,6 +10,7 @@ import {
   MoreHorizontal,
   RefreshCw,
   Redo2,
+  Save,
   Undo2,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
@@ -21,8 +23,12 @@ interface EditorToolbarProps {
   onPreview: () => void;
   onExport: () => void;
   onReload: () => void;
+  onSave: () => void;
   exporting: boolean;
   reloading: boolean;
+  saving: boolean;
+  saveError: string | null;
+  justSaved: boolean;
 }
 
 interface ChapterEntry {
@@ -36,8 +42,12 @@ export function EditorToolbar({
   onPreview,
   onExport,
   onReload,
+  onSave,
   exporting,
   reloading,
+  saving,
+  saveError,
+  justSaved,
 }: EditorToolbarProps) {
   const editor = useEditor();
   const { document: doc, activePageIndex } = editor;
@@ -118,14 +128,36 @@ export function EditorToolbar({
       ) : null}
 
       <div className="ml-auto flex items-center gap-2">
-        {editor.dirty ? (
+        {saveError ? (
+          <span
+            className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
+            title={saveError}
+          >
+            Save failed
+          </span>
+        ) : editor.dirty ? (
           <span
             className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10.5px] font-medium text-amber-800"
-            title="Manual edits live in this browser session. The backend POC has no document-save endpoint, so Export PDF renders the last version the backend stored."
+            title="You have unsaved manual edits. Click Save to persist them - Export PDF saves automatically first."
           >
-            Local changes
+            Unsaved changes
+          </span>
+        ) : justSaved ? (
+          <span className="flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10.5px] font-medium text-emerald-800">
+            <Check size={11} />
+            Saved
           </span>
         ) : null}
+
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onSave}
+          disabled={!editor.dirty || saving || exporting}
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+          Save
+        </Button>
 
         <div className="flex items-center rounded-[8px] border border-line">
           <IconButton
@@ -152,7 +184,7 @@ export function EditorToolbar({
           Preview
         </Button>
 
-        <Button size="sm" onClick={onExport} disabled={exporting}>
+        <Button size="sm" onClick={onExport} disabled={exporting || saving}>
           {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
           Export PDF
         </Button>

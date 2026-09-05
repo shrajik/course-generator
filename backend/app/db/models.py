@@ -10,6 +10,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, Uni
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.roles import DEFAULT_ROLE
 from app.db.base import Base
 
 
@@ -19,7 +20,7 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default=DEFAULT_ROLE.value)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -57,6 +58,12 @@ class Course(Base):
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
     template_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Nullable: courses created before ownership existed have no owner, and a
+    # deleted user's courses fall back to ownerless (admin-only) rather than
+    # disappearing - see ON DELETE SET NULL in the migration.
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     input_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -122,6 +122,10 @@ class CourseRecord(BaseModel):
     status: CourseStatus = "created"
     input: CourseInput
     template_id: str
+    # The user who created this course (their id, as a string). None for
+    # courses created before ownership existed, or when running without a
+    # database (no user identity to attach - see USE_DATABASE).
+    owner_id: str | None = None
     created_at: str
     updated_at: str
     chapters: list[ChapterProgress] = Field(default_factory=list)

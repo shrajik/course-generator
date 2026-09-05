@@ -29,6 +29,7 @@ class CourseRepository:
         search: str | None = None,
         status: str | None = None,
         owner: str | None = None,
+        owner_id: uuid.UUID | None = None,
     ) -> Select[tuple[Course]]:
         query = select(Course)
         if search:
@@ -51,6 +52,10 @@ class CourseRepository:
             owner_term = owner.strip()
             if owner_term:
                 query = query.where(Course.metadata_json["owner"].as_string().ilike(f"%{owner_term}%"))
+        if owner_id is not None:
+            # Real per-user ownership (courses.owner_id), distinct from the
+            # free-text `owner` display filter above used by the admin UI.
+            query = query.where(Course.owner_id == owner_id)
         return query
 
     async def count(
@@ -59,8 +64,11 @@ class CourseRepository:
         search: str | None = None,
         status: str | None = None,
         owner: str | None = None,
+        owner_id: uuid.UUID | None = None,
     ) -> int:
-        query = self._filtered_query(search=search, status=status, owner=owner).subquery()
+        query = self._filtered_query(
+            search=search, status=status, owner=owner, owner_id=owner_id
+        ).subquery()
         return await self.session.scalar(select(func.count()).select_from(query)) or 0
 
     async def list(
@@ -71,9 +79,10 @@ class CourseRepository:
         search: str | None = None,
         status: str | None = None,
         owner: str | None = None,
+        owner_id: uuid.UUID | None = None,
     ) -> Sequence[Course]:
         result = await self.session.scalars(
-            self._filtered_query(search=search, status=status, owner=owner)
+            self._filtered_query(search=search, status=status, owner=owner, owner_id=owner_id)
             .order_by(Course.updated_at.desc())
             .limit(limit)
             .offset(offset)

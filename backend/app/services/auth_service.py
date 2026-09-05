@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import ConflictError, UnauthorizedError
+from app.core.roles import DEFAULT_ROLE, Role
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -46,7 +47,9 @@ class AuthService:
         user = User(
             email=email,
             password_hash=hash_password(request.password),
-            role="admin" if email == normalize_email(settings.initial_admin_email) else "user",
+            role=Role.ADMIN.value
+            if email == normalize_email(settings.initial_admin_email)
+            else DEFAULT_ROLE.value,
             is_active=True,
             is_verified=False,
             created_at=now,

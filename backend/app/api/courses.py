@@ -6,8 +6,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
+from app.api.course_authorization import get_owned_course
+from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.errors import NotFoundError
+from app.core.roles import Role
 from app.course.templates.registry import available_templates, load_template
+from app.db.models import User
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.course import (
     CourseInput,
@@ -59,10 +63,16 @@ async def list_templates() -> dict[str, Any]:
 async def create_course(
     request: CreateCourseRequest,
     service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> CourseRecord:
-    """Create a course and (by default) run the planner to produce a blueprint."""
+    """Create a course and (by default) run the planner to produce a blueprint.
+
+    Ownership is always taken from the authenticated session, never from the
+    request body - `CreateCourseRequest` has no owner field to spoof.
+    """
     course_input = CourseInput.model_validate(request.model_dump(exclude={"run_planner"}))
-    return await service.create_course(course_input, run_planner=request.run_planner)
+    owner_id = str(current_user.id) if current_user is not None else None
+    return await service.create_course(course_input, run_planner=request.run_planner, owner_id=owner_id)
 
 
 @router.post("/improve-toc", response_model=ImproveTocResponse)
@@ -76,8 +86,15 @@ async def improve_toc(
 
 @router.get("", response_model=dict)
 @router.get("/", response_model=dict, include_in_schema=False)
-async def list_courses(service: CourseService = Depends(_service)) -> dict[str, Any]:
-    records = await service.list_courses()
+async def list_courses(
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """Every course for admins/offline mode; only the caller's own otherwise."""
+    owner_id = None
+    if current_user is not None and current_user.role != Role.ADMIN.value:
+        owner_id = str(current_user.id)
+    records = await service.list_courses(owner_id=owner_id)
     courses = [
         {
             "course_id": record.course_id,
@@ -98,8 +115,9 @@ async def get_course(
     include_blueprint: bool = Query(default=True),
     service: CourseService = Depends(_service),
     storage: StorageService = Depends(_storage),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> dict[str, Any]:
-    record = await service.get_course_record(course_id)
+    record = await get_owned_course(course_id, current_user, service)
     has_blueprint = await service.has_blueprint(course_id)
     payload: dict[str, Any] = {"course": record.model_dump(mode="json")}
     if include_blueprint and has_blueprint:
@@ -132,8 +150,11 @@ async def get_course(
 
 @router.get("/{course_id}/blueprint", response_model=CourseBlueprint)
 async def get_blueprint(
-    course_id: str, service: CourseService = Depends(_service)
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> CourseBlueprint:
+    await get_owned_course(course_id, current_user, service)
     return await service.get_blueprint(course_id)
 
 
@@ -142,6 +163,7 @@ async def generate_course(
     course_id: str,
     request: GenerateRequest | None = None,
     service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> GenerateResponse:
     """Research + write + review + assemble.
 
@@ -150,23 +172,30 @@ async def generate_course(
     finishes, `chapter_ids` to regenerate part of a course, or `resume: true` to
     continue an interrupted run.
     """
+    await get_owned_course(course_id, current_user, service)
     return await service.start_generation(course_id, request or GenerateRequest())
 
 
 @router.get("/{course_id}/run")
 async def get_run_state(
-    course_id: str, service: CourseService = Depends(_service)
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> dict[str, Any]:
     """Progress, ETA and timings for the current or last generation run."""
+    await get_owned_course(course_id, current_user, service)
     run = await service.job_state(course_id)
     return {"course_id": course_id, "run": run.model_dump(mode="json") if run else None}
 
 
 @router.get("/{course_id}/document", response_model=CourseDocument)
 async def get_course_document(
-    course_id: str, service: CourseService = Depends(_service)
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> CourseDocument:
     """The source of truth for this course."""
+    await get_owned_course(course_id, current_user, service)
     return await service.load_document(course_id)
 
 
@@ -176,7 +205,9 @@ async def get_chapter(
     chapter_id: str,
     service: CourseService = Depends(_service),
     storage: StorageService = Depends(_storage),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> dict[str, Any]:
+    await get_owned_course(course_id, current_user, service)
     blueprint = await service.get_blueprint(course_id)
     chapter = blueprint.chapter_by_id(chapter_id)
     if chapter is None:
@@ -195,7 +226,9 @@ async def get_chapter_research(
     chapter_id: str,
     service: CourseService = Depends(_service),
     storage: StorageService = Depends(_storage),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> dict[str, Any]:
+    await get_owned_course(course_id, current_user, service)
     blueprint = await service.get_blueprint(course_id)
     chapter = blueprint.chapter_by_id(chapter_id)
     if chapter is None:
@@ -205,7 +238,9 @@ async def get_chapter_research(
 
 @router.get("/{course_id}/template")
 async def get_course_template(
-    course_id: str, service: CourseService = Depends(_service)
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> dict[str, Any]:
-    record = await service.get_course_record(course_id)
+    record = await get_owned_course(course_id, current_user, service)
     return load_template(record.template_id).model_dump(mode="json")

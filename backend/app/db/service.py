@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -38,14 +39,28 @@ class DatabaseService:
             key: value
             for key, value in dumped.items()
             if key
-            not in {"course_id", "document_id", "status", "input", "template_id", "created_at", "updated_at"}
+            not in {
+                "course_id",
+                "document_id",
+                "status",
+                "input",
+                "template_id",
+                "owner_id",
+                "created_at",
+                "updated_at",
+            }
         }
+        owner_id = uuid.UUID(record.owner_id) if record.owner_id else None
         if existing:
             existing.title = record.input.course_title
             existing.status = record.status
             existing.template_id = record.template_id
             existing.input_json = record.input.model_dump(mode="json")
             existing.metadata_json = metadata
+            # Ownership is set once at creation and never overwritten by later
+            # saves (e.g. a save with no owner_id set shouldn't clear it).
+            if owner_id is not None:
+                existing.owner_id = owner_id
             existing.updated_at = now
             course = await self.courses.update(existing)
         else:
@@ -55,6 +70,7 @@ class DatabaseService:
                 title=record.input.course_title,
                 status=record.status,
                 template_id=record.template_id,
+                owner_id=owner_id,
                 input_json=record.input.model_dump(mode="json"),
                 metadata_json=metadata,
                 created_at=now,
@@ -70,9 +86,11 @@ class DatabaseService:
             raise NotFoundError(f"Course '{course_id}' not found")
         return self._to_course_record(course)
 
-    async def list_course_records(self, limit: int = 100, offset: int = 0) -> list[CourseRecord]:
-        """List all courses as CourseRecords."""
-        courses = await self.courses.list(limit, offset)
+    async def list_course_records(
+        self, limit: int = 100, offset: int = 0, *, owner_id: uuid.UUID | None = None
+    ) -> list[CourseRecord]:
+        """List courses as CourseRecords, optionally restricted to one owner."""
+        courses = await self.courses.list(limit, offset, owner_id=owner_id)
         return [self._to_course_record(c) for c in courses]
 
     async def course_exists(self, course_id: str) -> bool:
@@ -179,6 +197,7 @@ class DatabaseService:
             status=course.status,
             input=CourseInput.model_validate(course.input_json),
             template_id=course.template_id,
+            owner_id=str(course.owner_id) if course.owner_id else None,
             created_at=course.created_at.isoformat(),
             updated_at=course.updated_at.isoformat(),
             **(course.metadata_json or {}),

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from uuid import UUID
 
 from fastapi import Cookie, Depends, Header
 
+from app.core.config import get_settings
 from app.core.errors import ForbiddenError, UnauthorizedError
+from app.core.roles import Role
 from app.core.security import verify_access_token
 from app.db.models import User
 from app.db.service import DatabaseService, get_database_service
@@ -46,11 +48,43 @@ async def get_current_user(
         return user
 
 
-async def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
-    """Load the current user and require the database role to be admin."""
-    if current_user.role != "admin":
-        raise ForbiddenError("Admin access required")
-    return current_user
+async def get_current_user_if_db_enabled(
+    access_token: str | None = Cookie(default=None),
+    authorization: str | None = Header(default=None),
+) -> User | None:
+    """Like `get_current_user`, but only when Postgres-backed identity exists.
+
+    Course ownership is a database concept (`courses.owner_id -> users.id`).
+    With `USE_DATABASE=false` (the offline/filesystem mode used by the mock-AI
+    pipeline test suite and DB-less local runs) there is no user table to
+    authenticate against, so course/document routes keep their previous
+    unauthenticated behaviour there and skip ownership checks entirely.
+    """
+    if not get_settings().use_database:
+        return None
+    return await get_current_user(access_token=access_token, authorization=authorization)
+
+
+def require_roles(*allowed: Role) -> Callable[[User], Coroutine[None, None, User]]:
+    """Build a dependency that requires the current user to hold one of `allowed`.
+
+    Centralises role checks so individual routes never compare `user.role`
+    strings inline - they just declare `Depends(require_roles(Role.MANAGER, Role.ADMIN))`.
+    """
+
+    async def dependency(current_user: User = Depends(get_current_user)) -> User:
+        try:
+            role = Role(current_user.role)
+        except ValueError:
+            role = None
+        if role not in allowed:
+            raise ForbiddenError("You do not have permission to perform this action")
+        return current_user
+
+    return dependency
+
+
+get_current_admin = require_roles(Role.ADMIN)
 
 
 def _bearer_token(authorization: str | None) -> str | None:
