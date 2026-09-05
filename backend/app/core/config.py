@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ResearchMode = Literal["fast", "deep"]
 WritingMode = Literal["parallel", "sequential"]
+AppEnvironment = Literal["development", "production", "test"]
 
 
 class Settings(BaseSettings):
@@ -79,9 +80,25 @@ class Settings(BaseSettings):
 
     # --- Storage / misc -----------------------------------------------------
     data_dir: Path = Path("data")
+    database_url: str = "postgresql+asyncpg://course_app:course_app_dev@localhost:5432/course_generator"
+    #  PostgreSQL is the primary store for course/blueprint/document records.
+    #  Tests that don't need a live database turn this off (see conftest.py);
+    #  research/chapters/assets/exports always stay on the filesystem regardless.
+    use_database: bool = True
     log_level: str = "INFO"
     app_name: str = "AI Course Creation Platform - Backend POC"
     app_version: str = "0.2.0"
+    app_env: AppEnvironment = "development"
+    frontend_origin: str = "http://localhost:3000"
+
+    # --- Authentication -----------------------------------------------------
+    jwt_secret: str = ""
+    jwt_refresh_secret: str = ""
+    access_token_expire_minutes: int = Field(default=30, ge=1)
+    refresh_token_expire_days: int = Field(default=1, ge=1)
+    # Server-side bootstrap only: if set, registering this email creates the
+    # initial admin account. Public clients cannot choose their own role.
+    initial_admin_email: str = ""
 
     # --- derived ------------------------------------------------------------
     @property
@@ -96,6 +113,10 @@ class Settings(BaseSettings):
     @property
     def index_dir(self) -> Path:
         return self.data_dir / "index"
+
+    @property
+    def secure_cookies(self) -> bool:
+        return self.app_env == "production"
 
     def concurrency_for(self, phase: str) -> int:
         override = {

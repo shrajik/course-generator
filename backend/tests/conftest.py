@@ -18,6 +18,11 @@ os.environ["DATA_DIR"] = _TMP_DATA
 os.environ["ENABLE_IMAGE_GENERATION"] = "true"
 os.environ["MAX_REVIEW_REVISIONS"] = "0"
 os.environ["LOG_LEVEL"] = "WARNING"
+# This suite exercises the pipeline end-to-end against the filesystem, isolated
+# per test via DATA_DIR above; it never touches a real database. Postgres-backed
+# persistence has its own tests in test_database_foundation.py, which opt back
+# in with TEST_DATABASE_URL.
+os.environ["USE_DATABASE"] = "false"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

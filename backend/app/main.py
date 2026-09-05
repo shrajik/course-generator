@@ -8,10 +8,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import courses, documents, health
+from app.api import admin, auth, courses, documents, health
 from app.core.config import get_settings
 from app.core.errors import CourseCreatorError
 from app.core.logging import configure_logging, get_logger
+from app.db.engine import dispose_engine
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -35,6 +36,8 @@ async def lifespan(app: FastAPI):
             "return offline placeholder content."
         )
     yield
+    if settings.use_database:
+        await dispose_engine()
 
 
 app = FastAPI(
@@ -51,8 +54,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # POC only - lock this down before any real deployment
-    allow_credentials=False,
+    allow_origins=[settings.frontend_origin],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -67,5 +70,7 @@ async def handle_domain_error(request: Request, exc: CourseCreatorError) -> JSON
 
 
 app.include_router(health.router)
+app.include_router(auth.router)
+app.include_router(admin.router)
 app.include_router(courses.router)
 app.include_router(documents.router)

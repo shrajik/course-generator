@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AuthGate } from "@/components/auth/AuthGate";
+import { AuthProvider } from "@/lib/auth/auth-provider";
 import { CourseDraftProvider } from "@/lib/state/course-draft";
 
 export const metadata: Metadata = {
@@ -21,7 +23,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         />
       </head>
       <body>
-        <CourseDraftProvider>{children}</CourseDraftProvider>
+        <AuthProvider>
+          <AuthGate>
+            <CourseDraftProvider>{children}</CourseDraftProvider>
+          </AuthGate>
+        </AuthProvider>
       </body>
     </html>
   );

@@ -30,6 +30,16 @@ class ConflictError(CourseCreatorError):
     code = "conflict"
 
 
+class UnauthorizedError(CourseCreatorError):
+    status_code = 401
+    code = "unauthorized"
+
+
+class ForbiddenError(CourseCreatorError):
+    status_code = 403
+    code = "forbidden"
+
+
 class AIServiceError(CourseCreatorError):
     status_code = 502
     code = "ai_service_error"

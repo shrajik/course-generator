@@ -51,6 +51,7 @@ from app.schemas.document import CourseDocument
 from app.schemas.draft import GeneratedChapter
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
+from app.db.service import get_database_service
 from app.services.image_service import ImageService
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.research_service import ResearchService
@@ -65,10 +66,14 @@ class CourseService:
         ai: AIClient | None = None,
         storage: StorageService | None = None,
         settings: Settings | None = None,
+        use_db: bool | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.storage = storage or get_storage()
         self.ai = ai or get_ai_client()
+        # PostgreSQL is the primary store for course/blueprint/document records;
+        # tests without a live database flip this off (see conftest.py).
+        self.use_db = self.settings.use_database if use_db is None else use_db
         self.planner = PlannerAgent(self.ai, self.settings)
         self.writer = WriterAgent(self.ai, self.settings)
         self.reviewer = ReviewerAgent(self.ai, self.settings)
@@ -78,6 +83,86 @@ class CourseService:
         # chapter completions.
         self._document_locks: dict[str, asyncio.Lock] = {}
         self._jobs: dict[str, asyncio.Task] = {}
+
+    # --- persistence: course/blueprint/document live in Postgres when enabled,
+    # research/chapters/assets/exports always stay on the filesystem (below). Each
+    # call opens its own short-lived session - this service is a long-lived
+    # singleton and generation runs as a detached background task, so it cannot
+    # hold one request-scoped session across its whole lifetime. ------------
+    async def _save_course(self, record: CourseRecord) -> CourseRecord:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.save_course_record(record)
+        return self.storage.save_course(record)
+
+    async def _load_course(self, course_id: str) -> CourseRecord:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.load_course_record(course_id)
+        return self.storage.load_course(course_id)
+
+    async def _list_courses(self, limit: int = 100, offset: int = 0) -> list[CourseRecord]:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.list_course_records(limit, offset)
+        return [self.storage.load_course(cid) for cid in self.storage.list_course_ids()]
+
+    async def _save_blueprint(self, course_id: str, blueprint: CourseBlueprint) -> None:
+        if self.use_db:
+            async with get_database_service() as db:
+                await db.save_blueprint(course_id, blueprint)
+            return
+        self.storage.save_blueprint(course_id, blueprint)
+
+    async def _load_blueprint(self, course_id: str) -> CourseBlueprint:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.load_blueprint(course_id)
+        return self.storage.load_blueprint(course_id)
+
+    async def _has_blueprint(self, course_id: str) -> bool:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.has_blueprint(course_id)
+        return self.storage.has_blueprint(course_id)
+
+    async def _save_document(self, document: CourseDocument) -> None:
+        if self.use_db:
+            async with get_database_service() as db:
+                await db.save_document(document)
+            return
+        self.storage.save_document(document)
+
+    async def _load_document(self, course_id: str) -> CourseDocument:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.load_document_for_course(course_id)
+        return self.storage.load_document(course_id)
+
+    async def _has_document(self, course_id: str) -> bool:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.has_document(course_id)
+        return self.storage.has_document(course_id)
+
+    # --- public reads, used by the API routes -------------------------------
+    async def list_courses(self, limit: int = 100, offset: int = 0) -> list[CourseRecord]:
+        return await self._list_courses(limit, offset)
+
+    async def get_course_record(self, course_id: str) -> CourseRecord:
+        return await self._load_course(course_id)
+
+    async def get_blueprint(self, course_id: str) -> CourseBlueprint:
+        return await self._load_blueprint(course_id)
+
+    async def has_blueprint(self, course_id: str) -> bool:
+        return await self._has_blueprint(course_id)
+
+    async def has_document(self, course_id: str) -> bool:
+        return await self._has_document(course_id)
+
+    async def load_document(self, course_id: str) -> CourseDocument:
+        return await self._load_document(course_id)
 
     # --- phase 0: create ---------------------------------------------------
     async def create_course(
@@ -93,7 +178,7 @@ class CourseService:
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
         )
-        self.storage.save_course(record)
+        record = await self._save_course(record)
         log.info("Created course %s ('%s')", course_id, course_input.course_title)
 
         if run_planner:
@@ -107,9 +192,9 @@ class CourseService:
                 log.exception("Planning failed for %s", course_id)
                 record.last_error = f"planner: {exc}"
                 record.warnings.append("Planning failed; blueprint not created.")
-                self.storage.save_course(record)
+                record = await self._save_course(record)
                 return record
-            record = self.storage.load_course(course_id)
+            record = await self._load_course(course_id)
         return record
 
     # --- phase 1: plan -----------------------------------------------------
@@ -119,14 +204,14 @@ class CourseService:
             # Planned per-chapter summaries are the contract that lets chapters be
             # written in parallel, so make sure none are missing.
             await self.planner.ensure_planned_summaries(blueprint, record.input)
-        self.storage.save_blueprint(record.course_id, blueprint)
+        await self._save_blueprint(record.course_id, blueprint)
         record.has_blueprint = True
         record.status = "planned"
         record.chapters = [
             ChapterProgress(chapter_id=chapter.id, title=chapter.title)
             for chapter in blueprint.chapters
         ]
-        self.storage.save_course(record)
+        await self._save_course(record)
         return blueprint
 
     async def improve_toc(self, request: ImproveTocRequest) -> ImproveTocResponse:
@@ -141,7 +226,7 @@ class CourseService:
         A 40-minute blocking HTTP request is one proxy timeout away from throwing
         away the whole run; the frontend already polls the course record.
         """
-        record = self.storage.load_course(course_id)
+        record = await self._load_course(course_id)
 
         if request.mode == "sync":
             return await self.generate(course_id, request)
@@ -170,7 +255,7 @@ class CourseService:
             writing_mode=self.settings.writing_mode,
         )
         record.last_error = None
-        self.storage.save_course(record)
+        await self._save_course(record)
 
         task = asyncio.create_task(self._run_job(course_id, request, job_id))
         self._jobs[course_id] = task
@@ -189,22 +274,23 @@ class CourseService:
         try:
             await self.generate(course_id, request, job_id=job_id)
         except asyncio.CancelledError:  # pragma: no cover
-            self._patch_run(course_id, state="cancelled")
+            await self._patch_run(course_id, state="cancelled")
             raise
         except Exception as exc:  # noqa: BLE001 - a background run must not vanish silently
             log.exception("Background generation failed for %s", course_id)
-            self._patch_run(course_id, state="failed", error=str(exc)[:500])
+            await self._patch_run(course_id, state="failed", error=str(exc)[:500])
             try:
-                record = self.storage.load_course(course_id)
+                record = await self._load_course(course_id)
                 record.status = "failed"
                 record.last_error = str(exc)[:500]
-                self.storage.save_course(record)
+                await self._save_course(record)
             except Exception:  # pragma: no cover
                 pass
 
-    def job_state(self, course_id: str) -> RunInfo | None:
+    async def job_state(self, course_id: str) -> RunInfo | None:
         try:
-            return self.storage.load_course(course_id).run
+            record = await self._load_course(course_id)
+            return record.run
         except NotFoundError:
             return None
 
@@ -215,11 +301,11 @@ class CourseService:
         started = time.perf_counter()
 
         with run_metrics() as metrics:
-            record = self.storage.load_course(course_id)
-            if not self.storage.has_blueprint(course_id):
+            record = await self._load_course(course_id)
+            if not await self._has_blueprint(course_id):
                 await self.plan_course(record)
-                record = self.storage.load_course(course_id)
-            blueprint = self.storage.load_blueprint(course_id)
+                record = await self._load_course(course_id)
+            blueprint = await self._load_blueprint(course_id)
             template = load_template(blueprint.template_id or record.template_id)
 
             targets = self._select_chapters(blueprint, request)
@@ -256,7 +342,7 @@ class CourseService:
                 chapters_done=0,
                 writing_mode=self.settings.writing_mode,
             )
-            self.storage.save_course(record)
+            await self._save_course(record)
 
             warnings: list[str] = []
 
@@ -264,7 +350,7 @@ class CourseService:
             research_map = {}
             if not request.skip_research:
                 record.status = "researching"
-                self.storage.save_course(record)
+                await self._save_course(record)
                 research_map = await self.research.research_chapters(
                     course_id=course_id,
                     blueprint=blueprint,
@@ -279,7 +365,7 @@ class CourseService:
 
             # --- write + review --------------------------------------------
             record.status = "writing"
-            self.storage.save_course(record)
+            await self._save_course(record)
 
             written = self._existing_summaries(course_id, targets)
             parallel = self.settings.writing_mode == "parallel"
@@ -309,7 +395,7 @@ class CourseService:
             if parallel and self.settings.continuity_pass and len(generated) > 1:
                 warnings.extend(await self._continuity_warnings(course_id, blueprint))
 
-            record = self.storage.load_course(course_id)
+            record = await self._load_course(course_id)
             return await self._finalise(
                 record=record,
                 blueprint=blueprint,
@@ -359,7 +445,7 @@ class CourseService:
                 except Exception as exc:  # noqa: BLE001 - one chapter must not sink the run
                     log.exception("Chapter %s failed", chapter.id)
                     failed.append(chapter.id)
-                    self._mark_progress(record, chapter.id, error=str(exc)[:500])
+                    await self._mark_progress(record, chapter.id, error=str(exc)[:500])
                     return
                 generated.append(chapter.id)
                 written[chapter.id] = (chapter.order, chapter.title, artifact.summary)
@@ -367,7 +453,7 @@ class CourseService:
                 # Make the chapter readable in the editor immediately.
                 if request.build_document:
                     await self._rebuild_document(record.course_id)
-                self._patch_run(
+                await self._patch_run(
                     record.course_id,
                     chapters_done=done,
                     chapters_total=total,
@@ -413,13 +499,13 @@ class CourseService:
                 except Exception as exc:  # noqa: BLE001
                     log.exception("Chapter %s failed", chapter.id)
                     failed.append(chapter.id)
-                    self._mark_progress(record, chapter.id, error=str(exc)[:500])
+                    await self._mark_progress(record, chapter.id, error=str(exc)[:500])
                     continue
                 generated.append(chapter.id)
                 written[chapter.id] = (chapter.order, chapter.title, artifact.summary)
                 if request.build_document:
                     await self._rebuild_document(record.course_id)
-                self._patch_run(
+                await self._patch_run(
                     record.course_id,
                     chapters_done=index,
                     chapters_total=total,
@@ -475,7 +561,7 @@ class CourseService:
             research=research,
             continuity=continuity,
         )
-        self._mark_progress(record, chapter.id, researched=research is not None, written=True)
+        await self._mark_progress(record, chapter.id, researched=research is not None, written=True)
 
         review: ChapterReview | None = None
         revisions = 0
@@ -522,7 +608,7 @@ class CourseService:
             model="mock" if self.ai.is_mock else self.settings.writer_model,
         )
         self.storage.save_chapter(record.course_id, artifact)
-        self._mark_progress(
+        await self._mark_progress(
             record,
             chapter.id,
             reviewed=review is not None,
@@ -572,10 +658,10 @@ class CourseService:
 
         if request.build_document:
             record.status = "assembling"
-            self.storage.save_course(record)
+            await self._save_course(record)
             document = await self._rebuild_document(record.course_id)
             if document is None:
-                document = self.build_course_document(record.course_id)
+                document = await self.build_course_document(record.course_id)
 
             generate_images = (
                 self.settings.enable_image_generation
@@ -586,13 +672,13 @@ class CourseService:
                 # Images run after the document is already readable, so they are
                 # never what the user is waiting on to start editing.
                 record.status = "illustrating"
-                self.storage.save_course(record)
+                await self._save_course(record)
                 images = await self.images.generate_missing(
                     document=document, template=template, force=request.force
                 )
                 if images:
                     reflow_document(document, template)
-                self.storage.save_document(document)
+                await self._save_document(document)
             pages = len(document.pages)
             record.has_document = True
 
@@ -619,7 +705,7 @@ class CourseService:
             error=record.last_error,
             timings=summary or {},
         )
-        self.storage.save_course(record)
+        await self._save_course(record)
 
         return GenerateResponse(
             course_id=record.course_id,
@@ -653,15 +739,15 @@ class CourseService:
         """
         async with self._document_lock(course_id):
             try:
-                return self.build_course_document(course_id)
+                return await self.build_course_document(course_id)
             except NotFoundError:
                 return None
             except Exception as exc:  # noqa: BLE001
                 log.warning("Incremental document rebuild failed for %s: %s", course_id, exc)
                 return None
 
-    def build_course_document(self, course_id: str) -> CourseDocument:
-        blueprint = self.storage.load_blueprint(course_id)
+    async def build_course_document(self, course_id: str) -> CourseDocument:
+        blueprint = await self._load_blueprint(course_id)
         template = load_template(blueprint.template_id)
         chapters = self.storage.load_all_chapters(course_id)
         if not chapters:
@@ -669,9 +755,7 @@ class CourseService:
                 f"Course '{course_id}' has no generated chapters yet - run generation first"
             )
         existing = (
-            self.storage.load_document(course_id)
-            if self.storage.has_document(course_id)
-            else None
+            await self._load_document(course_id) if await self._has_document(course_id) else None
         )
         document = build_document(
             course_id=course_id,
@@ -683,7 +767,7 @@ class CourseService:
         # Carry generated image paths across rebuilds so we don't pay twice.
         if existing is not None:
             self._carry_over_assets(existing, document)
-        self.storage.save_document(document)
+        await self._save_document(document)
         return document
 
     @staticmethod
@@ -760,19 +844,19 @@ class CourseService:
             return round(elapsed_per_chapter * waves_left, 1)
         return round(elapsed_per_chapter * remaining, 1)
 
-    def _mark_progress(self, record: CourseRecord, chapter_id: str, **fields) -> None:
+    async def _mark_progress(self, record: CourseRecord, chapter_id: str, **fields) -> None:
         for progress in record.chapters:
             if progress.chapter_id == chapter_id:
                 for key, value in fields.items():
                     if value is not None:
                         setattr(progress, key, value)
                 break
-        self.storage.save_course(record)
+        await self._save_course(record)
 
-    def _patch_run(self, course_id: str, **fields) -> None:
+    async def _patch_run(self, course_id: str, **fields) -> None:
         """Update the persisted run record without clobbering concurrent writes."""
         try:
-            record = self.storage.load_course(course_id)
+            record = await self._load_course(course_id)
         except NotFoundError:  # pragma: no cover
             return
         run = record.run or RunInfo()
@@ -780,7 +864,7 @@ class CourseService:
             setattr(run, key, value)
         run.updated_at = utc_now_iso()
         record.run = run
-        self.storage.save_course(record)
+        await self._save_course(record)
 
 
 _service: CourseService | None = None

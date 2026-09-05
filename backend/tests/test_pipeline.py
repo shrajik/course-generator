@@ -178,7 +178,7 @@ async def test_a_failing_chapter_does_not_sink_the_run(service, technical_input,
 async def test_building_a_document_without_chapters_fails_clearly(service, technical_input):
     record = await service.create_course(technical_input)
     with pytest.raises(NotFoundError):
-        service.build_course_document(record.course_id)
+        await service.build_course_document(record.course_id)
 
 
 async def test_reviewer_detects_missing_required_blocks():

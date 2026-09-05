@@ -16,6 +16,8 @@ RUN python -m playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pytest.ini /app/pytest.ini
+COPY alembic.ini /app/alembic.ini
+COPY alembic /app/alembic
 COPY app /app/app
 COPY tests /app/tests
 

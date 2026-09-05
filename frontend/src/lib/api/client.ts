@@ -94,6 +94,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
       cache: "no-store",
+      credentials: "include",
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") throw error;
@@ -122,6 +123,7 @@ export async function requestBlob(
       body: body === undefined ? undefined : JSON.stringify(body),
       signal,
       cache: "no-store",
+      credentials: "include",
     });
   } catch {
     throw new ApiError(`Cannot reach the backend at ${API_BASE_URL}.`, 0, "network_error");

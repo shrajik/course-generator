@@ -23,7 +23,7 @@ def _service() -> DocumentService:
 async def get_document(
     document_id: str, service: DocumentService = Depends(_service)
 ) -> CourseDocument:
-    return service.load(document_id)
+    return await service.load(document_id)
 
 
 @router.post("/{document_id}/ai-edit", response_model=AiEditResponse)
@@ -50,7 +50,7 @@ async def export_pdf(
             "course_id": document.course_id,
             "version": document.version,
             "pages": len(document.pages),
-            "pdf_path": str(path),
+            "pdf_path": path.as_posix(),
             "size_bytes": path.stat().st_size,
         }
     return FileResponse(
@@ -65,7 +65,7 @@ async def preview_html(
     document_id: str, service: DocumentService = Depends(_service)
 ) -> HTMLResponse:
     """The exact HTML the PDF is rendered from - handy while iterating on styling."""
-    document = service.load(document_id)
+    document = await service.load(document_id)
     html = service.pdf.render_html(document).replace(
         'src="../assets/', f'src="/api/documents/{document_id}/assets/'
     )
@@ -76,7 +76,7 @@ async def preview_html(
 async def get_asset(
     document_id: str, asset_name: str, service: DocumentService = Depends(_service)
 ) -> FileResponse:
-    course_id = service.storage.resolve_course_id_for_document(document_id)
+    course_id = service.resolve_course_id(document_id)
     path = (service.storage.assets_dir(course_id) / asset_name).resolve()
     assets_root = service.storage.assets_dir(course_id).resolve()
     if not str(path).startswith(str(assets_root)) or not path.exists():

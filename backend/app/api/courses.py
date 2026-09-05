@@ -76,23 +76,19 @@ async def improve_toc(
 
 @router.get("", response_model=dict)
 @router.get("/", response_model=dict, include_in_schema=False)
-async def list_courses(storage: StorageService = Depends(_storage)) -> dict[str, Any]:
-    courses = []
-    for course_id in storage.list_course_ids():
-        try:
-            record = storage.load_course(course_id)
-        except Exception:  # pragma: no cover
-            continue
-        courses.append(
-            {
-                "course_id": record.course_id,
-                "document_id": record.document_id,
-                "course_title": record.input.course_title,
-                "template_id": record.template_id,
-                "status": record.status,
-                "updated_at": record.updated_at,
-            }
-        )
+async def list_courses(service: CourseService = Depends(_service)) -> dict[str, Any]:
+    records = await service.list_courses()
+    courses = [
+        {
+            "course_id": record.course_id,
+            "document_id": record.document_id,
+            "course_title": record.input.course_title,
+            "template_id": record.template_id,
+            "status": record.status,
+            "updated_at": record.updated_at,
+        }
+        for record in records
+    ]
     return {"courses": courses, "count": len(courses)}
 
 
@@ -100,17 +96,19 @@ async def list_courses(storage: StorageService = Depends(_storage)) -> dict[str,
 async def get_course(
     course_id: str,
     include_blueprint: bool = Query(default=True),
+    service: CourseService = Depends(_service),
     storage: StorageService = Depends(_storage),
 ) -> dict[str, Any]:
-    record = storage.load_course(course_id)
+    record = await service.get_course_record(course_id)
+    has_blueprint = await service.has_blueprint(course_id)
     payload: dict[str, Any] = {"course": record.model_dump(mode="json")}
-    if include_blueprint and storage.has_blueprint(course_id):
-        payload["blueprint"] = storage.load_blueprint(course_id).model_dump(mode="json")
+    if include_blueprint and has_blueprint:
+        payload["blueprint"] = (await service.get_blueprint(course_id)).model_dump(mode="json")
     payload["artifacts"] = {
-        "blueprint": storage.has_blueprint(course_id),
+        "blueprint": has_blueprint,
         # True as soon as the first chapter is assembled, so the editor can be
         # opened while later chapters are still being written.
-        "document": storage.has_document(course_id),
+        "document": await service.has_document(course_id),
         "chapters": [
             {
                 "chapter_id": chapter.chapter_id,
@@ -134,9 +132,9 @@ async def get_course(
 
 @router.get("/{course_id}/blueprint", response_model=CourseBlueprint)
 async def get_blueprint(
-    course_id: str, storage: StorageService = Depends(_storage)
+    course_id: str, service: CourseService = Depends(_service)
 ) -> CourseBlueprint:
-    return storage.load_blueprint(course_id)
+    return await service.get_blueprint(course_id)
 
 
 @router.post("/{course_id}/generate", response_model=GenerateResponse)
@@ -160,23 +158,26 @@ async def get_run_state(
     course_id: str, service: CourseService = Depends(_service)
 ) -> dict[str, Any]:
     """Progress, ETA and timings for the current or last generation run."""
-    run = service.job_state(course_id)
+    run = await service.job_state(course_id)
     return {"course_id": course_id, "run": run.model_dump(mode="json") if run else None}
 
 
 @router.get("/{course_id}/document", response_model=CourseDocument)
 async def get_course_document(
-    course_id: str, storage: StorageService = Depends(_storage)
+    course_id: str, service: CourseService = Depends(_service)
 ) -> CourseDocument:
     """The source of truth for this course."""
-    return storage.load_document(course_id)
+    return await service.load_document(course_id)
 
 
 @router.get("/{course_id}/chapters/{chapter_id}")
 async def get_chapter(
-    course_id: str, chapter_id: str, storage: StorageService = Depends(_storage)
+    course_id: str,
+    chapter_id: str,
+    service: CourseService = Depends(_service),
+    storage: StorageService = Depends(_storage),
 ) -> dict[str, Any]:
-    blueprint = storage.load_blueprint(course_id)
+    blueprint = await service.get_blueprint(course_id)
     chapter = blueprint.chapter_by_id(chapter_id)
     if chapter is None:
         raise NotFoundError(f"Chapter '{chapter_id}' is not part of this course")
@@ -190,9 +191,12 @@ async def get_chapter(
 
 @router.get("/{course_id}/chapters/{chapter_id}/research")
 async def get_chapter_research(
-    course_id: str, chapter_id: str, storage: StorageService = Depends(_storage)
+    course_id: str,
+    chapter_id: str,
+    service: CourseService = Depends(_service),
+    storage: StorageService = Depends(_storage),
 ) -> dict[str, Any]:
-    blueprint = storage.load_blueprint(course_id)
+    blueprint = await service.get_blueprint(course_id)
     chapter = blueprint.chapter_by_id(chapter_id)
     if chapter is None:
         raise NotFoundError(f"Chapter '{chapter_id}' is not part of this course")
@@ -201,7 +205,7 @@ async def get_chapter_research(
 
 @router.get("/{course_id}/template")
 async def get_course_template(
-    course_id: str, storage: StorageService = Depends(_storage)
+    course_id: str, service: CourseService = Depends(_service)
 ) -> dict[str, Any]:
-    record = storage.load_course(course_id)
+    record = await service.get_course_record(course_id)
     return load_template(record.template_id).model_dump(mode="json")
