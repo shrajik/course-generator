@@ -17,6 +17,15 @@ import {
 } from "react";
 import type { TemplateKind, TocItem } from "@/lib/types/course";
 
+/** The inputs a drafted TOC was generated from - lets the Create Course
+ * screen tell "still the same course, just fine-tuning" apart from "this is
+ * actually a new/different course" and decide whether to re-draft. */
+export interface TocDraftedFor {
+  courseTitle: string;
+  targetAudience: string;
+  template: TemplateKind;
+}
+
 export interface CourseDraft {
   courseTitle: string;
   targetAudience: string;
@@ -24,6 +33,9 @@ export interface CourseDraft {
   donts: string[];
   template: TemplateKind;
   toc: TocItem[];
+  /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
+   * a previous course) - see CreateCourseForm's regeneration check. */
+  tocDraftedFor: TocDraftedFor | null;
   /** Set once the course exists in the backend. */
   courseId: string | null;
   documentId: string | null;
@@ -50,6 +62,7 @@ export const EMPTY_DRAFT: CourseDraft = {
   donts: DEFAULT_DONTS,
   template: "technical",
   toc: [],
+  tocDraftedFor: null,
   courseId: null,
   documentId: null,
 };

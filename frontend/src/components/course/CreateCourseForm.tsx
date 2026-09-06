@@ -34,18 +34,33 @@ export function CreateCourseForm() {
    * title, audience and template, then hands it to the TOC screen for the user
    * to customise. The course itself is created when they press Generate, so the
    * edited TOC is what the backend stores.
+   *
+   * The draft (including `toc`) is mirrored to sessionStorage so a refresh
+   * doesn't lose it - which means it also survives navigating back here to
+   * start an entirely different course. Re-drafting only when `toc` happens
+   * to be empty isn't enough: it must re-draft whenever the title/audience/
+   * template have actually changed since the outline currently in state was
+   * generated, so a new course never inherits a previous one's chapters.
    */
   const handleContinue = async () => {
     if (!canContinue || busy) return;
     setBusy(true);
     setError(null);
+    const courseTitle = draft.courseTitle.trim();
+    const targetAudience = draft.targetAudience.trim();
+    const staleOrMissing =
+      draft.toc.length === 0 ||
+      !draft.tocDraftedFor ||
+      draft.tocDraftedFor.courseTitle !== courseTitle ||
+      draft.tocDraftedFor.targetAudience !== targetAudience ||
+      draft.tocDraftedFor.template !== draft.template;
     try {
       let toc: TocItem[] = draft.toc;
-      if (toc.length === 0) {
+      if (staleOrMissing) {
         const suggestion = await improveToc({
-          course_title: draft.courseTitle.trim(),
+          course_title: courseTitle,
           toc: [],
-          audience: draft.targetAudience.trim(),
+          audience: targetAudience,
           template: draft.template,
           dos: draft.dos,
           donts: draft.donts,
@@ -55,15 +70,19 @@ export function CreateCourseForm() {
           sections: item.sections ?? [],
           notes: item.notes ?? "",
         }));
+        update({ toc, tocDraftedFor: { courseTitle, targetAudience, template: draft.template } });
       }
-      update({ toc });
       router.push("/toc");
     } catch (caught) {
       // A failed draft must not block the user - they can build the TOC by hand.
       const message =
         caught instanceof ApiError ? caught.message : "Could not draft a table of contents.";
       setError(`${message} You can add chapters manually on the next step.`);
-      update({ toc: draft.toc });
+      if (staleOrMissing) {
+        // The stale outline must not be reused for a different course - clear
+        // it rather than carrying it forward under the new title.
+        update({ toc: [], tocDraftedFor: null });
+      }
       router.push("/toc");
     } finally {
       setBusy(false);
