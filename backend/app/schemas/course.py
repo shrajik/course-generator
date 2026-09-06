@@ -111,6 +111,24 @@ class RunInfo(BaseModel):
     timings: dict[str, Any] = Field(default_factory=dict)
 
 
+# Human review workflow - separate from `CourseStatus`, which tracks the AI
+# generation pipeline. A course starts as "draft"; the author submits it for
+# review ("in_review"); a reviewer either "approve"s it or sends it back with
+# "changes_requested" (author edits and resubmits to "in_review" again).
+ReviewStatus = Literal["draft", "in_review", "changes_requested", "approved"]
+
+
+class ReviewHistoryEntry(BaseModel):
+    """One entry in a course's review audit trail (append-only)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    action: Literal["submitted", "approved", "changes_requested"]
+    by: str | None = None  # user id of whoever performed the action
+    at: str
+    comment: str | None = None
+
+
 class CourseRecord(BaseModel):
     """Everything we persist about a course besides blueprint/research/chapters."""
 
@@ -126,6 +144,12 @@ class CourseRecord(BaseModel):
     # courses created before ownership existed, or when running without a
     # database (no user identity to attach - see USE_DATABASE).
     owner_id: str | None = None
+    # Review/approval workflow state - see ReviewStatus above.
+    review_status: ReviewStatus = "draft"
+    review_comment: str | None = None
+    reviewer_id: str | None = None
+    reviewed_at: str | None = None
+    review_history: list[ReviewHistoryEntry] = Field(default_factory=list)
     created_at: str
     updated_at: str
     chapters: list[ChapterProgress] = Field(default_factory=list)
@@ -219,3 +243,61 @@ class GenerateResponse(BaseModel):
     job_id: str = ""
     accepted: bool = False  # true when the run was started in the background
     timings: dict[str, Any] = Field(default_factory=dict)
+
+
+# --- review/approval workflow -----------------------------------------------
+
+
+class RequestChangesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    comment: str = Field(min_length=1, max_length=4000, description="Why changes are needed.")
+
+
+class ApproveCourseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    comment: str | None = Field(default=None, max_length=4000)
+
+
+class CourseReviewResponse(BaseModel):
+    """The review-workflow slice of a CourseRecord, returned by every
+    submit/approve/request-changes/status endpoint."""
+
+    model_config = ConfigDict(extra="allow")
+
+    course_id: str
+    owner_id: str | None
+    review_status: ReviewStatus
+    review_comment: str | None
+    reviewer_id: str | None
+    reviewed_at: str | None
+    history: list[ReviewHistoryEntry] = Field(default_factory=list)
+
+
+# --- activity log ------------------------------------------------------------
+
+ActivityAction = Literal[
+    "created",
+    "updated",
+    "submitted_for_review",
+    "changes_requested",
+    "approved",
+    "exported",
+]
+
+
+class CourseActivityEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    action: ActivityAction
+    user_id: str | None
+    user_email: str | None
+    message: str | None
+    created_at: str
+
+
+class CourseActivityListResponse(BaseModel):
+    course_id: str
+    activities: list[CourseActivityEntry] = Field(default_factory=list)

@@ -30,6 +30,7 @@ class CourseRepository:
         status: str | None = None,
         owner: str | None = None,
         owner_id: uuid.UUID | None = None,
+        review_statuses: list[str] | None = None,
     ) -> Select[tuple[Course]]:
         query = select(Course)
         if search:
@@ -56,6 +57,10 @@ class CourseRepository:
             # Real per-user ownership (courses.owner_id), distinct from the
             # free-text `owner` display filter above used by the admin UI.
             query = query.where(Course.owner_id == owner_id)
+        if review_statuses:
+            # A reviewer's queue: courses in one of these review states,
+            # regardless of who owns them.
+            query = query.where(Course.review_status.in_(review_statuses))
         return query
 
     async def count(
@@ -65,9 +70,14 @@ class CourseRepository:
         status: str | None = None,
         owner: str | None = None,
         owner_id: uuid.UUID | None = None,
+        review_statuses: list[str] | None = None,
     ) -> int:
         query = self._filtered_query(
-            search=search, status=status, owner=owner, owner_id=owner_id
+            search=search,
+            status=status,
+            owner=owner,
+            owner_id=owner_id,
+            review_statuses=review_statuses,
         ).subquery()
         return await self.session.scalar(select(func.count()).select_from(query)) or 0
 
@@ -80,9 +90,16 @@ class CourseRepository:
         status: str | None = None,
         owner: str | None = None,
         owner_id: uuid.UUID | None = None,
+        review_statuses: list[str] | None = None,
     ) -> Sequence[Course]:
         result = await self.session.scalars(
-            self._filtered_query(search=search, status=status, owner=owner, owner_id=owner_id)
+            self._filtered_query(
+                search=search,
+                status=status,
+                owner=owner,
+                owner_id=owner_id,
+                review_statuses=review_statuses,
+            )
             .order_by(Course.updated_at.desc())
             .limit(limit)
             .offset(offset)

@@ -6,11 +6,15 @@ import {
   ChevronDown,
   Download,
   Eye,
+  History,
   Loader2,
   MoreHorizontal,
   RefreshCw,
   Redo2,
   Save,
+  Send,
+  ThumbsDown,
+  ThumbsUp,
   Undo2,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
@@ -18,6 +22,8 @@ import { IconButton } from "@/components/ui/IconButton";
 import { useEditor } from "@/lib/editor/store";
 import { asString } from "@/lib/editor/blocks";
 import { cn } from "@/lib/utils/cn";
+import type { Role } from "@/lib/types/auth";
+import type { ActivityAction, CourseActivityEntry, CourseReview, ReviewStatus } from "@/lib/types/course";
 
 interface EditorToolbarProps {
   onPreview: () => void;
@@ -29,6 +35,45 @@ interface EditorToolbarProps {
   saving: boolean;
   saveError: string | null;
   justSaved: boolean;
+  review: CourseReview | null;
+  currentUserId: string | null;
+  currentUserRole: Role | null;
+  reviewBusy: boolean;
+  reviewError: string | null;
+  onSubmitForReview: () => void;
+  onApproveCourse: () => void;
+  onRequestChanges: () => void;
+  activity: CourseActivityEntry[] | null;
+}
+
+const REVIEW_STATUS_LABELS: Record<ReviewStatus, string> = {
+  draft: "Draft",
+  in_review: "In Review",
+  changes_requested: "Changes Requested",
+  approved: "Approved",
+};
+
+const REVIEW_STATUS_CLASSES: Record<ReviewStatus, string> = {
+  draft: "border-line bg-canvas text-ink-500",
+  in_review: "border-blue-200 bg-blue-50 text-blue-800",
+  changes_requested: "border-amber-200 bg-amber-50 text-amber-800",
+  approved: "border-emerald-200 bg-emerald-50 text-emerald-800",
+};
+
+const ACTIVITY_LABELS: Record<ActivityAction, string> = {
+  created: "created the course",
+  updated: "saved changes",
+  submitted_for_review: "submitted for review",
+  changes_requested: "requested changes",
+  approved: "approved the course",
+  exported: "exported the PDF",
+};
+
+function formatActivityTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
 }
 
 interface ChapterEntry {
@@ -48,11 +93,28 @@ export function EditorToolbar({
   saving,
   saveError,
   justSaved,
+  review,
+  currentUserId,
+  currentUserRole,
+  reviewBusy,
+  reviewError,
+  onSubmitForReview,
+  onApproveCourse,
+  onRequestChanges,
+  activity,
 }: EditorToolbarProps) {
   const editor = useEditor();
   const { document: doc, activePageIndex } = editor;
   const [menuOpen, setMenuOpen] = useState(false);
   const [chapterOpen, setChapterOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
+
+  // --- review/approval workflow --------------------------------------------
+  const isOwner = Boolean(review?.owner_id && review.owner_id === currentUserId);
+  const isReviewerRole = currentUserRole === "editor_reviewer" || currentUserRole === "admin";
+  const canSubmitForReview =
+    isOwner && (review?.review_status === "draft" || review?.review_status === "changes_requested");
+  const canReviewNow = isReviewerRole && review?.review_status === "in_review";
 
   /** Chapter list derived from the document itself, not hardcoded. */
   const chapters = useMemo<ChapterEntry[]>(() => {
@@ -127,7 +189,57 @@ export function EditorToolbar({
         </div>
       ) : null}
 
+      {review ? (
+        <div className="ml-3 flex items-center gap-2">
+          <span
+            className={cn(
+              "rounded-full border px-2 py-0.5 text-[10.5px] font-medium",
+              REVIEW_STATUS_CLASSES[review.review_status],
+            )}
+          >
+            {REVIEW_STATUS_LABELS[review.review_status]}
+          </span>
+          {review.review_status === "changes_requested" && review.review_comment ? (
+            <span
+              className="max-w-[280px] truncate text-[11.5px] text-amber-800"
+              title={review.review_comment}
+            >
+              “{review.review_comment}”
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="ml-auto flex items-center gap-2">
+        {reviewError ? (
+          <span
+            className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
+            title={reviewError}
+          >
+            Review action failed
+          </span>
+        ) : null}
+
+        {canSubmitForReview ? (
+          <Button variant="outline" size="sm" onClick={onSubmitForReview} disabled={reviewBusy}>
+            {reviewBusy ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+            Submit for Review
+          </Button>
+        ) : null}
+
+        {canReviewNow ? (
+          <>
+            <Button variant="outline" size="sm" onClick={onRequestChanges} disabled={reviewBusy}>
+              <ThumbsDown size={13} />
+              Request Changes
+            </Button>
+            <Button size="sm" onClick={onApproveCourse} disabled={reviewBusy}>
+              {reviewBusy ? <Loader2 size={13} className="animate-spin" /> : <ThumbsUp size={13} />}
+              Approve
+            </Button>
+          </>
+        ) : null}
+
         {saveError ? (
           <span
             className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
@@ -188,6 +300,52 @@ export function EditorToolbar({
           {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
           Export PDF
         </Button>
+
+        {activity ? (
+          <div className="relative">
+            <IconButton
+              aria-label="Activity history"
+              active={activityOpen}
+              onClick={() => setActivityOpen((open) => !open)}
+            >
+              <History size={15} />
+            </IconButton>
+            {activityOpen ? (
+              <div className="absolute right-0 top-8 z-30 w-80 overflow-hidden rounded-[10px] border border-line bg-white shadow-pop">
+                <div className="border-b border-line px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-ink-400">
+                  Activity
+                </div>
+                {activity.length === 0 ? (
+                  <p className="px-3 py-3 text-[12px] text-ink-400">No activity yet.</p>
+                ) : (
+                  <ul className="max-h-72 overflow-y-auto">
+                    {activity.map((entry) => (
+                      <li
+                        key={entry.id}
+                        className="border-b border-line px-3 py-2 text-[12px] last:border-0"
+                      >
+                        <p className="text-ink-700">
+                          <span className="font-medium text-ink">
+                            {entry.user_email ?? "Someone"}
+                          </span>{" "}
+                          {ACTIVITY_LABELS[entry.action]}
+                        </p>
+                        {entry.message ? (
+                          <p className="mt-0.5 truncate text-ink-500" title={entry.message}>
+                            “{entry.message}”
+                          </p>
+                        ) : null}
+                        <p className="mt-0.5 text-[11px] text-ink-400">
+                          {formatActivityTime(entry.created_at)}
+                        </p>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="relative">
           <IconButton

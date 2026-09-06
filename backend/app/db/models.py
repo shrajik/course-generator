@@ -64,6 +64,14 @@ class Course(Base):
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Human review workflow (separate from `status`, which tracks the AI
+    # generation pipeline - "draft" until the author submits it).
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft", index=True)
+    review_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewer_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     input_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -72,6 +80,7 @@ class Course(Base):
     document: Mapped["Document | None"] = relationship(back_populates="course", uselist=False)
     blueprints: Mapped[list["Blueprint"]] = relationship(back_populates="course")
     generation_runs: Mapped[list["GenerationRun"]] = relationship(back_populates="course")
+    activities: Mapped[list["CourseActivity"]] = relationship(back_populates="course")
 
 
 class Document(Base):
@@ -114,3 +123,25 @@ class GenerationRun(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     course: Mapped[Course] = relationship(back_populates="generation_runs")
+
+
+class CourseActivity(Base):
+    """Append-only audit log: one row per notable action on a course."""
+
+    __tablename__ = "course_activities"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    course_pk: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Nullable + a denormalised email snapshot: the log should still read
+    # sensibly ("jane@x.com approved this") even after the user is deleted.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    user_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    course: Mapped[Course] = relationship(back_populates="activities")

@@ -24,7 +24,7 @@ import json
 import random
 import re
 import time
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ValidationError
 
@@ -37,6 +37,20 @@ from app.core.metrics import CallRecord, current_metrics
 log = get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@runtime_checkable
+class StreamSink(Protocol):
+    """Receives real model output as it streams in, for `structured(on_delta=...)`.
+
+    `reset()` is called immediately before every attempt (including retries),
+    so a failed attempt's partial text is discarded rather than bleeding into
+    the next one. When not given, `structured()` behaves exactly as before -
+    one blocking call, no streaming.
+    """
+
+    def reset(self) -> None: ...
+    def append(self, delta: str) -> None: ...
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 _MISSING_MODEL_MARKERS = ("model_not_found", "does not exist", "do not have access")
@@ -68,8 +82,14 @@ class AIClient(abc.ABC):
         purpose: str = "",
         phase: str = "default",
         max_output_tokens: int | None = None,
+        on_delta: StreamSink | None = None,
     ) -> T:
-        """Return an instance of `schema` produced by the model."""
+        """Return an instance of `schema` produced by the model.
+
+        When `on_delta` is given, the *initial* attempt streams real model
+        output to it as it arrives (a retry or the validation-repair pass
+        still happen as plain blocking calls - see the real implementation).
+        """
 
     @abc.abstractmethod
     async def research(
@@ -280,6 +300,7 @@ class OpenAIClient(AIClient):
         purpose: str = "",
         phase: str = "default",
         max_output_tokens: int | None = None,
+        on_delta: StreamSink | None = None,
     ) -> T:
         requested = model or self.settings.writer_model
         model_name = self._resolve_model(requested)
@@ -292,7 +313,12 @@ class OpenAIClient(AIClient):
         usage: Any = None
         retries = 0
 
-        async def call(response_format: dict[str, Any], system_prompt: str, name: str) -> str:
+        async def call(
+            response_format: dict[str, Any],
+            system_prompt: str,
+            name: str,
+            stream_sink: StreamSink | None = None,
+        ) -> str:
             nonlocal usage
             kwargs: dict[str, Any] = {
                 "model": name,
@@ -304,9 +330,29 @@ class OpenAIClient(AIClient):
             }
             if max_output_tokens:
                 kwargs["max_completion_tokens"] = max_output_tokens
-            completion = await self.client.chat.completions.create(**kwargs)
-            usage = getattr(completion, "usage", None)
-            return completion.choices[0].message.content or ""
+
+            if stream_sink is None:
+                completion = await self.client.chat.completions.create(**kwargs)
+                usage = getattr(completion, "usage", None)
+                return completion.choices[0].message.content or ""
+
+            # Real token streaming: reset right before this attempt starts so a
+            # retry never mixes a failed attempt's text into the next one.
+            stream_sink.reset()
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+            parts: list[str] = []
+            stream = await self.client.chat.completions.create(**kwargs)
+            async for event in stream:
+                if getattr(event, "usage", None) is not None:
+                    usage = event.usage
+                if not event.choices:
+                    continue
+                delta = event.choices[0].delta.content
+                if delta:
+                    parts.append(delta)
+                    stream_sink.append(delta)
+            return "".join(parts)
 
         schema_format = {
             "type": "json_schema",
@@ -326,7 +372,7 @@ class OpenAIClient(AIClient):
         try:
             try:
                 raw, retries = await self._with_retries(
-                    label, phase, lambda: call(schema_format, system, model_name)
+                    label, phase, lambda: call(schema_format, system, model_name, on_delta)
                 )
             except AIServiceError as exc:
                 if self._is_missing_model_error(exc) and model_name != self.settings.fallback_model:
@@ -339,14 +385,16 @@ class OpenAIClient(AIClient):
                     self._unavailable_models.add(requested)
                     model_name = self.settings.fallback_model
                     raw, retries = await self._with_retries(
-                        label, phase, lambda: call(schema_format, system, model_name)
+                        label, phase, lambda: call(schema_format, system, model_name, on_delta)
                     )
                 else:
                     log.warning(
                         "%s: json_schema mode unavailable (%s) - falling back", label, exc
                     )
                     raw, retries = await self._with_retries(
-                        label, phase, lambda: call(json_format, system_with_schema, model_name)
+                        label,
+                        phase,
+                        lambda: call(json_format, system_with_schema, model_name, on_delta),
                     )
 
             try:

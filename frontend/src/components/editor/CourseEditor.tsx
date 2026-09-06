@@ -14,12 +14,22 @@ import { PropertiesPanel } from "./PropertiesPanel";
 import { UploadsPanel } from "./UploadsPanel";
 import { ApiError } from "@/lib/api/client";
 import { aiEdit, exportPdf, getDocument, saveDocument } from "@/lib/api/documents";
+import {
+  approveCourse,
+  getCourseActivity,
+  getCourseReview,
+  requestCourseChanges,
+  submitForReview,
+} from "@/lib/api/courses";
+import { useAuth } from "@/lib/auth/auth-provider";
 import { useEditor } from "@/lib/editor/store";
 import type { CourseDocument } from "@/lib/types/document";
+import type { CourseActivityEntry, CourseReview } from "@/lib/types/course";
 
 export function CourseEditor({ documentId }: { documentId: string }) {
   const router = useRouter();
   const editor = useEditor();
+  const { user } = useAuth();
   const [panel, setPanel] = useState<RailPanel>("pages");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -28,6 +38,15 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
+
+  const [review, setReview] = useState<CourseReview | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+
+  // null = not loaded / no access (e.g. viewer isn't the owner or admin) -
+  // the toolbar hides the Activity button in that case rather than showing
+  // an empty or broken list.
+  const [activity, setActivity] = useState<CourseActivityEntry[] | null>(null);
 
   const [instruction, setInstruction] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -62,6 +81,84 @@ export function CourseEditor({ documentId }: { documentId: string }) {
     };
   }, [documentId, load]);
 
+  // --- review/approval workflow --------------------------------------------
+  const courseId = editor.document?.course_id ?? null;
+
+  useEffect(() => {
+    if (!courseId) return;
+    let cancelled = false;
+    getCourseReview(courseId)
+      .then((info) => {
+        if (!cancelled) setReview(info);
+      })
+      .catch(() => {
+        // Review info is supplementary (e.g. filesystem/offline mode has no
+        // review workflow at all) - a failure here shouldn't block editing.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [courseId]);
+
+  // --- activity log ---------------------------------------------------------
+  const refreshActivity = useCallback((id: string) => {
+    getCourseActivity(id)
+      .then((response) => setActivity(response.activities))
+      .catch(() => setActivity(null)); // e.g. 403 - not the owner/admin
+  }, []);
+
+  useEffect(() => {
+    if (courseId) refreshActivity(courseId);
+  }, [courseId, refreshActivity]);
+
+  const handleSubmitForReview = useCallback(async () => {
+    if (!courseId) return;
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      setReview(await submitForReview(courseId));
+      refreshActivity(courseId);
+    } catch (caught) {
+      setReviewError(caught instanceof ApiError ? caught.message : "Could not submit for review.");
+    } finally {
+      setReviewBusy(false);
+    }
+  }, [courseId, refreshActivity]);
+
+  const handleApprove = useCallback(async () => {
+    if (!courseId) return;
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      setReview(await approveCourse(courseId));
+      refreshActivity(courseId);
+    } catch (caught) {
+      setReviewError(caught instanceof ApiError ? caught.message : "Could not approve the course.");
+    } finally {
+      setReviewBusy(false);
+    }
+  }, [courseId, refreshActivity]);
+
+  const handleRequestChanges = useCallback(async () => {
+    if (!courseId) return;
+    const reason = window.prompt("What changes are needed?");
+    if (reason === null) return; // cancelled
+    if (!reason.trim()) {
+      setReviewError("A reason is required when requesting changes.");
+      return;
+    }
+    setReviewBusy(true);
+    setReviewError(null);
+    try {
+      setReview(await requestCourseChanges(courseId, reason.trim()));
+      refreshActivity(courseId);
+    } catch (caught) {
+      setReviewError(caught instanceof ApiError ? caught.message : "Could not request changes.");
+    } finally {
+      setReviewBusy(false);
+    }
+  }, [courseId, refreshActivity]);
+
   const handleReload = useCallback(async () => {
     setReloading(true);
     try {
@@ -94,12 +191,13 @@ export function CourseEditor({ documentId }: { documentId: string }) {
     try {
       await saveManualEdits(editor.document);
       setJustSaved(true);
+      if (courseId) refreshActivity(courseId);
     } catch (caught) {
       setSaveError(caught instanceof ApiError ? caught.message : "Save failed.");
     } finally {
       setSaving(false);
     }
-  }, [editor.document, saveManualEdits]);
+  }, [editor.document, saveManualEdits, courseId, refreshActivity]);
 
   useEffect(() => {
     if (!justSaved) return;
@@ -199,12 +297,13 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+      if (courseId) refreshActivity(courseId);
     } catch (caught) {
       setAiError(caught instanceof ApiError ? caught.message : "PDF export failed.");
     } finally {
       setExporting(false);
     }
-  }, [documentId, editor.dirty, editor.document, saveManualEdits]);
+  }, [documentId, editor.dirty, editor.document, saveManualEdits, courseId, refreshActivity]);
 
   // --- keyboard shortcuts --------------------------------------------------
   useEffect(() => {
@@ -276,6 +375,15 @@ export function CourseEditor({ documentId }: { documentId: string }) {
         saving={saving}
         saveError={saveError}
         justSaved={justSaved}
+        review={review}
+        currentUserId={user?.id ?? null}
+        currentUserRole={user?.role ?? null}
+        reviewBusy={reviewBusy}
+        reviewError={reviewError}
+        onSubmitForReview={handleSubmitForReview}
+        onApproveCourse={handleApprove}
+        onRequestChanges={handleRequestChanges}
+        activity={activity}
       />
 
       <div className="flex min-h-0 flex-1">

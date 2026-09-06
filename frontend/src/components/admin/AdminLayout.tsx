@@ -13,12 +13,12 @@ type AdminAccessState = "checking" | "allowed" | "denied";
 
 function AdminAccessMessage({ denied }: { denied?: boolean }) {
   return (
-    <main className="flex min-h-screen items-center justify-center bg-[#1B1A18] px-4 text-[#F4EFE7]">
-      <div className="flex w-full max-w-[420px] items-center gap-3 rounded-[8px] border border-[#302D29] bg-[#201E1B] p-4 text-sm text-[#BEB6AD]">
+    <main className="flex min-h-screen items-center justify-center bg-canvas px-4 text-ink">
+      <div className="flex w-full max-w-[420px] items-center gap-3 rounded-[10px] border border-line bg-white p-4 text-sm text-ink-500 shadow-card">
         {denied ? (
-          <ShieldAlert size={18} className="shrink-0 text-[#D88445]" />
+          <ShieldAlert size={18} className="shrink-0 text-brand-500" />
         ) : (
-          <Loader2 size={18} className="shrink-0 animate-spin text-[#D88445]" />
+          <Loader2 size={18} className="shrink-0 animate-spin text-brand-500" />
         )}
         {denied ? "Admin access is not available for this account." : "Checking admin access"}
       </div>
@@ -64,7 +64,7 @@ export function AdminLayout({ children }: { children: React.ReactNode }) {
   if (access === "denied") return <AdminAccessMessage denied />;
 
   return (
-    <div className="min-h-screen bg-[#1B1A18] text-[#F4EFE7]">
+    <div className="min-h-screen bg-canvas text-ink">
       <div className="flex min-h-screen">
         <AdminSidebar />
         <div className="flex min-w-0 flex-1 flex-col">

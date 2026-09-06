@@ -9,6 +9,7 @@ import {
   Loader2,
   RefreshCcw,
   Search,
+  Users as UsersIcon,
   UserCheck,
   UserX,
 } from "lucide-react";
@@ -25,6 +26,14 @@ import {
 } from "@/lib/api/admin";
 import { useAuth } from "@/lib/auth/auth-provider";
 import type { Role } from "@/lib/types/auth";
+import {
+  AdminAlert,
+  AdminEmpty,
+  AdminLoading,
+  AdminPageHeader,
+  AdminPanel,
+  AdminStatusBadge,
+} from "@/components/admin/AdminUI";
 
 const PAGE_SIZE = 25;
 const ROLE_LABELS: Record<Role, string> = {
@@ -35,9 +44,9 @@ const ROLE_LABELS: Record<Role, string> = {
 };
 const ROLE_OPTIONS: Role[] = ["author", "editor_reviewer", "manager", "admin"];
 const selectClass =
-  "h-9 rounded-[8px] border border-[#34312D] bg-[#181614] px-3 text-[13px] text-[#E8DED3] outline-none transition-colors focus:border-[#D88445]";
+  "h-10 rounded-[8px] border border-line bg-white px-3 text-[13px] text-ink outline-none transition-colors focus:border-brand-500";
 const inputClass =
-  "h-9 w-full rounded-[8px] border border-[#34312D] bg-[#181614] px-3 pl-9 text-[13px] text-[#E8DED3] outline-none placeholder:text-[#786F66] transition-colors focus:border-[#D88445]";
+  "h-10 w-full rounded-[8px] border border-line bg-white px-3 pl-9 text-[13px] text-ink outline-none placeholder:text-ink-400 transition-colors focus:border-brand-500";
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -47,18 +56,7 @@ function formatDate(value: string): string {
 }
 
 function RoleBadge({ role }: { role: Role }) {
-  const isAdmin = role === "admin";
-  return (
-    <span
-      className={
-        isAdmin
-          ? "inline-flex h-7 items-center rounded-[8px] border border-[#614126] bg-[#2A2119] px-2.5 text-[12px] font-medium text-[#F1B273]"
-          : "inline-flex h-7 items-center rounded-[8px] border border-[#34312D] bg-[#24211E] px-2.5 text-[12px] font-medium text-[#C9C0B7]"
-      }
-    >
-      {ROLE_LABELS[role] ?? role}
-    </span>
-  );
+  return <AdminStatusBadge tone={role === "admin" ? "warning" : "neutral"}>{ROLE_LABELS[role] ?? role}</AdminStatusBadge>;
 }
 
 function StateBadge({ active, activeLabel, inactiveLabel }: {
@@ -66,24 +64,14 @@ function StateBadge({ active, activeLabel, inactiveLabel }: {
   activeLabel: string;
   inactiveLabel: string;
 }) {
-  return (
-    <span
-      className={
-        active
-          ? "inline-flex h-7 items-center rounded-[8px] border border-[#315640] bg-[#1E2A21] px-2.5 text-[12px] font-medium text-[#9BE0AC]"
-          : "inline-flex h-7 items-center rounded-[8px] border border-[#5A3529] bg-[#2A1D19] px-2.5 text-[12px] font-medium text-[#F0B59A]"
-      }
-    >
-      {active ? activeLabel : inactiveLabel}
-    </span>
-  );
+  return <AdminStatusBadge tone={active ? "success" : "danger"}>{active ? activeLabel : inactiveLabel}</AdminStatusBadge>;
 }
 
 function DetailRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="grid gap-1 border-b border-[#302D29] py-3 last:border-0 sm:grid-cols-[150px_1fr] sm:gap-4">
-      <dt className="text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">{label}</dt>
-      <dd className="break-words text-[13px] text-[#E8DED3]">{value}</dd>
+    <div className="grid gap-1 border-b border-line py-3 last:border-0 sm:grid-cols-[150px_1fr] sm:gap-4">
+      <dt className="text-[12px] uppercase tracking-[0.08em] text-ink-400">{label}</dt>
+      <dd className="break-words text-[13px] text-ink">{value}</dd>
     </div>
   );
 }
@@ -214,25 +202,12 @@ export default function AdminUsersPage() {
   const canGoForward = (page + 1) * PAGE_SIZE < total;
 
   return (
-    <div className="mx-auto flex w-full max-w-[1240px] flex-col gap-5">
-      <section className="rounded-[8px] border border-[#302D29] bg-[#201E1B] p-5 sm:p-6">
-        <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
-          User Management
-        </p>
-        <h2 className="mt-2 text-[24px] font-semibold text-[#F7EEE2]">Users</h2>
-        <p className="mt-2 max-w-2xl text-[14px] leading-6 text-[#BEB6AD]">
-          Inspect registered accounts, filter database records, and manage access controls.
-        </p>
-      </section>
+    <div className="admin-page mx-auto flex w-full max-w-[1240px] flex-col gap-5">
+      <AdminPageHeader eyebrow="User management" title="Users" description="Inspect registered accounts, filter database records, and manage access controls." />
 
-      {error ? (
-        <section className="flex items-center gap-2 rounded-[8px] border border-[#5A3529] bg-[#2A1D19] p-4 text-sm text-[#F0C4A6]">
-          <AlertCircle size={17} className="shrink-0" />
-          {error}
-        </section>
-      ) : null}
+      {error ? <AdminAlert>{error}</AdminAlert> : null}
 
-      <section className="rounded-[8px] border border-[#302D29] bg-[#201E1B] p-4">
+      <AdminPanel className="p-4">
         <div className="grid gap-3 lg:grid-cols-[minmax(240px,1fr)_160px_160px_180px_auto]">
           <form onSubmit={applySearch} className="relative flex gap-2">
             <Search
@@ -309,9 +284,9 @@ export default function AdminUsersPage() {
             Reset
           </Button>
         </div>
-      </section>
+      </AdminPanel>
 
-      <section className="overflow-hidden rounded-[8px] border border-[#302D29] bg-[#201E1B]">
+      <AdminPanel>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#302D29] px-4 py-3">
           <div className="text-[13px] text-[#BEB6AD]">
             {total.toLocaleString()} user{total === 1 ? "" : "s"}
@@ -344,17 +319,12 @@ export default function AdminUsersPage() {
         </div>
 
         {isLoading ? (
-          <div className="flex min-h-[220px] items-center justify-center text-sm text-[#BEB6AD]">
-            <Loader2 size={18} className="mr-2 animate-spin text-[#D88445]" />
-            Loading users
-          </div>
+          <AdminLoading label="Loading users" />
         ) : users.length === 0 ? (
-          <div className="flex min-h-[180px] items-center justify-center px-4 text-center text-sm text-[#8E8780]">
-            No users match the current filters.
-          </div>
+          <AdminEmpty><UsersIcon /><span>No users match the current filters.</span></AdminEmpty>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1120px] text-left text-[13px]">
+            <table className="admin-table w-full min-w-[1120px] text-left text-[13px]">
               <thead className="bg-[#181614] text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">
                 <tr>
                   <th className="px-4 py-3 font-medium">User ID</th>
@@ -449,10 +419,10 @@ export default function AdminUsersPage() {
             </table>
           </div>
         )}
-      </section>
+      </AdminPanel>
 
       {selectedUser ? (
-        <section className="rounded-[8px] border border-[#302D29] bg-[#201E1B] p-5">
+        <AdminPanel className="p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
@@ -503,7 +473,7 @@ export default function AdminUsersPage() {
             <DetailRow label="Created date" value={formatDate(selectedUser.created_at)} />
             <DetailRow label="Updated date" value={formatDate(selectedUser.updated_at)} />
           </dl>
-        </section>
+        </AdminPanel>
       ) : null}
     </div>
   );

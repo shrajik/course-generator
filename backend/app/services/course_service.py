@@ -30,7 +30,8 @@ from app.agents.reviewer import ReviewerAgent
 from app.agents.writer import WriterAgent, to_generated_chapter
 from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
-from app.core.errors import NotFoundError, ValidationFailedError
+from app.core.errors import ConflictError, NotFoundError, ValidationFailedError
+from app.core.generation_stream import get_stream_hub, make_stream_sink
 from app.core.ids import course_id as new_course_id
 from app.core.ids import document_id_for_course, new_id, utc_now_iso
 from app.core.logging import get_logger
@@ -40,12 +41,14 @@ from app.course.templates.registry import load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import (
     ChapterProgress,
+    CourseActivityEntry,
     CourseInput,
     CourseRecord,
     GenerateRequest,
     GenerateResponse,
     ImproveTocRequest,
     ImproveTocResponse,
+    ReviewHistoryEntry,
     RunInfo,
 )
 from app.schemas.document import CourseDocument
@@ -103,16 +106,26 @@ class CourseService:
         return self.storage.load_course(course_id)
 
     async def _list_courses(
-        self, limit: int = 100, offset: int = 0, *, owner_id: str | None = None
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        *,
+        owner_id: str | None = None,
+        review_statuses: list[str] | None = None,
     ) -> list[CourseRecord]:
         if self.use_db:
             async with get_database_service() as db:
                 return await db.list_course_records(
-                    limit, offset, owner_id=uuid.UUID(owner_id) if owner_id else None
+                    limit,
+                    offset,
+                    owner_id=uuid.UUID(owner_id) if owner_id else None,
+                    review_statuses=review_statuses,
                 )
         records = [self.storage.load_course(cid) for cid in self.storage.list_course_ids()]
         if owner_id is not None:
             records = [r for r in records if r.owner_id == owner_id]
+        if review_statuses is not None:
+            records = [r for r in records if r.review_status in review_statuses]
         return records
 
     async def _save_blueprint(self, course_id: str, blueprint: CourseBlueprint) -> None:
@@ -155,9 +168,16 @@ class CourseService:
 
     # --- public reads, used by the API routes -------------------------------
     async def list_courses(
-        self, limit: int = 100, offset: int = 0, *, owner_id: str | None = None
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        *,
+        owner_id: str | None = None,
+        review_statuses: list[str] | None = None,
     ) -> list[CourseRecord]:
-        return await self._list_courses(limit, offset, owner_id=owner_id)
+        return await self._list_courses(
+            limit, offset, owner_id=owner_id, review_statuses=review_statuses
+        )
 
     async def get_course_record(self, course_id: str) -> CourseRecord:
         return await self._load_course(course_id)
@@ -207,6 +227,113 @@ class CourseService:
                 return record
             record = await self._load_course(course_id)
         return record
+
+    # --- review/approval workflow -------------------------------------------
+    # draft -> in_review -> approved
+    #                     -> changes_requested -> in_review (resubmit) -> ...
+    # State transitions only; *who* may call these lives at the API layer
+    # (app/api/course_authorization.py, app/api/dependencies.require_roles),
+    # matching how ownership is checked outside CourseService everywhere else.
+    _RESUBMITTABLE_STATUSES = ("draft", "changes_requested")
+
+    async def submit_for_review(self, course_id: str, actor_id: str | None) -> CourseRecord:
+        record = await self._load_course(course_id)
+        if record.review_status not in self._RESUBMITTABLE_STATUSES:
+            raise ConflictError(
+                f"Course cannot be submitted for review from status '{record.review_status}'"
+            )
+        now = utc_now_iso()
+        record.review_status = "in_review"
+        # Clear the previous reviewer's note - it's stale once the author has
+        # acted on it and resubmitted; the audit trail below keeps it.
+        record.review_comment = None
+        record.reviewer_id = None
+        record.reviewed_at = None
+        record.review_history = [
+            *record.review_history,
+            ReviewHistoryEntry(action="submitted", by=actor_id, at=now),
+        ]
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Course %s submitted for review", course_id)
+        return record
+
+    async def approve_course(
+        self, course_id: str, reviewer_id: str, comment: str | None = None
+    ) -> CourseRecord:
+        record = await self._load_course(course_id)
+        if record.review_status != "in_review":
+            raise ConflictError(
+                f"Course is not ready for review approval (status '{record.review_status}')"
+            )
+        now = utc_now_iso()
+        record.review_status = "approved"
+        record.review_comment = comment
+        record.reviewer_id = reviewer_id
+        record.reviewed_at = now
+        record.review_history = [
+            *record.review_history,
+            ReviewHistoryEntry(action="approved", by=reviewer_id, at=now, comment=comment),
+        ]
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Course %s approved by %s", course_id, reviewer_id)
+        return record
+
+    async def request_changes(
+        self, course_id: str, reviewer_id: str, comment: str
+    ) -> CourseRecord:
+        record = await self._load_course(course_id)
+        if record.review_status != "in_review":
+            raise ConflictError(
+                f"Course is not ready for review (status '{record.review_status}')"
+            )
+        if not comment.strip():
+            raise ValidationFailedError("A reason is required when requesting changes")
+        now = utc_now_iso()
+        record.review_status = "changes_requested"
+        record.review_comment = comment
+        record.reviewer_id = reviewer_id
+        record.reviewed_at = now
+        record.review_history = [
+            *record.review_history,
+            ReviewHistoryEntry(action="changes_requested", by=reviewer_id, at=now, comment=comment),
+        ]
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Course %s sent back for changes by %s", course_id, reviewer_id)
+        return record
+
+    # --- activity log --------------------------------------------------------
+    # A thin, additive log alongside the actions above and the API routes that
+    # call them - it never gates or changes those actions, just records that
+    # they happened. No-ops in filesystem/offline mode (no DB to log to).
+    async def record_activity(
+        self,
+        course_id: str,
+        user_id: str | None,
+        user_email: str | None,
+        action: str,
+        message: str | None = None,
+    ) -> None:
+        if not self.use_db:
+            return
+        async with get_database_service() as db:
+            await db.record_activity(
+                course_id,
+                uuid.UUID(user_id) if user_id else None,
+                user_email,
+                action,
+                message,
+            )
+
+    async def list_activities(
+        self, course_id: str, limit: int = 50, offset: int = 0
+    ) -> list[CourseActivityEntry]:
+        if not self.use_db:
+            return []
+        async with get_database_service() as db:
+            return await db.list_activities(course_id, limit, offset)
 
     # --- phase 1: plan -----------------------------------------------------
     async def plan_course(self, record: CourseRecord) -> CourseBlueprint:
@@ -283,20 +410,26 @@ class CourseService:
 
     async def _run_job(self, course_id: str, request: GenerateRequest, job_id: str) -> None:
         try:
-            await self.generate(course_id, request, job_id=job_id)
-        except asyncio.CancelledError:  # pragma: no cover
-            await self._patch_run(course_id, state="cancelled")
-            raise
-        except Exception as exc:  # noqa: BLE001 - a background run must not vanish silently
-            log.exception("Background generation failed for %s", course_id)
-            await self._patch_run(course_id, state="failed", error=str(exc)[:500])
             try:
-                record = await self._load_course(course_id)
-                record.status = "failed"
-                record.last_error = str(exc)[:500]
-                await self._save_course(record)
-            except Exception:  # pragma: no cover
-                pass
+                await self.generate(course_id, request, job_id=job_id)
+            except asyncio.CancelledError:  # pragma: no cover
+                await self._patch_run(course_id, state="cancelled")
+                raise
+            except Exception as exc:  # noqa: BLE001 - a background run must not vanish silently
+                log.exception("Background generation failed for %s", course_id)
+                await self._patch_run(course_id, state="failed", error=str(exc)[:500])
+                try:
+                    record = await self._load_course(course_id)
+                    record.status = "failed"
+                    record.last_error = str(exc)[:500]
+                    await self._save_course(record)
+                except Exception:  # pragma: no cover
+                    pass
+        finally:
+            # Nothing is "currently streaming" once the run (however it
+            # ended) is over - bounds the hub's memory and lets a fresh SSE
+            # subscriber know there's nothing left to replay.
+            get_stream_hub().clear_course(course_id)
 
     async def job_state(self, course_id: str) -> RunInfo | None:
         try:
@@ -564,41 +697,29 @@ class CourseService:
         research,
         continuity: ContinuityContext,
     ) -> GeneratedChapter:
-        blocks, summary = await self.writer.write_chapter(
-            blueprint=blueprint,
-            chapter=chapter,
-            template=template,
-            course_input=record.input,
-            research=research,
-            continuity=continuity,
-        )
-        await self._mark_progress(record, chapter.id, researched=research is not None, written=True)
-
-        review: ChapterReview | None = None
-        revisions = 0
+        hub = get_stream_hub()
         try:
-            review = await self.reviewer.review_chapter(
+            blocks, summary = await self.writer.write_chapter(
                 blueprint=blueprint,
                 chapter=chapter,
                 template=template,
                 course_input=record.input,
-                blocks=blocks,
+                research=research,
                 continuity=continuity,
+                on_delta=make_stream_sink(record.course_id, chapter.id, "writing"),
             )
-            while review.needs_revision() and revisions < self.settings.max_review_revisions:
-                revisions += 1
-                log.info("Revising %s (pass %s)", chapter.id, revisions)
-                blocks, summary = await self.writer.revise_chapter(
-                    blueprint=blueprint,
-                    chapter=chapter,
-                    template=template,
-                    course_input=record.input,
-                    research=research,
-                    continuity=continuity,
-                    review=review,
-                    blocks=blocks,
-                    summary=summary,
-                )
+            await self._mark_progress(
+                record, chapter.id, researched=research is not None, written=True
+            )
+
+            review: ChapterReview | None = None
+            revisions = 0
+            try:
+                # ChapterReview is a critique object (scores/issues), not prose,
+                # so there's nothing meaningful to stream token-by-token here -
+                # just mark the phase so the UI can say "Reviewing" for real,
+                # exactly when the reviewer call actually starts.
+                hub.start(record.course_id, chapter.id, "reviewing")
                 review = await self.reviewer.review_chapter(
                     blueprint=blueprint,
                     chapter=chapter,
@@ -607,25 +728,51 @@ class CourseService:
                     blocks=blocks,
                     continuity=continuity,
                 )
-        except Exception as exc:  # noqa: BLE001 - review is advisory, not fatal
-            log.warning("Review failed for %s: %s", chapter.id, exc)
+                while review.needs_revision() and revisions < self.settings.max_review_revisions:
+                    revisions += 1
+                    log.info("Revising %s (pass %s)", chapter.id, revisions)
+                    blocks, summary = await self.writer.revise_chapter(
+                        blueprint=blueprint,
+                        chapter=chapter,
+                        template=template,
+                        course_input=record.input,
+                        research=research,
+                        continuity=continuity,
+                        review=review,
+                        blocks=blocks,
+                        summary=summary,
+                        on_delta=make_stream_sink(record.course_id, chapter.id, "reviewing"),
+                    )
+                    hub.start(record.course_id, chapter.id, "reviewing")
+                    review = await self.reviewer.review_chapter(
+                        blueprint=blueprint,
+                        chapter=chapter,
+                        template=template,
+                        course_input=record.input,
+                        blocks=blocks,
+                        continuity=continuity,
+                    )
+            except Exception as exc:  # noqa: BLE001 - review is advisory, not fatal
+                log.warning("Review failed for %s: %s", chapter.id, exc)
 
-        artifact = to_generated_chapter(
-            chapter=chapter,
-            blocks=blocks,
-            summary=summary,
-            review=review,
-            revisions=revisions,
-            model="mock" if self.ai.is_mock else self.settings.writer_model,
-        )
-        self.storage.save_chapter(record.course_id, artifact)
-        await self._mark_progress(
-            record,
-            chapter.id,
-            reviewed=review is not None,
-            review_score=review.scores.overall() if review else None,
-        )
-        return artifact
+            artifact = to_generated_chapter(
+                chapter=chapter,
+                blocks=blocks,
+                summary=summary,
+                review=review,
+                revisions=revisions,
+                model="mock" if self.ai.is_mock else self.settings.writer_model,
+            )
+            self.storage.save_chapter(record.course_id, artifact)
+            await self._mark_progress(
+                record,
+                chapter.id,
+                reviewed=review is not None,
+                review_score=review.scores.overall() if review else None,
+            )
+            return artifact
+        finally:
+            hub.finish(record.course_id, chapter.id)
 
     async def _continuity_warnings(
         self, course_id: str, blueprint: CourseBlueprint

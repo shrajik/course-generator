@@ -1,5 +1,5 @@
 import { AuthCard } from "@/components/auth/AuthCard";
 
 export default function LoginPage() {
-  return <AuthCard mode="login" />;
+  return <AuthCard mode="login" immersive />;
 }

@@ -89,7 +89,7 @@ export function codePanelStyle(style: BlockStyle): CSSProperties {
   };
 }
 
-export function accentColor(block: Block, fallback = "#6D3BEB"): string {
+export function accentColor(block: Block, fallback = "#C15F3C"): string {
   return block.style.accent_color ?? fallback;
 }
 

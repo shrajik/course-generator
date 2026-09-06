@@ -26,7 +26,7 @@ from app.schemas.draft import BlockRevision, ChapterDraft, DraftBlock, Generated
 from app.schemas.research import ChapterResearch
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
-from app.services.openai_service import AIClient, get_ai_client
+from app.services.openai_service import AIClient, StreamSink, get_ai_client
 
 log = get_logger(__name__)
 
@@ -46,6 +46,7 @@ class WriterAgent:
         research: ChapterResearch | None,
         continuity: ContinuityContext,
         revision_notes: str = "",
+        on_delta: StreamSink | None = None,
     ) -> tuple[list[Block], str]:
         """Returns (validated blocks, compact chapter summary)."""
         draft = await self.ai.structured(
@@ -64,6 +65,7 @@ class WriterAgent:
             model=self.settings.writer_model,
             purpose=f"writer:{chapter.id}",
             phase="writer",
+            on_delta=on_delta,
         )
 
         drafts = self._ensure_title_heading(draft.blocks, chapter.title)
@@ -92,6 +94,7 @@ class WriterAgent:
         review: ChapterReview,
         blocks: list[Block] | None = None,
         summary: str = "",
+        on_delta: StreamSink | None = None,
     ) -> tuple[list[Block], str]:
         """Fix a reviewed chapter.
 
@@ -110,6 +113,7 @@ class WriterAgent:
                     review=review,
                     blocks=blocks,
                     indices=indices,
+                    on_delta=on_delta,
                 )
                 if revised is not None:
                     return revised[0], revised[1] or summary
@@ -123,6 +127,7 @@ class WriterAgent:
             research=research,
             continuity=continuity,
             revision_notes=self.review_to_notes(review),
+            on_delta=on_delta,
         )
 
     async def _revise_blocks(
@@ -135,6 +140,7 @@ class WriterAgent:
         review: ChapterReview,
         blocks: list[Block],
         indices: list[int],
+        on_delta: StreamSink | None = None,
     ) -> tuple[list[Block], str] | None:
         payload = [block.model_dump(mode="json") for block in blocks]
         try:
@@ -153,6 +159,7 @@ class WriterAgent:
                 model=self.settings.writer_model,
                 purpose=f"revise:{chapter.id}",
                 phase="writer",
+                on_delta=on_delta,
             )
         except Exception as exc:  # noqa: BLE001 - fall back to a full rewrite
             log.warning("Surgical revision failed for %s: %s", chapter.id, exc)

@@ -7,7 +7,7 @@
  * a richer progress endpoint, only `deriveStages` needs to change.
  */
 
-import type { CourseDetail, CourseStatus } from "@/lib/types/course";
+import type { ChapterProgress, CourseDetail, CourseStatus } from "@/lib/types/course";
 
 export type StageStatus = "completed" | "active" | "pending" | "failed";
 
@@ -74,6 +74,24 @@ function statusLabel(status: StageStatus): string {
 
 export function stageStatusLabel(stage: GenerationStage): string {
   return statusLabel(stage.status);
+}
+
+/**
+ * The backend only ever persists done/not-done flags per chapter (no "started
+ * at" event exists - see course_service.py's `_mark_progress`), so "currently
+ * active chapter" is inferred the same way the writing stage already did
+ * before this change: the first chapter in blueprint order that this phase
+ * hasn't finished yet. That chapter is always a real one actually queued or
+ * in flight - never fabricated - even though several chapters can be
+ * in-progress concurrently and this only surfaces one of them.
+ */
+function activeChapterLabel(
+  chapters: ChapterProgress[],
+  notDoneYet: (chapter: ChapterProgress) => boolean,
+): string | undefined {
+  const index = chapters.findIndex(notDoneYet);
+  if (index === -1) return undefined;
+  return `Chapter ${index + 1}: ${chapters[index].title}`;
 }
 
 function ratioStage(
@@ -157,6 +175,10 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     total,
     status === "researching",
   );
+  if (research.stage.status === "active") {
+    research.stage.detail =
+      activeChapterLabel(chapters, (chapter) => !chapter.researched) ?? research.stage.detail;
+  }
 
   // --- writing, split into the chapter groups shown in the design ----------
   const writtenCount = chapters.filter((chapter) => chapter.written).length;
@@ -176,10 +198,14 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
       else if (groupWritten > 0 || writtenCount === start) {
         stageStatus = status === "writing" || status === "reviewing" ? "active" : "pending";
       }
+      const activeChapter = stageStatus === "active" ? group.find((c) => !c.written) : undefined;
       writingStages.push({
         id: `writing-${first}`,
         label: first === last ? `Writing Chapter ${first}` : `Writing Chapter ${first}-${last}`,
         status: stageStatus,
+        detail: activeChapter
+          ? `Chapter ${start + group.indexOf(activeChapter) + 1}: ${activeChapter.title}`
+          : undefined,
       });
     }
   }
@@ -194,29 +220,29 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     total,
     status === "reviewing" || (status === "writing" && reviewedCount > 0),
   );
+  if (reviewing.stage.status === "active") {
+    reviewing.stage.detail =
+      activeChapterLabel(chapters, (chapter) => chapter.written && !chapter.reviewed) ??
+      reviewing.stage.detail;
+  }
 
   // --- images + document --------------------------------------------------
+  const imagesActive = !ready && status === "illustrating";
   const images: GenerationStage = {
     id: "images",
     label: "Generating Images",
-    status: ready
-      ? "completed"
-      : status === "illustrating"
-        ? "active"
-        : failed
-          ? "failed"
-          : "pending",
+    status: ready ? "completed" : imagesActive ? "active" : failed ? "failed" : "pending",
+    // No per-chapter/per-image signal exists on the backend today (images are
+    // generated as one fire-and-forget batch) - a plain, honest "in progress"
+    // description is all that can be shown without inventing specifics.
+    detail: imagesActive ? "Generating images for your course" : undefined,
   };
+  const documentActive = !ready && (status === "assembling" || status === "illustrating");
   const document: GenerationStage = {
     id: "document",
     label: "Building Document",
-    status: ready
-      ? "completed"
-      : status === "assembling" || status === "illustrating"
-        ? "active"
-        : failed
-          ? "failed"
-          : "pending",
+    status: ready ? "completed" : documentActive ? "active" : failed ? "failed" : "pending",
+    detail: documentActive ? "Assembling your final document" : undefined,
   };
 
   const stages = [
@@ -243,7 +269,6 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
       );
 
   const active = stages.find((stage) => stage.status === "active");
-  const writingChapter = chapters.find((chapter) => !chapter.written);
 
   let currentLabel = "Preparing";
   let currentDetail = "";
@@ -255,11 +280,9 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     currentDetail = course.run?.error ?? course.last_error ?? "";
   } else if (active) {
     currentLabel = active.label;
-    if (active.id.startsWith("writing") && writingChapter) {
-      currentDetail = writingChapter.title;
-      currentDetailIsTitle = true;
-    } else if (active.detail) {
+    if (active.detail) {
       currentDetail = active.detail;
+      currentDetailIsTitle = active.detail.startsWith("Chapter ");
     }
   }
 
@@ -274,4 +297,22 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     etaSeconds: ready ? 0 : (course.run?.eta_seconds ?? null),
     documentReady: hasDocument,
   };
+}
+
+/**
+ * A friendly rephrasing of the *real* current stage for the live-preview
+ * panel's placeholder, shown only until the first actual content lands.
+ * Never invents progress - it's just `currentLabel` in prose form.
+ */
+export function emptyStateMessage(view: GenerationView): string {
+  if (view.failed) return view.currentDetail || "Generation hit a problem.";
+  if (view.currentLabel === "Course Planning" || view.currentLabel === "Preparing") {
+    return "Preparing your course...";
+  }
+  if (view.currentLabel === "Deep Research") return "Researching your content...";
+  if (view.currentLabel.startsWith("Writing")) return "Writing the first section...";
+  if (view.currentLabel === "Reviewing Content") return "Reviewing content for accuracy...";
+  if (view.currentLabel === "Generating Images") return "Generating images for your course...";
+  if (view.currentLabel === "Building Document") return "Assembling your document...";
+  return "Getting started...";
 }

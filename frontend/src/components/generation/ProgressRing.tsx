@@ -24,7 +24,7 @@ export function ProgressRing({ percent, size = 168, stroke = 14 }: ProgressRingP
           cy={size / 2}
           r={radius}
           fill="none"
-          stroke="#EDE9FE"
+          stroke="#F7E9E3"
           strokeWidth={stroke}
         />
         <circle
@@ -32,7 +32,7 @@ export function ProgressRing({ percent, size = 168, stroke = 14 }: ProgressRingP
           cy={size / 2}
           r={radius}
           fill="none"
-          stroke="#6D3BEB"
+          stroke="#C15F3C"
           strokeWidth={stroke}
           strokeLinecap="round"
           strokeDasharray={circumference}

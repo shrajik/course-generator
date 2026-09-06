@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
+  BookOpen as BookOpenEmpty,
   ChevronLeft,
   ChevronRight,
   Eye,
@@ -13,6 +14,14 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
+import {
+  AdminAlert,
+  AdminEmpty,
+  AdminLoading,
+  AdminPageHeader,
+  AdminPanel,
+  AdminStatusBadge,
+} from "@/components/admin/AdminUI";
 import {
   getAdminCourse,
   listAdminCourses,
@@ -34,9 +43,9 @@ const KNOWN_STATUSES = [
   "failed",
 ];
 const selectClass =
-  "h-9 rounded-[8px] border border-[#34312D] bg-[#181614] px-3 text-[13px] text-[#E8DED3] outline-none transition-colors focus:border-[#D88445]";
+  "h-10 rounded-[8px] border border-line bg-white px-3 text-[13px] text-ink outline-none transition-colors focus:border-brand-500";
 const inputClass =
-  "h-9 w-full rounded-[8px] border border-[#34312D] bg-[#181614] px-3 pl-9 text-[13px] text-[#E8DED3] outline-none placeholder:text-[#786F66] transition-colors focus:border-[#D88445]";
+  "h-10 w-full rounded-[8px] border border-line bg-white px-3 pl-9 text-[13px] text-ink outline-none placeholder:text-ink-400 transition-colors focus:border-brand-500";
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -49,28 +58,14 @@ function StatusBadge({ status }: { status: string }) {
   const ready = status === "ready";
   const failed = status === "failed";
   const active = ["researching", "writing", "reviewing", "assembling", "illustrating"].includes(status);
-  return (
-    <span
-      className={
-        failed
-          ? "inline-flex h-7 items-center rounded-[8px] border border-[#5A3529] bg-[#2A1D19] px-2.5 text-[12px] font-medium text-[#F0C4A6]"
-          : ready
-            ? "inline-flex h-7 items-center rounded-[8px] border border-[#34523B] bg-[#1C281F] px-2.5 text-[12px] font-medium text-[#A8D4AD]"
-            : active
-              ? "inline-flex h-7 items-center rounded-[8px] border border-[#614126] bg-[#2A2119] px-2.5 text-[12px] font-medium text-[#F1B273]"
-              : "inline-flex h-7 items-center rounded-[8px] border border-[#34312D] bg-[#24211E] px-2.5 text-[12px] font-medium text-[#C9C0B7]"
-      }
-    >
-      {status}
-    </span>
-  );
+  return <AdminStatusBadge tone={failed ? "danger" : ready ? "success" : active ? "warning" : "neutral"}>{status}</AdminStatusBadge>;
 }
 
 function DetailRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="grid gap-1 border-b border-[#302D29] py-3 last:border-0 sm:grid-cols-[160px_1fr] sm:gap-4">
-      <dt className="text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">{label}</dt>
-      <dd className="break-words text-[13px] text-[#E8DED3]">{value}</dd>
+    <div className="grid gap-1 border-b border-line py-3 last:border-0 sm:grid-cols-[160px_1fr] sm:gap-4">
+      <dt className="text-[12px] uppercase tracking-[0.08em] text-ink-400">{label}</dt>
+      <dd className="break-words text-[13px] text-ink">{value}</dd>
     </div>
   );
 }
@@ -169,25 +164,12 @@ export default function AdminCoursesPage() {
   const canGoForward = (page + 1) * PAGE_SIZE < total;
 
   return (
-    <div className="mx-auto flex w-full max-w-[1240px] flex-col gap-5">
-      <section className="rounded-[8px] border border-[#302D29] bg-[#201E1B] p-5 sm:p-6">
-        <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
-          Course Management
-        </p>
-        <h2 className="mt-2 text-[24px] font-semibold text-[#F7EEE2]">Courses</h2>
-        <p className="mt-2 max-w-2xl text-[14px] leading-6 text-[#BEB6AD]">
-          Inspect generated courses, filter processing states, and review stored course metadata.
-        </p>
-      </section>
+    <div className="admin-page mx-auto flex w-full max-w-[1240px] flex-col gap-5">
+      <AdminPageHeader eyebrow="Course management" title="Courses" description="Inspect generated courses, filter processing states, and review stored course metadata." />
 
-      {error ? (
-        <section className="flex items-center gap-2 rounded-[8px] border border-[#5A3529] bg-[#2A1D19] p-4 text-sm text-[#F0C4A6]">
-          <AlertCircle size={17} className="shrink-0" />
-          {error}
-        </section>
-      ) : null}
+      {error ? <AdminAlert>{error}</AdminAlert> : null}
 
-      <section className="rounded-[8px] border border-[#302D29] bg-[#201E1B] p-4">
+      <AdminPanel className="p-4">
         <form onSubmit={applyFilters} className="grid gap-3 lg:grid-cols-[minmax(240px,1fr)_220px_180px_auto]">
           <div className="relative">
             <Search
@@ -253,9 +235,9 @@ export default function AdminCoursesPage() {
             </Button>
           </div>
         </form>
-      </section>
+      </AdminPanel>
 
-      <section className="overflow-hidden rounded-[8px] border border-[#302D29] bg-[#201E1B]">
+      <AdminPanel>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#302D29] px-4 py-3">
           <div className="text-[13px] text-[#BEB6AD]">
             {total.toLocaleString()} course{total === 1 ? "" : "s"}
@@ -288,17 +270,12 @@ export default function AdminCoursesPage() {
         </div>
 
         {isLoading ? (
-          <div className="flex min-h-[220px] items-center justify-center text-sm text-[#BEB6AD]">
-            <Loader2 size={18} className="mr-2 animate-spin text-[#D88445]" />
-            Loading courses
-          </div>
+          <AdminLoading label="Loading courses" />
         ) : courses.length === 0 ? (
-          <div className="flex min-h-[180px] items-center justify-center px-4 text-center text-sm text-[#8E8780]">
-            No courses match the current filters.
-          </div>
+          <AdminEmpty><BookOpenEmpty /><span>No courses match the current filters.</span></AdminEmpty>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1180px] text-left text-[13px]">
+            <table className="admin-table w-full min-w-[1180px] text-left text-[13px]">
               <thead className="bg-[#181614] text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">
                 <tr>
                   <th className="px-4 py-3 font-medium">Course</th>
@@ -357,10 +334,10 @@ export default function AdminCoursesPage() {
             </table>
           </div>
         )}
-      </section>
+      </AdminPanel>
 
       {selectedCourse ? (
-        <section className="rounded-[8px] border border-[#302D29] bg-[#201E1B] p-5">
+        <AdminPanel className="p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
@@ -407,7 +384,7 @@ export default function AdminCoursesPage() {
             <DetailRow label="Created date" value={formatDate(selectedCourse.created_at)} />
             <DetailRow label="Updated date" value={formatDate(selectedCourse.updated_at)} />
           </dl>
-        </section>
+        </AdminPanel>
       ) : null}
     </div>
   );

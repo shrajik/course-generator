@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useState } from "react";
-import { ArrowRight, Loader2 } from "lucide-react";
+import { ArrowRight, BookOpen, FileText, Image as ImageIcon, Lightbulb, Loader2, Users } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
 import { useAuth } from "@/lib/auth/auth-provider";
@@ -23,7 +23,7 @@ function errorMessage(caught: unknown, mode: Mode): string {
   return caught.message || "Something went wrong. Please try again.";
 }
 
-export function AuthCard({ mode }: { mode: Mode }) {
+export function AuthCard({ mode, immersive = false }: { mode: Mode; immersive?: boolean }) {
   const router = useRouter();
   const auth = useAuth();
   const [email, setEmail] = useState("");
@@ -60,6 +60,44 @@ export function AuthCard({ mode }: { mode: Mode }) {
       setBusy(false);
     }
   };
+
+  if (immersive) {
+    return (
+      <main className="login-experience">
+        <section className="login-visual" aria-label="AI Course Creator overview">
+          <div className="login-visual-content">
+            <div className="login-brand"><span className="login-brand-mark"><BookOpen size={19} /></span><span>AI Course Creator</span></div>
+            <div className="login-visual-copy">
+              <p className="login-kicker">Learn · Create · Grow</p>
+              <h1>Turn your ideas<br />into complete<br /><em>courses with AI.</em></h1>
+              <p className="login-lede">Research, structure, write and design<br />beautiful courses — in minutes, not months.</p>
+              <div className="login-features">
+                <div><span><Lightbulb size={17} /></span><p><strong>AI-Powered Content</strong><small>From idea to full course</small></p></div>
+                <div><span><FileText size={17} /></span><p><strong>Structured &amp; Comprehensive</strong><small>Well-organized chapters</small></p></div>
+                <div><span><ImageIcon size={17} /></span><p><strong>Rich Media Support</strong><small>Images, examples and more</small></p></div>
+                <div><span><Users size={17} /></span><p><strong>For Educators, Creators &amp; Teams</strong><small>Share knowledge, make an impact</small></p></div>
+              </div>
+            </div>
+          </div>
+          <div className="login-visual-quote">“Knowledge grows<br />when it’s shared.”</div>
+        </section>
+
+        <section className="login-form-side">
+          <div className="login-form-card">
+            <div className="login-form-brand"><span className="login-form-brand-mark"><BookOpen size={18} /></span><strong>AI Course Creator</strong><span>LEARN ANYTHING. TEACH ANYONE.</span></div>
+            <div className="login-form-heading"><h2>Sign In</h2><p>{subtitle}</p></div>
+            <form className="login-form" onSubmit={handleSubmit}>
+              <div><label htmlFor="email">Email</label><input id="email" name="email" type="email" autoComplete="email" className="login-input" value={email} onChange={(event) => setEmail(event.target.value)} disabled={busy} required /></div>
+              <div><label htmlFor="password">Password</label><input id="password" name="password" type="password" autoComplete="current-password" className="login-input" value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} minLength={1} required /></div>
+              {error ? <p className="login-error">{error}</p> : null}
+              <Button type="submit" className="login-submit" disabled={busy}>{busy ? <><Loader2 size={15} className="animate-spin" /> Signing in</> : <>Sign In <ArrowRight size={15} /></>}</Button>
+            </form>
+            <p className="login-alternate">Need an account? <Link href={alternateHref}>{alternateAction}</Link></p>
+          </div>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-[480px] items-center px-4 py-8">

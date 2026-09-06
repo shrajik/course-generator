@@ -18,17 +18,17 @@ export function TocSummary({ estimate }: { estimate: CourseEstimate }) {
             width="68"
             height="86"
             rx="8"
-            fill="#F7F6FE"
-            stroke="#DDD5FE"
+            fill="#F7E9E3"
+            stroke="#E8B7A5"
             strokeWidth="1.5"
           />
-          <rect x="38" y="26" width="44" height="5" rx="2.5" fill="#DDD5FE" />
-          <rect x="38" y="39" width="36" height="4" rx="2" fill="#EDE9FE" />
-          <rect x="38" y="49" width="44" height="4" rx="2" fill="#EDE9FE" />
-          <rect x="38" y="59" width="30" height="4" rx="2" fill="#EDE9FE" />
-          <rect x="38" y="69" width="40" height="4" rx="2" fill="#EDE9FE" />
-          <rect x="38" y="79" width="24" height="4" rx="2" fill="#EDE9FE" />
-          <circle cx="28" cy="70" r="7" fill="#8B6DF6" />
+          <rect x="38" y="26" width="44" height="5" rx="2.5" fill="#E8B7A5" />
+          <rect x="38" y="39" width="36" height="4" rx="2" fill="#F3F0EC" />
+          <rect x="38" y="49" width="44" height="4" rx="2" fill="#F3F0EC" />
+          <rect x="38" y="59" width="30" height="4" rx="2" fill="#F3F0EC" />
+          <rect x="38" y="69" width="40" height="4" rx="2" fill="#F3F0EC" />
+          <rect x="38" y="79" width="24" height="4" rx="2" fill="#F3F0EC" />
+          <circle cx="28" cy="70" r="7" fill="#C15F3C" />
           <path
             d="M28 66.6v6.8M24.6 70h6.8"
             stroke="#FFFFFF"

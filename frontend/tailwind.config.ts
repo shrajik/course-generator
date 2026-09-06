@@ -1,49 +1,46 @@
 import type { Config } from "tailwindcss";
 
-/**
- * Tokens are taken from the approved UI design: a violet accent on a very light
- * neutral canvas, hairline #ECECF1 borders and 12-16px radii.
- */
+/** Shared visual tokens for the light, warm Course Creator theme. */
 const config: Config = {
   content: ["./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
         brand: {
-          50: "#F6F4FE",
-          100: "#EDE9FE",
-          200: "#DDD5FE",
-          300: "#C4B4FC",
-          400: "#A78BFA",
-          500: "#8B6DF6",
-          600: "#6D3BEB",
-          700: "#5B27CE",
-          800: "#4A1FA8",
-          900: "#3C1B85",
+          50: "#F7E9E3",
+          100: "#F7E9E3",
+          200: "#E8B7A5",
+          300: "#D98D73",
+          400: "#C15F3C",
+          500: "#C15F3C",
+          600: "#C15F3C",
+          700: "#A94F32",
+          800: "#8F422B",
+          900: "#763722",
         },
         ink: {
-          DEFAULT: "#1A1A1A",
-          700: "#33333D",
-          500: "#6B6B76",
-          400: "#8A8A94",
-          300: "#A9A9B2",
+          DEFAULT: "#1F2937",
+          700: "#1F2937",
+          500: "#5F6368",
+          400: "#8A8F98",
+          300: "#AEB2B8",
         },
         line: {
-          DEFAULT: "#ECECF1",
-          strong: "#DEDEE6",
+          DEFAULT: "#E5E0DA",
+          strong: "#D8D0C8",
         },
-        canvas: "#FAFAFC",
-        success: "#16A34A",
-        danger: "#EF4444",
+        canvas: "#F7F5F2",
+        success: "#3F8F68",
+        danger: "#C94C4C",
       },
       borderRadius: {
         card: "14px",
         panel: "16px",
       },
       boxShadow: {
-        card: "0 1px 2px rgba(16, 16, 32, 0.04)",
-        pop: "0 12px 32px -8px rgba(26, 20, 60, 0.18)",
-        canvas: "0 2px 14px rgba(26, 20, 60, 0.08)",
+        card: "0 1px 2px rgba(58, 45, 35, 0.04)",
+        pop: "0 12px 32px -8px rgba(58, 45, 35, 0.16)",
+        canvas: "0 2px 14px rgba(58, 45, 35, 0.08)",
       },
       fontFamily: {
         sans: [

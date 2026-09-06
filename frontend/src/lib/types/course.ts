@@ -10,6 +10,19 @@ export const TEMPLATE_IDS: Record<TemplateKind, string> = {
   non_technical: "non_technical_v1",
 };
 
+// --- live generation streaming ----------------------------------------------
+// Mirrors backend/app/core/generation_stream.py's ChapterStreamState.to_event().
+
+export type ChapterStreamPhase = "writing" | "reviewing";
+
+export interface ChapterStreamEvent {
+  chapter_id: string;
+  phase: ChapterStreamPhase;
+  text: string;
+  done: boolean;
+  sequence: number;
+}
+
 export interface TocItem {
   title: string;
   sections: string[];
@@ -70,6 +83,53 @@ export interface RunInfo {
   timings: Record<string, unknown>;
 }
 
+// --- review/approval workflow ------------------------------------------------
+// draft -> in_review -> approved
+//                     -> changes_requested -> in_review (resubmit) -> ...
+
+export type ReviewStatus = "draft" | "in_review" | "changes_requested" | "approved";
+
+export interface ReviewHistoryEntry {
+  action: "submitted" | "approved" | "changes_requested";
+  by: string | null;
+  at: string;
+  comment: string | null;
+}
+
+export interface CourseReview {
+  course_id: string;
+  owner_id: string | null;
+  review_status: ReviewStatus;
+  review_comment: string | null;
+  reviewer_id: string | null;
+  reviewed_at: string | null;
+  history: ReviewHistoryEntry[];
+}
+
+// --- activity log ------------------------------------------------------------
+
+export type ActivityAction =
+  | "created"
+  | "updated"
+  | "submitted_for_review"
+  | "changes_requested"
+  | "approved"
+  | "exported";
+
+export interface CourseActivityEntry {
+  id: string;
+  action: ActivityAction;
+  user_id: string | null;
+  user_email: string | null;
+  message: string | null;
+  created_at: string;
+}
+
+export interface CourseActivityListResponse {
+  course_id: string;
+  activities: CourseActivityEntry[];
+}
+
 export interface CourseRecord {
   course_id: string;
   document_id: string;
@@ -78,6 +138,11 @@ export interface CourseRecord {
   input: CourseInput;
   template_id: string;
   owner_id: string | null;
+  review_status: ReviewStatus;
+  review_comment: string | null;
+  reviewer_id: string | null;
+  reviewed_at: string | null;
+  review_history: ReviewHistoryEntry[];
   created_at: string;
   updated_at: string;
   chapters: ChapterProgress[];

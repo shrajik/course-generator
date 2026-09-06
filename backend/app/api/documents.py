@@ -54,7 +54,12 @@ async def save_document(
     JSON their browser sends.
     """
     await check_document_owner(document_id, current_user, course_service, service)
-    return await service.save(document_id, document)
+    saved = await service.save(document_id, document)
+    if current_user is not None:
+        await course_service.record_activity(
+            saved.course_id, str(current_user.id), current_user.email, "updated"
+        )
+    return saved
 
 
 @router.post("/{document_id}/ai-edit", response_model=AiEditResponse)
@@ -81,6 +86,10 @@ async def export_pdf(
     """Render the current Course Document JSON to PDF via HTML + Playwright."""
     await check_document_owner(document_id, current_user, course_service, service)
     path, document = await service.export_pdf(document_id)
+    if current_user is not None:
+        await course_service.record_activity(
+            document.course_id, str(current_user.id), current_user.email, "exported"
+        )
     if not download:
         return {
             "document_id": document.document_id,

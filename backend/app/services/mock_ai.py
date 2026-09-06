@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import time
 from typing import Any, TypeVar
@@ -21,7 +22,7 @@ from pydantic import BaseModel
 
 from app.core.config import Settings, get_settings
 from app.core.metrics import CallRecord, current_metrics
-from app.services.openai_service import AIClient, ResearchResult
+from app.services.openai_service import AIClient, ResearchResult, StreamSink
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -84,11 +85,27 @@ class MockAIClient(AIClient):
         purpose: str = "",
         phase: str = "default",
         max_output_tokens: int | None = None,
+        on_delta: StreamSink | None = None,
     ) -> T:
         self.calls.append({"kind": "structured", "schema": schema.__name__, "purpose": purpose})
         await self._simulate("structured", purpose or schema.__name__)
         builder = _BUILDERS.get(schema.__name__)
         payload = builder(user) if builder else {}
+        if on_delta is not None:
+            # Deliver the same real (deterministic mock) payload in chunks
+            # instead of one shot, so the streaming code path is exercised
+            # offline too - not fabricated content, just paced delivery of
+            # what would be returned anyway.
+            on_delta.reset()
+            raw = json.dumps(payload, ensure_ascii=False)
+            chunk_size = 24
+            for start in range(0, len(raw), chunk_size):
+                on_delta.append(raw[start : start + chunk_size])
+                # A cooperative yield, not a delay (sleep(0) adds no wall-clock
+                # time) - without it this loop never gives the event loop a
+                # chance to forward each chunk to an SSE subscriber before the
+                # whole payload is already done.
+                await asyncio.sleep(0)
         return schema.model_validate(payload)
 
     async def research(

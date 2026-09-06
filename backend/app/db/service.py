@@ -10,13 +10,14 @@ from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
-from app.db.models import Blueprint, Course, Document
+from app.db.models import Blueprint, Course, CourseActivity, Document
+from app.db.repositories.activities import CourseActivityRepository
 from app.db.repositories.blueprints import BlueprintRepository
 from app.db.repositories.courses import CourseRepository
 from app.db.repositories.documents import DocumentRepository
 from app.db.session import get_session_factory
 from app.schemas.blueprint import CourseBlueprint
-from app.schemas.course import CourseInput, CourseRecord
+from app.schemas.course import CourseActivityEntry, CourseInput, CourseRecord
 from app.schemas.document import CourseDocument
 
 
@@ -28,6 +29,7 @@ class DatabaseService:
         self.courses = CourseRepository(session)
         self.documents = DocumentRepository(session)
         self.blueprints = BlueprintRepository(session)
+        self.activities = CourseActivityRepository(session)
 
     # --- Courses ----------------------------------------------------------
     async def save_course_record(self, record: CourseRecord) -> CourseRecord:
@@ -46,11 +48,19 @@ class DatabaseService:
                 "input",
                 "template_id",
                 "owner_id",
+                "review_status",
+                "review_comment",
+                "reviewer_id",
+                "reviewed_at",
                 "created_at",
                 "updated_at",
             }
         }
         owner_id = uuid.UUID(record.owner_id) if record.owner_id else None
+        reviewer_id = uuid.UUID(record.reviewer_id) if record.reviewer_id else None
+        reviewed_at = (
+            datetime.fromisoformat(record.reviewed_at) if record.reviewed_at else None
+        )
         if existing:
             existing.title = record.input.course_title
             existing.status = record.status
@@ -61,6 +71,13 @@ class DatabaseService:
             # saves (e.g. a save with no owner_id set shouldn't clear it).
             if owner_id is not None:
                 existing.owner_id = owner_id
+            # Review fields DO need to be clearable (e.g. resubmitting clears
+            # the previous reviewer's comment), so always take the record's
+            # current value rather than guarding on non-None like owner_id.
+            existing.review_status = record.review_status
+            existing.review_comment = record.review_comment
+            existing.reviewer_id = reviewer_id
+            existing.reviewed_at = reviewed_at
             existing.updated_at = now
             course = await self.courses.update(existing)
         else:
@@ -71,6 +88,10 @@ class DatabaseService:
                 status=record.status,
                 template_id=record.template_id,
                 owner_id=owner_id,
+                review_status=record.review_status,
+                review_comment=record.review_comment,
+                reviewer_id=reviewer_id,
+                reviewed_at=reviewed_at,
                 input_json=record.input.model_dump(mode="json"),
                 metadata_json=metadata,
                 created_at=now,
@@ -87,10 +108,18 @@ class DatabaseService:
         return self._to_course_record(course)
 
     async def list_course_records(
-        self, limit: int = 100, offset: int = 0, *, owner_id: uuid.UUID | None = None
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        *,
+        owner_id: uuid.UUID | None = None,
+        review_statuses: list[str] | None = None,
     ) -> list[CourseRecord]:
-        """List courses as CourseRecords, optionally restricted to one owner."""
-        courses = await self.courses.list(limit, offset, owner_id=owner_id)
+        """List courses as CourseRecords, optionally restricted to one owner
+        and/or to a set of review statuses (the reviewer's queue)."""
+        courses = await self.courses.list(
+            limit, offset, owner_id=owner_id, review_statuses=review_statuses
+        )
         return [self._to_course_record(c) for c in courses]
 
     async def course_exists(self, course_id: str) -> bool:
@@ -187,6 +216,52 @@ class DatabaseService:
             return False
         return await self.documents.get_for_course(course.id) is not None
 
+    # --- Activity log -------------------------------------------------------
+    async def record_activity(
+        self,
+        course_id: str,
+        user_id: uuid.UUID | None,
+        user_email: str | None,
+        action: str,
+        message: str | None = None,
+    ) -> None:
+        """Best-effort: if the course is gone there's nothing to attach the
+        entry to, so this quietly no-ops rather than failing the caller's
+        already-succeeded action."""
+        course = await self.courses.get_by_course_id(course_id)
+        if course is None:
+            return
+        await self.activities.create(
+            CourseActivity(
+                course_pk=course.id,
+                user_id=user_id,
+                user_email=user_email,
+                action=action,
+                message=message,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+
+    async def list_activities(
+        self, course_id: str, limit: int = 50, offset: int = 0
+    ) -> list[CourseActivityEntry]:
+        course = await self.courses.get_by_course_id(course_id)
+        if course is None:
+            raise NotFoundError(f"Course '{course_id}' not found")
+        rows = await self.activities.list_for_course(course.id, limit, offset)
+        return [self._to_activity_entry(row) for row in rows]
+
+    @staticmethod
+    def _to_activity_entry(row: CourseActivity) -> CourseActivityEntry:
+        return CourseActivityEntry(
+            id=str(row.id),
+            action=row.action,
+            user_id=str(row.user_id) if row.user_id else None,
+            user_email=row.user_email,
+            message=row.message,
+            created_at=row.created_at.isoformat(),
+        )
+
     # --- Helpers ----------------------------------------------------------
     @staticmethod
     def _to_course_record(course: Course) -> CourseRecord:
@@ -198,6 +273,10 @@ class DatabaseService:
             input=CourseInput.model_validate(course.input_json),
             template_id=course.template_id,
             owner_id=str(course.owner_id) if course.owner_id else None,
+            review_status=course.review_status,
+            review_comment=course.review_comment,
+            reviewer_id=str(course.reviewer_id) if course.reviewer_id else None,
+            reviewed_at=course.reviewed_at.isoformat() if course.reviewed_at else None,
             created_at=course.created_at.isoformat(),
             updated_at=course.updated_at.isoformat(),
             **(course.metadata_json or {}),
