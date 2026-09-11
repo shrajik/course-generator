@@ -8,7 +8,8 @@ Create Course → Customize TOC → Generate → Canva-like Course Editor
 → select anything → ask AI → apply change → Export PDF
 ```
 
-FastAPI backend + Next.js frontend. No database, no queue, no object storage, no auth — those come in the next phase.
+FastAPI backend + Next.js frontend, backed by PostgreSQL with cookie-based JWT auth and role-based admin
+access. No queue, no object storage — those come in a later phase.
 
 ```
 Course Input → Planner → Blueprint → Deep Research → Research Artifacts
@@ -24,7 +25,8 @@ Course Input → Planner → Blueprint → Deep Research → Research Artifacts
 
 ```bash
 cp .env.example .env      # then put your OPENAI_API_KEY in it
-docker compose up --build
+docker compose up --build -d
+docker compose exec backend alembic upgrade head   # first run only, see below
 ```
 
 - App: <http://localhost:3000>
@@ -32,6 +34,44 @@ docker compose up --build
 
 No Python or Node installation needed on the host. Generated artifacts land in `backend/data/` on your machine
 (bind-mounted), so you can inspect every blueprint, research file, chapter, document and PDF directly.
+
+Useful follow-up commands:
+
+```bash
+docker compose ps                 # container status / health
+docker compose logs -f backend    # tail one service's logs
+docker compose logs -f frontend
+docker compose down               # stop and remove containers (keeps the postgres volume)
+docker compose down -v            # also wipe the postgres volume (destroys the database)
+docker compose up --build -d      # rebuild after a Dockerfile/dependency change
+```
+
+### Database & migrations
+
+Compose starts a `postgres:16-alpine` container and the backend connects to it via `DATABASE_URL`
+(defaulted in `docker-compose.yml` to the `postgres` service). Schema changes are managed with
+**Alembic** and are *not* applied automatically on container start, so after the first `up` — and after
+pulling any change that adds a migration under `backend/alembic/versions/` — run:
+
+```bash
+docker compose exec backend alembic upgrade head    # apply pending migrations
+docker compose exec backend alembic current          # check what's applied
+docker compose exec backend alembic heads             # check the latest available migration
+```
+
+If `alembic current` doesn't match `alembic heads`, endpoints touching the missing tables/columns will
+fail — run `upgrade head` again.
+
+You also need two secrets set in `.env` before auth will work (empty values make login/register fail):
+
+```bash
+JWT_SECRET=<random 32+ byte string>
+JWT_REFRESH_SECRET=<a different random 32+ byte string>
+```
+
+Generate them with `python -c "import secrets; print(secrets.token_urlsafe(48))"` (or any equivalent).
+Optionally set `INITIAL_ADMIN_EMAIL` in `.env` before the *first* registration — the first account created
+with that exact email is auto-promoted to `role=admin`; everyone else registers as `author`.
 
 ### Running it without an API key
 
@@ -42,11 +82,15 @@ This is what the test suite uses, and it's the fastest way to see the shape of t
 
 ### Local development without Docker
 
+Needs a Postgres instance reachable at the URL you set for `DATABASE_URL` (e.g. run just the `postgres`
+service with `docker compose up postgres -d`, or point at any local Postgres 16).
+
 ```bash
 # backend
 cd backend
 pip install -r requirements.txt
 python -m playwright install chromium
+alembic upgrade head    # apply migrations against DATABASE_URL from .env
 uvicorn app.main:app --reload
 
 # frontend (separate shell)
@@ -130,6 +174,7 @@ rendered from — much faster than re-exporting while you iterate on styling.
 | GET | `/api/courses/{course_id}/run` | Progress, ETA and timings for the current or last run |
 | GET | `/api/courses/{course_id}` | Status, progress and which artifacts exist |
 | GET | `/api/courses/{course_id}/document` | The Course Document JSON |
+| PUT | `/api/documents/{document_id}` | Persist manual editor changes (move/resize/type/insert/delete/style) |
 | POST | `/api/documents/{document_id}/ai-edit` | Instruction on selected blocks → validated patch |
 | POST | `/api/documents/{document_id}/export/pdf` | Render the current document to PDF |
 
@@ -137,6 +182,45 @@ Supporting endpoints: `GET /health`, `GET /api/courses`, `GET /api/courses/templ
 `GET /api/courses/{id}/blueprint`, `GET /api/courses/{id}/chapters/{chapter_id}`,
 `GET /api/courses/{id}/chapters/{chapter_id}/research`, `GET /api/courses/{id}/template`,
 `GET /api/documents/{id}`, `GET /api/documents/{id}/preview`, `GET /api/documents/{id}/assets/{name}`.
+
+---
+
+## Auth & admin
+
+Auth is JWT-based, issued as `HttpOnly` cookies (`access_token` 30 min, `refresh_token` 1 day by default —
+tune with `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS`). Roles are `author` (default on
+self-register), `editor_reviewer` and `admin`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/auth/register` | Create an account, sets auth cookies |
+| POST | `/auth/login` | Log in, sets auth cookies |
+| POST | `/auth/refresh` | Rotate access/refresh tokens from the refresh cookie |
+| POST | `/auth/logout` | Clear auth cookies, revoke the session |
+| GET | `/auth/me` | Current user from the access cookie |
+
+```bash
+curl -s -c cookies.txt localhost:8000/auth/register -H 'content-type: application/json' \
+  -d '{"email":"me@example.com","password":"a-strong-password","full_name":"Me"}' | jq
+curl -s -b cookies.txt localhost:8000/auth/me | jq
+```
+
+`/admin/*` requires the `admin` role (see `INITIAL_ADMIN_EMAIL` above for bootstrapping the first one):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/admin/health` | Admin-scoped health check |
+| GET | `/admin/dashboard` | Aggregate counts across users/courses |
+| GET | `/admin/users` | List users |
+| GET | `/admin/users/{user_id}` | User detail |
+| GET | `/admin/courses` | List courses across all owners |
+| GET | `/admin/courses/{course_id}` | Course detail with owner/review info |
+
+Course ownership and the review workflow (`draft → in_review → approved`, or `in_review →
+changes_requested → in_review` on rejection) are enforced per-request in `app/api/course_authorization.py`:
+an `author` (or `admin`) owns submit/resubmit actions on their own courses; an `editor_reviewer` can
+view/edit any course once it leaves `draft`, and approve/request-changes on any course regardless of
+ownership.
 
 ---
 
@@ -241,6 +325,10 @@ See `.env.example`. The ones that matter:
 | `MAX_CONCURRENCY` | `3` | Concurrent chapter research / image jobs |
 | `MAX_REVIEW_REVISIONS` | `1` | Rewrite passes when the reviewer finds blockers |
 | `PLANNER_MODEL` etc. | `gpt-5` | Per-agent model overrides |
+| `DATABASE_URL` | *(compose-provided)* | asyncpg URL; Compose points it at the `postgres` service, override for local/host Postgres |
+| `JWT_SECRET` / `JWT_REFRESH_SECRET` | *(empty)* | Required — auth endpoints fail without them |
+| `INITIAL_ADMIN_EMAIL` | *(empty)* | First registration matching this email becomes `role=admin` |
+| `FRONTEND_ORIGIN` | `http://localhost:3000` | CORS allow-origin for the backend |
 
 ---
 
@@ -248,17 +336,20 @@ See `.env.example`. The ones that matter:
 
 ```
 backend/app/
-  api/          courses.py, documents.py, health.py      — HTTP only
+  api/          courses.py, documents.py, health.py, auth.py, admin.py,
+                course_authorization.py, dependencies.py               — HTTP only
   agents/       planner, research, writer, reviewer, editor, prompts
   course/
     templates/  technical_v1.json, non_technical_v1.json, registry.py
     blocks/     normalizer.py   (writer draft → validated blocks)
     document/   builder.py, layout.py, patcher.py
   render/       html_renderer.py + templates/course.html.j2
-  schemas/      blocks, course, blueprint, research, draft, review, document, patch, template
-  services/     openai_service, mock_ai, research_service, image_service,
-                pdf_service, storage_service, course_service, document_service
-  core/         config, errors, ids, logging
+  schemas/      blocks, course, blueprint, research, draft, review, document, patch, template, auth
+  services/     openai_service, mock_ai, research_service, image_service, pdf_service,
+                storage_service, course_service, document_service, auth_service
+  db/           models.py, service.py, session.py, repositories/       — SQLAlchemy + asyncpg
+  core/         config, errors, ids, logging, roles, security
+alembic/        versions/ — schema migrations, run with `alembic upgrade head`
 ```
 
 AI logic, PDF logic and document models are kept in separate layers. `openai_service.AIClient` is the
@@ -310,7 +401,7 @@ continuity quality.
 
 ## Frontend
 
-Four screens, nothing else — no dashboard, no auth, no extra product pages.
+The core four-screen course flow, plus login/register and an admin section.
 
 | # | Screen | Route | What it does |
 | --- | --- | --- | --- |
@@ -318,6 +409,10 @@ Four screens, nothing else — no dashboard, no auth, no extra product pages.
 | 2 | Customize Table of Contents | `/toc` | Chapters + sections: expand, add, rename (double-click), delete, drag-and-drop reorder. Summary counts and estimates come from the outline being edited. **Improve with AI** shows the backend's suggestions with Apply / Cancel — your TOC is never overwritten silently. **Generate Course** creates the course and starts the pipeline. |
 | 3 | Generating Your Course | `/generate/[courseId]` | Progress ring and stage list driven by the backend's real persisted state (see below). |
 | 4 | Course Editor | `/editor/[documentId]` | Toolbar · left rail + page thumbnails · canvas · properties panel · AI Assistant. Plus `/preview/[documentId]` for the reader's view. |
+
+Supporting pages: `/login`, `/register`, `/courses` (list, filtered by ownership/review status),
+`/history`, `/templates`, and `/admin`, `/admin/users`, `/admin/courses` (admin-role only, backed by the
+`/admin/*` API).
 
 ### Generation progress is real
 
@@ -376,13 +471,8 @@ frontend/src/
 - Generation runs **in-process** (an asyncio task per course, state on disk). That covers timeouts, resume
   and progress without new infrastructure, but not parallelism across machines or cancellation — that is what
   a real queue is for, and it is deferred until there are concurrent users.
-- **Manual edits are not persisted.** The backend exposes exactly one document mutation — `ai-edit` — and
-  no "save document" endpoint, so AI edits are stored server-side while manual ones (typing, moving,
-  resizing, style changes, inserts, deletes) live only in the browser session. The editor shows a **Local
-  changes** badge when they diverge, and Export PDF renders the last version the backend stored. One
-  `PUT /api/documents/{document_id}` accepting a `CourseDocument` would close this; it was left out because
-  the brief said not to modify the backend.
-- No auth, no rate limiting, CORS is wide open. Do not deploy as-is.
+- **No rate limiting.** Auth and generation endpoints have no throttling — fine for local/dev use, not for
+  a public deployment.
 - Desktop-first, as specified: screens 1-2 adapt down, the editor assumes a laptop-sized window.
 - Underline is present in the toolbar but disabled: the backend's PDF renderer has no underline support, and
   a control that silently vanishes on export would be worse than a disabled one.
@@ -392,5 +482,5 @@ frontend/src/
 
 ## Next step
 
-Add a document-save endpoint so manual editor changes persist, then PostgreSQL, Redis, background workers
-and object storage.
+PostgreSQL, auth, admin and manual-edit persistence are in. Next: Redis, background workers (move
+generation off the in-process asyncio task) and object storage for generated assets.
