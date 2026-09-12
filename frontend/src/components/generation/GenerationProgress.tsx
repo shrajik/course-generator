@@ -41,6 +41,8 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const startedRef = useRef(false);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const pollRef = useRef<() => Promise<void>>(async () => {});
 
   const view = useMemo(() => deriveStages(detail), [detail]);
 
@@ -68,9 +70,17 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
     let cancelled = false;
     const controller = new AbortController();
 
+    const stopPolling = () => {
+      if (pollTimerRef.current !== undefined) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = undefined;
+      }
+    };
+
     const poll = async () => {
+      let next: CourseDetail;
       try {
-        const next = await getCourse(courseId, controller.signal);
+        next = await getCourse(courseId, controller.signal);
         if (cancelled) return;
         setDetail(next);
         update({ courseId: next.course.course_id, documentId: next.course.document_id });
@@ -85,22 +95,34 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
       }
 
       // The backend saves the document after every chapter, so it exists long
-      // before the run finishes - poll it too and render whatever's real so
-      // far. 404s until the first chapter lands; that's expected, not an error.
-      try {
-        const nextDocument = await getCourseDocument(courseId);
-        if (!cancelled) setLiveDocument(nextDocument);
-      } catch {
-        // not written yet - keep whatever we last had (or null).
+      // before the run finishes - but only fetch it once the course record
+      // actually reports one instead of hammering an endpoint that's expected
+      // to 404 on every tick during research/before the first chapter lands.
+      const hasDocument = next.artifacts.document || next.course.has_document;
+      if (hasDocument) {
+        try {
+          const nextDocument = await getCourseDocument(courseId);
+          if (!cancelled) setLiveDocument(nextDocument);
+        } catch {
+          // transient - keep whatever we last had.
+        }
+      }
+
+      // Nothing more will change once the run has reached a terminal state -
+      // stop polling until the user explicitly retries (see handleRetry).
+      const failed = next.course.status === "failed" || next.course.run?.state === "failed";
+      if (next.course.status === "ready" || failed) {
+        stopPolling();
       }
     };
 
+    pollRef.current = poll;
     void poll();
-    const timer = window.setInterval(poll, POLL_INTERVAL_MS);
+    pollTimerRef.current = setInterval(poll, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       controller.abort();
-      window.clearInterval(timer);
+      stopPolling();
     };
     // `update` is stable via useCallback in the provider.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -161,6 +183,13 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
     setRetrying(true);
     setError(null);
     await start(true);
+    // Polling stops once a run reaches ready/failed (see the effect above);
+    // a manual retry starts a fresh run, so resume it instead of leaving the
+    // UI frozen on the old outcome.
+    if (pollTimerRef.current === undefined) {
+      void pollRef.current();
+      pollTimerRef.current = setInterval(() => pollRef.current(), POLL_INTERVAL_MS);
+    }
     setRetrying(false);
   };
 

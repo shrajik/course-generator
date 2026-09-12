@@ -14,13 +14,18 @@ from sqlalchemy import text
 
 from app.commands.import_filesystem_data import import_courses
 from app.core.config import reset_settings_cache
-from app.db.engine import dispose_engine, get_engine
+from app.core.ids import new_suffix
+from app.db.engine import get_engine
 from app.db.models import Course, Document
 from app.db.repositories.courses import CourseRepository
 from app.db.repositories.documents import DocumentRepository
 from app.db.session import get_session_factory
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+# Appended to every hardcoded id this file uses, so re-running pytest against
+# the same (never-dropped, see db_schema in conftest.py) test database twice
+# doesn't collide with the previous run's rows.
+_RUN = new_suffix()
 
 
 def test_alembic_initial_migration_generates_sql() -> None:
@@ -38,20 +43,18 @@ def test_alembic_initial_migration_generates_sql() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def database_schema():
+def database_schema(request, monkeypatch):
+    """Schema lifecycle lives in conftest.py's session-scoped db_schema
+    fixture for every test below except test_alembic_initial_migration_generates_sql
+    (which needs no database at all - alembic's `--sql` mode never connects).
+    Scopes DATABASE_URL/USE_DATABASE to this test only (monkeypatch reverts
+    them automatically), so they don't leak into unrelated offline tests."""
     if not DATABASE_URL:
-        yield
         return
-    os.environ["DATABASE_URL"] = DATABASE_URL or ""
+    url = request.getfixturevalue("db_schema")
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("USE_DATABASE", "true")
     reset_settings_cache()
-    async with get_engine().begin() as connection:
-        await connection.run_sync(lambda sync_connection: Course.metadata.create_all(sync_connection))
-        await connection.run_sync(lambda sync_connection: Document.metadata.create_all(sync_connection))
-    yield
-    async with get_engine().begin() as connection:
-        await connection.run_sync(lambda sync_connection: Document.metadata.drop_all(sync_connection))
-        await connection.run_sync(lambda sync_connection: Course.metadata.drop_all(sync_connection))
-    await dispose_engine()
 
 
 def timestamp() -> datetime:
@@ -69,13 +72,24 @@ async def test_database_connection() -> None:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not DATABASE_URL, reason="TEST_DATABASE_URL is not configured")
 async def test_course_document_retrieval_and_jsonb() -> None:
+    course_id = f"crs_testphase1_{_RUN}"
+    document_id = f"doc_testphase1_{_RUN}"
     course = Course(
-        course_id="crs_testphase1",
-        document_id="doc_testphase1",
+        course_id=course_id,
+        document_id=document_id,
         title="Database Test",
         status="created",
         template_id="technical_v1",
-        input_json={"toc": [{"title": "JSONB"}]},
+        # A full, valid CourseInput shape - this row is never dropped between
+        # tests any more (see db_schema in conftest.py), so any other
+        # DB-gated test that lists every course in the table must still be
+        # able to CourseInput.model_validate() this row's input_json.
+        input_json={
+            "course_title": "Database Test",
+            "toc": [{"title": "JSONB"}],
+            "target_audience": "Testers",
+            "template": "technical",
+        },
         metadata_json={"nested": {"enabled": True}},
         created_at=timestamp(),
         updated_at=timestamp(),
@@ -84,7 +98,7 @@ async def test_course_document_retrieval_and_jsonb() -> None:
         async with session.begin():
             await CourseRepository(session).create(course)
             document = Document(
-                document_id="doc_testphase1",
+                document_id=document_id,
                 course=course,
                 version=3,
                 document_json={"pages": [], "meta": {"source": "test"}},
@@ -92,8 +106,8 @@ async def test_course_document_retrieval_and_jsonb() -> None:
                 updated_at=timestamp(),
             )
             await DocumentRepository(session).create(document)
-        loaded_course = await CourseRepository(session).get_by_course_id("crs_testphase1")
-        loaded_document = await DocumentRepository(session).get_by_document_id("doc_testphase1")
+        loaded_course = await CourseRepository(session).get_by_course_id(course_id)
+        loaded_document = await DocumentRepository(session).get_by_document_id(document_id)
     assert loaded_course is not None
     assert loaded_course.input_json["toc"][0]["title"] == "JSONB"
     assert loaded_document is not None
@@ -104,12 +118,14 @@ async def test_course_document_retrieval_and_jsonb() -> None:
 @pytest.mark.asyncio
 @pytest.mark.skipif(not DATABASE_URL, reason="TEST_DATABASE_URL is not configured")
 async def test_importer_is_idempotent_and_preserves_ids(tmp_path: Path) -> None:
-    course_dir = tmp_path / "courses" / "crs_existing123"
+    course_id = f"crs_existing123_{_RUN}"
+    document_id = f"doc_existing123_{_RUN}"
+    course_dir = tmp_path / "courses" / course_id
     course_dir.mkdir(parents=True)
     now = datetime.now(timezone.utc).isoformat()
     course_payload = {
-        "course_id": "crs_existing123",
-        "document_id": "doc_existing123",
+        "course_id": course_id,
+        "document_id": document_id,
         "status": "planned",
         "input": {
             "course_title": "Imported Course",
@@ -122,8 +138,8 @@ async def test_importer_is_idempotent_and_preserves_ids(tmp_path: Path) -> None:
         "updated_at": now,
     }
     document_payload = {
-        "document_id": "doc_existing123",
-        "course_id": "crs_existing123",
+        "document_id": document_id,
+        "course_id": course_id,
         "course_title": "Imported Course",
         "template_id": "technical_v1",
         "version": 1,
@@ -142,8 +158,25 @@ async def test_importer_is_idempotent_and_preserves_ids(tmp_path: Path) -> None:
 
     async with get_session_factory()() as session:
         courses = await CourseRepository(session).list()
-        document = await DocumentRepository(session).get_by_document_id("doc_existing123")
-    assert len(courses) == 1
-    assert courses[0].course_id == "crs_existing123"
-    assert courses[0].document_id == "doc_existing123"
+        document = await DocumentRepository(session).get_by_document_id(document_id)
+    # Scoped to this test's own course rather than an absolute table count -
+    # the shared test database is no longer wiped between tests/files (see
+    # db_schema in conftest.py), so other tests' rows may also be present;
+    # the guarantee that matters here (the importer didn't duplicate this
+    # course on its second, idempotent run) is unaffected either way.
+    matching = [c for c in courses if c.course_id == course_id]
+    assert len(matching) == 1
+    assert matching[0].document_id == document_id
     assert document is not None
+
+    # Clean up: the schema is never dropped between tests (see db_schema in
+    # conftest.py), so leaving this row around would keep it visible to every
+    # later DB-gated test in the session for no reason. `Course`'s child
+    # relationships use `passive_deletes=True` (see app/db/models.py), so this
+    # relies on the database's own ON DELETE CASCADE for the document row
+    # rather than the ORM nulling out its NOT NULL course_pk itself.
+    async with get_session_factory()() as session:
+        async with session.begin():
+            row = await CourseRepository(session).get_by_course_id(course_id)
+            if row is not None:
+                await CourseRepository(session).delete(row)

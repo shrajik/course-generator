@@ -4,8 +4,9 @@ import { useMemo } from "react";
 import { FileText, Loader2 } from "lucide-react";
 import { assetUrl } from "@/lib/api/documents";
 import { asString, asStringArray } from "@/lib/editor/blocks";
+import { isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
 import type { ChapterProgress } from "@/lib/types/course";
-import type { Block, CourseDocument } from "@/lib/types/document";
+import type { Block, BlockContent, CourseDocument } from "@/lib/types/document";
 import type { ChapterStreamView } from "./GenerationProgress";
 
 interface LiveDocumentPreviewProps {
@@ -354,25 +355,8 @@ function FlowBlock({ block, documentId }: { block: Block; documentId: string }) 
       );
     }
 
-    case "image": {
-      const path = typeof content.path === "string" ? content.path : null;
-      const src = path ? assetUrl(documentId, path) : null;
-      return (
-        <div className="gen-block-in mt-4 overflow-hidden rounded-[10px] border border-line bg-canvas">
-          {src ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={src} alt={asString(content.alt)} className="w-full object-cover" />
-          ) : (
-            <div className="flex h-40 items-center justify-center text-[12px] text-ink-400">
-              Image generating…
-            </div>
-          )}
-          {content.caption ? (
-            <p className="px-3 py-2 text-[11.5px] text-ink-400">{asString(content.caption)}</p>
-          ) : null}
-        </div>
-      );
-    }
+    case "image":
+      return <ImagePreviewBlock content={content} documentId={documentId} />;
 
     case "divider":
       return <hr className="gen-block-in my-5 border-line" />;
@@ -397,4 +381,48 @@ function FlowBlock({ block, documentId }: { block: Block; documentId: string }) 
     default:
       return null;
   }
+}
+
+/** A diagram is inlined (hover/focus tooltips need real DOM, not `<img
+ * src>`) and never cropped - `object-cover` would cut off diagram labels.
+ * A raster illustration keeps the original cropped, fill-the-box look. */
+function ImagePreviewBlock({
+  content,
+  documentId,
+}: {
+  content: BlockContent;
+  documentId: string;
+}) {
+  const path = typeof content.path === "string" ? content.path : null;
+  const src = path ? assetUrl(documentId, path) : null;
+  const isDiagram = asString(content.kind) === "diagram" && isSvgPath(path);
+  const inlineMarkup = useInlineDiagramSvg(documentId, path, isDiagram);
+
+  return (
+    <div className="gen-block-in mt-4 overflow-hidden rounded-[10px] border border-line bg-canvas">
+      {inlineMarkup ? (
+        <div
+          className="flex items-center justify-center p-2 [&>svg]:h-auto [&>svg]:max-h-[360px] [&>svg]:w-full"
+          role="img"
+          aria-label={asString(content.alt)}
+          // Trusted source: our own backend-rendered SVG, not user HTML.
+          dangerouslySetInnerHTML={{ __html: inlineMarkup }}
+        />
+      ) : src ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={src}
+          alt={asString(content.alt)}
+          className={isDiagram ? "w-full object-contain" : "w-full object-cover"}
+        />
+      ) : (
+        <div className="flex h-40 items-center justify-center text-[12px] text-ink-400">
+          Image generating…
+        </div>
+      )}
+      {content.caption ? (
+        <p className="px-3 py-2 text-[11.5px] text-ink-400">{asString(content.caption)}</p>
+      ) : null}
+    </div>
+  );
 }

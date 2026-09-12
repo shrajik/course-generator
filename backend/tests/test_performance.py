@@ -49,58 +49,133 @@ def slow_service(monkeypatch, tmp_path):
 # --- the structural change -------------------------------------------------
 
 
-async def test_parallel_writing_is_faster_than_sequential(slow_service, technical_input):
+def _track_peak_concurrent_writes(monkeypatch) -> dict[str, int]:
+    """Counts how many `WriterAgent.write_chapter` calls are in flight at
+    once - a direct, phase-scoped measurement of writer concurrency.
+
+    The three tests below used to read `RunMetrics`' whole-run
+    `peak_concurrent_calls` instead, but that counter has no idea which
+    *phase* a call belongs to: research (`research_service.py`) and image
+    generation (`image_service.py`) each run their own, unrelated
+    `asyncio.gather` fan-out with their own concurrency limiter, elsewhere in
+    the same `generate()` call, and both feed the same counter. That made the
+    metric register concurrency from a completely different phase regardless
+    of `writer_concurrency` - not flaky exactly, but measuring the wrong
+    thing. Patching `write_chapter` itself (the same technique already used
+    below by `test_parallel_chapters_get_topic_boundaries`) counts only what
+    these tests are actually about, and needs no wall-clock assumption:
+    either N writer calls were genuinely in flight at once, or they weren't.
+
+    Call this ONCE per test, even when comparing two `generate()` runs -
+    reset `state["peak"] = 0` between them instead of calling this a second
+    time. A second call would capture the *already-patched* method as its
+    own "original", double-wrapping it so the first run's counter keeps
+    getting updated by the second run too.
+    """
+    state = {"current": 0, "peak": 0}
+    original = WriterAgent.write_chapter
+
+    async def wrapped(self, **kwargs):
+        state["current"] += 1
+        state["peak"] = max(state["peak"], state["current"])
+        try:
+            return await original(self, **kwargs)
+        finally:
+            state["current"] -= 1
+
+    monkeypatch.setattr(WriterAgent, "write_chapter", wrapped)
+    return state
+
+
+async def test_parallel_writing_is_faster_than_sequential(
+    slow_service, technical_input, monkeypatch
+):
     """The headline change: chapters no longer wait for each other."""
     course_input = _wide_input(technical_input, 6)
     settings = slow_service.settings
     settings.writer_concurrency = 6
+    peak = _track_peak_concurrent_writes(monkeypatch)
 
     settings.writing_mode = "sequential"
     record = await slow_service.create_course(course_input)
     started = time.perf_counter()
     sequential = await slow_service.generate(record.course_id, GenerateRequest(mode="sync"))
     sequential_wall = time.perf_counter() - started
+    sequential_peak = peak["peak"]
+    peak["peak"] = 0  # `current` is already back to 0 between runs
 
     settings.writing_mode = "parallel"
     record2 = await slow_service.create_course(course_input)
     started = time.perf_counter()
     parallel = await slow_service.generate(record2.course_id, GenerateRequest(mode="sync"))
     parallel_wall = time.perf_counter() - started
+    parallel_peak = peak["peak"]
 
     assert len(sequential.chapters_generated) == 6
     assert len(parallel.chapters_generated) == 6
-    # Sequential does 6 x (write + review) one after another; parallel does one wave.
-    assert parallel_wall < sequential_wall * 0.75, (
+
+    # Sequential mode has exactly one `write_chapter` call in flight at a
+    # time by construction (a plain `for` loop, no `asyncio.gather` - see
+    # `_write_sequential`); parallel mode really does run all 6 chapters'
+    # writer calls concurrently. This is the deterministic "parallel differs
+    # from sequential" proof - not inferred from timing.
+    assert sequential_peak == 1
+    assert parallel_peak == 6
+
+    # With genuinely more overlap and identical total work, parallel cannot
+    # take longer than sequential - a plain ordering check, not a specific
+    # ratio, so it isn't sensitive to whatever else is running on this
+    # machine.
+    assert parallel_wall < sequential_wall, (
         f"parallel {parallel_wall:.2f}s vs sequential {sequential_wall:.2f}s"
     )
 
 
-async def test_writer_calls_actually_overlap(slow_service, technical_input):
+async def test_writer_calls_actually_overlap(slow_service, technical_input, monkeypatch):
     slow_service.settings.writing_mode = "parallel"
     slow_service.settings.writer_concurrency = 4
+    peak = _track_peak_concurrent_writes(monkeypatch)
     record = await slow_service.create_course(_wide_input(technical_input, 4))
-    result = await slow_service.generate(record.course_id, GenerateRequest(mode="sync"))
-    assert result.timings["peak_concurrent_calls"] > 1
-    # More model-seconds than wall-seconds is only possible if calls overlapped.
-    assert result.timings["parallel_speedup"] > 1.0
+    await slow_service.generate(record.course_id, GenerateRequest(mode="sync"))
+    # All 4 chapters are independent and the limiter permits all 4 at once -
+    # a genuinely parallel writer must let all 4 write_chapter calls be in
+    # flight together at some point during the run.
+    assert peak["peak"] == 4
 
 
-async def test_raising_the_writer_limit_shortens_the_write_phase(slow_service, technical_input):
+async def test_raising_the_writer_limit_shortens_the_write_phase(
+    slow_service, technical_input, monkeypatch
+):
+    """Raising the limit is the actual mechanism that lets more chapters
+    overlap - proved directly via the live concurrent-call counter rather
+    than inferred from a wall-clock ratio (see `_track_peak_concurrent_writes`
+    above for why that counter isn't RunMetrics' whole-run one)."""
     course_input = _wide_input(technical_input, 6)
     slow_service.settings.writing_mode = "parallel"
+    peak = _track_peak_concurrent_writes(monkeypatch)
 
     slow_service.settings.writer_concurrency = 1
     record = await slow_service.create_course(course_input)
     narrow = await slow_service.generate(record.course_id, GenerateRequest(mode="sync"))
+    narrow_peak = peak["peak"]
+    assert narrow_peak == 1, "concurrency=1 must never overlap"
+    peak["peak"] = 0  # `current` is already back to 0 between runs
 
     concurrency.reset_limiters()
     slow_service.settings.writer_concurrency = 6
     record2 = await slow_service.create_course(course_input)
     wide = await slow_service.generate(record2.course_id, GenerateRequest(mode="sync"))
+    wide_peak = peak["peak"]
+    assert wide_peak == 6, (
+        "concurrency=6 with 6 independent chapters should let all 6 overlap"
+    )
 
+    # With genuinely more overlap and the same total work, the wide run
+    # cannot take longer than the narrow one - a plain ordering check
+    # instead of a specific ratio.
     narrow_phase = narrow.timings["phases"]["write+review"]["seconds"]
     wide_phase = wide.timings["phases"]["write+review"]["seconds"]
-    assert wide_phase < narrow_phase * 0.6, f"{wide_phase} vs {narrow_phase}"
+    assert wide_phase < narrow_phase, f"{wide_phase} vs {narrow_phase}"
 
 
 # --- continuity safeguards --------------------------------------------------

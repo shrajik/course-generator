@@ -53,10 +53,13 @@ from app.schemas.course import (
 )
 from app.schemas.document import CourseDocument
 from app.schemas.draft import GeneratedChapter
+from app.schemas.memory import GenerationRunEntry
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
 from app.db.service import get_database_service
 from app.services.image_service import ImageService
+from app.services.memory_embedding_sync import sync_embedding
+from app.services.memory_embedding_text import generation_run_text
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.research_service import ResearchService
 from app.services.storage_service import StorageService, get_storage
@@ -335,6 +338,14 @@ class CourseService:
         async with get_database_service() as db:
             return await db.list_activities(course_id, limit, offset)
 
+    async def list_generation_runs(
+        self, course_id: str, limit: int = 20, offset: int = 0
+    ) -> list[GenerationRunEntry]:
+        if not self.use_db:
+            return []
+        async with get_database_service() as db:
+            return await db.list_generation_runs(course_id, limit, offset)
+
     # --- phase 1: plan -----------------------------------------------------
     async def plan_course(self, record: CourseRecord) -> CourseBlueprint:
         with metrics_phase("planner"):
@@ -425,6 +436,7 @@ class CourseService:
                     await self._save_course(record)
                 except Exception:  # pragma: no cover
                     pass
+                await self._record_generation_run(course_id, job_id, "failed", error=str(exc)[:500])
         finally:
             # Nothing is "currently streaming" once the run (however it
             # ended) is over - bounds the hub's memory and lets a fresh SSE
@@ -864,6 +876,15 @@ class CourseService:
             timings=summary or {},
         )
         await self._save_course(record)
+        await self._record_generation_run(
+            record.course_id,
+            job_id or record.run.job_id,
+            record.run.state,
+            generated=generated,
+            failed=failed,
+            warnings=warnings,
+            error=record.last_error,
+        )
 
         return GenerateResponse(
             course_id=record.course_id,
@@ -880,6 +901,43 @@ class CourseService:
             accepted=False,
             timings=summary or {},
         )
+
+    async def _record_generation_run(
+        self,
+        course_id: str,
+        job_id: str,
+        state: str,
+        *,
+        generated: list[str] | None = None,
+        failed: list[str] | None = None,
+        warnings: list[str] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """One row per generation attempt (see GenerationRun/generation_runs) -
+        best-effort and never allowed to affect the run it's recording."""
+        if not self.use_db or not job_id:
+            return
+        try:
+            async with get_database_service() as db:
+                result = await db.record_generation_run(
+                    course_id,
+                    job_id=job_id,
+                    state=state,
+                    payload={
+                        "chapters_generated": generated or [],
+                        "chapters_failed": failed or [],
+                        "warnings": warnings or [],
+                    },
+                    error=error,
+                )
+        except Exception as exc:  # noqa: BLE001 - history must never break generation
+            log.warning("Could not record generation run history for %s: %s", course_id, exc)
+            return
+        if result is not None:
+            run, course_title = result
+            # Only a compact, bounded representation is embedded - never the
+            # raw payload_json, which can list every chapter in the course.
+            await sync_embedding("generation_run", run.id, generation_run_text(course_title, run))
 
     # --- document ---------------------------------------------------------
     def _document_lock(self, course_id: str) -> asyncio.Lock:

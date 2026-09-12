@@ -43,10 +43,16 @@ export function exportPdf(documentId: string): Promise<Blob> {
   return requestBlob(`/api/documents/${documentId}/export/pdf`, { method: "POST" });
 }
 
-/** Resolve a document-relative asset path such as "assets/image_001.png". */
-export function assetUrl(documentId: string, path: string | null | undefined): string | null {
+/** API-relative path for a document-relative asset such as "assets/image_001.png". */
+export function assetPath(documentId: string, path: string | null | undefined): string | null {
   if (!path) return null;
   const name = path.split("/").pop();
   if (!name) return null;
-  return apiUrl(`/api/documents/${documentId}/assets/${name}`);
+  return `/api/documents/${documentId}/assets/${name}`;
+}
+
+/** Resolve a document-relative asset path such as "assets/image_001.png". */
+export function assetUrl(documentId: string, path: string | null | undefined): string | null {
+  const relative = assetPath(documentId, path);
+  return relative ? apiUrl(relative) : null;
 }

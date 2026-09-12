@@ -1,8 +1,11 @@
 """Image generation for `image` blocks.
 
 The writer decides *where* a visual helps and supplies the prompt; this service
-turns those prompts into PNG files under `data/courses/{course_id}/assets/` and
-writes the relative path back into the Course Document.
+turns those prompts into asset files under `data/courses/{course_id}/assets/`
+and writes the relative path back into the Course Document. A block marked
+`kind == "diagram"` is delegated to `DiagramService` first (a structured, on-
+theme SVG); everything else - and any diagram that doesn't work out - gets a
+raster illustration from the image model, as before.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from app.core.metrics import phase as metrics_phase
 from app.schemas.blocks import BlockType, merge_content
 from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
+from app.services.diagram_service import DiagramService
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.storage_service import StorageService, get_storage
 
@@ -34,6 +38,7 @@ class ImageService:
         self.ai = ai or get_ai_client()
         self.storage = storage or get_storage()
         self.settings = settings or get_settings()
+        self.diagrams = DiagramService(self.ai, self.storage, self.settings)
 
     # --- prompt -----------------------------------------------------------
     @staticmethod
@@ -62,6 +67,28 @@ class ImageService:
 
     # --- generation -------------------------------------------------------
     async def generate_for_block(
+        self,
+        *,
+        course_id: str,
+        block: Block,
+        template: CourseTemplate,
+        course_title: str,
+    ) -> bool:
+        """Diagram blocks try the structured/SVG path first and fall back to
+        the raster illustration path on any failure - a block must never end
+        up with nothing just because the diagram-specific path had trouble."""
+        if block.content.get("kind") == "diagram" and self.settings.enable_diagram_generation:
+            ok = await self.diagrams.generate_for_block(
+                course_id=course_id, block=block, template=template, course_title=course_title
+            )
+            if ok:
+                return True
+            log.info("Falling back to a raster illustration for %s", block.id)
+        return await self._generate_illustration(
+            course_id=course_id, block=block, template=template, course_title=course_title
+        )
+
+    async def _generate_illustration(
         self,
         *,
         course_id: str,

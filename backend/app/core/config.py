@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     fallback_model: str = "gpt-5"
     image_model: str = "gpt-image-1"
     image_size: str = "1024x1024"
+    #  Diagrams ask for *structure* (nodes/edges), not pixels, so a cheaper
+    #  reasoning-tier model is enough - the same tier as the planner/reviewer.
+    diagram_model: str = "gpt-5-mini"
 
     # --- pipeline behaviour -------------------------------------------------
     research_mode: ResearchMode = "fast"
@@ -67,6 +70,40 @@ class Settings(BaseSettings):
     #  can be measured without an API key. Never set this in production.
     mock_latency_ms: int = Field(default=0, ge=0, le=10000)
     enable_image_generation: bool = True
+    #  When true, `image` blocks marked kind="diagram" render as a structured
+    #  SVG instead of a raster illustration. Falls back to the raster path on
+    #  any failure either way, so this only controls the preferred path.
+    enable_diagram_generation: bool = True
+    #  AI memory layer (templates/visual knowledge/course samples/generation
+    #  history retrieval - see app.services.memory_service). Retrieval always
+    #  fails soft regardless of this flag; the flag exists to disable the
+    #  extra DB queries entirely, e.g. for a slow/degraded database.
+    enable_memory_retrieval: bool = True
+
+    # --- embeddings / semantic memory ---------------------------------------
+    #  Hybrid retrieval = keyword (ILIKE, always available) + semantic
+    #  (embeddings + pgvector, best-effort). This flag controls only the
+    #  semantic half - turning it off (or any failure: no API key, provider
+    #  down, pgvector missing) always leaves plain keyword retrieval intact.
+    #  See app.services.embedding_service / hybrid_retriever.
+    enable_embeddings: bool = True
+    embedding_model: str = "text-embedding-3-small"
+    #  Must match the Vector(...) column width created by the migration - see
+    #  alembic/versions/20260912_0008_memory_embeddings.py. Changing this
+    #  requires a new migration, not just a config change.
+    embedding_dimensions: int = Field(default=1536, ge=1, le=4096)
+    embedding_batch_size: int = Field(default=64, ge=1, le=512)
+    #  Below this cosine similarity (0..1), a semantic match is discarded
+    #  rather than merged into results - keeps irrelevant nearest-neighbours
+    #  out of the prompt. Tune per embedding model if this one changes.
+    semantic_similarity_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    #  Hybrid score = keyword_weight * (1 if an ILIKE hit) +
+    #  semantic_weight * cosine_similarity. Keyword gets the larger default
+    #  weight because an exact substring match is a stronger, zero-ambiguity
+    #  signal than a continuous similarity score; semantic still meaningfully
+    #  moves the ranking and is what surfaces differently-worded matches.
+    keyword_score_weight: float = Field(default=0.55, ge=0.0, le=1.0)
+    semantic_score_weight: float = Field(default=0.45, ge=0.0, le=1.0)
 
     # --- concurrency --------------------------------------------------------
     #  Per-phase limits; 0 means "use max_concurrency". Each phase gets its own

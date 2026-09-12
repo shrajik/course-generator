@@ -8,10 +8,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import admin, auth, courses, documents, health
+from app.api import admin, auth, course_samples, courses, documents, health, memory, templates, visual_knowledge
 from app.core.config import get_settings
 from app.core.errors import CourseCreatorError
 from app.core.logging import configure_logging, get_logger
+from app.course.templates.registry import refresh_db_templates
 from app.db.engine import dispose_engine
 
 settings = get_settings()
@@ -35,6 +36,10 @@ async def lifespan(app: FastAPI):
             "No OPENAI_API_KEY configured (or MOCK_OPENAI=true): generation will "
             "return offline placeholder content."
         )
+    # Best-effort: an unreachable database at startup must not block the app -
+    # it just means DB-backed templates aren't available until the next write
+    # or a manual refresh (see app.course.templates.registry).
+    await refresh_db_templates()
     yield
     if settings.use_database:
         await dispose_engine()
@@ -74,3 +79,7 @@ app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(courses.router)
 app.include_router(documents.router)
+app.include_router(templates.router)
+app.include_router(visual_knowledge.router)
+app.include_router(course_samples.router)
+app.include_router(memory.router)

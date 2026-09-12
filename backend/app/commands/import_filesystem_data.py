@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from app.core.config import reset_settings_cache
 from app.core.ids import document_id_for_course
 from app.db.engine import dispose_engine
 from app.db.models import Blueprint, Course, Document
+from app.db.service import COURSE_RECORD_COLUMN_FIELDS
 from app.db.session import get_session_factory
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.course import CourseRecord
@@ -37,17 +39,25 @@ def _read_json(path: Path) -> Any:
 
 def _course_values(record: CourseRecord) -> dict[str, Any]:
     dumped = record.model_dump(mode="json")
-    metadata = {
-        key: value
-        for key, value in dumped.items()
-        if key not in {"course_id", "document_id", "status", "input", "template_id", "created_at", "updated_at"}
-    }
+    # Excludes the same fields as DatabaseService.save_course_record - both
+    # writers share COURSE_RECORD_COLUMN_FIELDS so they can't drift apart
+    # again (they previously did: this importer used a shorter, stale list
+    # that left owner_id/review_* in metadata_json instead of their own
+    # columns, which then collided with those same fields read back
+    # explicitly in _to_course_record and crashed GET /api/courses for every
+    # course whenever an imported one was in the list).
+    metadata = {key: value for key, value in dumped.items() if key not in COURSE_RECORD_COLUMN_FIELDS}
     return {
         "course_id": record.course_id,
         "document_id": record.document_id,
         "title": record.input.course_title,
         "status": record.status,
         "template_id": record.template_id,
+        "owner_id": uuid.UUID(record.owner_id) if record.owner_id else None,
+        "review_status": record.review_status,
+        "review_comment": record.review_comment,
+        "reviewer_id": uuid.UUID(record.reviewer_id) if record.reviewer_id else None,
+        "reviewed_at": _timestamp(record.reviewed_at) if record.reviewed_at else None,
         "input_json": record.input.model_dump(mode="json"),
         "metadata_json": metadata,
         "created_at": _timestamp(record.created_at),

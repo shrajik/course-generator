@@ -1,6 +1,16 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 is upstream Postgres 16 with the pgvector
+    # extension precompiled in - a drop-in replacement for postgres:16-alpine
+    # (same data format, same named volume below), needed for the semantic
+    # memory feature's `CREATE EXTENSION vector` migration to succeed here.
+    # NOTE: switching a *running* container's image requires recreating it
+    # (`docker compose up -d --force-recreate postgres`) - your data in the
+    # `postgres_data` volume is preserved, but the container restarts
+    # briefly. Do this at a time of your choosing; until then this service
+    # keeps running on its previous image and the app keeps working on
+    # keyword-only retrieval (semantic retrieval fails soft without pgvector).
+    image: pgvector/pgvector:pg16
     container_name: course_creator_postgres
     ports:
       - "5432:5432"
@@ -15,6 +25,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # A separate, disposable database for the pytest suite's DB-backed tests -
+  # never point destructive test fixtures (Base.metadata.drop_all) at the
+  # `postgres` service above, which holds real course data. No named volume:
+  # this is meant to be thrown away and recreated freely.
+  postgres-test:
+    image: pgvector/pgvector:pg16
+    container_name: course_creator_postgres_test
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: ${TEST_POSTGRES_DB:-course_generator_test}
+      POSTGRES_USER: ${TEST_POSTGRES_USER:-course_app_test}
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD:-course_app_test}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles:
+      - test
 
   backend:
     build:

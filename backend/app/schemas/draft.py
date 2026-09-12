@@ -83,6 +83,11 @@ class DraftBlock(BaseModel):
     image_purpose: str = ""
     image_prompt: str = ""
     alt_text: str = ""
+    image_kind: str = ""  # "illustration" (default) | "diagram"
+    # Which diagram shape is needed, when image_kind == "diagram" - one of
+    # app.schemas.diagram.DIAGRAM_KINDS (e.g. "concept_map", "flow_chart").
+    # Optional: leave blank to let DiagramService decide.
+    diagram_kind: str = ""
 
 
 class BlockReplacement(BaseModel):

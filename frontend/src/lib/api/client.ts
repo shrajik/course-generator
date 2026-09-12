@@ -131,3 +131,17 @@ export async function requestBlob(
   if (!response.ok) throw await toApiError(response);
   return response.blob();
 }
+
+/** Raw text of an asset (used to inline an SVG diagram so its hover/focus
+ * tooltips actually work - an `<img src>` reference can't do that). */
+export async function requestText(path: string, signal?: AbortSignal): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetch(apiUrl(path), { signal, cache: "no-store", credentials: "include" });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new ApiError(`Cannot reach the backend at ${API_BASE_URL}.`, 0, "network_error");
+  }
+  if (!response.ok) throw await toApiError(response);
+  return response.text();
+}

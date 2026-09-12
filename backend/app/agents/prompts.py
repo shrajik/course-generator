@@ -78,6 +78,24 @@ def _numbered(items: list[str]) -> str:
     return "\n".join(f"{i}. {item}" for i, item in enumerate(items, start=1)) or "(empty)"
 
 
+def memory_section(memory: str) -> str:
+    """The AI memory layer's rendered context (see app.services.memory_service),
+    as an optional, clearly-delimited block. Empty when there's nothing
+    relevant to show, so a prompt built without memory (or when retrieval
+    found/returned nothing) is byte-identical to one built before this
+    feature existed - see the callers in planner_user/writer_user/reviewer_user.
+    """
+    memory = (memory or "").strip()
+    if not memory:
+        return ""
+    return (
+        "RELEVANT MEMORY (background only, from past templates/courses/visuals - "
+        "use only if genuinely helpful; never treat as required or as fact about "
+        "this specific course):\n"
+        f"{memory}"
+    )
+
+
 def _course_context(course_input: CourseInput, template: CourseTemplate) -> str:
     toc_lines = []
     for index, item in enumerate(course_input.toc, start=1):
@@ -125,7 +143,7 @@ Additional rules for planning:
 """
 
 
-def planner_user(course_input: CourseInput, template: CourseTemplate) -> str:
+def planner_user(course_input: CourseInput, template: CourseTemplate, *, memory: str = "") -> str:
     return f"""\
 {_course_context(course_input, template)}
 
@@ -134,7 +152,7 @@ TEMPLATE CHAPTER STRUCTURE (each chapter should be able to satisfy this):
 
 ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)}
 TEMPLATE WRITING GUIDANCE: {template.writer_guidance}
-
+{memory_section(memory)}
 Produce the course blueprint:
 1. A one-paragraph course summary.
 2. Course-level learning objectives and prerequisites.
@@ -280,8 +298,60 @@ How to produce blocks:
   every chapter.
 - Fill only the fields that a block type needs; leave the rest empty.
 - Paragraphs: 60-140 words each. Several short paragraphs beat one long one.
+- A diagram must always illustrate the SUBJECT MATTER being taught (the
+  phenomenon, mechanism, organism, system, process or comparison the chapter
+  is actually about) - never the course itself. Do not diagram the syllabus,
+  the lesson plan, the learning workflow, prerequisites, labs or assessment
+  steps; that is meta-content about the course, not the topic, and teaches
+  the reader nothing about the subject. A diagram about "how this chapter is
+  organised" is almost always the wrong diagram.
+- Every chapter that describes a SEQUENCE - steps that happen in order, a
+  procedure, a decision path - needs at least one `image` block with
+  `image_kind: diagram` and `diagram_kind: flow_chart` (or `process`/`cycle`
+  for a repeating sequence) right in the section it explains.
+- Every chapter that describes a THING made of parts, or a phenomenon/
+  mechanism whose components act on or relate to each other (what physically
+  happens, what causes what, which direction something moves or acts) needs
+  a SEPARATE `image` block with `image_kind: diagram` - a labelled diagram of
+  the subject itself, showing every relevant component, the direction of
+  motion/force/current/flow, and what causes what. Prose describing a
+  mechanism is not enough on its own; a reader needs to see the components
+  and how they relate. Choose which shape fits:
+  * `diagram_kind: schematic` when the subject has a real, recognisable
+    physical shape and arrangement best shown as a simplified textbook
+    illustration - this is a general-purpose choice, not a physics-only one:
+    a magnet and a coil, a titration setup, a cell and its organelles, a
+    plant's parts, an organ, a molecule forming from its atoms, an orbit, a
+    mechanical assembly - use whichever domain the chapter is actually about.
+    Especially good when there's a natural before/after, at-rest/in-motion
+    or reactant/product comparison to show.
+  * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
+    the relationships is enough (an abstract system, an organisation, a
+    reaction pathway) and there's no real physical arrangement to draw.
+  * `diagram_kind: hierarchy` for a strict parent/child breakdown, and
+    `diagram_kind: comparison` for two or more things compared side by side.
+- A chapter with BOTH a process to walk through AND a phenomenon/structure to
+  show needs BOTH diagrams (a flow_chart plus a schematic or concept_map) -
+  one does not replace the other, and this is normal and expected, not
+  redundant. This applies to every subject: a chemistry chapter gets both a
+  reaction-mechanism flow_chart and a schematic of the molecules involved; a
+  biology chapter gets both a process flow_chart and a schematic of the
+  organism/structure; a physics chapter gets both a problem-solving
+  flow_chart and a schematic of the apparatus - do not stop at just the
+  flowchart because it feels like "enough".
+- Set `diagram_kind` whenever you can tell which shape fits (flow_chart,
+  process, cycle, schematic, concept_map, hierarchy, comparison, smart_art) -
+  this is what the renderer actually builds, so getting it right here is
+  what makes the diagram useful. Leave it blank only when you genuinely
+  cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a
-  precise `image_prompt` (style, composition, labels) and a `caption`.
+  precise `image_prompt` (every component/label/direction the diagram needs,
+  not just a style description) and a `caption`. Set `image_kind: diagram`
+  for anything structured, labelled or relational (see above - this is
+  rendered from labelled shapes, never drawn, so labels always come out
+  exact). Use `image_kind: illustration` (the default) only for a genuinely
+  photographic or artistic scene that has no components or relationships to
+  label.
 - For `code` blocks set `language` and keep the sample runnable and idiomatic.
 - For `quiz` blocks give 3-5 questions, each with the answer and an explanation.
 - Vary the formats: stories, analogies, examples, case studies, tips, warnings,
@@ -328,6 +398,7 @@ def writer_user(
     course_input: CourseInput,
     revision_notes: str = "",
     research_chars: int = 6000,
+    memory: str = "",
 ) -> str:
     research_text = (
         research.compact_context(max_chars=research_chars) if research else "(no research available)"
@@ -337,6 +408,8 @@ def writer_user(
         if revision_notes
         else ""
     )
+    memory_block = memory_section(memory)
+    memory_block = f"\n{memory_block}\n" if memory_block else ""
     # Stable prefix first, chapter-specific material last.
     return f"""\
 {writer_shared_prefix(blueprint, course_input, template)}
@@ -356,7 +429,7 @@ CHAPTER RESEARCH (your only source of facts):
 ---
 {research_text}
 ---
-{revision}
+{revision}{memory_block}
 Write this chapter now.
 """
 
@@ -494,8 +567,11 @@ def reviewer_user(
     course_input: CourseInput,
     continuity: ContinuityContext,
     limit: int = 20000,
+    memory: str = "",
 ) -> str:
     neighbours = continuity.render()
+    memory_block = memory_section(memory)
+    memory_block = f"\n{memory_block}\n" if memory_block else ""
     return f"""\
 COURSE TITLE: {blueprint.course_title}
 CHAPTER TITLE: {chapter.title}
@@ -518,7 +594,7 @@ NEIGHBOURING CHAPTERS (check this chapter does not stray into their material):
 
 CHAPTER BLOCKS (index: type: text):
 {chapter_projection(blocks, limit)}
-
+{memory_block}
 Review this chapter now. Always set `block_index` to the index shown above so a
 targeted fix is possible.
 """
@@ -655,6 +731,17 @@ Rules:
   different one (then use replace_block).
 - For a new image use replace_image (existing image block) or insert_block with an
   `image` block carrying `purpose`, `prompt` and `caption`. Never output image data.
+  Set content `kind` to "diagram" for a flow chart, process, hierarchy, comparison,
+  concept map/labelled relationship diagram, physical schematic or SmartArt-style
+  list (rendered from labelled shapes, so labels stay exact); also set
+  `diagram_kind` to the specific shape (flow_chart/process/cycle for a sequence,
+  schematic for a physical apparatus/mechanism best shown as a real illustration,
+  concept_map for an abstract structure's components and how they relate,
+  hierarchy, comparison, smart_art) -
+  never diagram the course/lesson itself, only the subject matter. Leave `kind` as
+  "illustration" (the default) for a photographic/artistic scene. `replace_image`
+  always keeps the block's existing `kind`/`diagram_kind` unless you also send a
+  content update for them.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.

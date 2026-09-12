@@ -24,15 +24,22 @@ from app.schemas.course import CourseInput
 from app.schemas.document import Block
 from app.schemas.review import ChapterReview, ContinuityReport
 from app.schemas.template import CourseTemplate
+from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 
 log = get_logger(__name__)
 
 
 class ReviewerAgent:
-    def __init__(self, ai: AIClient | None = None, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        ai: AIClient | None = None,
+        settings: Settings | None = None,
+        memory: MemoryService | None = None,
+    ) -> None:
         self.ai = ai or get_ai_client()
         self.settings = settings or get_settings()
+        self.memory = memory or get_memory_service()
 
     async def review_chapter(
         self,
@@ -45,6 +52,12 @@ class ReviewerAgent:
         continuity: ContinuityContext,
     ) -> ChapterReview:
         payload = [block.model_dump(mode="json") for block in blocks]
+        memory = await self.memory.build_context(
+            stage="reviewer",
+            course_title=blueprint.course_title,
+            chapter_title=chapter.title,
+            template=template,
+        )
         review = await self.ai.structured(
             schema=ChapterReview,
             system=prompts.REVIEWER_SYSTEM,
@@ -56,6 +69,7 @@ class ReviewerAgent:
                 course_input=course_input,
                 continuity=continuity,
                 limit=self.settings.reviewer_context_chars,
+                memory=memory.render(),
             ),
             model=self.settings.reviewer_model,
             purpose=f"reviewer:{chapter.id}",

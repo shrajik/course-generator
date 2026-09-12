@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from app.api.course_authorization import get_course_for_author_action, get_owned_course
 from app.api.dependencies import get_current_user, get_current_user_if_db_enabled, require_roles
-from app.core.errors import NotFoundError
+from app.core.errors import NotFoundError, ValidationFailedError
 from app.core.generation_stream import get_stream_hub
 from app.core.roles import Role
 from app.course.templates.registry import available_templates, load_template
@@ -31,6 +31,7 @@ from app.schemas.course import (
     RequestChangesRequest,
 )
 from app.schemas.document import CourseDocument
+from app.schemas.memory import GenerationRunListResponse
 from app.services.course_service import CourseService, get_course_service
 from app.services.storage_service import StorageService, get_storage
 
@@ -79,6 +80,13 @@ async def create_course(
     request body - `CreateCourseRequest` has no owner field to spoof.
     """
     course_input = CourseInput.model_validate(request.model_dump(exclude={"run_planner"}))
+    if request.template_id_override:
+        known_ids = {t.template_id for t in available_templates()}
+        if request.template_id_override not in known_ids:
+            raise ValidationFailedError(
+                f"Unknown template_id_override '{request.template_id_override}'",
+                details={"available": sorted(known_ids)},
+            )
     owner_id = str(current_user.id) if current_user is not None else None
     record = await service.create_course(course_input, run_planner=request.run_planner, owner_id=owner_id)
     if current_user is not None:
@@ -412,3 +420,22 @@ async def get_course_activity(
     await get_course_for_author_action(course_id, current_user, service)
     activities = await service.list_activities(course_id, limit=limit, offset=offset)
     return CourseActivityListResponse(course_id=course_id, activities=activities)
+
+
+# --- generation history --------------------------------------------------------
+# One row per generation attempt (see GenerationRun/generation_runs) - unlike
+# `run` on the course record (only the latest attempt), this survives being
+# overwritten by a later run. Same owner-or-admin boundary as activity.
+
+
+@router.get("/{course_id}/runs", response_model=GenerationRunListResponse)
+async def get_course_generation_runs(
+    course_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_user),
+) -> GenerationRunListResponse:
+    await get_course_for_author_action(course_id, current_user, service)
+    runs = await service.list_generation_runs(course_id, limit=limit, offset=offset)
+    return GenerationRunListResponse(course_id=course_id, runs=runs)

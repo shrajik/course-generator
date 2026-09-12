@@ -8,9 +8,9 @@
       "key": "introduction",
       "label": "Introduction",
       "required": true,
-      "block_types": ["heading", "paragraph"],
-      "guidance": "Open with why this chapter matters and what problem it solves. 2-3 short paragraphs, no fluff.",
-      "max_blocks": 3
+      "block_types": ["heading", "paragraph", "image"],
+      "guidance": "Open with why this chapter matters and what problem it solves. 2-3 short paragraphs, no fluff. If the chapter is about a concrete, visualizable thing (a system, architecture, device, organism, structure), follow the opening paragraph with one well-labelled `image` block (`image_kind: diagram`) that orients the reader before any other section - seeing the whole thing up front makes everything that follows easier to place.",
+      "max_blocks": 4
     },
     {
       "key": "learning_objectives",
@@ -32,8 +32,8 @@
       "key": "how_it_works",
       "label": "How It Works",
       "required": true,
-      "block_types": ["heading", "paragraph", "table", "callout"],
-      "guidance": "Explain the mechanism step by step: inputs, processing, outputs, failure modes.",
+      "block_types": ["heading", "paragraph", "table", "callout", "image"],
+      "guidance": "Explain the mechanism step by step: inputs, processing, outputs, failure modes. When the mechanism has real steps, layers or a data flow, add an `image` block with `image_kind: diagram` right here instead of only describing it in prose.",
       "max_blocks": 6
     },
     {
@@ -41,8 +41,8 @@
       "label": "Visual Explanation",
       "required": false,
       "block_types": ["image"],
-      "guidance": "Add a diagram only when the structure or data flow is genuinely hard to describe in words.",
-      "max_blocks": 2
+      "guidance": "Add 1-2 diagrams (flow_chart, hierarchy, comparison or smart_art - pick whichever structure fits) whenever this chapter has a process, architecture, comparison or hierarchy to show. A labelled diagram beats a paragraph for this - only skip it when the chapter is genuinely free of structure to show.",
+      "max_blocks": 3
     },
     {
       "key": "technical_example",

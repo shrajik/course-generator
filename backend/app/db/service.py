@@ -7,18 +7,121 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
-from app.db.models import Blueprint, Course, CourseActivity, Document
+from app.core.logging import get_logger
+from app.db.models import Blueprint, Course, CourseActivity, Document, GenerationRun
 from app.db.repositories.activities import CourseActivityRepository
 from app.db.repositories.blueprints import BlueprintRepository
 from app.db.repositories.courses import CourseRepository
 from app.db.repositories.documents import DocumentRepository
+from app.db.repositories.generation_runs import GenerationRunRepository
 from app.db.session import get_session_factory
 from app.schemas.blueprint import CourseBlueprint
-from app.schemas.course import CourseActivityEntry, CourseInput, CourseRecord
+from app.schemas.course import CourseActivityEntry, CourseInput, CourseRecord, TocItem
 from app.schemas.document import CourseDocument
+from app.schemas.memory import GenerationRunEntry
+
+log = get_logger(__name__)
+
+# `CourseRecord` fields that live in their own dedicated `courses` columns
+# (see `Course` in app/db/models.py) rather than the catch-all `metadata_json`
+# column - every other `CourseRecord` field (chapters, run, warnings, ...)
+# goes into `metadata_json`. Both writers (`save_course_record` below and
+# `app.commands.import_filesystem_data`) and the reader (`_to_course_record`)
+# share this one constant instead of each maintaining their own copy of the
+# list, which is what let `import_filesystem_data.py` drift out of sync and
+# leak `owner_id`/review fields into `metadata_json` - colliding with the
+# same fields passed explicitly in `_to_course_record` and crashing
+# `GET /api/courses` for every course, not just the imported one.
+COURSE_RECORD_COLUMN_FIELDS = frozenset(
+    {
+        "course_id",
+        "document_id",
+        "status",
+        "input",
+        "template_id",
+        "owner_id",
+        "review_status",
+        "review_comment",
+        "reviewer_id",
+        "reviewed_at",
+        "created_at",
+        "updated_at",
+    }
+)
+
+# Placeholders used only when a persisted `input_json` is missing or has an
+# invalid value for one of CourseInput's required fields (see
+# `_coerce_course_input`). They make a legacy row representable without
+# inventing anything that looks like real course content.
+_LEGACY_TOC_PLACEHOLDER = [{"title": "Untitled chapter"}]
+_LEGACY_TARGET_AUDIENCE_PLACEHOLDER = "Not specified (legacy record)"
+_LEGACY_TEMPLATE_PLACEHOLDER = "technical"
+
+
+def _safe_str_list(value: object) -> list[str]:
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    return []
+
+
+def _coerce_course_input(raw: object, course_id: str) -> CourseInput:
+    """Hydrate a persisted `input_json` blob into a `CourseInput`.
+
+    `CourseInput` is deliberately strict (`extra="forbid"`, required fields)
+    because it also validates *new* course creation. Older or externally
+    edited rows can predate a required field or carry a since-removed key,
+    which would otherwise 500 every read that touches that row (including
+    `GET /api/courses`, which fails the whole list for one bad course). On
+    failure here we keep every field that still validates and backfill only
+    what's missing/invalid with explicit placeholders, so the row stays
+    listable without silently inventing real course content.
+    """
+    try:
+        return CourseInput.model_validate(raw)
+    except ValidationError as exc:
+        log.warning(
+            "Course %s has a legacy/invalid input_json; reconstructing with "
+            "placeholders for missing or invalid fields: %s",
+            course_id,
+            exc,
+        )
+        source = raw if isinstance(raw, dict) else {}
+
+        title = source.get("course_title")
+        if not isinstance(title, str) or not (1 <= len(title) <= 300):
+            title = "(untitled course)"
+
+        toc_payload = list(_LEGACY_TOC_PLACEHOLDER)
+        toc = source.get("toc")
+        if isinstance(toc, list) and toc:
+            try:
+                toc_payload = [TocItem.model_validate(item).model_dump() for item in toc]
+            except ValidationError:
+                pass
+
+        audience = source.get("target_audience")
+        if not isinstance(audience, str) or not (1 <= len(audience) <= 2000):
+            audience = _LEGACY_TARGET_AUDIENCE_PLACEHOLDER
+
+        template = source.get("template")
+        if template not in ("technical", "non_technical"):
+            template = _LEGACY_TEMPLATE_PLACEHOLDER
+
+        fallback = {
+            "course_title": title,
+            "toc": toc_payload,
+            "target_audience": audience,
+            "template": template,
+            "dos": _safe_str_list(source.get("dos")),
+            "donts": _safe_str_list(source.get("donts")),
+            "language": source.get("language") if isinstance(source.get("language"), str) else "en",
+            "tone": source.get("tone") if isinstance(source.get("tone"), str) else "",
+        }
+        return CourseInput.model_validate(fallback)
 
 
 class DatabaseService:
@@ -30,6 +133,7 @@ class DatabaseService:
         self.documents = DocumentRepository(session)
         self.blueprints = BlueprintRepository(session)
         self.activities = CourseActivityRepository(session)
+        self.generation_runs = GenerationRunRepository(session)
 
     # --- Courses ----------------------------------------------------------
     async def save_course_record(self, record: CourseRecord) -> CourseRecord:
@@ -38,23 +142,7 @@ class DatabaseService:
         now = datetime.now(timezone.utc)
         dumped = record.model_dump(mode="json")
         metadata = {
-            key: value
-            for key, value in dumped.items()
-            if key
-            not in {
-                "course_id",
-                "document_id",
-                "status",
-                "input",
-                "template_id",
-                "owner_id",
-                "review_status",
-                "review_comment",
-                "reviewer_id",
-                "reviewed_at",
-                "created_at",
-                "updated_at",
-            }
+            key: value for key, value in dumped.items() if key not in COURSE_RECORD_COLUMN_FIELDS
         }
         owner_id = uuid.UUID(record.owner_id) if record.owner_id else None
         reviewer_id = uuid.UUID(record.reviewer_id) if record.reviewer_id else None
@@ -251,6 +339,71 @@ class DatabaseService:
         rows = await self.activities.list_for_course(course.id, limit, offset)
         return [self._to_activity_entry(row) for row in rows]
 
+    # --- Generation history ------------------------------------------------
+    # `generation_runs` existed since the very first migration but was never
+    # written to - `CourseRecord.run` only ever tracked the latest attempt.
+    # This records one row per attempt so history survives being overwritten.
+    async def record_generation_run(
+        self,
+        course_id: str,
+        *,
+        job_id: str,
+        state: str,
+        payload: dict,
+        error: str | None = None,
+    ) -> tuple[GenerationRun, str] | None:
+        """Best-effort: a missing course or a duplicate job_id (a retried
+        finalise on the same run) must not break the generation it's meant
+        to be recording. Returns the (run, course_title) pair so the caller
+        can sync its memory embedding once this session has committed -
+        never None just because it's an update rather than an insert."""
+        course = await self.courses.get_by_course_id(course_id)
+        if course is None:
+            return None
+        now = datetime.now(timezone.utc)
+        existing = await self.generation_runs.get_by_job_id(job_id)
+        if existing is not None:
+            existing.state = state
+            existing.payload_json = payload
+            existing.error = error
+            existing.updated_at = now
+            run = await self.generation_runs.update(existing)
+            return run, course.title
+        run = await self.generation_runs.create(
+            GenerationRun(
+                course_pk=course.id,
+                job_id=job_id,
+                state=state,
+                payload_json=payload,
+                error=error,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return run, course.title
+
+    async def list_generation_runs(
+        self, course_id: str, limit: int = 20, offset: int = 0
+    ) -> list[GenerationRunEntry]:
+        course = await self.courses.get_by_course_id(course_id)
+        if course is None:
+            raise NotFoundError(f"Course '{course_id}' not found")
+        rows = await self.generation_runs.list_for_course(course.id, limit, offset)
+        return [self._to_generation_run_entry(row) for row in rows]
+
+    @staticmethod
+    def _to_generation_run_entry(row: GenerationRun) -> GenerationRunEntry:
+        payload = row.payload_json or {}
+        return GenerationRunEntry(
+            id=row.id,
+            job_id=row.job_id,
+            state=row.state,
+            chapters_generated=payload.get("chapters_generated") or [],
+            chapters_failed=payload.get("chapters_failed") or [],
+            error=row.error,
+            created_at=row.created_at,
+        )
+
     @staticmethod
     def _to_activity_entry(row: CourseActivity) -> CourseActivityEntry:
         return CourseActivityEntry(
@@ -266,11 +419,23 @@ class DatabaseService:
     @staticmethod
     def _to_course_record(course: Course) -> CourseRecord:
         """Convert a database Course to a CourseRecord Pydantic model."""
+        # A row written before a writer's exclusion list matched
+        # COURSE_RECORD_COLUMN_FIELDS (e.g. an older import_filesystem_data.py)
+        # can have `owner_id`/review fields duplicated inside `metadata_json`
+        # itself. Drop anything that collides with a field already supplied
+        # explicitly below instead of letting `CourseRecord(...)` raise
+        # "got multiple values" for it - the explicit, column-backed value
+        # always wins over whatever a legacy `metadata_json` also has.
+        metadata = {
+            key: value
+            for key, value in (course.metadata_json or {}).items()
+            if key not in COURSE_RECORD_COLUMN_FIELDS
+        }
         return CourseRecord(
             course_id=course.course_id,
             document_id=course.document_id,
             status=course.status,
-            input=CourseInput.model_validate(course.input_json),
+            input=_coerce_course_input(course.input_json, course.course_id),
             template_id=course.template_id,
             owner_id=str(course.owner_id) if course.owner_id else None,
             review_status=course.review_status,
@@ -279,7 +444,7 @@ class DatabaseService:
             reviewed_at=course.reviewed_at.isoformat() if course.reviewed_at else None,
             created_at=course.created_at.isoformat(),
             updated_at=course.updated_at.isoformat(),
-            **(course.metadata_json or {}),
+            **metadata,
         )
 
 

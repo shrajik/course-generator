@@ -46,6 +46,12 @@ class CourseInput(BaseModel):
     template: TemplateKind
     language: str = "en"
     tone: str = ""
+    # A specific DB-backed or static template id (e.g. "my_template_v2"),
+    # overriding the built-in default for `template`. Optional and unset by
+    # existing callers, so this is fully backward compatible - see
+    # app.course.templates.registry for how it's resolved and
+    # app.services.template_service for how such an id comes to exist.
+    template_id_override: str | None = None
 
     @field_validator("toc", mode="before")
     @classmethod
@@ -57,7 +63,7 @@ class CourseInput(BaseModel):
 
     @property
     def template_id(self) -> str:
-        return TEMPLATE_IDS[self.template]
+        return self.template_id_override or TEMPLATE_IDS[self.template]
 
     def chapter_titles(self) -> list[str]:
         return [item.title for item in self.toc]

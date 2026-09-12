@@ -11,9 +11,6 @@ only exists once Postgres-backed user identity does (see
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -29,20 +26,12 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module", autouse=True)
-def migrated_database():
-    os.environ["DATABASE_URL"] = DATABASE_URL or ""
-    os.environ["USE_DATABASE"] = "true"
+def migrated_database(db_schema):
+    """Schema lifecycle lives in conftest.py's session-scoped db_schema
+    fixture; this just keeps the JWT env vars set for the whole module."""
     os.environ["JWT_SECRET"] = "test-access-secret"
     os.environ["JWT_REFRESH_SECRET"] = "test-refresh-secret"
     reset_settings_cache()
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=Path(__file__).parents[1],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert result.returncode == 0
 
 
 @pytest.fixture

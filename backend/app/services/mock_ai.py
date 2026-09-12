@@ -147,6 +147,38 @@ class MockAIClient(AIClient):
         await self._simulate("image", "image")
         return _placeholder_png(prompt, size or self.settings.image_size)
 
+    async def embed(
+        self, *, texts: list[str], model: str | None = None, phase: str = "embedding"
+    ) -> list[list[float]]:
+        self.calls.append({"kind": "embedding", "count": len(texts)})
+        await self._simulate("embedding", "embedding")
+        dims = self.settings.embedding_dimensions
+        return [_fake_embedding(text, dims) for text in texts]
+
+
+def _fake_embedding(text: str, dimensions: int) -> list[float]:
+    """Deterministic offline stand-in for a real embedding model, using the
+    "hashing trick" (feature hashing): every word (and word-bigram) hashes
+    into a fixed dimension with a deterministic sign, then the vector is
+    normalised. Two texts that share vocabulary land closer together in
+    cosine similarity than two that don't - enough to exercise ranking/
+    threshold/dedup logic offline - but unlike a real model this has no
+    notion of synonymy (e.g. "voltage" vs "EMF" share no tokens), so it
+    cannot substitute for a real model when judging true semantic quality.
+    """
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    tokens = list(words) + [f"{a}_{b}" for a, b in zip(words, words[1:])]
+    if not tokens:
+        tokens = ["__empty__"]
+    vector = [0.0] * dimensions
+    for token in tokens:
+        digest = int(hashlib.sha256(token.encode("utf-8")).hexdigest(), 16)
+        index = digest % dimensions
+        sign = 1.0 if (digest // dimensions) % 2 == 0 else -1.0
+        vector[index] += sign
+    norm = sum(v * v for v in vector) ** 0.5 or 1.0
+    return [v / norm for v in vector]
+
 
 # ---------------------------------------------------------------------------
 # payload builders (keyed by schema class name)
@@ -633,6 +665,68 @@ def _block_revision(user: str) -> dict[str, Any]:
     }
 
 
+def _diagram_spec(user: str) -> dict[str, Any]:
+    brief = _line(re.compile(r"VISUAL BRIEF:\s*\n(.+)", re.DOTALL), user, "the concept")
+    title = (brief.splitlines() or ["Overview"])[0][:60]
+    requested = _line(re.compile(r"REQUESTED DIAGRAM TYPE:\s*(\S+)"), user, "")
+
+    if requested in ("concept_map", "conceptual", "hierarchy"):
+        nodes = [
+            {"id": "subject", "label": title or "Subject", "detail": "", "level": 0},
+            {"id": "part_a", "label": "Component A", "detail": "", "level": 1},
+            {"id": "part_b", "label": "Component B", "detail": "", "level": 1},
+            {"id": "part_c", "label": "Component C", "detail": "", "level": 1},
+        ]
+        edges = [
+            {"source": "part_a", "target": "subject", "label": "acts on"},
+            {"source": "subject", "target": "part_b", "label": "produces"},
+            {"source": "part_c", "target": "subject", "label": "relates to"},
+        ]
+        return {"kind": requested, "title": title, "nodes": nodes, "edges": edges}
+
+    if requested == "comparison":
+        nodes = [
+            {"id": "option_a", "label": "Option A", "detail": "First alternative"},
+            {"id": "option_b", "label": "Option B", "detail": "Second alternative"},
+        ]
+        return {"kind": "comparison", "title": title, "nodes": nodes, "edges": []}
+
+    if requested == "schematic":
+        # Semantically authored (role/anchor/priority/size), matching what the
+        # real prompt now asks for - the layout engine
+        # (app.render.schematic_layout) computes actual x/y/width/height, so
+        # this offline path exercises the same code the real model's output
+        # goes through instead of a hand-picked, always-non-overlapping guess.
+        shapes = [
+            {"type": "block", "id": "source", "role": "primary", "size": "medium", "label": "Source"},
+            {
+                "type": "flow", "id": "flow", "anchor": "right_of:source", "target_id": "source",
+                "priority": "important", "size": "small", "intensity": 0.6, "label": "Effect",
+            },
+            {
+                "type": "gauge", "id": "reading", "anchor": "below:source", "priority": "important",
+                "size": "small", "rotation": 30, "sublabel": "Reading",
+            },
+        ]
+        return {
+            "kind": "schematic",
+            "title": title,
+            "learning_objective": f"Understand {title.lower() or 'the concept'}",
+            "max_annotations": 5,
+            "states": [
+                {"caption": "At rest", "shapes": shapes},
+                {"caption": "In effect", "shapes": shapes},
+            ],
+        }
+
+    steps = ["Define the problem", "Design the approach", "Apply it", "Review the outcome"]
+    nodes = [{"id": f"n{i}", "label": step, "detail": ""} for i, step in enumerate(steps)]
+    edges = [
+        {"source": f"n{i}", "target": f"n{i + 1}", "label": ""} for i in range(len(steps) - 1)
+    ]
+    return {"kind": requested or "flow_chart", "title": title, "nodes": nodes, "edges": edges}
+
+
 _BUILDERS: dict[str, Any] = {
     "PlannerOutput": _planner_output,
     "PlannedSummaries": _planned_summaries,
@@ -643,6 +737,7 @@ _BUILDERS: dict[str, Any] = {
     "ChapterDraft": _chapter_draft,
     "ChapterReview": _chapter_review,
     "DocumentPatch": _document_patch,
+    "DiagramSpec": _diagram_spec,
 }
 
 

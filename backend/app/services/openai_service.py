@@ -113,6 +113,16 @@ class AIClient(abc.ABC):
     ) -> bytes:
         """Return PNG bytes."""
 
+    @abc.abstractmethod
+    async def embed(
+        self, *, texts: list[str], model: str | None = None, phase: str = "embedding"
+    ) -> list[list[float]]:
+        """Return one embedding vector per input text, same order as `texts`.
+
+        Callers (EmbeddingService) are responsible for batching and for
+        treating any failure here as soft - this method itself may raise.
+        """
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -607,6 +617,47 @@ class OpenAIClient(AIClient):
                 model=self.settings.image_model,
                 started=started,
                 retries=retries,
+            )
+            if metrics:
+                metrics.call_finished()
+
+    # --- embeddings ----------------------------------------------------------
+    async def embed(
+        self, *, texts: list[str], model: str | None = None, phase: str = "embedding"
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        model_name = model or self.settings.embedding_model
+        started = time.perf_counter()
+        metrics = current_metrics()
+        if metrics:
+            metrics.call_started()
+
+        usage: Any = None
+
+        async def call():
+            nonlocal usage
+            response = await self.client.embeddings.create(model=model_name, input=texts)
+            usage = getattr(response, "usage", None)
+            return response
+
+        retries = 0
+        failed = True
+        try:
+            response, retries = await self._with_retries("embed", phase, call)
+            # The API guarantees `data` is returned in the same order as `input`.
+            vectors = [item.embedding for item in response.data]
+            failed = False
+            return vectors
+        finally:
+            self._record(
+                kind="embedding",
+                purpose="embedding",
+                model=model_name,
+                started=started,
+                retries=retries,
+                usage=usage,
+                failed=failed,
             )
             if metrics:
                 metrics.call_finished()

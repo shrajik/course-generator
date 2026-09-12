@@ -4,13 +4,21 @@ import { ImageOff } from "lucide-react";
 import { Caption, readText } from "./parts";
 import { assetUrl } from "@/lib/api/documents";
 import { imageBoxHeight } from "@/lib/editor/style";
+import { isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
 import type { BlockViewProps } from "./types";
 
+/** Diagrams are generated as SVG with built-in hover/focus tooltips and
+ * highlighting (see backend app/render/diagram_renderer.py) - but that only
+ * works once the markup lives in this page's own DOM, not behind `<img
+ * src>`. So a diagram is fetched and inlined; every other image (a raster
+ * illustration) keeps using a plain `<img>`, unchanged. */
 export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewProps) {
   const path = typeof block.content.path === "string" ? block.content.path : null;
   const source = assetUrl(documentId, path);
   const boxHeight = imageBoxHeight(block);
   const error = readText(block.content, "error");
+  const wantsInline = readText(block.content, "kind") === "diagram" && isSvgPath(path);
+  const inlineMarkup = useInlineDiagramSvg(documentId, path, wantsInline);
 
   return (
     <div>
@@ -19,13 +27,24 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
           className="flex items-center justify-center overflow-hidden"
           style={{ height: boxHeight }}
         >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src={source}
-            alt={readText(block.content, "alt")}
-            className="block h-auto max-h-full w-auto max-w-full"
-            draggable={false}
-          />
+          {inlineMarkup ? (
+            <div
+              className="diagram-inline flex h-full w-full items-center justify-center [&>svg]:h-auto [&>svg]:max-h-full [&>svg]:w-auto [&>svg]:max-w-full"
+              role="img"
+              aria-label={readText(block.content, "alt")}
+              // Trusted source: this markup is our own backend-rendered SVG
+              // (app/render/diagram_renderer.py), not user-supplied HTML.
+              dangerouslySetInnerHTML={{ __html: inlineMarkup }}
+            />
+          ) : (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={source}
+              alt={readText(block.content, "alt")}
+              className="block h-auto max-h-full w-auto max-w-full"
+              draggable={false}
+            />
+          )}
         </div>
       ) : (
         <div

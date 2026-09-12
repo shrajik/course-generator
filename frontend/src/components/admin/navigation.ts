@@ -1,4 +1,4 @@
-import { BarChart3, BookOpen, LayoutDashboard, Settings, Users } from "lucide-react";
+import { BarChart3, BookMarked, BookOpen, Image as ImageIcon, LayoutDashboard, Layers3, Settings, Users } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 export interface AdminNavigationItem {
@@ -11,6 +11,9 @@ export const ADMIN_NAVIGATION: AdminNavigationItem[] = [
   { label: "Dashboard", href: "/admin", icon: LayoutDashboard },
   { label: "Users", href: "/admin/users", icon: Users },
   { label: "Courses", href: "/admin/courses", icon: BookOpen },
+  { label: "Templates", href: "/admin/templates", icon: Layers3 },
+  { label: "Visual knowledge", href: "/admin/visual-knowledge", icon: ImageIcon },
+  { label: "Course samples", href: "/admin/course-samples", icon: BookMarked },
 ];
 
 export const ADMIN_SECONDARY_NAVIGATION: AdminNavigationItem[] = [

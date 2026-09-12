@@ -8,9 +8,9 @@
       "key": "introduction",
       "label": "Introduction",
       "required": true,
-      "block_types": ["heading", "paragraph"],
-      "guidance": "Hook the reader with the stake: what changes for them once they master this chapter.",
-      "max_blocks": 3
+      "block_types": ["heading", "paragraph", "image"],
+      "guidance": "Hook the reader with the stake: what changes for them once they master this chapter. If the chapter centres on a concrete thing worth seeing (a model, a structure, a named framework), follow the opening paragraph with one well-labelled `image` block (`image_kind: diagram`) that orients the reader before any other section.",
+      "max_blocks": 4
     },
     {
       "key": "learning_objectives",
@@ -32,8 +32,8 @@
       "key": "core_concept",
       "label": "Core Concept",
       "required": true,
-      "block_types": ["heading", "paragraph", "callout", "quote"],
-      "guidance": "Explain the idea in plain language, then define any jargon you must introduce.",
+      "block_types": ["heading", "paragraph", "callout", "quote", "image"],
+      "guidance": "Explain the idea in plain language, then define any jargon you must introduce. If the concept has parts, stages or a relationship worth seeing, add an `image` block with `image_kind: diagram` (smart_art or conceptual work well here) instead of only describing it in prose.",
       "max_blocks": 6
     },
     {
@@ -57,7 +57,7 @@
       "label": "Framework / Method",
       "required": true,
       "block_types": ["table", "learning_objectives", "paragraph", "image"],
-      "guidance": "Give the reader a repeatable model or checklist they can apply on Monday morning.",
+      "guidance": "Give the reader a repeatable model or checklist they can apply on Monday morning. Whenever the framework has named steps, stages or a 2x2/quadrant shape, add an `image` block with `image_kind: diagram` (flow_chart, cycle, hierarchy, comparison or smart_art - whichever fits) instead of only listing it as text.",
       "max_blocks": 4
     },
     {

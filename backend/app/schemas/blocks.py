@@ -79,6 +79,16 @@ class ImageContent(_Content):
     # Intrinsic pixel size of the generated asset, used by the layout engine.
     width: int | None = None
     height: int | None = None
+    # "illustration" (default) renders `prompt` through the image model as a
+    # raster picture. "diagram" renders it as a structured, on-theme SVG -
+    # see app.services.diagram_service - for flow charts, SmartArt-style
+    # lists, hierarchies and other content where exact labels matter.
+    kind: str = "illustration"
+    # Optional hint for which DiagramSpec shape this should be (e.g.
+    # "concept_map", "flow_chart") - see app.schemas.diagram.DIAGRAM_KINDS.
+    # Only meaningful when kind == "diagram"; ignored otherwise. Empty means
+    # DiagramService free-decides, same as before this field existed.
+    diagram_kind: str = ""
 
 
 class QuoteContent(_Content):

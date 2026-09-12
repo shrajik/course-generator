@@ -23,8 +23,6 @@ import os
 import pytest
 
 from app.core.config import reset_settings_cache
-from app.db.base import Base
-from app.db.engine import dispose_engine, get_engine
 from app.db.repositories.courses import CourseRepository
 from app.db.service import get_database_service
 from app.db.session import get_session_factory
@@ -43,15 +41,14 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-async def database_schema():
-    os.environ["DATABASE_URL"] = DATABASE_URL or ""
+def database_schema(db_schema, monkeypatch):
+    """Schema lifecycle lives in conftest.py's session-scoped db_schema
+    fixture - see its docstring for why this no longer drops tables. Scopes
+    DATABASE_URL/USE_DATABASE to this test only (monkeypatch reverts them
+    automatically), so they don't leak into unrelated offline tests."""
+    monkeypatch.setenv("DATABASE_URL", db_schema)
+    monkeypatch.setenv("USE_DATABASE", "true")
     reset_settings_cache()
-    async with get_engine().begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield
-    async with get_engine().begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
-    await dispose_engine()
 
 
 @pytest.fixture

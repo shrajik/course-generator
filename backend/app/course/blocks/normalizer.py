@@ -32,11 +32,14 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
         return {"text": _first(draft.text, draft.intro)}
 
     if t is BlockType.IMAGE:
+        kind = draft.image_kind.strip().lower()
         return {
             "purpose": _first(draft.image_purpose, draft.title, draft.text),
             "prompt": _first(draft.image_prompt, draft.text),
             "caption": _first(draft.caption, draft.title),
             "alt": _first(draft.alt_text, draft.caption, draft.title),
+            "kind": kind if kind == "diagram" else "illustration",
+            "diagram_kind": draft.diagram_kind.strip().lower().replace(" ", "_"),
         }
 
     if t is BlockType.QUOTE:

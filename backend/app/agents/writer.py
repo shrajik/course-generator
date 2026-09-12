@@ -26,15 +26,22 @@ from app.schemas.draft import BlockRevision, ChapterDraft, DraftBlock, Generated
 from app.schemas.research import ChapterResearch
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
+from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, StreamSink, get_ai_client
 
 log = get_logger(__name__)
 
 
 class WriterAgent:
-    def __init__(self, ai: AIClient | None = None, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        ai: AIClient | None = None,
+        settings: Settings | None = None,
+        memory: MemoryService | None = None,
+    ) -> None:
         self.ai = ai or get_ai_client()
         self.settings = settings or get_settings()
+        self.memory = memory or get_memory_service()
 
     async def write_chapter(
         self,
@@ -49,6 +56,12 @@ class WriterAgent:
         on_delta: StreamSink | None = None,
     ) -> tuple[list[Block], str]:
         """Returns (validated blocks, compact chapter summary)."""
+        memory = await self.memory.build_context(
+            stage="writer",
+            course_title=blueprint.course_title,
+            chapter_title=chapter.title,
+            template=template,
+        )
         draft = await self.ai.structured(
             schema=ChapterDraft,
             system=prompts.WRITER_SYSTEM,
@@ -61,6 +74,7 @@ class WriterAgent:
                 course_input=course_input,
                 revision_notes=revision_notes,
                 research_chars=self.settings.research_context_chars,
+                memory=memory.render(),
             ),
             model=self.settings.writer_model,
             purpose=f"writer:{chapter.id}",

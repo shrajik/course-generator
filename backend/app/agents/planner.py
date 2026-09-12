@@ -15,23 +15,33 @@ from app.schemas.blueprint import (
     PlannerOutput,
 )
 from app.schemas.course import CourseInput, ImproveTocRequest, ImproveTocResponse, TocItem
+from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 
 log = get_logger(__name__)
 
 
 class PlannerAgent:
-    def __init__(self, ai: AIClient | None = None, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        ai: AIClient | None = None,
+        settings: Settings | None = None,
+        memory: MemoryService | None = None,
+    ) -> None:
         self.ai = ai or get_ai_client()
         self.settings = settings or get_settings()
+        self.memory = memory or get_memory_service()
 
     # --- blueprint --------------------------------------------------------
     async def plan(self, course_input: CourseInput) -> CourseBlueprint:
         template = load_template(course_input.template_id)
+        memory = await self.memory.build_context(
+            stage="planner", course_title=course_input.course_title, template=template
+        )
         output = await self.ai.structured(
             schema=PlannerOutput,
             system=prompts.PLANNER_SYSTEM,
-            user=prompts.planner_user(course_input, template),
+            user=prompts.planner_user(course_input, template, memory=memory.render()),
             model=self.settings.planner_model,
             purpose="planner",
             phase="planner",
