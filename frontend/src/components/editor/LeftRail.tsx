@@ -5,7 +5,6 @@ import {
   Image as ImageIcon,
   LayoutGrid,
   Shapes,
-  Sparkles,
   Type,
   Upload,
 } from "lucide-react";
@@ -17,10 +16,9 @@ export type RailPanel = "pages" | "blocks" | "uploads";
 interface LeftRailProps {
   panel: RailPanel;
   onPanelChange: (panel: RailPanel) => void;
-  onFocusAssistant: () => void;
 }
 
-export function LeftRail({ panel, onPanelChange, onFocusAssistant }: LeftRailProps) {
+export function LeftRail({ panel, onPanelChange }: LeftRailProps) {
   const editor = useEditor();
   const anchor = editor.selectedIds[0] ?? null;
 
@@ -66,13 +64,6 @@ export function LeftRail({ panel, onPanelChange, onFocusAssistant }: LeftRailPro
       Icon: Upload,
       active: panel === "uploads",
       onClick: () => onPanelChange("uploads"),
-    },
-    {
-      id: "assistant",
-      label: "AI Assistant",
-      Icon: Sparkles,
-      active: false,
-      onClick: onFocusAssistant,
     },
   ];
 

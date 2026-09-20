@@ -1,5 +1,7 @@
 import { request } from "./client";
 import type {
+  ChapterDetailResponse,
+  ChapterResearch,
   CourseActivityListResponse,
   CourseBlueprint,
   CourseDetail,
@@ -66,6 +68,20 @@ export function getCourse(courseId: string, signal?: AbortSignal): Promise<Cours
 
 export function getBlueprint(courseId: string): Promise<CourseBlueprint> {
   return request<CourseBlueprint>(`/api/courses/${courseId}/blueprint`);
+}
+
+/** The web-search/Deep Research findings (including sources) for one
+ * chapter - see ResearchAgent. Throws a 404 ApiError if the chapter has no
+ * cached research (e.g. offline/mock mode). */
+export function getChapterResearch(courseId: string, chapterId: string): Promise<ChapterResearch> {
+  return request<ChapterResearch>(`/api/courses/${courseId}/chapters/${chapterId}/research`);
+}
+
+/** The drafted chapter (title/summary/block count) plus its reviewer verdict,
+ * if reviewed yet - what the "Writing Chapter N" / "Reviewing Content" stages
+ * on the generation screen drill into. */
+export function getChapter(courseId: string, chapterId: string): Promise<ChapterDetailResponse> {
+  return request<ChapterDetailResponse>(`/api/courses/${courseId}/chapters/${chapterId}`);
 }
 
 // --- review/approval workflow ------------------------------------------------

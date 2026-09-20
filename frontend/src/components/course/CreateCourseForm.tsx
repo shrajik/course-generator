@@ -2,13 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Loader2, Save } from "lucide-react";
+import { ArrowRight, CheckCircle2, FileText, Layers3, Loader2, Save } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { CoursePreviewArt } from "./CoursePreviewArt";
 import { RuleList } from "./RuleList";
-import { TemplateSelector } from "./TemplateSelector";
 import { improveToc } from "@/lib/api/courses";
+import { classifyTemplateType } from "@/lib/api/course-templates";
 import { ApiError } from "@/lib/api/client";
 import { useCourseDraft } from "@/lib/state/course-draft";
 import type { TocItem } from "@/lib/types/course";
@@ -48,12 +48,32 @@ export function CreateCourseForm() {
     setError(null);
     const courseTitle = draft.courseTitle.trim();
     const targetAudience = draft.targetAudience.trim();
+
+    // The Default Template has no type of its own - resolve it now that a
+    // title (required by canContinue) is guaranteed to exist, rather than
+    // leaving "Course Template" stuck on "Detecting type…" forever if the
+    // user picked it before typing a title.
+    let template = draft.template;
+    if (draft.selectedTemplate?.templateType === "auto") {
+      try {
+        const classification = await classifyTemplateType({ courseTitle, targetAudience });
+        template = classification.template_type;
+        update({
+          template,
+          selectedTemplate: { ...draft.selectedTemplate, templateType: classification.template_type },
+        });
+      } catch {
+        // Fall back to the draft's existing template rather than blocking
+        // Continue on a classification hiccup.
+      }
+    }
+
     const staleOrMissing =
       draft.toc.length === 0 ||
       !draft.tocDraftedFor ||
       draft.tocDraftedFor.courseTitle !== courseTitle ||
       draft.tocDraftedFor.targetAudience !== targetAudience ||
-      draft.tocDraftedFor.template !== draft.template;
+      draft.tocDraftedFor.template !== template;
     try {
       let toc: TocItem[] = draft.toc;
       if (staleOrMissing) {
@@ -61,7 +81,7 @@ export function CreateCourseForm() {
           course_title: courseTitle,
           toc: [],
           audience: targetAudience,
-          template: draft.template,
+          template,
           dos: draft.dos,
           donts: draft.donts,
         });
@@ -70,7 +90,7 @@ export function CreateCourseForm() {
           sections: item.sections ?? [],
           notes: item.notes ?? "",
         }));
-        update({ toc, tocDraftedFor: { courseTitle, targetAudience, template: draft.template } });
+        update({ toc, tocDraftedFor: { courseTitle, targetAudience, template } });
       }
       router.push("/toc");
     } catch (caught) {
@@ -158,11 +178,57 @@ export function CreateCourseForm() {
           </div>
 
           <div>
-            <p className="mb-2.5 text-[12.5px] font-medium text-ink-700">Choose Template</p>
-            <TemplateSelector
-              value={draft.template}
-              onChange={(template) => update({ template })}
-            />
+            <p className="mb-2.5 text-[12.5px] font-medium text-ink-700">Course Template</p>
+            {draft.selectedTemplate ? (
+              <div className="flex items-center justify-between gap-3 rounded-card border border-brand-200 bg-brand-50 px-4 py-3.5">
+                <div className="flex items-start gap-3">
+                  <FileText size={16} className="mt-0.5 shrink-0 text-brand-600" aria-hidden />
+                  <div>
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-ink-400">
+                      Selected Template
+                    </p>
+                    <p className="mt-0.5 text-[13.5px] font-semibold text-ink">
+                      {draft.selectedTemplate.name}
+                    </p>
+                    <p className="text-[12px] text-ink-500">
+                      {draft.selectedTemplate.templateType === "auto"
+                        ? "Detecting type…"
+                        : draft.selectedTemplate.templateType === "technical"
+                          ? "Technical"
+                          : "Non-Technical"}
+                    </p>
+                    <p className="mt-1 flex items-center gap-1 text-[11.5px] text-brand-700">
+                      <CheckCircle2 size={12} />
+                      {draft.selectedTemplate.templateType === "auto"
+                        ? "Type will be detected automatically"
+                        : "Template selected"}
+                    </p>
+                  </div>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => router.push("/templates?select=1")}>
+                  Change Template
+                </Button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between gap-3 rounded-card border border-line bg-cream-50 px-4 py-3.5">
+                <div className="flex items-center gap-2.5 text-[12.5px] text-ink-500">
+                  <Layers3 size={16} className="shrink-0" aria-hidden />
+                  No template selected
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    className="text-[12px] font-medium text-ink-400 underline-offset-2 hover:text-ink-600 hover:underline"
+                    onClick={() => update({ selectedTemplate: null })}
+                  >
+                    Start from Scratch
+                  </button>
+                  <Button variant="outline" size="sm" onClick={() => router.push("/templates?select=1")}>
+                    Select Template
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
 
           {error ? (

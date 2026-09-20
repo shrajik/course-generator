@@ -7,12 +7,13 @@ import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { ProgressRing } from "./ProgressRing";
 import { StageList } from "./StageList";
+import { StageDetailModal } from "./StageDetailModal";
 import { LiveDocumentPreview } from "./LiveDocumentPreview";
 import { getCourse } from "@/lib/api/courses";
 import { generateCourse } from "@/lib/api/generation";
 import { getCourseDocument } from "@/lib/api/documents";
 import { apiUrl, ApiError } from "@/lib/api/client";
-import { deriveStages, emptyStateMessage, formatEta } from "@/lib/generation/stages";
+import { deriveStages, emptyStateMessage, formatEta, type GenerationStage } from "@/lib/generation/stages";
 import { useCourseDraft } from "@/lib/state/course-draft";
 import type { ChapterStreamEvent, CourseDetail } from "@/lib/types/course";
 import type { CourseDocument } from "@/lib/types/document";
@@ -40,6 +41,7 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
   );
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [selectedStage, setSelectedStage] = useState<GenerationStage | null>(null);
   const startedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const pollRef = useRef<() => Promise<void>>(async () => {});
@@ -226,7 +228,7 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
           </div>
 
           <div className="border-t border-line pt-6">
-            <StageList stages={view.stages} />
+            <StageList stages={view.stages} onSelect={setSelectedStage} />
           </div>
 
           {error || view.failed ? (
@@ -296,6 +298,13 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
           />
         </div>
       </div>
+
+      <StageDetailModal
+        courseId={courseId}
+        stage={selectedStage}
+        document={liveDocument}
+        onClose={() => setSelectedStage(null)}
+      />
     </div>
   );
 }

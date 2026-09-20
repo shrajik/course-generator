@@ -286,3 +286,58 @@ export interface CourseDetail {
     pdf: string | null;
   };
 }
+
+/** A source the research stage found for one chapter (web search / Deep
+ * Research) - see ResearchAgent in the backend. `note` is an optional
+ * one-line reason the model kept it, not always populated. */
+export interface ChapterReference {
+  title: string;
+  url: string;
+  note: string;
+}
+
+export interface ChapterResearch {
+  chapter_id: string;
+  chapter_title: string;
+  mode: "fast" | "deep" | "mock" | string;
+  model: string;
+  generated_at: string;
+  payload: {
+    references: ChapterReference[];
+    [key: string]: unknown;
+  };
+}
+
+// --- chapter detail (drives the generation screen's "what happened" view) ---
+
+export interface ReviewIssue {
+  severity: "blocker" | "major" | "minor" | string;
+  category: string;
+  description: string;
+  suggestion: string;
+}
+
+export interface ChapterReviewResult {
+  approved: boolean;
+  scores: Record<string, number | null>;
+  issues: ReviewIssue[];
+  summary: string;
+  reviewed_at: string;
+}
+
+export interface GeneratedChapterSummary {
+  chapter_id: string;
+  chapter_number: number;
+  title: string;
+  summary: string;
+  blocks: unknown[];
+  review: ChapterReviewResult | null;
+  revisions: number;
+  model: string;
+  generated_at: string;
+}
+
+export interface ChapterDetailResponse {
+  chapter: GeneratedChapterSummary;
+  research_available: boolean;
+}

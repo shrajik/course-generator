@@ -340,7 +340,7 @@ export function CourseEditor({ documentId }: { documentId: string }) {
 
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center gap-2 text-[13px] text-ink-500">
+      <div className="editor-shell flex items-center justify-center gap-2 text-[13px] text-ink-500">
         <Loader2 size={16} className="animate-spin text-brand-600" />
         Loading course document…
       </div>
@@ -349,7 +349,7 @@ export function CourseEditor({ documentId }: { documentId: string }) {
 
   if (loadError || !editor.document) {
     return (
-      <div className="flex h-screen flex-col items-center justify-center gap-3 px-6 text-center">
+      <div className="editor-shell flex flex-col items-center justify-center gap-3 px-6 text-center">
         <AlertTriangle size={20} className="text-danger" />
         <p className="text-[13px] text-ink">{loadError ?? "No document available."}</p>
         <button
@@ -364,7 +364,7 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   }
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-white">
+    <div className="editor-shell flex flex-col overflow-hidden bg-white">
       <EditorToolbar
         onPreview={() => router.push(`/preview/${documentId}`)}
         onExport={handleExport}
@@ -387,11 +387,7 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       />
 
       <div className="flex min-h-0 flex-1">
-        <LeftRail
-          panel={panel}
-          onPanelChange={setPanel}
-          onFocusAssistant={() => assistantRef.current?.focus()}
-        />
+        <LeftRail panel={panel} onPanelChange={setPanel} />
 
         <div className="w-[128px] shrink-0 border-r border-line bg-white">
           {panel === "pages" ? <PageSidebar /> : null}

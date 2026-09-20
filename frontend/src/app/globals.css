@@ -41,6 +41,19 @@ body {
   padding: 20px 24px 36px;
 }
 
+/* The course editor owns its own full-height chrome (toolbar, panels, canvas
+   all manage their own internal scrolling) instead of flowing inside
+   .creator-main-content's padded, page-scrolling box like every other route.
+   Negative margins cancel that padding exactly and `height` claims the same
+   vertical budget .creator-main-content already reserves via its own
+   min-height, so the window itself never grows past one viewport tall.
+   Keep these offsets in sync with .creator-main-content's above (and its
+   @media (max-width: 767px) override below) if either ever changes. */
+.editor-shell {
+  height: calc(100vh - 49px);
+  margin: -20px -24px -36px;
+}
+
 .creator-brand-mark {
   display: flex;
   height: 30px;
@@ -86,6 +99,7 @@ body {
   .creator-main-content { min-height: calc(100vh - 101px); margin-left: 0; padding: 16px 12px 28px; }
   .creator-mobile-backdrop { position: fixed; inset: 0; z-index: 39; display: block; background: rgba(31, 41, 55, 0.16); }
   .creator-sidebar-mobile { display: flex; z-index: 40; top: 0; width: 250px; padding-top: 20px; box-shadow: 12px 0 30px rgba(58, 45, 35, 0.12); }
+  .editor-shell { height: calc(100vh - 101px); margin: -16px -12px -28px; }
 }
 
 .creator-page { animation: creator-fade-in 200ms ease-out both; }

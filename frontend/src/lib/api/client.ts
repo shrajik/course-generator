@@ -132,6 +132,28 @@ export async function requestBlob(
   return response.blob();
 }
 
+/** Multipart upload (e.g. a template file). The browser sets the
+ * multipart boundary itself from the FormData body - never set
+ * `content-type` manually here, or the boundary gets lost and the backend
+ * can't parse the parts. */
+export async function requestForm<T>(path: string, form: FormData, signal?: AbortSignal): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(apiUrl(path), {
+      method: "POST",
+      body: form,
+      signal,
+      cache: "no-store",
+      credentials: "include",
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new ApiError(`Cannot reach the backend at ${API_BASE_URL}. Is it running?`, 0, "network_error");
+  }
+  if (!response.ok) throw await toApiError(response);
+  return (await response.json()) as T;
+}
+
 /** Raw text of an asset (used to inline an SVG diagram so its hover/focus
  * tooltips actually work - an `<img src>` reference can't do that). */
 export async function requestText(path: string, signal?: AbortSignal): Promise<string> {

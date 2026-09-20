@@ -16,6 +16,24 @@ import {
   useState,
 } from "react";
 import type { TemplateKind, TocItem } from "@/lib/types/course";
+import type { CourseTemplateType } from "@/lib/api/course-templates";
+
+/** The uploaded reference document (or the hardcoded "Default Template")
+ * chosen on Create Course, if any - see CreateCourseForm's "Course Template"
+ * section. Distinct from `template` (TemplateKind) below, which is what the
+ * generation pipeline actually reads; picking one auto-sets `template` to
+ * match its type so the pipeline keeps getting a valid value without the
+ * user being asked to choose it directly.
+ *
+ * `templateType: "auto"` is the Default Template before its type has been
+ * resolved - it has none of its own, so it's classified (Technical vs
+ * Non-Technical) from the course title/audience the moment both exist; see
+ * TemplatesPage.handleUse and CreateCourseForm.handleContinue. */
+export interface SelectedCourseTemplate {
+  id: string;
+  name: string;
+  templateType: CourseTemplateType | "auto";
+}
 
 /** The inputs a drafted TOC was generated from - lets the Create Course
  * screen tell "still the same course, just fine-tuning" apart from "this is
@@ -32,6 +50,8 @@ export interface CourseDraft {
   dos: string[];
   donts: string[];
   template: TemplateKind;
+  /** Null means "Start from Scratch" (or nothing chosen yet). */
+  selectedTemplate: SelectedCourseTemplate | null;
   toc: TocItem[];
   /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
    * a previous course) - see CreateCourseForm's regeneration check. */
@@ -61,6 +81,7 @@ export const EMPTY_DRAFT: CourseDraft = {
   dos: DEFAULT_DOS,
   donts: DEFAULT_DONTS,
   template: "technical",
+  selectedTemplate: null,
   toc: [],
   tocDraftedFor: null,
   courseId: null,

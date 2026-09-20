@@ -13,6 +13,7 @@ from app.api import (
     admin,
     auth,
     course_samples,
+    course_templates,
     courses,
     documents,
     health,
@@ -94,4 +95,5 @@ app.include_router(documents.router)
 app.include_router(templates.router)
 app.include_router(visual_knowledge.router)
 app.include_router(course_samples.router)
+app.include_router(course_templates.router)
 app.include_router(memory.router)

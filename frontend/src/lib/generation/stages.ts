@@ -16,6 +16,9 @@ export interface GenerationStage {
   label: string;
   status: StageStatus;
   detail?: string;
+  /** Real chapter ids this stage covers, for drilling into "what happened"
+   * once it's done - never populated with anything invented. */
+  chapterIds?: string[];
 }
 
 export interface GenerationView {
@@ -175,6 +178,7 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     total,
     status === "researching",
   );
+  research.stage.chapterIds = chapters.filter((chapter) => chapter.researched).map((c) => c.chapter_id);
   if (research.stage.status === "active") {
     research.stage.detail =
       activeChapterLabel(chapters, (chapter) => !chapter.researched) ?? research.stage.detail;
@@ -206,6 +210,7 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
         detail: activeChapter
           ? `Chapter ${start + group.indexOf(activeChapter) + 1}: ${activeChapter.title}`
           : undefined,
+        chapterIds: group.filter((chapter) => chapter.written).map((chapter) => chapter.chapter_id),
       });
     }
   }
@@ -220,6 +225,7 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     total,
     status === "reviewing" || (status === "writing" && reviewedCount > 0),
   );
+  reviewing.stage.chapterIds = chapters.filter((chapter) => chapter.reviewed).map((c) => c.chapter_id);
   if (reviewing.stage.status === "active") {
     reviewing.stage.detail =
       activeChapterLabel(chapters, (chapter) => chapter.written && !chapter.reviewed) ??
