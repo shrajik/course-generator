@@ -148,6 +148,36 @@ class TestGenerationStreamHub:
         assert queue.empty()
 
 
+class TestAppendLine:
+    def test_start_then_append_line_builds_newline_joined_text(self):
+        hub = GenerationStreamHub()
+        hub.start("course_1", "chapter_1", "research")
+        hub.append_line("course_1", "chapter_1", "Searching: photosynthesis")
+        hub.append_line("course_1", "chapter_1", "Reading: https://example.com/bio")
+
+        snapshot = hub.snapshot("course_1")
+        assert snapshot[0].phase == "research"
+        assert snapshot[0].text == "Searching: photosynthesis\nReading: https://example.com/bio"
+
+    def test_append_line_after_done_is_a_noop(self):
+        hub = GenerationStreamHub()
+        hub.start("course_1", "chapter_1", "research")
+        hub.finish("course_1", "chapter_1")
+        hub.append_line("course_1", "chapter_1", "too late")
+
+        assert hub.snapshot("course_1")[0].text == ""
+
+    def test_append_line_does_not_run_it_through_the_json_text_extractor(self):
+        """A plain activity line containing something that looks like a
+        `"text": "..."` field must be shown verbatim, not parsed as if it
+        were still-streaming JSON (that heuristic is for append(), not this)."""
+        hub = GenerationStreamHub()
+        hub.start("course_1", "chapter_1", "research")
+        hub.append_line("course_1", "chapter_1", 'Reading: a page about "text": "extraction"')
+
+        assert hub.snapshot("course_1")[0].text == 'Reading: a page about "text": "extraction"'
+
+
 async def test_writer_streams_real_content_into_the_hub(service, technical_input):
     """End-to-end through the real pipeline (offline mock client): proves
     `on_delta` is actually wired from CourseService through WriterAgent/
@@ -197,3 +227,28 @@ async def test_writer_streams_real_content_into_the_hub(service, technical_input
         )
 
     assert any(any_fragment_persisted(e["text"]) for e in writing_events)
+
+
+async def test_research_streams_real_activity_lines_into_the_hub(service, technical_input):
+    """Same end-to-end proof as the writer test above, for the research phase:
+    `on_event` is wired from CourseService through ResearchService/ResearchAgent
+    through `AIClient.research()` into the hub, and a cache hit (the second
+    chapter research call for an already-researched course) does not re-emit
+    a "research" phase at all."""
+    from app.core.generation_stream import get_stream_hub
+
+    hub = get_stream_hub()
+    record = await service.create_course(technical_input, run_planner=True)
+    queue = hub.subscribe(record.course_id)
+
+    await service.generate(record.course_id, GenerateRequest(mode="sync", generate_images=False))
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    assert events
+
+    research_events = [e for e in events if e["phase"] == "research" and e["text"]]
+    assert research_events, "expected at least one non-empty research-phase event"
+    assert any("Searching:" in e["text"] for e in research_events)
+    assert any(e["done"] for e in events if e["phase"] == "research")

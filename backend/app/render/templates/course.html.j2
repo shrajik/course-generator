@@ -98,7 +98,9 @@
       {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
 
     {%- elif b.type == 'image' -%}
-      {% if b.image_src %}
+      {% if b.inline_html %}
+        <div class="figure-box cev-pdf-wrap" style="height:{{ b.image_box }}px">{{ b.inline_html | safe }}</div>
+      {% elif b.image_src %}
         <div class="figure-box" style="height:{{ b.image_box }}px">
           <img class="figure" src="{{ b.image_src }}" alt="{{ c.get('alt', '') }}">
         </div>

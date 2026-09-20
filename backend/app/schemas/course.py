@@ -307,3 +307,18 @@ class CourseActivityEntry(BaseModel):
 class CourseActivityListResponse(BaseModel):
     course_id: str
     activities: list[CourseActivityEntry] = Field(default_factory=list)
+
+
+class WorkspaceActivityEntry(CourseActivityEntry):
+    """One `CourseActivityEntry`, plus which course it happened in - the
+    workspace-wide feed (`GET /api/activity`) spans every course the caller
+    owns, so each row needs to say where it came from. `document_id` (not
+    `course_id`) is what the editor route is keyed by."""
+
+    course_id: str
+    document_id: str
+    course_title: str
+
+
+class WorkspaceActivityListResponse(BaseModel):
+    activities: list[WorkspaceActivityEntry] = Field(default_factory=list)

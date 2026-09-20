@@ -138,14 +138,26 @@ def render_document_html(
     *,
     asset_prefix: str = "../",
     language: str = "en",
+    inline_fragments: dict[str, str] | None = None,
 ) -> str:
     theme = template.theme.model_dump(mode="json")
     theme.update(document.meta.theme or {})
+    inline_fragments = inline_fragments or {}
 
     pages: list[dict[str, Any]] = []
     for page in document.pages:
         blocks: list[dict[str, Any]] = []
         for block in page.blocks:
+            # A concept_experience or toc block is a self-contained static
+            # fragment (inline <style>, no script) - an <img src="foo.html">
+            # cannot render it at all, so its own markup is inlined straight
+            # into the page DOM instead (the caller supplies it, already read
+            # from disk, so this function stays filesystem-agnostic). Every
+            # other block keeps using image_src, unchanged.
+            inline_html = None
+            path = block.content.get("path")
+            if block.content.get("kind") in ("concept_experience", "toc") and path in inline_fragments:
+                inline_html = inline_fragments[path]
             blocks.append(
                 {
                     "type": block.type.value,
@@ -153,6 +165,7 @@ def render_document_html(
                     "css": _css(block, theme),
                     "paragraphs": _paragraphs(block),
                     "image_src": _image_src(block, asset_prefix),
+                    "inline_html": inline_html,
                     "image_box": round(image_box_height(block), 2),
                     "panel_css": _code_panel_css(block)
                     if block.type is BlockType.CODE

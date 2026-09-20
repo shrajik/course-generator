@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-Phase = Literal["writing", "reviewing"]
+Phase = Literal["writing", "reviewing", "research"]
 
 # Matches any `"text": "..."` field - the flat prose field on DraftBlock and on
 # BlockRevision's nested `block` (see app/schemas/draft.py) - handling escaped
@@ -124,6 +124,18 @@ class GenerationStreamHub:
             return
         state.raw += delta
         state.text = extract_preview_text(state.raw)
+        state.sequence = self._next_sequence()
+        self._publish(course_id, state)
+
+    def append_line(self, course_id: str, chapter_id: str, line: str) -> None:
+        """Like `append`, but for research's already-finished short activity
+        lines (e.g. "Searching: ..."), not a still-streaming JSON buffer -
+        `extract_preview_text` doesn't apply here, there's nothing to parse
+        out of a plain line."""
+        state = self._states.get(course_id, {}).get(chapter_id)
+        if state is None or state.done:
+            return
+        state.text = f"{state.text}\n{line}" if state.text else line
         state.sequence = self._next_sequence()
         self._publish(course_id, state)
 

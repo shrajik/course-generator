@@ -25,7 +25,9 @@ import math
 from dataclasses import dataclass, field
 
 from app.render.schematic_layout import _parse_anchor
-from app.schemas.diagram import DiagramSpec, SchematicShape, SchematicState
+from app.render.textbook_palette import COLOR_ROLES
+from app.render.visual_blueprints import get_blueprint
+from app.schemas.diagram import RELATIONSHIP_TYPES, DiagramSpec, SchematicShape, SchematicState
 
 # --- structured failure reasons ---------------------------------------------
 
@@ -42,6 +44,15 @@ TOO_MANY_ANNOTATIONS = "too_many_annotations"
 MISSING_OBJECT = "missing_object"
 MISSING_RELATIONSHIP = "missing_relationship"
 WRONG_VISUAL_TYPE = "wrong_visual_type"
+
+# --- blueprint/style reason codes (see evaluate_blueprint) -------------------
+MISSING_REQUIRED_COMPONENT = "missing_required_component"
+UNKNOWN_COMPONENT = "unknown_component"
+INVALID_RELATIONSHIP = "invalid_relationship"
+DANGLING_RELATIONSHIP = "dangling_relationship"
+DUPLICATE_CRITICAL_COMPONENT = "duplicate_critical_component"
+MISSING_PRIMARY_OBJECT = "missing_primary_object"
+INVALID_COLOR_ROLE = "invalid_color_role"
 
 # Shape types that annotate/connect rather than occupy their own "object"
 # footprint the way block/circle/coil/gauge do - excluded from density,
@@ -71,12 +82,15 @@ class DiagramQAResult:
 
     def feedback(self) -> str:
         """One paragraph naming exactly what to change - never a bare "try
-        again". Fed into the retry prompt by DiagramService."""
+        again". Fed into the retry prompt by DiagramService and (via
+        app.services.concept_qa, which reuses this same class) by
+        ConceptVisualService - the wording stays kind-agnostic since both
+        callers share it."""
         if not self.issues:
             return ""
         lines = [f"- {issue.detail}" for issue in self.issues]
         return (
-            "The previous schematic failed quality review for these specific reasons:\n"
+            "The previous attempt failed quality review for these specific reasons:\n"
             + "\n".join(lines)
             + "\nFix exactly these problems while keeping every correct label, object and "
             "relationship from the brief - do not start over from scratch."
@@ -349,5 +363,120 @@ def evaluate_schematic(spec: DiagramSpec) -> DiagramQAResult:
                 continue
             seen_reasons.add(issue.reason)
             issues.append(issue)
+
+    return DiagramQAResult(issues=issues)
+
+
+def evaluate_blueprint(spec: DiagramSpec) -> DiagramQAResult:
+    """Semantic/structural validation, run on the model's raw output
+    *before* layout resolution - catching a wrong or incomplete component
+    set early is more useful than spending a layout pass on it first.
+
+    Two layers:
+
+    1. Universal checks (always run, no blueprint needed): duplicate shape
+       ids, a declared relationship using an unrecognised type or pointing
+       at a shape that doesn't exist, and a `color_role` that isn't in the
+       centralized palette. These catch real mistakes regardless of whether
+       `visual_type` names anything this codebase has a canonical blueprint
+       for.
+    2. Blueprint checks (only when `visual_type` resolves via
+       `get_blueprint`): the blueprint's required components are actually
+       present, and - if the blueprint designates one - some shape is
+       marked the primary/focal object.
+
+    An unset or unrecognised `visual_type` runs only the universal checks
+    and never fails for "not matching a blueprint" - this is what keeps the
+    generic semantic schematic system fully usable for every subject this
+    registry doesn't know about yet (see app.render.visual_blueprints)."""
+    if spec.normalised_kind() != "schematic":
+        return DiagramQAResult()
+
+    states: list[SchematicState] = spec.states if spec.states else (
+        [SchematicState(caption="", shapes=spec.shapes)] if spec.shapes else []
+    )
+    all_shapes = [shape for state in states for shape in state.shapes]
+    if not all_shapes:
+        return DiagramQAResult()
+
+    issues: list[DiagramQAIssue] = []
+
+    # --- universal: duplicate ids --------------------------------------------
+    # Checked per-state, not across the flattened `all_shapes` - a multi-state
+    # schematic (before/after) is *expected* to repeat the same ids in every
+    # state (see DIAGRAM_SYSTEM: "keep the same ids ... across states so the
+    # layout stays consistent"), so a global duplicate check would wrongly
+    # flag every legitimate before/after schematic as broken.
+    by_id: dict[str, list[SchematicShape]] = {}
+    for shape in all_shapes:
+        if shape.id:
+            by_id.setdefault(shape.id, []).append(shape)
+    duplicates: set[str] = set()
+    for state in states:
+        seen_in_state: dict[str, int] = {}
+        for shape in state.shapes:
+            if shape.id:
+                seen_in_state[shape.id] = seen_in_state.get(shape.id, 0) + 1
+        duplicates.update(sid for sid, count in seen_in_state.items() if count > 1)
+    duplicates = sorted(duplicates)
+    if duplicates:
+        issues.append(DiagramQAIssue(
+            DUPLICATE_CRITICAL_COMPONENT,
+            f"These component ids are used more than once: {', '.join(duplicates[:3])}. "
+            "Give every shape a unique id so relationships and anchors resolve unambiguously.",
+        ))
+
+    # --- universal: color roles -----------------------------------------------
+    bad_colors = sorted({
+        shape.color_role.strip().lower() for shape in all_shapes
+        if shape.color_role.strip() and shape.color_role.strip().lower() not in COLOR_ROLES
+    })
+    if bad_colors:
+        issues.append(DiagramQAIssue(
+            INVALID_COLOR_ROLE,
+            f"These color roles aren't recognised: {', '.join(bad_colors[:3])}. Use one of the "
+            f"centralized textbook color roles: {', '.join(COLOR_ROLES)}.",
+        ))
+
+    # --- universal: declared relationships -------------------------------------
+    known_ids = set(by_id)
+    invalid_types = sorted({rel.type.strip().lower() for rel in spec.relationships if rel.type.strip().lower() not in RELATIONSHIP_TYPES})
+    if invalid_types:
+        issues.append(DiagramQAIssue(
+            INVALID_RELATIONSHIP,
+            f"These relationship types aren't recognised: {', '.join(invalid_types[:3])}. Use one "
+            f"of: {', '.join(RELATIONSHIP_TYPES)}.",
+        ))
+    dangling_rels = [
+        rel for rel in spec.relationships
+        if rel.type.strip().lower() in RELATIONSHIP_TYPES
+        and (rel.source not in known_ids or rel.target not in known_ids)
+    ]
+    if dangling_rels:
+        names = ", ".join(f"{rel.source} {rel.type} {rel.target}" for rel in dangling_rels[:3])
+        issues.append(DiagramQAIssue(
+            DANGLING_RELATIONSHIP,
+            f"These relationships reference a component that doesn't exist among the shapes: "
+            f"{names}. Either add the missing component or remove the relationship.",
+        ))
+
+    # --- blueprint checks (only when visual_type resolves) --------------------
+    blueprint = get_blueprint(spec.visual_type)
+    if blueprint is not None:
+        missing = [cid for cid in blueprint.required_components if cid not in known_ids]
+        if missing:
+            names = ", ".join(blueprint.components[cid].label if cid in blueprint.components else cid for cid in missing)
+            issues.append(DiagramQAIssue(
+                MISSING_REQUIRED_COMPONENT,
+                f"{blueprint.title} requires: {names}. Add shape(s) with id(s) matching the "
+                f"canonical blueprint: {', '.join(missing)}.",
+            ))
+        expects_primary = any(comp.role == "primary" for comp in blueprint.components.values())
+        if expects_primary and not any(shape.role == "primary" for shape in all_shapes):
+            issues.append(DiagramQAIssue(
+                MISSING_PRIMARY_OBJECT,
+                f"{blueprint.title} needs one shape marked role=\"primary\" - the single focal "
+                "component this diagram is actually about.",
+            ))
 
     return DiagramQAResult(issues=issues)

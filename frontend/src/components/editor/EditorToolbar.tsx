@@ -21,9 +21,10 @@ import { Button } from "@/components/ui/Button";
 import { IconButton } from "@/components/ui/IconButton";
 import { useEditor } from "@/lib/editor/store";
 import { asString } from "@/lib/editor/blocks";
+import { ACTIVITY_LABELS, formatActivityTime } from "@/lib/activity";
 import { cn } from "@/lib/utils/cn";
 import type { Role } from "@/lib/types/auth";
-import type { ActivityAction, CourseActivityEntry, CourseReview, ReviewStatus } from "@/lib/types/course";
+import type { CourseActivityEntry, CourseReview, ReviewStatus } from "@/lib/types/course";
 
 interface EditorToolbarProps {
   onPreview: () => void;
@@ -59,22 +60,6 @@ const REVIEW_STATUS_CLASSES: Record<ReviewStatus, string> = {
   changes_requested: "border-amber-200 bg-amber-50 text-amber-800",
   approved: "border-emerald-200 bg-emerald-50 text-emerald-800",
 };
-
-const ACTIVITY_LABELS: Record<ActivityAction, string> = {
-  created: "created the course",
-  updated: "saved changes",
-  submitted_for_review: "submitted for review",
-  changes_requested: "requested changes",
-  approved: "approved the course",
-  exported: "exported the PDF",
-};
-
-function formatActivityTime(value: string): string {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value));
-}
 
 interface ChapterEntry {
   id: string;

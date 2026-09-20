@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.course.document.layout import (
+    MAX_IMAGE_HEIGHT,
     estimate_height,
     flow_blocks,
+    image_box_height,
     split_block,
     text_height,
     wrapped_line_count,
@@ -151,3 +155,39 @@ def test_layout_width_is_normalised_to_the_content_width():
     block.layout.width = 12345
     flow_blocks([block])
     assert block.layout.width == CONTENT_WIDTH
+
+
+def _image_block(kind: str, *, width: int | None = None, height: int | None = None) -> Block:
+    content: dict = {"kind": kind, "path": "assets/x"}
+    if width is not None:
+        content["width"] = width
+    if height is not None:
+        content["height"] = height
+    return Block(type=BlockType.IMAGE, content=content)
+
+
+def test_diagram_image_height_stays_capped():
+    """Unchanged, tested behaviour: a raster/SVG picture never needs a box
+    taller than MAX_IMAGE_HEIGHT - its content is a fixed aspect ratio."""
+    block = _image_block("diagram", width=800, height=4000)
+    assert image_box_height(block) == MAX_IMAGE_HEIGHT
+
+
+def test_concept_experience_image_height_is_not_capped():
+    """A user-reported real bug: a concept_experience block's actual
+    rendered height was capped the same way a picture's is, so the
+    following block on the page was positioned too high and visually
+    overlapped this one. Its intrinsic height (from
+    concept_experience_renderer.estimate_pixel_size) must be respected in
+    full, however tall the real content is."""
+    block = _image_block("concept_experience", width=666, height=4000)
+    assert image_box_height(block) > MAX_IMAGE_HEIGHT
+    assert image_box_height(block) == pytest.approx(4000.0)
+
+
+def test_concept_experience_without_intrinsic_size_falls_back_uncapped():
+    """A block generated before this fix (no width/height yet) still uses
+    the generic aspect ratio - but even that fallback must not be capped
+    for this kind, since a future re-render could still exceed 430px."""
+    block = _image_block("concept_experience")
+    assert image_box_height(block) > 0

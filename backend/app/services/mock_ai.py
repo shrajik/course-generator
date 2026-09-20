@@ -16,7 +16,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, TypeVar
+from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel
 
@@ -116,10 +116,20 @@ class MockAIClient(AIClient):
         system: str = "",
         schema: type[BaseModel] | None = None,
         phase: str = "research",
+        on_event: Callable[[str], None] | None = None,
     ) -> ResearchResult:
         self.calls.append({"kind": "research", "deep": deep, "structured": schema is not None})
-        await self._simulate("research", "research")
         title = _line(_TITLE_RE, prompt, "the chapter topic")
+        if on_event is not None:
+            # Same "real payload, just paced" convention as structured()'s
+            # on_delta chunking above - two lines shaped like genuine
+            # web-search-tool progress, derived from the real chapter title,
+            # so the SSE wiring is exercised offline without a network call.
+            on_event(f"\U0001f50d Searching: {title}")
+            await asyncio.sleep(0)
+            on_event("\U0001f4c4 Reading: https://example.com/mock-reference")
+            await asyncio.sleep(0)
+        await self._simulate("research", "research")
         # Mirror the real client: when a schema is requested the single call can
         # return the structured payload directly.
         payload = None
@@ -665,6 +675,437 @@ def _block_revision(user: str) -> dict[str, Any]:
     }
 
 
+def _schematic_spec(title: str, brief: str) -> dict[str, Any]:
+    """Offline `schematic` examples spanning physics, chemistry, biology and
+    engineering, each matching a registered `app.render.visual_blueprints`
+    canonical visual - so the offline test suite exercises the same
+    blueprint-defaults / semantic-validation / color-role path the real
+    model's output goes through, per domain, with zero external API calls.
+    Falls back to a plain, un-typed example (no `visual_type`) for any brief
+    that doesn't match a known subject, exercising the generic-schematic
+    fallback that must keep working for every visual_type the registry
+    doesn't (yet) know about."""
+    text = brief.lower()
+
+    if "pulley" in text:
+        shapes = [
+            {"type": "circle", "id": "pulley", "label": "Pulley Wheel", "role": "primary",
+             "size": "medium", "color_role": "structure", "priority": "critical"},
+            {"type": "block", "id": "load", "label": "Load", "anchor": "below:pulley",
+             "role": "secondary", "size": "medium", "color_role": "secondary", "priority": "critical"},
+            {"type": "arrow", "id": "applied_force", "label": "Applied Force", "anchor": "right_of:pulley",
+             "target_id": "pulley", "role": "secondary", "size": "small", "color_role": "accent",
+             "priority": "important", "rotation": 270},
+            {"type": "arrow", "id": "lifting_force", "label": "Lifting Force", "anchor": "left_of:pulley",
+             "target_id": "load", "role": "secondary", "size": "small", "color_role": "accent",
+             "priority": "important", "rotation": 90},
+        ]
+        return {
+            "kind": "schematic",
+            "title": title or "Fixed Pulley",
+            "visual_type": "fixed_pulley",
+            "learning_objective": "Understand how a fixed pulley redirects an applied force to lift a load.",
+            "max_annotations": 5,
+            "relationships": [
+                {"source": "applied_force", "type": "points_to", "target": "pulley"},
+                {"source": "lifting_force", "type": "points_to", "target": "load"},
+                {"source": "load", "type": "attached_to", "target": "pulley"},
+            ],
+            "shapes": shapes,
+        }
+
+    if any(word in text for word in ("hydrogen", "oxygen", "water formation", "combustion")):
+        shapes = [
+            {"type": "block", "id": "hydrogen", "label": "2H₂", "role": "primary", "size": "medium",
+             "color_role": "primary", "priority": "critical"},
+            {"type": "block", "id": "oxygen", "label": "O₂", "anchor": "orbit:hydrogen",
+             "role": "secondary", "size": "medium", "color_role": "secondary", "priority": "critical"},
+            {"type": "arrow", "id": "reaction_arrow", "label": "Reaction", "anchor": "right_of:hydrogen",
+             "target_id": "water", "role": "secondary", "size": "small", "color_role": "accent",
+             "priority": "important"},
+            {"type": "block", "id": "water", "label": "2H₂O", "anchor": "orbit:hydrogen",
+             "role": "secondary", "size": "medium", "color_role": "fluid", "priority": "critical"},
+        ]
+        return {
+            "kind": "schematic",
+            "title": title or "Formation of Water",
+            "visual_type": "water_formation",
+            "learning_objective": "Understand that hydrogen and oxygen combine in a chemical reaction to form water.",
+            "max_annotations": 5,
+            "relationships": [
+                {"source": "hydrogen", "type": "connected_to", "target": "water"},
+                {"source": "oxygen", "type": "connected_to", "target": "water"},
+                {"source": "reaction_arrow", "type": "points_to", "target": "water"},
+            ],
+            "shapes": shapes,
+        }
+
+    if "cell" in text and any(word in text for word in ("membrane", "nucleus", "organelle", "cytoplasm")):
+        shapes = [
+            {"type": "circle", "id": "cell_membrane", "label": "Cell Membrane", "role": "primary",
+             "size": "large", "color_role": "structure", "priority": "critical"},
+            {"type": "circle", "id": "nucleus", "label": "Nucleus", "anchor": "inside:cell_membrane",
+             "role": "secondary", "size": "small", "color_role": "secondary", "priority": "critical"},
+            {"type": "label", "id": "mitochondria", "label": "Mitochondria", "anchor": "orbit:cell_membrane",
+             "role": "secondary", "color_role": "accent", "priority": "important"},
+            {"type": "label", "id": "ribosomes", "label": "Ribosomes", "anchor": "orbit:cell_membrane",
+             "role": "secondary", "color_role": "accent", "priority": "important"},
+            {"type": "label", "id": "golgi_apparatus", "label": "Golgi Apparatus", "anchor": "orbit:cell_membrane",
+             "role": "secondary", "color_role": "fluid", "priority": "optional"},
+        ]
+        return {
+            "kind": "schematic",
+            "title": title or "Animal Cell",
+            "visual_type": "animal_cell",
+            "learning_objective": "Identify the main organelles of an animal cell and how they're arranged within the cell membrane.",
+            "max_annotations": 5,
+            "relationships": [
+                {"source": "nucleus", "type": "inside", "target": "cell_membrane"},
+                {"source": "mitochondria", "type": "inside", "target": "cell_membrane"},
+            ],
+            "shapes": shapes,
+        }
+
+    if any(word in text for word in ("ammeter", "induction", "induced current", "galvanometer")):
+        rest_shapes = [
+            {"type": "coil", "id": "coil", "label": "Coil", "role": "primary", "size": "large",
+             "color_role": "accent", "priority": "critical"},
+            {"type": "block", "id": "magnet", "label": "Bar Magnet", "sublabel": "N / S",
+             "anchor": "left_of:coil", "role": "secondary", "size": "medium", "color_role": "structure",
+             "priority": "critical"},
+            {"type": "flow", "id": "field_lines", "anchor": "orbit:coil", "target_id": "coil",
+             "role": "secondary", "size": "small", "color_role": "magnetic_field", "priority": "important",
+             "intensity": 0.3, "label": "Field lines"},
+            {"type": "gauge", "id": "ammeter", "sublabel": "Ammeter", "anchor": "below:coil",
+             "role": "secondary", "size": "small", "color_role": "secondary", "priority": "critical",
+             "rotation": 0},
+        ]
+        active_shapes = [
+            {**shape, "intensity": 0.7} if shape["id"] == "field_lines"
+            else {**shape, "rotation": 35} if shape["id"] == "ammeter"
+            else shape
+            for shape in rest_shapes
+        ]
+        return {
+            "kind": "schematic",
+            "title": title or "Electromagnetic Induction",
+            "visual_type": "electromagnetic_induction",
+            "learning_objective": "Understand how a moving magnet induces a current in a coil, shown by the ammeter's deflection.",
+            "max_annotations": 5,
+            "relationships": [
+                {"source": "magnet", "type": "flows_into", "target": "coil"},
+                {"source": "coil", "type": "connected_to", "target": "ammeter"},
+            ],
+            "states": [
+                {"caption": "No current", "shapes": rest_shapes},
+                {"caption": "Current flows", "shapes": active_shapes},
+            ],
+        }
+
+    if any(word in text for word in ("motor", "commutator", "brush", "rotor")):
+        shapes = [
+            {"type": "coil", "id": "coil", "label": "Coil", "role": "primary", "size": "large",
+             "color_role": "accent", "priority": "critical"},
+            {"type": "block", "id": "magnet", "label": "Magnet", "sublabel": "N / S", "anchor": "orbit:coil",
+             "role": "secondary", "size": "medium", "color_role": "structure", "priority": "critical"},
+            {"type": "block", "id": "axle", "label": "Axle", "anchor": "right_of:coil", "role": "secondary",
+             "size": "small", "color_role": "structure", "priority": "critical"},
+            {"type": "block", "id": "commutator", "label": "Commutator", "anchor": "right_of:axle",
+             "role": "secondary", "size": "small", "color_role": "secondary", "priority": "critical"},
+            {"type": "block", "id": "brush", "label": "Brush", "anchor": "right_of:commutator",
+             "role": "secondary", "size": "small", "color_role": "structure", "priority": "important"},
+            {"type": "flow", "id": "magnetic_field", "anchor": "orbit:coil", "target_id": "coil",
+             "role": "secondary", "size": "small", "color_role": "magnetic_field", "priority": "important",
+             "intensity": 0.6, "label": "Magnetic field"},
+        ]
+        return {
+            "kind": "schematic",
+            "title": title or "Simple DC Electric Motor",
+            "visual_type": "electric_motor",
+            "learning_objective": "Understand how a current-carrying coil in a magnetic field is driven to rotate continuously by the commutator and brushes.",
+            "max_annotations": 6,
+            "relationships": [
+                {"source": "coil", "type": "inside", "target": "magnet"},
+                {"source": "axle", "type": "passes_through", "target": "coil"},
+                {"source": "coil", "type": "attached_to", "target": "axle"},
+                {"source": "axle", "type": "attached_to", "target": "commutator"},
+                {"source": "brush", "type": "contacts", "target": "commutator"},
+                {"source": "commutator", "type": "connected_to", "target": "coil"},
+            ],
+            "shapes": shapes,
+        }
+
+    # Generic fallback: no visual_type at all - proves an unrecognised/absent
+    # visual_type keeps working via the plain semantic schematic path, with
+    # no blueprint involved (see app.render.visual_blueprints.get_blueprint).
+    shapes = [
+        {"type": "block", "id": "source", "role": "primary", "size": "medium", "label": "Source"},
+        {
+            "type": "flow", "id": "flow", "anchor": "right_of:source", "target_id": "source",
+            "priority": "important", "size": "small", "intensity": 0.6, "label": "Effect",
+        },
+        {
+            "type": "gauge", "id": "reading", "anchor": "below:source", "priority": "important",
+            "size": "small", "rotation": 30, "sublabel": "Reading",
+        },
+    ]
+    return {
+        "kind": "schematic",
+        "title": title,
+        "learning_objective": f"Understand {title.lower() or 'the concept'}",
+        "max_annotations": 5,
+        "states": [
+            {"caption": "At rest", "shapes": shapes},
+            {"caption": "In effect", "shapes": shapes},
+        ],
+    }
+
+
+def _java_class_and_object_mock() -> dict[str, Any]:
+    return {
+        "kind": "concept_experience",
+        "concept": "java_class_and_object",
+        "domain": "java",
+        "representation": "object",
+        "title": "Class and Object",
+        "learner_level": "beginner",
+        "learning_objectives": [
+            "Explain that a class is a blueprint/template, not a real thing by itself",
+            "Explain that an object is a real instance created from a class",
+            "Identify that different objects of the same class can hold different property values",
+        ],
+        "core_message": "A class is a blueprint; an object is a real thing built from it.",
+        "visual_metaphor": "a car blueprint (the Class) and real cars built from it (Objects)",
+        "technical_signature": "class Car { color; model; speed; start(); stop(); drive(); }",
+        "entities": [
+            {
+                "id": "car_class", "role": "template", "label": "Car (Class)",
+                "properties": {"color": "", "model": "", "speed": ""},
+                "actions": ["start()", "stop()", "drive()"],
+                "icon": "🏭", "color_role": "primary",
+            },
+            {
+                "id": "car1", "role": "instance", "label": "car1",
+                "properties": {"color": "Red", "model": "X1", "speed": "80"},
+                "icon": "🚗", "color_role": "accent",
+            },
+            {
+                "id": "car2", "role": "instance", "label": "car2",
+                "properties": {"color": "Blue", "model": "X2", "speed": "95"},
+                "icon": "🚙", "color_role": "secondary",
+            },
+            {
+                "id": "car3", "role": "instance", "label": "car3",
+                "properties": {"color": "Green", "model": "X3", "speed": "70"},
+                "icon": "🚘", "color_role": "fluid",
+            },
+        ],
+        "interactions": [
+            {"type": "click_class", "target_entity_ids": ["car_class"], "trigger_label": "Click the Class"},
+            {"type": "click_object", "target_entity_ids": ["car1", "car2", "car3"], "trigger_label": "click a car"},
+            {"type": "create_object", "target_entity_ids": ["car_class"], "trigger_label": "Create Object"},
+            {"type": "reset", "target_entity_ids": [], "trigger_label": "Reset"},
+        ],
+        "validation_criteria": [
+            "The Class is visually distinct from every Object",
+            "At least two Objects are shown with genuinely different property values",
+            "It is visually obvious the Objects were created FROM the Class",
+            "No paragraph of body text is required to understand that class=blueprint, object=instance",
+        ],
+    }
+
+
+def _python_list_mock() -> dict[str, Any]:
+    return {
+        "kind": "concept_experience",
+        "concept": "python_list",
+        "domain": "python",
+        "representation": "data_structure",
+        "title": "Python List",
+        "learner_level": "beginner",
+        "learning_objectives": [
+            "Explain that a list holds an ordered sequence of items, indexed from 0",
+            "Explain that append() adds to the end and pop() removes from the end",
+        ],
+        "core_message": "A list keeps items in order, and you can add or remove from either end.",
+        "technical_signature": "fruits = ['apple', 'banana', 'cherry']",
+        "entities": [
+            {"id": "item0", "role": "element", "label": "'apple'", "properties": {"index": "0"}, "icon": "🍎", "color_role": "accent"},
+            {"id": "item1", "role": "element", "label": "'banana'", "properties": {"index": "1"}, "icon": "🍌", "color_role": "secondary"},
+            {"id": "item2", "role": "element", "label": "'cherry'", "properties": {"index": "2"}, "icon": "🍒", "color_role": "fluid"},
+        ],
+        "interactions": [
+            {"type": "push", "target_entity_ids": [], "trigger_label": "append()"},
+            {"type": "pop", "target_entity_ids": [], "trigger_label": "pop()"},
+            {"type": "reset", "target_entity_ids": [], "trigger_label": "Reset"},
+        ],
+        "validation_criteria": [
+            "Items are shown in their actual list order, indexed from 0",
+            "append() and pop() are both demonstrated",
+        ],
+    }
+
+
+def _sql_join_mock() -> dict[str, Any]:
+    return {
+        "kind": "concept_experience",
+        "concept": "sql_join",
+        "domain": "sql",
+        "representation": "relationship",
+        "title": "SQL JOIN",
+        "learner_level": "beginner",
+        "learning_objectives": [
+            "Explain that a JOIN combines rows from two tables using a shared key",
+            "Identify which column links the two tables together",
+        ],
+        "core_message": "A JOIN combines matching rows from two tables using a shared key.",
+        "technical_signature": "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id",
+        "entities": [
+            {"id": "orders", "role": "table", "label": "orders", "properties": {"customer_id": "FK"}, "icon": "🧾", "color_role": "primary"},
+            {"id": "customers", "role": "table", "label": "customers", "properties": {"id": "PK"}, "icon": "🗂️", "color_role": "secondary"},
+        ],
+        "relationships": [
+            {"source": "orders", "type": "connected_to", "target": "customers"},
+        ],
+        "interactions": [
+            {"type": "click_object", "target_entity_ids": ["orders", "customers"], "trigger_label": "click a table"},
+            {"type": "reset", "target_entity_ids": [], "trigger_label": "Reset"},
+        ],
+        "validation_criteria": [
+            "The two tables are visibly connected, not just two disconnected boxes",
+            "The connecting key (customer_id -> id) is identifiable",
+        ],
+    }
+
+
+def _tcp_handshake_mock() -> dict[str, Any]:
+    return {
+        "kind": "concept_experience",
+        "concept": "tcp_three_way_handshake",
+        "domain": "computer_networks",
+        "representation": "sequence",
+        "title": "TCP Three-Way Handshake",
+        "learner_level": "beginner",
+        "learning_objectives": [
+            "Understand why the handshake is required before data can be sent",
+            "Identify the SYN, SYN-ACK and ACK messages in order",
+        ],
+        "core_message": "Client and server exchange three messages to establish a reliable connection.",
+        "steps": [
+            {"id": "syn", "label": "SYN", "description": "Client requests a connection", "order": 0, "icon": "📤", "color_role": "primary"},
+            {"id": "syn_ack", "label": "SYN-ACK", "description": "Server acknowledges and replies", "order": 1, "icon": "📥", "color_role": "secondary"},
+            {"id": "ack", "label": "ACK", "description": "Client confirms - connection established", "order": 2, "icon": "✅", "color_role": "positive"},
+        ],
+        "interactions": [
+            {"type": "play", "target_entity_ids": [], "trigger_label": "Play"},
+            {"type": "next", "target_entity_ids": [], "trigger_label": "Next"},
+            {"type": "reset", "target_entity_ids": [], "trigger_label": "Reset"},
+        ],
+        "validation_criteria": [
+            "All three messages (SYN, SYN-ACK, ACK) are shown in the correct order",
+            "It is clear the connection is only established after all three steps",
+        ],
+    }
+
+
+def _stack_mock() -> dict[str, Any]:
+    return {
+        "kind": "concept_experience",
+        "concept": "stack",
+        "domain": "dsa",
+        "representation": "data_structure",
+        "title": "Stack",
+        "learner_level": "beginner",
+        "learning_objectives": [
+            "Explain that a stack is Last In, First Out (LIFO)",
+            "Explain that push adds to the top and pop removes from the top",
+        ],
+        "core_message": "A stack is Last In, First Out - the last item pushed is the first one popped.",
+        "entities": [
+            {"id": "plate1", "role": "element", "label": "Plate 1", "properties": {"position": "bottom"}, "icon": "🍽️", "color_role": "structure"},
+            {"id": "plate2", "role": "element", "label": "Plate 2", "properties": {"position": "middle"}, "icon": "🍽️", "color_role": "secondary"},
+            {"id": "plate3", "role": "element", "label": "Plate 3", "properties": {"position": "top"}, "icon": "🍽️", "color_role": "accent"},
+        ],
+        "interactions": [
+            {"type": "push", "target_entity_ids": [], "trigger_label": "Push"},
+            {"type": "pop", "target_entity_ids": [], "trigger_label": "Pop"},
+            {"type": "reset", "target_entity_ids": [], "trigger_label": "Reset"},
+        ],
+        "validation_criteria": [
+            "The top of the stack is visually distinguishable from the bottom",
+            "Push adds to the top; pop removes from the top - not the bottom",
+        ],
+    }
+
+
+def _rag_pipeline_mock() -> dict[str, Any]:
+    return {
+        "kind": "concept_experience",
+        "concept": "rag_pipeline",
+        "domain": "ai_llm",
+        "representation": "pipeline",
+        "title": "RAG (Retrieval-Augmented Generation)",
+        "learner_level": "beginner",
+        "learning_objectives": [
+            "Explain why an LLM retrieves external context before answering",
+            "Identify the stages a query passes through in a RAG pipeline",
+        ],
+        "core_message": "RAG retrieves relevant context first, then asks the LLM to answer using it.",
+        "steps": [
+            {"id": "query", "label": "Query", "description": "The user asks a question", "order": 0, "icon": "❓", "color_role": "primary"},
+            {"id": "embed", "label": "Embed", "description": "The query becomes a vector", "order": 1, "icon": "🔢", "color_role": "secondary"},
+            {"id": "retrieve", "label": "Retrieve", "description": "Similar chunks are fetched from a vector DB", "order": 2, "icon": "📚", "color_role": "accent"},
+            {"id": "generate", "label": "Generate", "description": "The LLM answers using the retrieved context", "order": 3, "icon": "✨", "color_role": "positive"},
+        ],
+        "interactions": [
+            {"type": "play", "target_entity_ids": [], "trigger_label": "Play"},
+            {"type": "next", "target_entity_ids": [], "trigger_label": "Next"},
+            {"type": "reset", "target_entity_ids": [], "trigger_label": "Reset"},
+        ],
+        "validation_criteria": [
+            "All four stages (query, embed, retrieve, generate) are shown in order",
+            "It is clear retrieval happens BEFORE generation, not after",
+        ],
+    }
+
+
+# Keyword -> mock builder, checked in order against the lower-cased brief -
+# mirrors _schematic_spec's existing keyword-detection pattern. Only
+# "java_class_and_object" has a registered CONCEPT_BLUEPRINT_REGISTRY entry;
+# the other five deliberately have none, proving blueprint-free operation
+# for real (see the approved plan, section G).
+_CONCEPT_EXPERIENCE_KEYWORDS: tuple[tuple[tuple[str, ...], Any], ...] = (
+    (("sql", "join"), _sql_join_mock),
+    (("tcp", "handshake"), _tcp_handshake_mock),
+    (("rag", "retrieval"), _rag_pipeline_mock),
+    (("python", "list"), _python_list_mock),
+    (("stack",), _stack_mock),
+    (("class", "object"), _java_class_and_object_mock),
+)
+
+
+def _concept_experience_spec(title: str, brief: str) -> dict[str, Any]:
+    """Offline stand-in for VisualPlanner.plan() - keyword-detects the brief
+    across six representative concepts (mirrors `_schematic_spec`'s existing
+    physics/bio/chem keyword-detection pattern), so offline tests can prove
+    representation-selection genuinely varies by concept without an API key.
+    Falls back to the Java Class & Object spec (this POC's one registered
+    blueprint) when nothing else matches. `generation_strategy` is left
+    blank on the Java entry deliberately, so tests exercise
+    concept_visual_blueprints.apply_concept_blueprint_defaults filling it in
+    from the registered blueprint, not just echoing back whatever the mock
+    already set."""
+    text = brief.lower()
+    for keywords, builder in _CONCEPT_EXPERIENCE_KEYWORDS:
+        if all(keyword in text for keyword in keywords):
+            spec = builder()
+            spec["title"] = title or spec["title"]
+            return spec
+    spec = _java_class_and_object_mock()
+    spec["title"] = title or spec["title"]
+    return spec
+
+
 def _diagram_spec(user: str) -> dict[str, Any]:
     brief = _line(re.compile(r"VISUAL BRIEF:\s*\n(.+)", re.DOTALL), user, "the concept")
     title = (brief.splitlines() or ["Overview"])[0][:60]
@@ -692,32 +1133,10 @@ def _diagram_spec(user: str) -> dict[str, Any]:
         return {"kind": "comparison", "title": title, "nodes": nodes, "edges": []}
 
     if requested == "schematic":
-        # Semantically authored (role/anchor/priority/size), matching what the
-        # real prompt now asks for - the layout engine
-        # (app.render.schematic_layout) computes actual x/y/width/height, so
-        # this offline path exercises the same code the real model's output
-        # goes through instead of a hand-picked, always-non-overlapping guess.
-        shapes = [
-            {"type": "block", "id": "source", "role": "primary", "size": "medium", "label": "Source"},
-            {
-                "type": "flow", "id": "flow", "anchor": "right_of:source", "target_id": "source",
-                "priority": "important", "size": "small", "intensity": 0.6, "label": "Effect",
-            },
-            {
-                "type": "gauge", "id": "reading", "anchor": "below:source", "priority": "important",
-                "size": "small", "rotation": 30, "sublabel": "Reading",
-            },
-        ]
-        return {
-            "kind": "schematic",
-            "title": title,
-            "learning_objective": f"Understand {title.lower() or 'the concept'}",
-            "max_annotations": 5,
-            "states": [
-                {"caption": "At rest", "shapes": shapes},
-                {"caption": "In effect", "shapes": shapes},
-            ],
-        }
+        return _schematic_spec(title, brief)
+
+    if "concept_experience" in user:
+        return _concept_experience_spec(title, brief)
 
     steps = ["Define the problem", "Design the approach", "Apply it", "Review the outcome"]
     nodes = [{"id": f"n{i}", "label": step, "detail": ""} for i, step in enumerate(steps)]
@@ -725,6 +1144,23 @@ def _diagram_spec(user: str) -> dict[str, Any]:
         {"source": f"n{i}", "target": f"n{i + 1}", "label": ""} for i in range(len(steps) - 1)
     ]
     return {"kind": requested or "flow_chart", "title": title, "nodes": nodes, "edges": edges}
+
+
+def _concept_critique(user: str) -> dict[str, Any]:
+    """Offline stand-in for concept_qa's Layer-2 semantic grading call -
+    always "everything passed", so an offline test's QA outcome is driven
+    entirely by Layer 1 (deterministic) unless a test overrides this builder
+    itself to exercise a Layer-2 failure."""
+    return {
+        "objective_verdicts": [],
+        "core_message_delivered": True,
+        "core_message_detail": "",
+        "criteria_verdicts": [],
+        "structure_correct": True,
+        "structure_detail": "",
+        "interactions_useful": True,
+        "interactions_detail": "",
+    }
 
 
 _BUILDERS: dict[str, Any] = {
@@ -738,6 +1174,7 @@ _BUILDERS: dict[str, Any] = {
     "ChapterReview": _chapter_review,
     "DocumentPatch": _document_patch,
     "DiagramSpec": _diagram_spec,
+    "ConceptCritique": _concept_critique,
 }
 
 

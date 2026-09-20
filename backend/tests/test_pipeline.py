@@ -156,7 +156,13 @@ async def test_image_generation_can_be_disabled(service, technical_input):
     )
     assert result.images_generated == 0
     document = service.storage.load_document(record.course_id)
-    assert all(b.content.get("path") is None for b in document.blocks_of_type(BlockType.IMAGE))
+    # The "toc" block (app.render.toc_renderer) is built deterministically
+    # alongside the rest of the document, not through the AI image pipeline
+    # `generate_images` gates - it always has a path.
+    ai_image_blocks = [
+        b for b in document.blocks_of_type(BlockType.IMAGE) if b.content.get("kind") != "toc"
+    ]
+    assert all(b.content.get("path") is None for b in ai_image_blocks)
 
 
 async def test_a_failing_chapter_does_not_sink_the_run(service, technical_input, monkeypatch):

@@ -116,6 +116,34 @@ def test_html_uses_layout_coordinates():
     assert "left:80px" in html and "top:100px" in html and "width:600px" in html
 
 
+def test_concept_experience_block_is_inlined_not_img_src(documents, storage):
+    """A concept_experience block's saved `.html` fragment is a
+    self-contained interactive widget (inline <style>+<script>) -
+    `<img src="foo.html">` cannot render it at all (see Phase 4 plan).
+    PdfService must inline the fragment's own markup into the page instead."""
+    course_id = "crs_concept_pdf"
+    storage.ensure_course_dirs(course_id)
+    fragment = '<div class="cev-root"><span data-cev-marker="1">Hi</span></div>'
+    relative = storage.save_asset(course_id, fragment.encode("utf-8"), extension="html")
+
+    block = Block(
+        type=BlockType.IMAGE,
+        content={"kind": "concept_experience", "path": relative, "caption": "A concept"},
+    )
+    document = CourseDocument(
+        document_id="doc_concept_pdf",
+        course_id=course_id,
+        course_title="T",
+        template_id="technical_v1",
+        pages=[Page(blocks=[block])],
+    )
+
+    html = documents.pdf.render_html(document)
+    assert 'data-cev-marker="1"' in html
+    assert f'src="{relative}"' not in html
+    assert f'<img class="figure" src="../{relative}"' not in html
+
+
 def test_pdf_service_writes_html_next_to_the_pdf(documents, storage):
     document = _document_with_every_block_type()
     storage.ensure_course_dirs(document.course_id)

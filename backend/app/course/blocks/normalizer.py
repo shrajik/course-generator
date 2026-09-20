@@ -38,7 +38,7 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
             "prompt": _first(draft.image_prompt, draft.text),
             "caption": _first(draft.caption, draft.title),
             "alt": _first(draft.alt_text, draft.caption, draft.title),
-            "kind": kind if kind == "diagram" else "illustration",
+            "kind": kind if kind in ("diagram", "concept_experience") else "illustration",
             "diagram_kind": draft.diagram_kind.strip().lower().replace(" ", "_"),
         }
 

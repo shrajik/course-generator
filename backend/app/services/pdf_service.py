@@ -27,9 +27,27 @@ class PdfService:
         self.storage = storage or get_storage()
         self.settings = settings or get_settings()
 
+    def _inline_fragments(self, document: CourseDocument) -> dict[str, str]:
+        """Reads every concept_experience/toc block's saved `.html` fragment
+        off disk so `render_document_html` can inline it straight into the
+        page DOM (an `<img src="foo.html">` cannot render it at all - see
+        html_renderer.py)."""
+        fragments: dict[str, str] = {}
+        for page in document.pages:
+            for block in page.blocks:
+                path = block.content.get("path")
+                if block.content.get("kind") not in ("concept_experience", "toc") or not path or path in fragments:
+                    continue
+                abs_path = self.storage.asset_abs_path(document.course_id, path)
+                if abs_path.exists():
+                    fragments[path] = abs_path.read_text(encoding="utf-8")
+        return fragments
+
     def render_html(self, document: CourseDocument) -> str:
         template = load_template(document.template_id)
-        return render_document_html(document, template, asset_prefix="../")
+        return render_document_html(
+            document, template, asset_prefix="../", inline_fragments=self._inline_fragments(document)
+        )
 
     def write_html(self, document: CourseDocument) -> Path:
         path = self.storage.html_path(document.course_id)

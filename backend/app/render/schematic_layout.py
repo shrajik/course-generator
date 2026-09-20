@@ -40,6 +40,23 @@ _SIZE_FRACTIONS: dict[str, tuple[float, float]] = {
 }
 _DEFAULT_SIZE = "medium"
 
+# A "circle" shape's rendered radius is min(width_px, height_px) / 2 (see
+# diagram_renderer._draw_circle) - on the schematic panel's actual pixel
+# aspect ratio (much wider than tall), the height component is always the
+# binding one, so reusing the block height-fractions above (tuned for a
+# rectangle's silhouette, not a circle's diameter) makes every circle read
+# as noticeably smaller than same-class blocks/coils sitting right next to
+# it - a cell or atom that's meant to be the large, dominant focal object
+# ends up looking like a minor detail. Bumping only the height component
+# for circles (width stays whatever the block table already gives, which
+# was never the constraint) fixes the diameter without touching how any
+# other shape type sizes or how the ring-placement/collision math works.
+_CIRCLE_HEIGHT_FRACTIONS: dict[str, float] = {
+    "small": 0.20,
+    "medium": 0.28,
+    "large": 0.38,
+}
+
 # Minimum gap (panel fraction) kept between adjacent shape edges - the same
 # role a fixed pixel gap constant plays in diagram_renderer's box layouts,
 # just expressed in the 0..1 panel space schematic shapes already use.
@@ -53,7 +70,10 @@ def _is_semantically_authored(shapes: list[SchematicShape]) -> bool:
 
 def _size_fraction(shape: SchematicShape) -> tuple[float, float]:
     if shape.size in _SIZE_FRACTIONS:
-        return _SIZE_FRACTIONS[shape.size]
+        width_fraction, height_fraction = _SIZE_FRACTIONS[shape.size]
+        if shape.type == "circle":
+            height_fraction = max(height_fraction, _CIRCLE_HEIGHT_FRACTIONS[shape.size])
+        return width_fraction, height_fraction
     if shape.width and shape.height:
         return shape.width, shape.height
     return _SIZE_FRACTIONS[_DEFAULT_SIZE]
@@ -114,6 +134,7 @@ def _merge_inside_anchors(shapes: list[SchematicShape]) -> list[SchematicShape]:
         if target is None or target.type not in ("block", "circle", "gauge") or target.sublabel.strip():
             continue
         target.sublabel = shape.label
+        target.sublabel_color_role = shape.color_role
         merged_ids.add(id(shape))
     if not merged_ids:
         return shapes
@@ -323,7 +344,67 @@ def _place_ring(
                     theta, personal_radius = candidate, candidate_radius
         x = rx + personal_radius * math.cos(theta)
         y = ry + personal_radius * math.sin(theta)
-        positions[key_of(shape)] = (x, y)
+        key = key_of(shape)
+        if not inward:
+            # This ring's own angle math already keeps siblings of the SAME
+            # reference apart (see the docstring above) - it has no way to
+            # know about a shape placed against a *different* reference
+            # earlier in `_resolve_state`'s pass order, so a multi-level
+            # anchor chain (e.g. several things each anchored to a
+            # different, already-placed sibling rather than all to one
+            # shared reference) can still land two shapes on top of each
+            # other. Push this one outward along its own angle - same
+            # direction the model asked for, just far enough to clear
+            # whatever's already there - before falling back to accepting
+            # the overlap (still better than an unbounded push past the
+            # panel edge). Skipped for the inner/"inside" ring: nested
+            # content is *meant* to sit inside its reference's own box (a
+            # nucleus inside a cell) - that's not a collision to escape.
+            max_radius = _max_radius_along(rx, ry, theta, half_w, half_h)
+            step = max(max_radius - personal_radius, 0.01) / 10
+            attempts = 0
+            while (
+                _collides_with_placed(x, y, w, h, positions=positions, sizes=sizes, exclude=key)
+                and personal_radius < max_radius
+                and attempts < 10
+            ):
+                personal_radius = min(personal_radius + step, max_radius)
+                x = rx + personal_radius * math.cos(theta)
+                y = ry + personal_radius * math.sin(theta)
+                attempts += 1
+        positions[key] = (x, y)
+
+
+def _boxes_overlap(
+    ax: float, ay: float, aw: float, ah: float, bx: float, by: float, bw: float, bh: float, *, margin: float = 0.0
+) -> bool:
+    al, at = ax - aw / 2 - margin, ay - ah / 2 - margin
+    ar, ab = ax + aw / 2 + margin, ay + ah / 2 + margin
+    bl, bt, br, bb = bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2
+    return al < br and bl < ar and at < bb and bt < ab
+
+
+def _collides_with_placed(
+    x: float, y: float, w: float, h: float, *,
+    positions: dict[str, tuple[float, float]], sizes: dict[str, tuple[float, float]], exclude: str,
+) -> bool:
+    """True if a box at (x, y)/(w, h) overlaps any shape already in
+    `positions` - which, thanks to `_resolve_state`'s pass ordering, is
+    every shape resolved so far, not just this one's own ring siblings.
+    This is what lets `_place_ring` catch the collision `_place_children`'s
+    per-reference ring math structurally cannot see: a shape anchored to a
+    *different* reference than an earlier shape (e.g. "right_of:table" vs
+    "orbit:key") is placed in its own separate ring call with no idea where
+    the other ended up - each ring alone is collision-free among its own
+    siblings, but two rings around different references can still land on
+    top of each other. See _place_ring's post-placement nudge."""
+    for key, (px, py) in positions.items():
+        if key == exclude:
+            continue
+        pw, ph = sizes.get(key, _SIZE_FRACTIONS[_DEFAULT_SIZE])
+        if _boxes_overlap(x, y, w, h, px, py, pw, ph, margin=_MARGIN):
+            return True
+    return False
 
 
 def _max_radius_along(rx: float, ry: float, angle: float, half_w: float, half_h: float) -> float:

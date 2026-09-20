@@ -8,6 +8,10 @@ export function isSvgPath(path: string | null | undefined): boolean {
   return !!path && path.toLowerCase().endsWith(".svg");
 }
 
+export function isHtmlPath(path: string | null | undefined): boolean {
+  return !!path && path.toLowerCase().endsWith(".html");
+}
+
 /**
  * Fetches and returns the raw markup of a diagram's SVG asset so a caller can
  * inline it into the DOM - the hover/focus tooltips and highlighting baked

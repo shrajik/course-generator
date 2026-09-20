@@ -24,7 +24,7 @@ import json
 import random
 import re
 import time
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ValidationError
 
@@ -100,11 +100,17 @@ class AIClient(abc.ABC):
         system: str = "",
         schema: type[BaseModel] | None = None,
         phase: str = "research",
+        on_event: Callable[[str], None] | None = None,
     ) -> ResearchResult:
         """Gather grounded notes, using web search where the model supports it.
 
         When `schema` is given the client tries to have the same call return the
         structured payload, saving a second round trip.
+
+        When `on_event` is given, the underlying web-search tool's own
+        progress (what it's searching for, which page it's opening) is
+        reported to it as short human-readable lines as they happen. When
+        not given, behaviour is unchanged - one blocking call.
         """
 
     @abc.abstractmethod
@@ -154,6 +160,32 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 def schema_hint(schema: type[BaseModel]) -> str:
     return json.dumps(schema.model_json_schema(), ensure_ascii=False)
+
+
+def _describe_web_search_action(item: Any) -> str | None:
+    """One short human-readable line for a `web_search_call` output item's
+    own `action` (search/open_page/find - see the Responses API streaming
+    event `response.output_item.added`), or None for a shape we don't
+    recognise. Every field access is defensive: a line worth showing is a
+    bonus, never something worth failing the research call over."""
+    action = getattr(item, "action", None)
+    action_type = getattr(action, "type", None)
+    if action_type == "search":
+        query = getattr(action, "query", None)
+        if not query:
+            queries = getattr(action, "queries", None) or []
+            query = queries[0] if queries else None
+        return f"\U0001f50d Searching: {query}" if query else None
+    if action_type == "open_page":
+        url = getattr(action, "url", None)
+        return f"\U0001f4c4 Reading: {url}" if url else None
+    if action_type == "find":
+        pattern = getattr(action, "pattern", None)
+        url = getattr(action, "url", None)
+        if pattern and url:
+            return f'\U0001f50e Looking for "{pattern}" on {url}'
+        return None
+    return None
 
 
 def _status_of(exc: Exception) -> int | None:
@@ -454,6 +486,7 @@ class OpenAIClient(AIClient):
         system: str = "",
         schema: type[BaseModel] | None = None,
         phase: str = "research",
+        on_event: Callable[[str], None] | None = None,
     ) -> ResearchResult:
         requested = self.settings.deep_research_model if deep else self.settings.research_model
         model_name = self._resolve_model(requested)
@@ -484,7 +517,34 @@ class OpenAIClient(AIClient):
                         "strict": False,
                     }
                 }
-            return await self.client.responses.create(**kwargs)
+            if on_event is None:
+                return await self.client.responses.create(**kwargs)
+
+            # Streaming path: same call, `stream=True`, translating the
+            # web-search tool's own progress events into short lines while
+            # we wait for the one event (`response.completed`) that carries
+            # the exact same `Response` object the non-streaming call above
+            # returns - every line below this function is unaffected by
+            # which path produced that object.
+            kwargs["stream"] = True
+            stream = await self.client.responses.create(**kwargs)
+            final_response = None
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+                # A `web_search_call` item's `action` is still None on
+                # `.added` (verified against a live streaming call) - it's
+                # only populated once the call actually finishes, on
+                # `.done`, which is also when it's safe to say what was
+                # searched/read (not "about to").
+                if event_type == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", None) == "web_search_call":
+                        line = _describe_web_search_action(item)
+                        if line:
+                            on_event(line)
+                elif event_type == "response.completed":
+                    final_response = getattr(event, "response", None)
+            return final_response
 
         retries = 0
         response = None

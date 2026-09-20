@@ -10,6 +10,8 @@ and stops the model from having to search and format in a single shot.
 
 from __future__ import annotations
 
+from typing import Callable
+
 from app.agents import prompts
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
@@ -36,6 +38,7 @@ class ResearchAgent:
         template: CourseTemplate,
         course_input: CourseInput,
         mode: str | None = None,
+        on_event: Callable[[str], None] | None = None,
     ) -> ChapterResearch:
         research_mode = mode or self.settings.research_mode
         deep = research_mode == "deep"
@@ -51,6 +54,7 @@ class ResearchAgent:
             system=prompts.RESEARCH_SYSTEM,
             schema=ResearchPayload if self.settings.single_call_research else None,
             phase="research",
+            on_event=on_event,
         )
 
         payload: ResearchPayload | None = None

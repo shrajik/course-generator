@@ -198,6 +198,41 @@ def test_replace_image_clears_the_asset_and_queues_regeneration(document, templa
     assert result.images_to_generate == [image.id]
 
 
+def test_replace_image_can_reclassify_a_stale_diagram_to_concept_experience(document, template):
+    image = document.pages[0].blocks[2]
+    image.content["kind"] = "diagram"
+    image.content["diagram_kind"] = "concept_map"
+    patch = DocumentPatch.model_validate(
+        {
+            "operations": [
+                {
+                    "type": "replace_image",
+                    "block_id": image.id,
+                    "prompt": "context window as a token budget",
+                    "kind": "concept_experience",
+                }
+            ]
+        }
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["kind"] == "concept_experience"
+    assert updated.content["diagram_kind"] == ""
+
+
+def test_replace_image_without_kind_keeps_the_existing_classification(document, template):
+    image = document.pages[0].blocks[2]
+    image.content["kind"] = "diagram"
+    image.content["diagram_kind"] = "concept_map"
+    patch = DocumentPatch.model_validate(
+        {"operations": [{"type": "replace_image", "block_id": image.id, "prompt": "clearer"}]}
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["kind"] == "diagram"
+    assert updated.content["diagram_kind"] == "concept_map"
+
+
 def test_replace_image_on_a_non_image_block_is_rejected(document, template):
     paragraph = document.pages[0].blocks[1]
     patch = DocumentPatch.model_validate(

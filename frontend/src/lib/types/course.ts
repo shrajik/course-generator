@@ -13,7 +13,7 @@ export const TEMPLATE_IDS: Record<TemplateKind, string> = {
 // --- live generation streaming ----------------------------------------------
 // Mirrors backend/app/core/generation_stream.py's ChapterStreamState.to_event().
 
-export type ChapterStreamPhase = "writing" | "reviewing";
+export type ChapterStreamPhase = "writing" | "reviewing" | "research";
 
 export interface ChapterStreamEvent {
   chapter_id: string;
@@ -128,6 +128,18 @@ export interface CourseActivityEntry {
 export interface CourseActivityListResponse {
   course_id: string;
   activities: CourseActivityEntry[];
+}
+
+/** One CourseActivityEntry plus which course it happened in - the
+ * workspace-wide feed spans every course the caller owns. */
+export interface WorkspaceActivityEntry extends CourseActivityEntry {
+  course_id: string;
+  document_id: string;
+  course_title: string;
+}
+
+export interface WorkspaceActivityListResponse {
+  activities: WorkspaceActivityEntry[];
 }
 
 export interface CourseRecord {

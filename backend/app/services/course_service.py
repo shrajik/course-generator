@@ -50,6 +50,7 @@ from app.schemas.course import (
     ImproveTocResponse,
     ReviewHistoryEntry,
     RunInfo,
+    WorkspaceActivityEntry,
 )
 from app.schemas.document import CourseDocument
 from app.schemas.draft import GeneratedChapter
@@ -337,6 +338,18 @@ class CourseService:
             return []
         async with get_database_service() as db:
             return await db.list_activities(course_id, limit, offset)
+
+    async def list_activities_for_owner(
+        self, owner_id: str, limit: int = 50, offset: int = 0
+    ) -> list[WorkspaceActivityEntry]:
+        """The workspace-wide feed - every activity entry across every
+        course `owner_id` owns, newest first. Same DB-only contract as
+        `list_activities`: a filesystem-only deployment has no audit log to
+        aggregate, so this returns empty rather than raising."""
+        if not self.use_db:
+            return []
+        async with get_database_service() as db:
+            return await db.list_activities_for_owner(uuid.UUID(owner_id), limit, offset)
 
     async def list_generation_runs(
         self, course_id: str, limit: int = 20, offset: int = 0
@@ -979,6 +992,7 @@ class CourseService:
             template=template,
             chapters=chapters,
             existing=existing,
+            storage=self.storage,
         )
         # Carry generated image paths across rebuilds so we don't pay twice.
         if existing is not None:

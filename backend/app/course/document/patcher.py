@@ -182,6 +182,16 @@ def apply_patch(
                     update["caption"] = operation.caption
                 if operation.alt is not None:
                     update["alt"] = operation.alt
+                if operation.kind is not None:
+                    update["kind"] = operation.kind
+                    # A block moving off "diagram" carries no shape anymore;
+                    # a stale diagram_kind would otherwise persist unused in
+                    # content and confuse anyone reading it later.
+                    update["diagram_kind"] = (
+                        operation.diagram_kind if operation.kind == "diagram" else ""
+                    )
+                elif operation.diagram_kind is not None:
+                    update["diagram_kind"] = operation.diagram_kind
                 block.content = merge_content(block.type, block.content, update)
                 block.meta.origin = "edited"
                 block.meta.updated_at = utc_now_iso()

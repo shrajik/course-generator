@@ -6,6 +6,7 @@ from app.core.ids import block_id as new_block_id
 from app.core.ids import document_id_for_course, page_id, utc_now_iso
 from app.core.logging import get_logger
 from app.course.document.layout import estimate_height, flow_blocks
+from app.render.toc_renderer import TocChapter, estimate_toc_pixel_size, render_toc_html
 from app.schemas.blocks import BlockType
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.document import (
@@ -20,6 +21,7 @@ from app.schemas.document import (
 )
 from app.schemas.draft import GeneratedChapter
 from app.schemas.template import CourseTemplate
+from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
 
@@ -117,39 +119,50 @@ def _cover_page(
     )
 
 
-def _toc_page(chapters: list[GeneratedChapter], template: CourseTemplate) -> Page:
-    items = [f"{chapter.chapter_number}. {chapter.title}" for chapter in chapters]
-    blocks = [
-        Block(
-            id=new_block_id(),
-            type=BlockType.HEADING,
-            content={"text": "Contents", "level": 1},
-            style=BlockStyle(font_size=30, font_weight=700, color=template.theme.text_color),
-            layout=BlockLayout(x=64, y=72, width=666, height=48),
-            meta=BlockMeta(origin="system", section_key="toc"),
-        ),
-        Block(
-            id=new_block_id(),
-            type=BlockType.LEARNING_OBJECTIVES,
-            content={"title": "", "items": items},
-            style=BlockStyle(
-                font_size=15,
-                line_height=2.0,
-                color=template.theme.text_color,
-                background=None,
-                padding=0,
-            ),
-            layout=BlockLayout(x=64, y=140, width=666, height=min(len(items) * 34 + 20, 860)),
-            meta=BlockMeta(origin="system", section_key="toc"),
-        ),
+def _toc_page(
+    chapters: list[GeneratedChapter],
+    template: CourseTemplate,
+    *,
+    course_title: str,
+    course_id: str,
+    storage: StorageService,
+) -> Page:
+    """A colorful, static chapter-card grid - same deterministic, AI-free,
+    "one motionless picture" contract as a concept_experience visual (see
+    app.render.toc_renderer), stored and inlined the exact same way so the
+    editor/preview/PDF all render it identically without any new plumbing."""
+    toc_chapters = [
+        TocChapter(number=chapter.chapter_number, title=chapter.title, summary=chapter.summary)
+        for chapter in chapters
     ]
+    html_bytes = render_toc_html(toc_chapters, course_title=course_title, theme=template.theme)
+    relative = storage.save_asset(course_id, html_bytes, extension="html")
+    width, height = estimate_toc_pixel_size(toc_chapters)
+
+    block = Block(
+        id=new_block_id(),
+        type=BlockType.IMAGE,
+        content={
+            "kind": "toc",
+            "path": relative,
+            "asset_id": relative.rsplit("/", 1)[-1],
+            "generated": True,
+            "alt": "Course contents overview",
+            "width": width,
+            "height": height,
+        },
+        style=BlockStyle(),
+        layout=BlockLayout(x=64, y=72, width=666),
+        meta=BlockMeta(origin="system", section_key="toc"),
+    )
+    block.layout.height = round(estimate_height(block), 2)
     return Page(
         id=page_id(2),
         page_number=2,
         kind="toc",
         size=PageSize(),
         background=template.theme.page_background,
-        blocks=blocks,
+        blocks=[block],
     )
 
 
@@ -174,6 +187,7 @@ def build_document(
     chapters: list[GeneratedChapter],
     include_front_matter: bool = True,
     existing: CourseDocument | None = None,
+    storage: StorageService | None = None,
 ) -> CourseDocument:
     content_blocks = blocks_from_chapters(chapters)
     pages: list[Page] = []
@@ -181,7 +195,15 @@ def build_document(
     if include_front_matter:
         pages.append(_cover_page(blueprint, template, len(chapters)))
         if len(chapters) > 1:
-            pages.append(_toc_page(chapters, template))
+            pages.append(
+                _toc_page(
+                    chapters,
+                    template,
+                    course_title=blueprint.course_title,
+                    course_id=course_id,
+                    storage=storage or get_storage(),
+                )
+            )
 
     offset = len(pages)
     for index, page_blocks in enumerate(flow_blocks(content_blocks), start=1):

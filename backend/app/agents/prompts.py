@@ -305,15 +305,36 @@ How to produce blocks:
   steps; that is meta-content about the course, not the topic, and teaches
   the reader nothing about the subject. A diagram about "how this chapter is
   organised" is almost always the wrong diagram.
+- BEFORE reaching for `image_kind: diagram` anywhere below, always check
+  this first: does the content belong to programming, DSA, databases/SQL,
+  computer networks, operating systems, system design, cloud/DevOps,
+  cybersecurity, AI/ML, data engineering, Git/APIs or software engineering,
+  AND does it center on ONE nameable concept with real internal structure
+  (a class and its objects, a data structure and its operations, a protocol
+  handshake, a pipeline like RAG, a state machine, a relationship like a
+  SQL JOIN)? If yes, that image block gets `image_kind: concept_experience`
+  (leave `diagram_kind` blank - a separate planner decides how it's actually
+  shown), not `diagram` - this is the RIGHT choice for that content, not a
+  fallback, because it's purpose-built for teaching one technical concept
+  clearly with a metaphor and named parts, not a generic labelled-box
+  diagram. This check applies to a SEQUENCE just as much as a
+  THING-with-parts below -
+  don't reach for `diagram`/`flow_chart` out of habit for a technical
+  process (a protocol handshake, an algorithm's steps, a CI/CD pipeline)
+  when concept_experience's own "process"/"sequence" shape already covers
+  it better. Physics, biology, chemistry, math and other non-technical
+  domains never use concept_experience - always use `diagram` for those.
 - Every chapter that describes a SEQUENCE - steps that happen in order, a
-  procedure, a decision path - needs at least one `image` block with
-  `image_kind: diagram` and `diagram_kind: flow_chart` (or `process`/`cycle`
-  for a repeating sequence) right in the section it explains.
+  procedure, a decision path - and didn't already get `concept_experience`
+  above needs at least one `image` block with `image_kind: diagram` and
+  `diagram_kind: flow_chart` (or `process`/`cycle` for a repeating
+  sequence) right in the section it explains.
 - Every chapter that describes a THING made of parts, or a phenomenon/
   mechanism whose components act on or relate to each other (what physically
-  happens, what causes what, which direction something moves or acts) needs
-  a SEPARATE `image` block with `image_kind: diagram` - a labelled diagram of
-  the subject itself, showing every relevant component, the direction of
+  happens, what causes what, which direction something moves or acts), and
+  didn't already get `concept_experience` above, needs a SEPARATE `image`
+  block with `image_kind: diagram` - a labelled diagram of the subject
+  itself, showing every relevant component, the direction of
   motion/force/current/flow, and what causes what. Prose describing a
   mechanism is not enough on its own; a reader needs to see the components
   and how they relate. Choose which shape fits:
@@ -349,9 +370,9 @@ How to produce blocks:
   not just a style description) and a `caption`. Set `image_kind: diagram`
   for anything structured, labelled or relational (see above - this is
   rendered from labelled shapes, never drawn, so labels always come out
-  exact). Use `image_kind: illustration` (the default) only for a genuinely
-  photographic or artistic scene that has no components or relationships to
-  label.
+  exact), or `image_kind: concept_experience` per the rule above. Use
+  `image_kind: illustration` (the default) only for a genuinely photographic
+  or artistic scene that has no components or relationships to label.
 - For `code` blocks set `language` and keep the sample runnable and idiomatic.
 - For `quiz` blocks give 3-5 questions, each with the answer and an explanation.
 - Vary the formats: stories, analogies, examples, case studies, tips, warnings,
@@ -731,17 +752,31 @@ Rules:
   different one (then use replace_block).
 - For a new image use replace_image (existing image block) or insert_block with an
   `image` block carrying `purpose`, `prompt` and `caption`. Never output image data.
-  Set content `kind` to "diagram" for a flow chart, process, hierarchy, comparison,
-  concept map/labelled relationship diagram, physical schematic or SmartArt-style
+  FIRST check: is this a programming/DSA/databases/networks/OS/system-design/
+  cloud/DevOps/cybersecurity/AI-ML/data-engineering/Git/software-engineering
+  topic centered on one nameable technical concept with real internal
+  structure (a class and its objects, a data structure, a protocol
+  handshake, a pipeline, a state machine, a SQL JOIN)? If yes, set `kind` to
+  "concept_experience" and leave `diagram_kind` blank - this is the right
+  choice for that content, not a fallback. Otherwise set `kind` to
+  "diagram" for a flow chart, process, hierarchy, comparison, concept
+  map/labelled relationship diagram, physical schematic or SmartArt-style
   list (rendered from labelled shapes, so labels stay exact); also set
   `diagram_kind` to the specific shape (flow_chart/process/cycle for a sequence,
   schematic for a physical apparatus/mechanism best shown as a real illustration,
   concept_map for an abstract structure's components and how they relate,
   hierarchy, comparison, smart_art) -
-  never diagram the course/lesson itself, only the subject matter. Leave `kind` as
-  "illustration" (the default) for a photographic/artistic scene. `replace_image`
-  always keeps the block's existing `kind`/`diagram_kind` unless you also send a
-  content update for them.
+  never diagram the course/lesson itself, only the subject matter. Leave `kind`
+  as "illustration" (the default) for a photographic/artistic scene.
+  `replace_image` (both fields are directly on the operation, not inside a
+  content update) keeps the block's existing `kind`/`diagram_kind` when you
+  leave them unset - but when the instruction is to regenerate/replace/redo an
+  image, always re-run the check above against the block's actual topic first,
+  even if the user didn't mention "kind" at all. A block sitting on `kind:
+  "diagram"` whose topic clearly qualifies for `concept_experience` is a bug
+  to fix while you're there, not a choice to preserve - set `kind` to
+  "concept_experience" (diagram_kind clears itself) instead of only swapping
+  the prompt and reproducing the same wrong output.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.

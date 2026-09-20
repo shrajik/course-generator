@@ -20,7 +20,13 @@ from app.db.repositories.documents import DocumentRepository
 from app.db.repositories.generation_runs import GenerationRunRepository
 from app.db.session import get_session_factory
 from app.schemas.blueprint import CourseBlueprint
-from app.schemas.course import CourseActivityEntry, CourseInput, CourseRecord, TocItem
+from app.schemas.course import (
+    CourseActivityEntry,
+    CourseInput,
+    CourseRecord,
+    TocItem,
+    WorkspaceActivityEntry,
+)
 from app.schemas.document import CourseDocument
 from app.schemas.memory import GenerationRunEntry
 
@@ -338,6 +344,20 @@ class DatabaseService:
             raise NotFoundError(f"Course '{course_id}' not found")
         rows = await self.activities.list_for_course(course.id, limit, offset)
         return [self._to_activity_entry(row) for row in rows]
+
+    async def list_activities_for_owner(
+        self, owner_id: uuid.UUID, limit: int = 50, offset: int = 0
+    ) -> list[WorkspaceActivityEntry]:
+        rows = await self.activities.list_for_owner(owner_id, limit, offset)
+        return [
+            WorkspaceActivityEntry(
+                **self._to_activity_entry(activity).model_dump(),
+                course_id=course_id,
+                document_id=document_id,
+                course_title=course_title,
+            )
+            for activity, course_id, document_id, course_title in rows
+        ]
 
     # --- Generation history ------------------------------------------------
     # `generation_runs` existed since the very first migration but was never

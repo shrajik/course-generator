@@ -8,7 +8,18 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import admin, auth, course_samples, courses, documents, health, memory, templates, visual_knowledge
+from app.api import (
+    activity,
+    admin,
+    auth,
+    course_samples,
+    courses,
+    documents,
+    health,
+    memory,
+    templates,
+    visual_knowledge,
+)
 from app.core.config import get_settings
 from app.core.errors import CourseCreatorError
 from app.core.logging import configure_logging, get_logger
@@ -77,6 +88,7 @@ async def handle_domain_error(request: Request, exc: CourseCreatorError) -> JSON
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(admin.router)
+app.include_router(activity.router)
 app.include_router(courses.router)
 app.include_router(documents.router)
 app.include_router(templates.router)

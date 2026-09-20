@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from xml.sax.saxutils import escape
 
+from app.render.textbook_palette import resolve_color_role, stroke_width_for
 from app.schemas.diagram import (
     SHAPE_TYPES,
     DiagramEdge,
@@ -23,17 +24,21 @@ from app.schemas.template import TemplateTheme
 
 CANVAS_WIDTH = 880.0
 MARGIN = 40.0
-LABEL_SIZE = 15.0
-DETAIL_SIZE = 12.5
+# Bumped up from 15/12.5 - a course document renders this SVG scaled down to
+# fit its block width (often noticeably narrower than this diagram's own
+# intrinsic canvas), so the on-page text ends up smaller than these numbers
+# look in isolation. Sized here so it still reads clearly after that shrink.
+LABEL_SIZE = 17.5
+DETAIL_SIZE = 14.0
 LINE_HEIGHT = 1.35
-BOX_PADDING = 14.0
-BADGE_RADIUS = 14.0
+BOX_PADDING = 16.0
+BADGE_RADIUS = 15.0
 _SANS_RATIO = 0.56
 
 # --- schematic panel geometry -------------------------------------------
 PANEL_HEIGHT = 300.0
 PANEL_GAP = 30.0
-PANEL_CAPTION_SIZE = 13.0
+PANEL_CAPTION_SIZE = 14.5
 
 
 def _wrap(text: str, *, font_size: float, width: float, max_lines: int = 3) -> list[str]:
@@ -161,7 +166,7 @@ def _node_block(
         cx = x + BOX_PADDING + BADGE_RADIUS - 6
         parts.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{BADGE_RADIUS:.1f}" fill="{theme.accent_color}"/>')
         parts.append(
-            f'<text x="{cx:.1f}" y="{cy + 4.5:.1f}" font-size="12" font-weight="700" '
+            f'<text x="{cx:.1f}" y="{cy + 4.5:.1f}" font-size="13" font-weight="700" '
             f'fill="#ffffff" text-anchor="middle" font-family="{escape(theme.font_family)}">{escape(badge)}</text>'
         )
     parts.append(label_svg)
@@ -171,7 +176,7 @@ def _node_block(
     return group, height
 
 
-EDGE_LABEL_FONT_SIZE = 11.0
+EDGE_LABEL_FONT_SIZE = 13.0
 EDGE_LABEL_MAX_WIDTH = 200.0
 EDGE_LABEL_LINE_GAP = 14.0  # vertical distance between wrapped lines
 
@@ -379,6 +384,18 @@ def _shorten_to_box_edge(
     return start, end
 
 
+def _bisecting_angle(a1: float, a2: float) -> float:
+    """The angle 'between' a1 and a2 along their *shorter* arc - e.g. bisect
+    (10°, 350°) as 0°, not 180°. Averaging the two angles directly breaks
+    exactly at the wraparound point; this normalises the difference into
+    (-π, π] first so the result always points the intuitive way, including
+    for two satellites on nearly opposite sides of the ring, where averaging
+    their *positions* instead would land almost exactly on the centre and
+    give no usable outward direction at all."""
+    diff = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+    return a1 + diff / 2
+
+
 CONCEPT_MAP_LABEL_MAX_WIDTH = 150.0  # narrower than the default pill - leaves room beside neighbouring spokes
 # The reserved gap between focal/satellite box edges must comfortably fit
 # the label pill *and* its own left/right margin - a gap merely equal to
@@ -445,11 +462,13 @@ def _layout_concept_map(
     canvas_w = 2 * cx
 
     positions: dict[str, tuple[float, float, float, float]] = {focal_id: (cx, cy, focal_w, focal_h)}
+    sat_angles: dict[str, float] = {}
     for index, sat in enumerate(satellites):
         angle = (2 * math.pi * index / count) - math.pi / 2
         sx = cx + radius * math.cos(angle)
         sy = cy + radius * math.sin(angle)
         positions[sat_ids[index]] = (sx, sy, sat_w, sat_heights[index])
+        sat_angles[sat_ids[index]] = angle
 
     # Relationship lines first, so node boxes sit cleanly on top of them.
     for edge in edges:
@@ -460,11 +479,37 @@ def _layout_concept_map(
         start, end = _shorten_to_box_edge(
             (p1[0], p1[1]), (p2[0], p2[1]), w1=p1[2], h1=p1[3], w2=p2[2], h2=p2[3]
         )
-        elements.append(
-            f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
-            f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
-        )
-        mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+        if focal_id in (edge.source, edge.target):
+            # A spoke to/from the focal node: straight, as before - these
+            # never cross anything else since every satellite sits on the
+            # same ring around the one shared centre.
+            elements.append(
+                f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+                f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+            mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+        else:
+            # A relationship between two satellites (not through the focal
+            # node) is real and common - e.g. "std::move produces an
+            # xvalue" - but a straight chord between two ring positions cuts
+            # across the focal box and every satellite in between, which is
+            # exactly what read as "messy" crossing lines. Bow the line
+            # outward instead, along the direction that bisects the two
+            # satellites' own ring angles (not their averaged *position*,
+            # which collapses toward the centre for near-opposite satellites
+            # and would leave the curve just as central as a straight line).
+            theta = _bisecting_angle(sat_angles[edge.source], sat_angles[edge.target])
+            bulge = radius * 0.55 + 30.0
+            ctrl = (cx + bulge * math.cos(theta), cy + bulge * math.sin(theta))
+            elements.append(
+                f'<path d="M{start[0]:.1f},{start[1]:.1f} Q{ctrl[0]:.1f},{ctrl[1]:.1f} '
+                f'{end[0]:.1f},{end[1]:.1f}" fill="none" stroke="{theme.accent_color}" '
+                f'stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+            mid = (
+                0.25 * start[0] + 0.5 * ctrl[0] + 0.25 * end[0],
+                0.25 * start[1] + 0.5 * ctrl[1] + 0.25 * end[1],
+            )
         elements.append(_edge_label(mid[0], mid[1], edge.label, theme, max_width=CONCEPT_MAP_LABEL_MAX_WIDTH))
 
     focal_svg, _ = _node_block(
@@ -501,6 +546,57 @@ def _centered_text(
     )
 
 
+def _fit_boxed_text(
+    cx: float, cy: float, text: str, *, width: float, height: float, color: str,
+    theme: TemplateTheme, base_size: float = 13.0, weight: int = 700,
+    min_size: float = 9.5, padding: float = 6.0,
+) -> str:
+    """Centers `text` inside a box of the given pixel size, wrapping to
+    multiple lines and - only if that still doesn't fit - shrinking the
+    font down to `min_size` (and, as a last resort, letting `_wrap`'s own
+    ellipsis truncate it) so a long model-generated label can never bleed
+    outside its own shape into whatever sits next to it. The deterministic
+    layout engine fixes every schematic shape's box size before this runs,
+    so growing the box itself isn't an option here - fitting the text to
+    the box (not the other way around) is what keeps a shape's own
+    footprint - and the collision/clipping guarantees QA already checked
+    against it - unchanged."""
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    usable_w = max(width - 2 * padding, 10.0)
+    usable_h = max(height - 2 * padding, 10.0)
+    size = base_size
+    lines: list[str] = []
+    while True:
+        max_lines = max(int(usable_h // (size * LINE_HEIGHT)), 1)
+        full_lines = _wrap(text, font_size=size, width=usable_w, max_lines=1000)
+        if len(full_lines) <= max_lines or size <= min_size:
+            lines = _wrap(text, font_size=size, width=usable_w, max_lines=max_lines)
+            break
+        size -= 0.75
+    line_gap = size * LINE_HEIGHT
+    first_y = cy - line_gap * (len(lines) - 1) / 2 + size * 0.35
+    svg, _ = _text(cx, first_y, lines, font_size=size, weight=weight, color=color, font_family=theme.font_family)
+    return svg
+
+
+def _caption_text(
+    cx: float, top_y: float, text: str, *, width: float, color: str, theme: TemplateTheme,
+    size: float = 12.5, weight: int = 500, max_lines: int = 2,
+) -> str:
+    """A caption sitting *beside/below* a shape (a coil/gauge's name, a
+    circle's outer label) rather than inside a fixed box - wrapped to a
+    reasonable width so a long label doesn't run into a neighbouring shape,
+    but without `_fit_boxed_text`'s font-shrinking since there's no hard
+    height ceiling here the way there is inside a shape's own outline."""
+    lines = _wrap(text, font_size=size, width=max(width, 70.0), max_lines=max_lines)
+    if not lines:
+        return ""
+    svg, _ = _text(cx, top_y, lines, font_size=size, weight=weight, color=color, font_family=theme.font_family)
+    return svg
+
+
 def _shape_group(shape: SchematicShape, inner_svg: str) -> str:
     tooltip = shape.label.strip()
     if shape.sublabel.strip():
@@ -509,26 +605,53 @@ def _shape_group(shape: SchematicShape, inner_svg: str) -> str:
     return f'<g class="diagram-node" tabindex="0" role="img">{title}{inner_svg}</g>'
 
 
+def _schematic_colors(shape: SchematicShape, theme: TemplateTheme) -> tuple[str, str, str, float]:
+    """(fill, stroke, text_color, stroke_width) for a schematic shape's main
+    body. A blank `color_role` (every legacy/coordinate-authored shape, and
+    any shape a model simply didn't set one on) falls back to exactly the
+    theme colors this renderer always used - zero visual change for those.
+    A primary shape's stroke is heavier regardless of color, reinforcing
+    focal hierarchy the same way concept_map's `emphasis` flag already does
+    for labelled boxes."""
+    stroke_width = stroke_width_for(shape.role)
+    if not shape.color_role.strip():
+        return theme.surface_color, theme.border_color, theme.text_color, stroke_width
+    role = resolve_color_role(shape.color_role)
+    return role.fill, role.stroke, role.text, stroke_width
+
+
 def _draw_block(shape: SchematicShape, cx: float, cy: float, w: float, h: float, theme: TemplateTheme) -> str:
     x, y = cx - w / 2, cy - h / 2
+    fill, stroke, text_color, stroke_width = _schematic_colors(shape, theme)
     if shape.sublabel.strip():
         # A two-part object (a magnet's N/S poles, a battery's +/- terminals,
-        # any two-state block) - each half gets a different theme tone so the
-        # split reads clearly without hardcoding colours.
+        # any two-state block) - solid, high-contrast halves so the split
+        # reads clearly at a glance. The left/primary half carries the
+        # shape's semantic color (or the theme's accent, unchanged, when no
+        # color_role is set); the right/secondary half stays a neutral dark
+        # tone either way - two strong colors on one block would fight the
+        # "don't make every object equally saturated" rule.
         half_w = w / 2
+        left_fill = stroke if shape.color_role.strip() else theme.accent_color
         parts = [
             f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{half_w:.1f}" height="{h:.1f}" '
-            f'fill="{theme.accent_color}" stroke="{theme.border_color}" stroke-width="1.5"/>',
+            f'fill="{left_fill}" stroke="{theme.border_color}" stroke-width="1.5"/>',
             f'<rect class="diagram-box" x="{x + half_w:.1f}" y="{y:.1f}" width="{half_w:.1f}" height="{h:.1f}" '
             f'fill="{theme.text_color}" stroke="{theme.border_color}" stroke-width="1.5"/>',
-            _centered_text(x + half_w / 2, cy, shape.label, color="#ffffff", theme=theme, size=14),
-            _centered_text(x + half_w + half_w / 2, cy, shape.sublabel, color="#ffffff", theme=theme, size=14),
+            _fit_boxed_text(
+                x + half_w / 2, cy, shape.label, width=half_w, height=h, color="#ffffff",
+                theme=theme, base_size=14,
+            ),
+            _fit_boxed_text(
+                x + half_w + half_w / 2, cy, shape.sublabel, width=half_w, height=h, color="#ffffff",
+                theme=theme, base_size=14,
+            ),
         ]
     else:
         parts = [
             f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="6" '
-            f'fill="{theme.surface_color}" stroke="{theme.border_color}" stroke-width="1.5"/>',
-            _centered_text(cx, cy, shape.label, color=theme.text_color, theme=theme, size=13),
+            f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>',
+            _fit_boxed_text(cx, cy, shape.label, width=w, height=h, color=text_color, theme=theme, base_size=13),
         ]
     return _shape_group(shape, "".join(parts))
 
@@ -539,21 +662,38 @@ def _draw_circle(shape: SchematicShape, cx: float, cy: float, w: float, h: float
     rectangular objects. With a `sublabel`, draws a smaller labelled circle
     inside it (a nucleus, a core, an embryo)."""
     radius = min(w, h) / 2
+    fill, stroke, text_color, stroke_width = _schematic_colors(shape, theme)
     if shape.sublabel.strip():
         inner_r = radius * 0.42
+        # A merged "inside:" child (see _merge_inside_anchors) carries its
+        # own color_role separately in `sublabel_color_role` - use that when
+        # set so a nested object (a nucleus) reads as its own distinct
+        # semantic color instead of just a smaller copy of the parent's.
+        # Falls back to the parent's own color_role for a directly-authored
+        # sublabel (a gauge caption, a block's second half - no separate
+        # nested shape ever existed to have its own color).
+        inner_role = shape.sublabel_color_role.strip() or shape.color_role.strip()
+        inner_fill = resolve_color_role(inner_role).fill if inner_role else theme.accent_soft
+        inner_stroke = resolve_color_role(inner_role).stroke if inner_role else theme.accent_color
         parts = [
             f'<circle class="diagram-box" cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" '
-            f'fill="{theme.surface_color}" stroke="{theme.border_color}" stroke-width="1.5"/>',
-            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{inner_r:.1f}" fill="{theme.accent_soft}" '
-            f'stroke="{theme.accent_color}" stroke-width="1.5"/>',
-            _centered_text(cx, cy, shape.sublabel, color=theme.accent_color, theme=theme, size=11, weight=700),
-            _centered_text(cx, cy + radius + 16, shape.label, color=theme.text_color, theme=theme, size=13),
+            f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>',
+            f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{inner_r:.1f}" fill="{inner_fill}" '
+            f'stroke="{inner_stroke}" stroke-width="1.5"/>',
+            _fit_boxed_text(
+                cx, cy, shape.sublabel, width=inner_r * 1.6, height=inner_r * 1.6, color=inner_stroke,
+                theme=theme, base_size=11,
+            ),
+            _caption_text(cx, cy + radius + 16, shape.label, width=max(radius * 2.2, 90), color=theme.text_color, theme=theme, size=13, weight=700),
         ]
     else:
         parts = [
             f'<circle class="diagram-box" cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" '
-            f'fill="{theme.surface_color}" stroke="{theme.border_color}" stroke-width="1.5"/>',
-            _centered_text(cx, cy, shape.label, color=theme.text_color, theme=theme, size=13),
+            f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>',
+            _fit_boxed_text(
+                cx, cy, shape.label, width=radius * 1.6, height=radius * 1.6, color=text_color,
+                theme=theme, base_size=13,
+            ),
         ]
     return _shape_group(shape, "".join(parts))
 
@@ -562,12 +702,19 @@ def _draw_coil(shape: SchematicShape, cx: float, cy: float, w: float, h: float, 
     loops = max(int(w / 24), 4)
     step = w / loops
     left = cx - w / 2
+    _, stroke, text_color, stroke_width = _schematic_colors(shape, theme)
+    loop_stroke = stroke if shape.color_role.strip() else theme.text_color
     parts = [
         f'<ellipse cx="{left + step * (i + 0.5):.1f}" cy="{cy:.1f}" rx="{step * 0.55:.1f}" ry="{h / 2:.1f}" '
-        f'fill="none" stroke="{theme.text_color}" stroke-width="2"/>'
+        f'fill="none" stroke="{loop_stroke}" stroke-width="{stroke_width}"/>'
         for i in range(loops)
     ]
-    parts.append(_centered_text(cx, cy + h / 2 + 18, shape.label, color=theme.text_color, theme=theme, size=12.5))
+    parts.append(
+        _caption_text(
+            cx, cy + h / 2 + 18, shape.label, width=max(w, 90), color=text_color, theme=theme,
+            size=12.5, weight=700,
+        )
+    )
     return _shape_group(shape, "".join(parts))
 
 
@@ -576,13 +723,18 @@ def _draw_gauge(shape: SchematicShape, cx: float, cy: float, w: float, h: float,
     angle = math.radians(shape.rotation - 90)  # rotation=0 -> needle points up (resting)
     needle_len = radius * 0.72
     nx, ny = cx + needle_len * math.cos(angle), cy + needle_len * math.sin(angle)
+    fill, stroke, text_color, stroke_width = _schematic_colors(shape, theme)
+    needle_color = stroke if shape.color_role.strip() else theme.accent_color
     parts = [
-        f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" fill="{theme.surface_color}" '
-        f'stroke="{theme.border_color}" stroke-width="1.5"/>',
-        f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="{theme.accent_color}" '
+        f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" fill="{fill}" '
+        f'stroke="{stroke}" stroke-width="{stroke_width}"/>',
+        f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="{needle_color}" '
         f'stroke-width="2.5" stroke-linecap="round"/>',
-        f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="{theme.accent_color}"/>',
-        _centered_text(cx, cy + radius + 18, shape.sublabel or shape.label, color=theme.text_color, theme=theme, size=12.5),
+        f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="{needle_color}"/>',
+        _caption_text(
+            cx, cy + radius + 18, shape.sublabel or shape.label, width=max(radius * 2.2, 90),
+            color=theme.text_color, theme=theme, size=12.5, weight=700,
+        ),
     ]
     return _shape_group(shape, "".join(parts))
 
@@ -594,6 +746,7 @@ def _draw_flow(shape: SchematicShape, cx: float, cy: float, w: float, h: float, 
     count = max(3, min(7, round(3 + shape.intensity * 5)))
     length = max(w, h)
     spread = 64.0
+    line_color = resolve_color_role(shape.color_role).stroke if shape.color_role.strip() else theme.muted_color
     parts = []
     for i in range(count):
         frac = (i / (count - 1) - 0.5) if count > 1 else 0.0
@@ -602,7 +755,7 @@ def _draw_flow(shape: SchematicShape, cx: float, cy: float, w: float, h: float, 
         mx, my = (cx + sx) / 2, (cy + sy) / 2
         parts.append(
             f'<path d="M{sx:.1f},{sy:.1f} Q{mx:.1f},{my:.1f} {cx:.1f},{cy:.1f}" fill="none" '
-            f'stroke="{theme.muted_color}" stroke-width="1.5" marker-end="url(#diagram-arrow)"/>'
+            f'stroke="{line_color}" stroke-width="1.5" marker-end="url(#diagram-arrow)"/>'
         )
     # The label sits to the *side* of the fan (perpendicular to the flow
     # direction), not further along it - `rotation` points back toward
@@ -613,26 +766,57 @@ def _draw_flow(shape: SchematicShape, cx: float, cy: float, w: float, h: float, 
     perp_angle = math.radians(shape.rotation + 90)
     label_offset = min(length * 0.5, 90.0) + 14.0
     lx, ly = cx + label_offset * math.cos(perp_angle), cy + label_offset * math.sin(perp_angle)
-    parts.append(_centered_text(lx, ly, shape.label, color=theme.muted_color, theme=theme, size=11.5, weight=500))
+    parts.append(_caption_text(lx, ly, shape.label, width=130, color=line_color, theme=theme, size=11.5))
     return _shape_group(shape, "".join(parts))
 
 
-def _draw_arrow(shape: SchematicShape, cx: float, cy: float, w: float, h: float, theme: TemplateTheme) -> str:
+def _draw_arrow(
+    shape: SchematicShape, cx: float, cy: float, w: float, h: float, theme: TemplateTheme,
+    connector: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> str:
+    line_color = resolve_color_role(shape.color_role).stroke if shape.color_role.strip() else theme.accent_color
+    if connector is not None:
+        # A real point-to-point connector: `target_id` resolved to another
+        # shape in this state, so the arrow is drawn from its own box edge
+        # all the way to that shape's box edge (see _draw_shape) instead of
+        # a short segment floating near its own anchor position - what makes
+        # "applied force -> pulley" or "reaction -> water" actually read as
+        # touching the thing it's pointing at.
+        (sx, sy), (ex, ey) = connector
+        mx, my = (sx + ex) / 2, (sy + ey) / 2
+        dx, dy = ex - sx, ey - sy
+        dist = max(math.hypot(dx, dy), 1.0)
+        # Label offset perpendicular to the connector, not along it - keeps
+        # it clear of the line itself regardless of the connector's angle.
+        px, py = -dy / dist, dx / dist
+        lx, ly = mx + px * 14, my + py * 14
+        parts = [
+            f'<line x1="{sx:.1f}" y1="{sy:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" '
+            f'stroke="{line_color}" stroke-width="3" marker-end="url(#diagram-arrow)"/>',
+            _caption_text(lx, ly, shape.label, width=130, color=line_color, theme=theme, size=12, weight=700),
+        ]
+        return _shape_group(shape, "".join(parts))
+
     length = max(w, h)
     angle = math.radians(shape.rotation)
     dx, dy = (length / 2) * math.cos(angle), (length / 2) * math.sin(angle)
     parts = [
         f'<line x1="{cx - dx:.1f}" y1="{cy - dy:.1f}" x2="{cx + dx:.1f}" y2="{cy + dy:.1f}" '
-        f'stroke="{theme.accent_color}" stroke-width="3" marker-end="url(#diagram-arrow)"/>',
-        _centered_text(cx, cy - 14, shape.label, color=theme.accent_color, theme=theme, size=12),
+        f'stroke="{line_color}" stroke-width="3" marker-end="url(#diagram-arrow)"/>',
+        _caption_text(cx, cy - 14, shape.label, width=130, color=line_color, theme=theme, size=12, weight=700),
     ]
     return _shape_group(shape, "".join(parts))
 
 
 def _draw_label(shape: SchematicShape, cx: float, cy: float, w: float, theme: TemplateTheme) -> str:
+    # A standalone annotation has no fill behind it (it sits directly on the
+    # page background), so its color_role tints the text itself rather than
+    # a box - every palette stroke color is dark/saturated enough to stay
+    # readable on white, unlike the light `fill` tones meant for behind text.
+    text_color = resolve_color_role(shape.color_role).stroke if shape.color_role.strip() else theme.text_color
     lines = _wrap(shape.label, font_size=DETAIL_SIZE, width=max(w, 80), max_lines=3) or [""]
     svg, _ = _text(
-        cx, cy, lines, font_size=DETAIL_SIZE, weight=500, color=theme.text_color,
+        cx, cy, lines, font_size=DETAIL_SIZE, weight=500, color=text_color,
         font_family=theme.font_family,
     )
     return _shape_group(shape, svg)
@@ -653,6 +837,7 @@ def _draw_shape(
     panel_w: float,
     panel_h: float,
     positions: dict[str, tuple[float, float]],
+    boxes: dict[str, tuple[float, float, float, float]],
     theme: TemplateTheme,
 ) -> str:
     cx = panel_x0 + shape.x * panel_w
@@ -672,14 +857,72 @@ def _draw_shape(
     if kind == "flow":
         return _draw_flow(resolved, cx, cy, w, h, theme)
     if kind == "arrow":
-        return _draw_arrow(resolved, cx, cy, w, h, theme)
+        connector = None
+        target_box = boxes.get(shape.target_id) if shape.target_id else None
+        if target_box is not None:
+            tx, ty, tw, th = target_box
+            connector = _shorten_to_box_edge((cx, cy), (tx, ty), w1=w, h1=h, w2=tw, h2=th)
+        return _draw_arrow(resolved, cx, cy, w, h, theme, connector=connector)
     return _draw_label(shape, cx, cy, w, theme)
+
+
+# Declared relationships that are worth drawing as an actual connector line
+# between the two shapes' resolved positions - a physical/functional link a
+# reader would otherwise have to infer from proximity alone. Split into
+# "directional" (rendered with an arrowhead - something clearly flows/points
+# from source to target) and "structural" (rendered dashed, no arrowhead - a
+# mutual link with no implied direction, like two parts touching or being
+# fastened together). Spatial-only descriptors (above/below/left_of/right_of/
+# between) are already conveyed by the anchor-driven layout itself, and
+# containment (inside/contains/surrounds) is already conveyed by nesting/the
+# sublabel merge - drawing a line for either would be redundant, not
+# clarifying, so both are deliberately left undrawn here.
+_RELATIONSHIP_DIRECTIONAL_TYPES = {"points_to", "flows_into"}
+_RELATIONSHIP_STRUCTURAL_TYPES = {"connected_to", "attached_to", "contacts", "passes_through", "rotates_around"}
+_DRAWABLE_RELATIONSHIP_TYPES = _RELATIONSHIP_DIRECTIONAL_TYPES | _RELATIONSHIP_STRUCTURAL_TYPES
+
+
+def _draw_relationship_connectors(
+    relationships, *, boxes: dict[str, tuple[float, float, float, float]], theme: TemplateTheme,
+) -> list[str]:
+    """One subtle connector line per declared relationship whose type is
+    drawable and whose source/target both resolve to a real shape in this
+    state - e.g. a merged-into-sublabel id (see _merge_inside_anchors)
+    simply has no entry in `boxes` and is silently skipped, never an error.
+    Deliberately muted/thin relative to the shapes' own semantic colors:
+    this is a structural hint, not another colored object competing for
+    attention."""
+    elements: list[str] = []
+    for rel in relationships:
+        rel_type = rel.type.strip().lower()
+        if rel_type not in _DRAWABLE_RELATIONSHIP_TYPES or rel.source == rel.target:
+            continue
+        box1, box2 = boxes.get(rel.source), boxes.get(rel.target)
+        if not box1 or not box2:
+            continue
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        start, end = _shorten_to_box_edge((x1, y1), (x2, y2), w1=w1, h1=h1, w2=w2, h2=h2)
+        if rel_type in _RELATIONSHIP_DIRECTIONAL_TYPES:
+            elements.append(
+                f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+                f'stroke="{theme.muted_color}" stroke-width="1.5" '
+                f'marker-end="url(#schematic-relationship-arrow)"/>'
+            )
+        else:
+            elements.append(
+                f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+                f'stroke="{theme.muted_color}" stroke-width="1.5" stroke-dasharray="4 3"/>'
+            )
+    return elements
 
 
 def _layout_schematic(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
     states = spec.states if spec.states else [SchematicState(caption="", shapes=spec.shapes)]
     panel_w = CANVAS_WIDTH - 2 * MARGIN
     elements = [_arrow_marker("diagram-arrow", theme.muted_color)]
+    if spec.relationships:
+        elements.append(_arrow_marker("schematic-relationship-arrow", theme.muted_color))
 
     y = top
     for state in states:
@@ -688,16 +931,30 @@ def _layout_schematic(spec: DiagramSpec, *, theme: TemplateTheme, top: float) ->
             f'<rect x="{MARGIN:.1f}" y="{panel_y0:.1f}" width="{panel_w:.1f}" height="{PANEL_HEIGHT:.1f}" '
             f'rx="10" fill="{theme.page_background}" stroke="{theme.border_color}" stroke-width="1.5"/>'
         )
-        positions = {
-            shape.id: (MARGIN + shape.x * panel_w, panel_y0 + shape.y * PANEL_HEIGHT)
+        # One box per identified shape (centre x/y + pixel width/height) -
+        # the single source of truth `_shape_rotation` (target direction),
+        # `_draw_shape`'s arrow-target lookup and the relationship connectors
+        # below all resolve other shapes' positions from, so a target/
+        # relationship endpoint is always measured against the same numbers
+        # actually drawn on screen.
+        boxes = {
+            shape.id: (
+                MARGIN + shape.x * panel_w, panel_y0 + shape.y * PANEL_HEIGHT,
+                max(shape.width, 0.04) * panel_w, max(shape.height, 0.04) * PANEL_HEIGHT,
+            )
             for shape in state.shapes
             if shape.id
         }
+        positions = {shape_id: (x, y) for shape_id, (x, y, _, _) in boxes.items()}
+        if spec.relationships:
+            elements.extend(
+                _draw_relationship_connectors(spec.relationships, boxes=boxes, theme=theme)
+            )
         for shape in state.shapes:
             elements.append(
                 _draw_shape(
                     shape, panel_x0=MARGIN, panel_y0=panel_y0, panel_w=panel_w, panel_h=PANEL_HEIGHT,
-                    positions=positions, theme=theme,
+                    positions=positions, boxes=boxes, theme=theme,
                 )
             )
         if state.caption.strip():
@@ -745,12 +1002,12 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
     top = MARGIN
     title_svg = ""
     if spec.title.strip():
-        title_lines = _wrap(spec.title, font_size=18, width=CANVAS_WIDTH - 2 * MARGIN, max_lines=1)
+        title_lines = _wrap(spec.title, font_size=21, width=CANVAS_WIDTH - 2 * MARGIN, max_lines=1)
         title_svg, title_h = _text(
             CANVAS_WIDTH / 2,
-            top + 18,
+            top + 21,
             title_lines,
-            font_size=18,
+            font_size=21,
             weight=700,
             color=theme.text_color,
             font_family=theme.font_family,

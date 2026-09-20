@@ -74,6 +74,20 @@ class Settings(BaseSettings):
     #  SVG instead of a raster illustration. Falls back to the raster path on
     #  any failure either way, so this only controls the preferred path.
     enable_diagram_generation: bool = True
+    #  When true, `image` blocks marked kind="concept_experience" render as a
+    #  deterministic, static HTML+CSS visual (see
+    #  app.services.concept_visual_service) instead of a raster illustration.
+    #  Was a POC feature flag defaulting to False; validated end-to-end
+    #  (offline tests, real-API dry runs, a real writer→PDF→frontend pass)
+    #  and turned on for real. Every existing diagram/illustration block is
+    #  unaffected either way, and `ImageService` still falls back to a raster
+    #  illustration on any failure - flipping this off reproduces the exact
+    #  pre-Phase-4 behaviour with no other change.
+    enable_concept_experience_visuals: bool = True
+    #  Same reasoning-tier choice as `diagram_model` - concept_experience
+    #  planning asks for structure (concept/entities/interactions), not
+    #  pixels.
+    concept_visual_model: str = "gpt-5-mini"
     #  AI memory layer (templates/visual knowledge/course samples/generation
     #  history retrieval - see app.services.memory_service). Retrieval always
     #  fails soft regardless of this flag; the flag exists to disable the

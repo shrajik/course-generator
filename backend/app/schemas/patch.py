@@ -82,6 +82,11 @@ class ReplaceImageOp(BaseModel):
     prompt: str
     caption: str | None = None
     alt: str | None = None
+    # When set, reclassifies the block (e.g. a stale "diagram" that should
+    # now be "concept_experience") instead of just redrawing the same kind
+    # with a new prompt - see EDITOR_SYSTEM's replace_image guidance.
+    kind: str | None = None
+    diagram_kind: str | None = None
 
 
 class UpdateStyleOp(BaseModel):

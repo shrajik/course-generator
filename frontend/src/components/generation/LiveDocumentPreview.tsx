@@ -4,7 +4,7 @@ import { useMemo } from "react";
 import { FileText, Loader2 } from "lucide-react";
 import { assetUrl } from "@/lib/api/documents";
 import { asString, asStringArray } from "@/lib/editor/blocks";
-import { isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
+import { isHtmlPath, isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
 import type { ChapterProgress } from "@/lib/types/course";
 import type { Block, BlockContent, CourseDocument } from "@/lib/types/document";
 import type { ChapterStreamView } from "./GenerationProgress";
@@ -137,6 +137,17 @@ export function LiveDocumentPreview({
               const isActive = chapter.chapter_id === activeChapterId;
               const stream = streamingChapters[chapter.chapter_id];
               if (stream && stream.text) {
+                if (stream.phase === "research") {
+                  return (
+                    <ChapterResearching
+                      key={chapter.chapter_id}
+                      number={index + 1}
+                      title={chapter.title}
+                      text={stream.text}
+                      done={stream.done}
+                    />
+                  );
+                }
                 return (
                   <ChapterStreaming
                     key={chapter.chapter_id}
@@ -237,6 +248,55 @@ function ChapterStreaming({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/** The real web-search activity for a chapter's research phase, one line per
+ * search/read the model's own search tool reported (see `on_event` in
+ * `openai_service.py` - never a simulated progress bar). Each line already
+ * carries its own leading emoji from the backend; older lines sit static,
+ * the newest one pulses until the next line (or `done`) arrives. */
+function ChapterResearching({
+  number,
+  title,
+  text,
+  done,
+}: {
+  number: number;
+  title: string;
+  text: string;
+  done: boolean;
+}) {
+  const lines = text.split("\n").filter((line) => line.trim());
+  return (
+    <div className="mt-8">
+      <div className="flex items-center gap-2">
+        {!done ? <span className="gen-active-dot" aria-hidden /> : null}
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-ink-400">
+          Chapter {number} · Researching
+        </p>
+      </div>
+      <p className="mt-1 text-[18px] font-semibold text-ink">{title}</p>
+      <ul className="mt-3 space-y-1.5">
+        {lines.map((line, index) => {
+          const isLast = index === lines.length - 1;
+          return (
+            <li
+              key={index}
+              className={`gen-block-in flex items-baseline gap-2 text-[12.5px] leading-[1.6] ${
+                isLast && !done ? "text-ink-700" : "text-ink-400"
+              }`}
+            >
+              <span aria-hidden>{isLast && !done ? "→" : "·"}</span>
+              <span>
+                {line}
+                {isLast && !done ? <span className="gen-cursor" aria-hidden /> : null}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
@@ -384,8 +444,14 @@ function FlowBlock({ block, documentId }: { block: Block; documentId: string }) 
 }
 
 /** A diagram is inlined (hover/focus tooltips need real DOM, not `<img
- * src>`) and never cropped - `object-cover` would cut off diagram labels.
- * A raster illustration keeps the original cropped, fill-the-box look. */
+ * src>`) and never cropped - `object-cover` would cut off diagram labels. A
+ * concept_experience or toc block is an HTML+CSS fragment, not an image at
+ * all - `<img src="foo.html">` can't render it, so it's inlined the same
+ * way (see ImageBlock.tsx for the full-size, non-cropped treatment this
+ * compact live-preview panel intentionally doesn't need - a capped, scrolled
+ * snapshot is fine here since the real editor/PDF is where it's actually
+ * read). A raster illustration keeps the original cropped, fill-the-box
+ * look. */
 function ImagePreviewBlock({
   content,
   documentId,
@@ -395,17 +461,22 @@ function ImagePreviewBlock({
 }) {
   const path = typeof content.path === "string" ? content.path : null;
   const src = path ? assetUrl(documentId, path) : null;
-  const isDiagram = asString(content.kind) === "diagram" && isSvgPath(path);
-  const inlineMarkup = useInlineDiagramSvg(documentId, path, isDiagram);
+  const kind = asString(content.kind);
+  const isDiagram = kind === "diagram" && isSvgPath(path);
+  const isHtmlFragment = (kind === "concept_experience" || kind === "toc") && isHtmlPath(path);
+  const wantsInline = isDiagram || isHtmlFragment;
+  const inlineMarkup = useInlineDiagramSvg(documentId, path, wantsInline);
 
   return (
     <div className="gen-block-in mt-4 overflow-hidden rounded-[10px] border border-line bg-canvas">
       {inlineMarkup ? (
         <div
-          className="flex items-center justify-center p-2 [&>svg]:h-auto [&>svg]:max-h-[360px] [&>svg]:w-full"
+          className="flex items-center justify-center overflow-y-auto p-2 [&>div]:w-full [&>svg]:h-auto [&>svg]:max-h-[360px] [&>svg]:w-full"
+          style={{ maxHeight: 360 }}
           role="img"
           aria-label={asString(content.alt)}
-          // Trusted source: our own backend-rendered SVG, not user HTML.
+          // Trusted source: our own backend-rendered SVG or HTML fragment,
+          // not user-supplied markup.
           dangerouslySetInnerHTML={{ __html: inlineMarkup }}
         />
       ) : src ? (

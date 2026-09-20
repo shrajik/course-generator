@@ -133,8 +133,25 @@ def caption_height(block: Block) -> float:
     return text_height(str(caption), font_size=12.5, width=width, line_height=1.45) + 8
 
 
+# Kinds whose own renderer already caps its height at roughly one page and
+# reports the real (not fixed-aspect) result via content.width/height - see
+# app.render.concept_experience_renderer.estimate_pixel_size and
+# app.render.toc_renderer.estimate_toc_pixel_size. Every block after one of
+# these on the page is positioned from that estimate, so re-capping it here
+# with MAX_IMAGE_HEIGHT would silently reintroduce the exact overlap those
+# estimates exist to prevent.
+_UNCAPPED_IMAGE_KINDS = {"concept_experience", "toc"}
+
+
 def image_box_height(block: Block) -> float:
-    """Height reserved for the picture itself (excluding caption and padding)."""
+    """Height reserved for the picture itself (excluding caption and padding).
+
+    `MAX_IMAGE_HEIGHT` caps a raster/SVG picture's box - reasonable there,
+    since a photo or diagram at a fixed aspect ratio never needs to grow
+    past it. The kinds in `_UNCAPPED_IMAGE_KINDS` are not pictures at a fixed
+    aspect ratio; they manage their own one-page ceiling internally, so the
+    cap here would only double (and wrongly shrink) what they already do.
+    """
     pad = _padding(block)
     width = float(block.layout.width or CONTENT_WIDTH) - 2 * pad
     intrinsic_w = block.content.get("width")
@@ -143,7 +160,10 @@ def image_box_height(block: Block) -> float:
         aspect = float(intrinsic_h) / float(intrinsic_w)
     else:
         aspect = DEFAULT_IMAGE_ASPECT
-    return min(width * aspect, MAX_IMAGE_HEIGHT)
+    height = width * aspect
+    if block.content.get("kind") in _UNCAPPED_IMAGE_KINDS:
+        return height
+    return min(height, MAX_IMAGE_HEIGHT)
 
 
 def estimate_height(block: Block) -> float:

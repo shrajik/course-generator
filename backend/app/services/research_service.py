@@ -11,6 +11,7 @@ import asyncio
 from app.agents.research import ResearchAgent
 from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
+from app.core.generation_stream import get_stream_hub
 from app.core.logging import get_logger
 from app.core.metrics import phase as metrics_phase
 from app.course.templates.registry import load_template
@@ -49,13 +50,19 @@ class ResearchService:
             return self.storage.load_research(course_id, chapter.id, chapter.order)
 
         template = load_template(blueprint.template_id or course_input.template_id)
-        research = await self.agent.research_chapter(
-            blueprint=blueprint,
-            chapter=chapter,
-            template=template,
-            course_input=course_input,
-            mode=mode,
-        )
+        hub = get_stream_hub()
+        hub.start(course_id, chapter.id, "research")
+        try:
+            research = await self.agent.research_chapter(
+                blueprint=blueprint,
+                chapter=chapter,
+                template=template,
+                course_input=course_input,
+                mode=mode,
+                on_event=lambda line: hub.append_line(course_id, chapter.id, line),
+            )
+        finally:
+            hub.finish(course_id, chapter.id)
         self.storage.save_research(course_id, research, chapter.order)
         return research
 

@@ -26,11 +26,12 @@ from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.render.diagram_renderer import render_diagram_svg
 from app.render.schematic_layout import resolve_schematic_layout
+from app.render.visual_blueprints import apply_blueprint_defaults
 from app.schemas.blocks import merge_content
 from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
-from app.services.diagram_qa import evaluate_schematic
+from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.storage_service import StorageService, get_storage
@@ -181,6 +182,38 @@ a biology structure or a mechanical device as it is for an electrical one:
   ones that do - keep the same `id`s and `role`/`anchor` across states so
   the layout stays consistent). Leave `states` empty and use the top-level
   `shapes` for a single static illustration.
+- If the subject is a well-known textbook visual (an electric motor,
+  electromagnetic induction, a fixed pulley, the human heart, an animal or
+  plant cell, a nephron, a convex/concave lens ray diagram, a transformer, a
+  simple electric circuit, or similar), set `visual_type` to its canonical
+  snake_case name (e.g. "electric_motor", "animal_cell"). This lets a
+  canonical blueprint fill in any component you omit and validates your
+  structure against it - prefer matching the real textbook structure for
+  that visual over inventing your own arrangement. Leave `visual_type` blank
+  for anything else; the diagram still renders normally.
+- Use the *minimum* set of components a textbook diagram of this subject
+  actually needs to teach the learning objective - do not add extra shapes
+  just to fill space or make the diagram look busier. Never invent a
+  decorative component (a random gear, an unrelated label, a made-up part)
+  that isn't a real part of the thing being depicted.
+- Set `color_role` on a shape to one of the semantic color roles ("primary",
+  "secondary", "accent", "structure", "current", "magnetic_field",
+  "positive", "negative", "fluid", "highlight", "annotation", "neutral") to
+  give it deliberate, consistent educational color instead of the plain
+  default - e.g. current-carrying parts get "current", a magnet/field gets
+  "magnetic_field", the single focal/primary object usually gets "primary"
+  or "accent". Leave it blank when no particular color meaning applies. This
+  is always a semantic role name, never a hex code. Reuse the same role for
+  every shape that shares the same meaning so the color language stays
+  consistent across the diagram - don't scatter many different roles just to
+  look colorful.
+- Optionally set `relationships` (each with `source`, `type`, `target` shape
+  ids) to state real structural facts using exactly one of: inside,
+  contains, connected_to, attached_to, above, below, left_of, right_of,
+  passes_through, surrounds, contacts, points_to, flows_into, rotates_around,
+  between. This documents *what is true* for validation - it does not affect
+  layout (that's still `anchor`'s job), so a relationship and its matching
+  anchor are independent and both may be set.
 - Base every label, relationship and state only on the brief below. Do not
   invent facts, numbers or components that were not implied by it.
 """
@@ -312,6 +345,23 @@ class DiagramService:
             phase="image",
         )
 
+    @staticmethod
+    def _check_schematic(spec: DiagramSpec) -> tuple[DiagramSpec, DiagramQAResult]:
+        """Apply canonical blueprint defaults, validate the pre-layout
+        semantic structure (missing/unknown components, invalid
+        relationships, color roles), resolve layout, then run the geometry/
+        composition checks on the result - one combined result so a single
+        retry can address both a structural problem and a layout problem at
+        once. `apply_blueprint_defaults` is a no-op for an unset/unrecognised
+        `visual_type`, so this is exactly today's behaviour for every
+        schematic that doesn't opt into the blueprint system."""
+        spec = apply_blueprint_defaults(spec)
+        blueprint_result = evaluate_blueprint(spec)
+        resolved = resolve_schematic_layout(spec)
+        geometry_result = evaluate_schematic(resolved)
+        combined = DiagramQAResult(issues=[*blueprint_result.issues, *geometry_result.issues])
+        return resolved, combined
+
     async def _resolve_and_check_schematic(
         self,
         spec: DiagramSpec,
@@ -324,15 +374,14 @@ class DiagramService:
         kind_hint: str,
         block_id: str,
     ) -> DiagramSpec:
-        """Turn semantic shapes into real coordinates and run the geometry/
-        composition quality gate; on failure, ONE retry with the exact
-        reasons fed back to the model (never a bare "try again"), keeping
-        whichever attempt is actually better. A schematic that still has
-        issues after the retry is still rendered - quality review sharpens
-        the diagram, it isn't a second reason (beyond is_usable()) to fall
-        back to a raster illustration."""
-        resolved = resolve_schematic_layout(spec)
-        result = evaluate_schematic(resolved)
+        """Turn semantic shapes into real coordinates and run the combined
+        blueprint/geometry/composition quality gate; on failure, ONE retry
+        with the exact reasons fed back to the model (never a bare "try
+        again"), keeping whichever attempt is actually better. A schematic
+        that still has issues after the retry is still rendered - quality
+        review sharpens the diagram, it isn't a second reason (beyond
+        is_usable()) to fall back to a raster illustration."""
+        resolved, result = self._check_schematic(spec)
         if result.passed:
             return resolved
 
@@ -354,8 +403,7 @@ class DiagramService:
         if retried.normalised_kind() != "schematic" or not retried.is_usable():
             return resolved
 
-        retried_resolved = resolve_schematic_layout(retried)
-        retried_result = evaluate_schematic(retried_resolved)
+        retried_resolved, retried_result = self._check_schematic(retried)
         if len(retried_result.issues) < len(result.issues):
             return retried_resolved
         return resolved

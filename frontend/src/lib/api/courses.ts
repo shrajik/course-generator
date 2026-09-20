@@ -8,6 +8,7 @@ import type {
   CourseReview,
   ImproveTocRequest,
   ImproveTocResponse,
+  WorkspaceActivityListResponse,
 } from "@/lib/types/course";
 
 export interface CourseListItem {
@@ -100,6 +101,14 @@ export function getCourseActivity(
   limit = 20,
 ): Promise<CourseActivityListResponse> {
   return request<CourseActivityListResponse>(`/api/courses/${courseId}/activity`, {
+    query: { limit },
+  });
+}
+
+/** Every activity entry across every course the caller owns - the
+ * workspace-wide feed behind the sidebar's "History" page. */
+export function getWorkspaceActivity(limit = 50): Promise<WorkspaceActivityListResponse> {
+  return request<WorkspaceActivityListResponse>("/api/activity", {
     query: { limit },
   });
 }

@@ -245,3 +245,52 @@ def test_admin_can_view_any_courses_activity(activity_client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert _actions(response) == ["created"]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/activity - the workspace-wide feed (frontend's sidebar "History"
+# page). Same underlying log as above, aggregated across every course the
+# caller owns instead of scoped to one.
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_activity_aggregates_across_the_users_courses(activity_client):
+    _register(activity_client, _email("act-workspace"))
+    first = _create_course(activity_client, "First Course")
+    second = _create_course(activity_client, "Second Course")
+    activity_client.put(
+        f"/api/documents/{first['document_id']}", json=_document_payload(first, "Edited")
+    )
+
+    response = activity_client.get("/api/activity")
+    assert response.status_code == 200, response.text
+    entries = response.json()["activities"]
+
+    # Newest first, spanning both courses: the edit to `first` is the most
+    # recent event, then each course's own "created" entry.
+    assert [e["action"] for e in entries] == ["updated", "created", "created"]
+    course_ids = {e["course_id"] for e in entries}
+    assert course_ids == {first["course_id"], second["course_id"]}
+    titles = {e["course_title"] for e in entries}
+    assert titles == {"First Course", "Second Course"}
+
+
+def test_workspace_activity_only_shows_the_callers_own_courses(activity_client):
+    _register(activity_client, _email("act-workspace-owner"))
+    _create_course(activity_client, "Owner's Course")
+    activity_client.post("/auth/logout")
+
+    _register(activity_client, _email("act-workspace-other"))
+    _create_course(activity_client, "Other User's Course")
+
+    response = activity_client.get("/api/activity")
+    assert response.status_code == 200, response.text
+    titles = {e["course_title"] for e in response.json()["activities"]}
+    assert titles == {"Other User's Course"}
+
+
+def test_workspace_activity_is_empty_for_a_user_with_no_courses(activity_client):
+    _register(activity_client, _email("act-workspace-empty"))
+    response = activity_client.get("/api/activity")
+    assert response.status_code == 200, response.text
+    assert response.json()["activities"] == []

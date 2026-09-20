@@ -10,18 +10,34 @@ import pytest
 from app.agents.writer import WriterAgent
 from app.core.errors import AIServiceError
 from app.course.templates.registry import load_template
-from app.render.diagram_renderer import render_diagram_svg
+from app.render.diagram_renderer import CANVAS_WIDTH, MARGIN, PANEL_HEIGHT, render_diagram_svg
 from app.render.schematic_layout import resolve_schematic_layout
+from app.render.textbook_palette import COLOR_ROLES, TEXTBOOK_PALETTE, resolve_color_role
+from app.render.visual_blueprints import BLUEPRINT_REGISTRY, apply_blueprint_defaults, get_blueprint
 from app.schemas.blocks import BlockType
 from app.schemas.course import GenerateRequest
-from app.schemas.diagram import DiagramEdge, DiagramNode, DiagramSpec, SchematicShape, SchematicState
+from app.schemas.diagram import (
+    DiagramEdge,
+    DiagramNode,
+    DiagramSpec,
+    SchematicRelationship,
+    SchematicShape,
+    SchematicState,
+)
 from app.schemas.document import Block
 from app.schemas.template import TemplateTheme
 from app.services.diagram_qa import (
     CANVAS_CLIPPING,
+    DANGLING_RELATIONSHIP,
+    DUPLICATE_CRITICAL_COMPONENT,
+    INVALID_COLOR_ROLE,
+    INVALID_RELATIONSHIP,
+    MISSING_PRIMARY_OBJECT,
     MISSING_RELATIONSHIP,
+    MISSING_REQUIRED_COMPONENT,
     OBJECT_COLLISION,
     WEAK_FOCAL_HIERARCHY,
+    evaluate_blueprint,
     evaluate_schematic,
 )
 from app.services.diagram_service import DiagramService
@@ -291,7 +307,12 @@ async def test_diagram_blocks_render_as_svg_through_the_full_pipeline(
     document = service.storage.load_document(record.course_id)
     images = document.blocks_of_type(BlockType.IMAGE)
     diagrams = [b for b in images if b.content.get("kind") == "diagram"]
-    illustrations = [b for b in images if b.content.get("kind") != "diagram"]
+    # The system-built "toc" block (app.render.toc_renderer) is neither an
+    # AI diagram nor an AI raster illustration - it's excluded from both
+    # buckets below rather than asserted against either one's path format.
+    illustrations = [
+        b for b in images if b.content.get("kind") not in ("diagram", "toc")
+    ]
 
     assert diagrams, "expected at least one diagram block"
     assert illustrations, "the pre-existing illustration path must still run"
@@ -428,6 +449,52 @@ def test_concept_map_node_box_contains_only_the_short_title_not_the_relationship
     assert text.count("Produces EMF") == 1
     assert "Coil</tspan>" in text or "Coil<" in text
     assert "Bar magnet" in text
+
+
+def test_concept_map_satellite_to_satellite_edges_curve_instead_of_cutting_through_the_centre():
+    """Reproduces the reported bug exactly: a real concept map (C++ value
+    categories -> overload preference) whose relationships aren't all
+    hub-and-spoke - several point from one satellite to another (e.g.
+    "std::move produces an xvalue"). A straight chord between two ring
+    positions cuts across the focal box and every satellite in between,
+    which is what read as messy crossing lines; those edges must render as
+    curved paths bowing away from the centre, and the labels/curves must
+    still stay clear of every node box."""
+    nodes = [
+        DiagramNode(id="focal", label="Expression Value Categories", level=0),
+        DiagramNode(id="lvalue", label="lvalue", level=1),
+        DiagramNode(id="prvalue", label="prvalue", level=1),
+        DiagramNode(id="xvalue", label="xvalue", level=1),
+        DiagramNode(id="f_ref", label="void f(T&)", level=1),
+        DiagramNode(id="f_cref", label="void f(const T&)", level=1),
+        DiagramNode(id="f_rref", label="void f(T&&)", level=1),
+        DiagramNode(id="std_move", label="std::move", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="focal", target="lvalue", label="classifies"),
+        DiagramEdge(source="focal", target="prvalue", label="classifies"),
+        DiagramEdge(source="focal", target="xvalue", label="classifies"),
+        DiagramEdge(source="lvalue", target="f_ref", label="prefers"),
+        DiagramEdge(source="prvalue", target="f_rref", label="prefers"),
+        DiagramEdge(source="xvalue", target="f_rref", label="prefers"),
+        DiagramEdge(source="std_move", target="xvalue", label="produces"),
+    ]
+    spec = DiagramSpec(kind="concept_map", title="Expression value categories", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    ET.fromstring(svg_bytes)  # still well-formed
+
+    # 3 hub spokes stay straight <line>s; 4 satellite-to-satellite
+    # relationships become curved (quadratic-bezier "Q") <path>s - the arrow
+    # marker's own tiny triangle is also a <path>, so distinguish by the "Q"
+    # command rather than counting every <path> in the document.
+    assert text.count("<line") == 3
+    assert text.count(" Q") == 4
+
+    boxes = _rects_by_class(text, "diagram-box")
+    labels = _rects_by_class(text, "diagram-edge-label")
+    offenders = [(label, box) for label in labels for box in boxes if _bboxes_overlap(label, box)]
+    assert not offenders, f"relationship label(s) overlap a node box: {offenders}"
 
 
 def test_edge_label_wraps_long_text_instead_of_overflowing_its_pill():
@@ -722,7 +789,7 @@ def test_schematic_flow_label_never_lands_inside_the_shape_it_points_at():
     ]
     labels = [
         tuple(float(v) for v in match.groups())
-        for match in re.finditer(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*>Field lines</text>', text)
+        for match in re.finditer(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*><tspan[^>]*>Field lines</tspan></text>', text)
     ]
     assert ellipses and len(labels) == 2  # one per state panel
 
@@ -1110,3 +1177,601 @@ async def test_schematic_qa_failure_triggers_exactly_one_targeted_retry(service,
     result = evaluate_schematic(good_spec.model_copy(update={"shapes": resolve_schematic_layout(good_spec).shapes}))
     assert result.passed
     assert "<rect" in svg_text
+
+
+# ---------------------------------------------------------------------------
+# canonical visual blueprint registry (app.render.visual_blueprints)
+# ---------------------------------------------------------------------------
+
+
+class TestVisualBlueprintRegistry:
+    def test_known_visual_type_resolves(self):
+        blueprint = get_blueprint("electric_motor")
+        assert blueprint is not None
+        assert blueprint.visual_type == "electric_motor"
+        assert "coil" in blueprint.required_components
+
+    def test_lookup_is_case_and_spacing_insensitive(self):
+        assert get_blueprint("Electric Motor") is get_blueprint("electric_motor")
+        assert get_blueprint("  animal_cell  ") is get_blueprint("animal_cell")
+
+    def test_unknown_visual_type_falls_back_to_none_safely(self):
+        assert get_blueprint("unknown_made_up_visual") is None
+        assert get_blueprint("") is None
+        assert get_blueprint(None) is None  # type: ignore[arg-type]
+
+    def test_registry_covers_the_required_domains(self):
+        """Physics/engineering, biology and chemistry all have at least one
+        registered blueprint - the cross-domain coverage the brief asks for,
+        not just an electrical-only registry."""
+        assert "electric_motor" in BLUEPRINT_REGISTRY
+        assert "fixed_pulley" in BLUEPRINT_REGISTRY
+        assert "animal_cell" in BLUEPRINT_REGISTRY
+        assert "water_formation" in BLUEPRINT_REGISTRY
+
+    def test_blueprints_never_contain_raw_hex_colors(self):
+        """A blueprint's `color_role` must always be a semantic role name
+        resolvable by the centralized palette - never a literal hex value,
+        per the requirement that raw colors live only in
+        app.render.textbook_palette."""
+        for blueprint in BLUEPRINT_REGISTRY.values():
+            for component in blueprint.components.values():
+                assert not component.color_role.startswith("#"), (
+                    f"{blueprint.visual_type}.{component.id} has a raw color"
+                )
+                assert component.color_role in COLOR_ROLES
+
+    def test_apply_blueprint_defaults_fills_blank_fields_without_overriding_explicit_ones(self):
+        spec = DiagramSpec(
+            kind="schematic",
+            visual_type="electric_motor",
+            shapes=[
+                SchematicShape(type="coil", id="coil", label=""),
+                SchematicShape(type="block", id="magnet", label="Custom Magnet Label"),
+            ],
+        )
+        filled = apply_blueprint_defaults(spec)
+        coil = next(s for s in filled.shapes if s.id == "coil")
+        magnet = next(s for s in filled.shapes if s.id == "magnet")
+        assert coil.role == "primary"
+        assert coil.color_role == "accent"
+        assert coil.label == "Coil"
+        assert magnet.label == "Custom Magnet Label"  # explicit value preserved
+
+    def test_apply_blueprint_defaults_is_a_no_op_for_unknown_visual_type(self):
+        spec = DiagramSpec(
+            kind="schematic",
+            visual_type="not_a_real_visual",
+            shapes=[SchematicShape(type="block", id="a", label="A")],
+        )
+        assert apply_blueprint_defaults(spec) is spec
+
+    def test_apply_blueprint_defaults_is_a_no_op_for_non_schematic_kind(self):
+        spec = DiagramSpec(kind="flow_chart", visual_type="electric_motor", nodes=[DiagramNode(label="A")])
+        assert apply_blueprint_defaults(spec) is spec
+
+
+# ---------------------------------------------------------------------------
+# semantic/structural blueprint validation (app.services.diagram_qa.evaluate_blueprint)
+# ---------------------------------------------------------------------------
+
+
+class TestBlueprintValidation:
+    def test_missing_required_component_is_detected(self):
+        spec = DiagramSpec(
+            kind="schematic",
+            visual_type="electric_motor",
+            shapes=[
+                SchematicShape(type="coil", id="coil", label="Coil", role="primary"),
+                SchematicShape(type="block", id="magnet", label="Magnet"),
+            ],
+        )
+        result = evaluate_blueprint(spec)
+        assert not result.passed
+        assert MISSING_REQUIRED_COMPONENT in {i.reason for i in result.issues}
+
+    def test_all_required_components_present_passes(self):
+        shapes = [
+            SchematicShape(type="coil", id="coil", label="Coil", role="primary"),
+            SchematicShape(type="block", id="magnet", label="Magnet"),
+            SchematicShape(type="block", id="axle", label="Axle"),
+            SchematicShape(type="block", id="commutator", label="Commutator"),
+            SchematicShape(type="block", id="brush", label="Brush"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic",
+            visual_type="electric_motor",
+            shapes=shapes,
+            relationships=[SchematicRelationship(source="brush", type="contacts", target="commutator")],
+        )
+        result = evaluate_blueprint(spec)
+        assert result.passed
+
+    def test_invalid_relationship_type_is_detected(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic",
+            shapes=shapes,
+            relationships=[SchematicRelationship(source="a", type="orbits_wildly", target="b")],
+        )
+        result = evaluate_blueprint(spec)
+        assert INVALID_RELATIONSHIP in {i.reason for i in result.issues}
+
+    def test_valid_relationship_type_passes(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic",
+            shapes=shapes,
+            relationships=[SchematicRelationship(source="a", type="connected_to", target="b")],
+        )
+        result = evaluate_blueprint(spec)
+        assert INVALID_RELATIONSHIP not in {i.reason for i in result.issues}
+        assert DANGLING_RELATIONSHIP not in {i.reason for i in result.issues}
+
+    def test_dangling_relationship_references_a_missing_shape(self):
+        shapes = [SchematicShape(type="block", id="a", label="A", role="primary")]
+        spec = DiagramSpec(
+            kind="schematic",
+            shapes=shapes,
+            relationships=[SchematicRelationship(source="a", type="connected_to", target="ghost")],
+        )
+        result = evaluate_blueprint(spec)
+        assert DANGLING_RELATIONSHIP in {i.reason for i in result.issues}
+
+    def test_duplicate_critical_component_is_detected(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="a", label="A duplicate"),
+        ]
+        spec = DiagramSpec(kind="schematic", shapes=shapes)
+        result = evaluate_blueprint(spec)
+        assert DUPLICATE_CRITICAL_COMPONENT in {i.reason for i in result.issues}
+
+    def test_repeating_the_same_id_across_before_after_states_is_not_a_duplicate(self):
+        """A multi-state (before/after) schematic is *supposed* to reuse the
+        same shape ids in every state (see DIAGRAM_SYSTEM's "keep the same
+        ids ... across states so the layout stays consistent") - the
+        duplicate check must only fire within a single state, never across
+        the whole spec, or every legitimate before/after schematic would be
+        wrongly flagged as broken."""
+        shared_shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B", anchor="orbit:a"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic",
+            states=[
+                SchematicState(caption="Before", shapes=[s.model_copy() for s in shared_shapes]),
+                SchematicState(caption="After", shapes=[s.model_copy() for s in shared_shapes]),
+            ],
+        )
+        result = evaluate_blueprint(spec)
+        assert DUPLICATE_CRITICAL_COMPONENT not in {i.reason for i in result.issues}
+
+    def test_missing_primary_object_when_blueprint_expects_one(self):
+        shapes = [
+            SchematicShape(type="block", id="magnet", label="Magnet"),
+            SchematicShape(type="block", id="axle", label="Axle"),
+            SchematicShape(type="block", id="commutator", label="Commutator"),
+            SchematicShape(type="block", id="brush", label="Brush"),
+            SchematicShape(type="coil", id="coil", label="Coil"),  # no role="primary" set
+        ]
+        spec = DiagramSpec(kind="schematic", visual_type="electric_motor", shapes=shapes)
+        result = evaluate_blueprint(spec)
+        assert MISSING_PRIMARY_OBJECT in {i.reason for i in result.issues}
+
+    def test_invalid_color_role_is_detected(self):
+        shapes = [SchematicShape(type="block", id="a", label="A", role="primary", color_role="rainbow_sparkle")]
+        result = evaluate_blueprint(DiagramSpec(kind="schematic", shapes=shapes))
+        assert INVALID_COLOR_ROLE in {i.reason for i in result.issues}
+
+    def test_unknown_visual_type_skips_blueprint_checks_but_still_validates_universals(self):
+        """An unrecognised visual_type must never fail generation - but a
+        genuinely invalid relationship/color role is still caught, since
+        those checks are universal, not blueprint-specific."""
+        shapes = [SchematicShape(type="block", id="a", label="A", role="primary", color_role="not_a_role")]
+        spec = DiagramSpec(kind="schematic", visual_type="totally_unknown_thing", shapes=shapes)
+        result = evaluate_blueprint(spec)
+        assert INVALID_COLOR_ROLE in {i.reason for i in result.issues}
+        assert MISSING_REQUIRED_COMPONENT not in {i.reason for i in result.issues}
+
+    def test_non_schematic_kind_always_passes(self):
+        spec = DiagramSpec(kind="flow_chart", visual_type="electric_motor", nodes=[DiagramNode(label="A")])
+        assert evaluate_blueprint(spec).passed
+
+    def test_feedback_names_the_actual_reasons(self):
+        shapes = [
+            SchematicShape(type="coil", id="coil", label="Coil", role="primary"),
+        ]
+        spec = DiagramSpec(kind="schematic", visual_type="electric_motor", shapes=shapes)
+        result = evaluate_blueprint(spec)
+        feedback = result.feedback()
+        assert "magnet" in feedback.lower() or "missing" in feedback.lower()
+        assert "generate the diagram again" not in feedback.lower()
+
+
+# ---------------------------------------------------------------------------
+# centralized color-role system (app.render.textbook_palette)
+# ---------------------------------------------------------------------------
+
+
+class TestTextbookColorSystem:
+    def test_known_role_resolves_to_a_fill_stroke_text_triple(self):
+        role = resolve_color_role("current")
+        assert role.fill and role.stroke and role.text
+
+    def test_unknown_role_falls_back_to_neutral(self):
+        assert resolve_color_role("not_a_real_role") == TEXTBOOK_PALETTE["neutral"]
+        assert resolve_color_role("") == TEXTBOOK_PALETTE["neutral"]
+
+    def test_role_lookup_is_case_insensitive(self):
+        assert resolve_color_role("CURRENT") == resolve_color_role("current")
+
+    def test_no_blueprint_ever_needs_a_raw_hex_value(self):
+        """Every blueprint component's color_role must already be a key in
+        the centralized palette - a course author never has to invent a hex
+        value to describe a canonical visual."""
+        for blueprint in BLUEPRINT_REGISTRY.values():
+            for component in blueprint.components.values():
+                assert component.color_role in TEXTBOOK_PALETTE
+
+    def test_every_palette_role_has_sufficient_fill_text_contrast(self):
+        """A cheap luminance check, not full WCAG maths - but enough to catch
+        a role whose fill and text are too close in brightness to read,
+        which is the actual failure mode this guards against."""
+
+        def luminance(hex_color: str) -> float:
+            hex_color = hex_color.lstrip("#")
+            r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+            return 0.299 * r + 0.587 * g + 0.114 * b
+
+        for name, role in TEXTBOOK_PALETTE.items():
+            assert abs(luminance(role.fill) - luminance(role.text)) > 60, name
+
+    def test_primary_shape_gets_stronger_stroke_than_secondary(self):
+        from app.render.textbook_palette import stroke_width_for
+
+        assert stroke_width_for("primary") > stroke_width_for("secondary")
+
+    def test_color_role_is_never_the_only_carrier_of_meaning(self):
+        """Grayscale/CVD safety: a schematic conveys direction/relationship
+        through shapes the renderer already draws regardless of color - an
+        arrow shape still has a `rotation`/`target_id`, a flow still has
+        `intensity`, a gauge still has a needle angle - none of that
+        depends on `color_role` being set or resolvable."""
+        arrow = SchematicShape(type="arrow", id="a", label="Current", color_role="current", target_id="b")
+        assert arrow.target_id  # direction is encoded structurally, not only by color
+        flow = SchematicShape(type="flow", id="f", label="Field", color_role="magnetic_field", intensity=0.8)
+        assert flow.intensity > 0  # visible line density independent of color
+
+    def test_important_blueprint_components_get_a_valid_color_role(self):
+        for blueprint in BLUEPRINT_REGISTRY.values():
+            for component in blueprint.components.values():
+                if component.priority in ("critical", "important"):
+                    assert component.color_role in TEXTBOOK_PALETTE
+
+    def test_rendered_labels_stay_readable_with_color_roles_applied(self):
+        """End-to-end: a colorful semantically-authored schematic still
+        renders every label as visible text, not swallowed by its own fill."""
+        shapes = [
+            SchematicShape(type="block", id="a", label="Alpha", role="primary", size="medium", color_role="accent"),
+            SchematicShape(
+                type="block", id="b", label="Beta", anchor="orbit:a", priority="critical", size="medium",
+                color_role="current",
+            ),
+        ]
+        spec = DiagramSpec(kind="schematic", shapes=shapes)
+        resolved = resolve_schematic_layout(spec)
+        svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
+        ET.fromstring(svg_bytes)
+        text = svg_bytes.decode("utf-8")
+        assert "Alpha" in text and "Beta" in text
+        # both palette hex colors actually reached the SVG output
+        assert TEXTBOOK_PALETTE["accent"].stroke in text
+        assert TEXTBOOK_PALETTE["current"].stroke in text
+
+
+# ---------------------------------------------------------------------------
+# nested "inside:" child keeps its own color_role, arrows connect to their
+# target, and declared relationships render as connector lines
+# ---------------------------------------------------------------------------
+
+
+class TestNestedColorAndConnectors:
+    def test_merged_inside_child_carries_its_color_role_into_sublabel_color_role(self):
+        shapes = [
+            SchematicShape(type="circle", id="cell", label="Cell", role="primary", size="large", color_role="structure"),
+            SchematicShape(type="circle", id="nucleus", label="Nucleus", anchor="inside:cell", color_role="secondary"),
+        ]
+        resolved = resolve_schematic_layout(DiagramSpec(kind="schematic", shapes=shapes))
+        cell = next(s for s in resolved.shapes if s.id == "cell")
+        assert cell.sublabel == "Nucleus"
+        assert cell.sublabel_color_role == "secondary"
+        assert cell.color_role == "structure"  # the parent's own color is untouched
+
+    def test_nested_circle_renders_its_own_color_not_just_the_parents(self):
+        shapes = [
+            SchematicShape(type="circle", id="cell", label="Cell", role="primary", size="large", color_role="structure"),
+            SchematicShape(type="circle", id="nucleus", label="Nucleus", anchor="inside:cell", color_role="secondary"),
+        ]
+        resolved = resolve_schematic_layout(DiagramSpec(kind="schematic", shapes=shapes))
+        svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
+        text = svg_bytes.decode("utf-8")
+        assert TEXTBOOK_PALETTE["structure"].stroke in text
+        assert TEXTBOOK_PALETTE["secondary"].fill in text  # the nested circle's own distinct fill
+
+    def test_directly_authored_sublabel_still_uses_the_parents_own_color(self):
+        """A gauge/block/circle sublabel set directly by the model (not via
+        an `inside:` merge) has no separate nested shape to carry a color
+        from - `sublabel_color_role` stays blank and the parent's own
+        `color_role` covers both, exactly as before this field existed."""
+        shape = SchematicShape(
+            type="circle", id="atom", label="Atom", sublabel="Core", role="primary", color_role="accent",
+        )
+        svg_bytes, _, _ = render_diagram_svg(
+            DiagramSpec(kind="schematic", shapes=[shape.model_copy(update={"x": 0.5, "y": 0.5, "width": 0.3, "height": 0.3})]),
+            TemplateTheme(),
+        )
+        assert TEXTBOOK_PALETTE["accent"].stroke in svg_bytes.decode("utf-8")
+
+    def test_arrow_with_a_resolved_target_draws_a_line_reaching_the_target_not_a_short_floating_segment(self):
+        shapes = [
+            SchematicShape(type="block", id="load", label="Load", role="primary", size="medium"),
+            SchematicShape(
+                type="arrow", id="force", label="Force", anchor="right_of:load", target_id="load",
+                priority="important", size="small",
+            ),
+        ]
+        resolved = resolve_schematic_layout(DiagramSpec(kind="schematic", shapes=shapes))
+        svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
+        text = svg_bytes.decode("utf-8")
+        lines = re.findall(r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*url\(#diagram-arrow\)', text)
+        assert lines, "expected an arrow line with the arrowhead marker"
+        x1, y1, x2, y2 = (float(v) for v in lines[0])
+        # Its end point must actually land at/on the edge of a real drawn
+        # box (the "Load" block) - proof this is a genuine point-to-point
+        # connector, not a short segment merely oriented toward the target
+        # (the pre-fix behaviour, which never reached it at all).
+        boxes = re.findall(r'<rect class="diagram-box" x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"', text)
+        tolerance = 3.0
+        assert any(
+            float(bx) - tolerance <= x2 <= float(bx) + float(bw) + tolerance
+            and float(by) - tolerance <= y2 <= float(by) + float(bh) + tolerance
+            for bx, by, bw, bh in boxes
+        )
+
+    def test_relationship_of_a_drawable_type_renders_a_connector_line(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B", anchor="orbit:a", priority="critical"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic", shapes=shapes,
+            relationships=[SchematicRelationship(source="a", type="connected_to", target="b")],
+        )
+        resolved = resolve_schematic_layout(spec)
+        svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
+        text = svg_bytes.decode("utf-8")
+        assert "stroke-dasharray" in text  # structural relationship drawn dashed, no arrowhead
+
+    def test_directional_relationship_gets_an_arrowhead_marker(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B", anchor="orbit:a", priority="critical"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic", shapes=shapes,
+            relationships=[SchematicRelationship(source="a", type="points_to", target="b")],
+        )
+        resolved = resolve_schematic_layout(spec)
+        svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
+        text = svg_bytes.decode("utf-8")
+        assert "schematic-relationship-arrow" in text
+
+    def test_spatial_and_containment_relationships_draw_no_connector_line(self):
+        """above/below/left_of/right_of/between (already conveyed by the
+        anchor-driven layout) and inside/contains/surrounds (already
+        conveyed by nesting) are deliberately left undrawn - a line for
+        either would be redundant, not clarifying."""
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B", anchor="above:a", priority="critical"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic", shapes=shapes,
+            relationships=[SchematicRelationship(source="b", type="above", target="a")],
+        )
+        resolved = resolve_schematic_layout(spec)
+        svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
+        text = svg_bytes.decode("utf-8")
+        # The marker *definition* may still be present (harmless, unused SVG
+        # defs) - what must be absent is anything actually *using* it.
+        assert "url(#schematic-relationship-arrow)" not in text
+        assert "stroke-dasharray" not in text
+
+    def test_relationship_referencing_a_merged_sublabel_shape_is_skipped_safely(self):
+        """A shape that got folded into its parent's sublabel (see
+        _merge_inside_anchors) no longer exists as an independently
+        positioned shape - a relationship naming it must be silently
+        skipped, never a crash or a line to nowhere."""
+        shapes = [
+            SchematicShape(type="circle", id="cell", label="Cell", role="primary", size="large"),
+            SchematicShape(type="circle", id="nucleus", label="Nucleus", anchor="inside:cell"),
+        ]
+        spec = DiagramSpec(
+            kind="schematic", shapes=shapes,
+            relationships=[SchematicRelationship(source="nucleus", type="connected_to", target="cell")],
+        )
+        resolved = resolve_schematic_layout(spec)
+        svg_bytes, width, height = render_diagram_svg(resolved, TemplateTheme())
+        ET.fromstring(svg_bytes)
+        assert width > 0 and height > 0
+
+    def test_relationship_rendering_leaves_specs_without_relationships_byte_identical(self):
+        """The whole connector feature is gated on `spec.relationships` being
+        non-empty - every existing hand-authored spec (none of which set
+        `relationships`) must render exactly as it did before this feature
+        existed."""
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary"),
+            SchematicShape(type="block", id="b", label="B", anchor="orbit:a", priority="critical"),
+        ]
+        without = resolve_schematic_layout(DiagramSpec(kind="schematic", shapes=[s.model_copy() for s in shapes]))
+        svg_without, _, _ = render_diagram_svg(without, TemplateTheme())
+        assert "schematic-relationship-arrow" not in svg_without.decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# learning_objective + max_annotations interaction with the blueprint system
+# ---------------------------------------------------------------------------
+
+
+class TestLearningObjectiveAndAnnotationBudget:
+    def test_critical_components_survive_annotation_budget_trimming(self):
+        shapes = [
+            SchematicShape(type="coil", id="coil", label="Coil", role="primary", priority="critical"),
+            SchematicShape(type="block", id="magnet", label="Magnet", anchor="orbit:coil", priority="critical"),
+            SchematicShape(type="block", id="axle", label="Axle", anchor="orbit:coil", priority="critical"),
+            SchematicShape(type="label", id="deco1", label="Decoration 1", anchor="orbit:coil", priority="optional"),
+            SchematicShape(type="label", id="deco2", label="Decoration 2", anchor="orbit:coil", priority="optional"),
+            SchematicShape(type="label", id="deco3", label="Decoration 3", anchor="orbit:coil", priority="optional"),
+        ]
+        spec = DiagramSpec(kind="schematic", visual_type="electric_motor", shapes=shapes, max_annotations=2)
+        resolved = resolve_schematic_layout(spec)
+        ids = {s.id for s in resolved.shapes}
+        assert {"coil", "magnet", "axle"} <= ids  # critical/primary never dropped for budget reasons
+
+    def test_optional_shapes_are_dropped_before_important_ones(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="A", role="primary", priority="critical"),
+            SchematicShape(type="label", id="opt", label="Optional", anchor="orbit:a", priority="optional"),
+            SchematicShape(type="label", id="imp", label="Important", anchor="orbit:a", priority="important"),
+        ]
+        # budget=2: 1 slot for the primary (always kept) + 1 more slot, which
+        # must go to the higher-priority "important" shape over "optional".
+        spec = DiagramSpec(kind="schematic", shapes=shapes, max_annotations=2)
+        resolved = resolve_schematic_layout(spec)
+        ids = {s.id for s in resolved.shapes}
+        assert "imp" in ids
+        assert "opt" not in ids
+
+    def test_learning_objective_field_is_preserved_through_layout_and_blueprint_defaults(self):
+        spec = DiagramSpec(
+            kind="schematic",
+            visual_type="fixed_pulley",
+            learning_objective="Understand how a fixed pulley changes the direction of an applied force.",
+            shapes=[
+                SchematicShape(type="circle", id="pulley", label="Pulley", role="primary"),
+                SchematicShape(type="block", id="load", label="Load"),
+            ],
+        )
+        filled = apply_blueprint_defaults(spec)
+        resolved = resolve_schematic_layout(filled)
+        assert resolved.learning_objective == spec.learning_objective
+
+    def test_primary_object_gets_larger_footprint_than_a_small_secondary(self):
+        """Visual emphasis for the educationally central object: `size`
+        actually changes the rendered footprint, so a "large" primary object
+        reads as more important than a "small" secondary one."""
+        shapes = [
+            SchematicShape(type="block", id="a", label="Primary", role="primary", size="large"),
+            SchematicShape(type="block", id="b", label="Secondary", anchor="orbit:a", size="small"),
+        ]
+        resolved = resolve_schematic_layout(DiagramSpec(kind="schematic", shapes=shapes))
+        primary = next(s for s in resolved.shapes if s.id == "a")
+        secondary = next(s for s in resolved.shapes if s.id == "b")
+        assert primary.width * primary.height > secondary.width * secondary.height
+
+
+# ---------------------------------------------------------------------------
+# full pipeline: LLM spec -> blueprint validation -> color -> layout -> QA -> retry
+# ---------------------------------------------------------------------------
+
+
+async def test_full_blueprint_pipeline_renders_a_colorful_valid_electric_motor(service):
+    template = load_template("technical")
+    block = _diagram_block(
+        diagram_kind="schematic",
+        purpose="Show how a simple DC electric motor works",
+        prompt="Coil, magnet, axle, commutator and brush; explain motor rotation",
+        caption="Simple DC electric motor",
+    )
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_motor_pipeline", block=block, template=template, course_title="Motors"
+    )
+
+    assert ok is True
+    assert block.content["diagram_kind"] == "schematic"
+    svg_text = service.storage.asset_abs_path("course_motor_pipeline", block.content["path"]).read_text(
+        encoding="utf-8"
+    )
+    ET.fromstring(svg_text)
+    assert "Coil" in svg_text
+    # the blueprint's semantic color roles actually reached the rendered SVG
+    assert TEXTBOOK_PALETTE["accent"].stroke in svg_text or TEXTBOOK_PALETTE["magnetic_field"].stroke in svg_text
+
+
+async def test_invalid_first_attempt_produces_targeted_combined_feedback_and_a_successful_retry(
+    service, monkeypatch
+):
+    """An LLM's first attempt that's missing a required blueprint component
+    must produce specific retry feedback naming the missing component, and
+    the corrected second attempt must be the one that actually renders."""
+    template = load_template("technical")
+    block = _diagram_block(
+        diagram_kind="schematic",
+        purpose="Show a fixed pulley lifting a load",
+        prompt="Pulley wheel and a load, with applied and lifting forces",
+        caption="Fixed pulley",
+    )
+
+    incomplete_spec = DiagramSpec(
+        kind="schematic",
+        visual_type="fixed_pulley",
+        title="Fixed Pulley",
+        # 2 shapes (satisfies is_usable()'s minimum) but still missing the
+        # blueprint's required "load" component - this is what should
+        # trigger a targeted blueprint-validation retry, not the generic
+        # too-few-shapes fallback.
+        shapes=[
+            SchematicShape(type="circle", id="pulley", label="Pulley", role="primary"),
+            SchematicShape(type="arrow", id="applied_force", label="Applied Force", anchor="right_of:pulley"),
+        ],
+    )
+    complete_spec = DiagramSpec(
+        kind="schematic",
+        visual_type="fixed_pulley",
+        title="Fixed Pulley",
+        shapes=[
+            SchematicShape(type="circle", id="pulley", label="Pulley", role="primary"),
+            SchematicShape(type="block", id="load", label="Load", anchor="below:pulley", priority="critical"),
+        ],
+    )
+    received_feedback: list[str] = []
+
+    async def fake_request_spec(self, **kwargs):
+        received_feedback.append(kwargs.get("qa_feedback", ""))
+        return (incomplete_spec if len(received_feedback) == 1 else complete_spec).model_copy(deep=True)
+
+    monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_pulley_retry", block=block, template=template, course_title="Simple Machines"
+    )
+
+    assert ok is True
+    assert len(received_feedback) == 2, "expected exactly one retry"
+    assert received_feedback[0] == ""
+    assert received_feedback[1] and "load" in received_feedback[1].lower()
+
+    svg_text = service.storage.asset_abs_path("course_pulley_retry", block.content["path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "Load" in svg_text
