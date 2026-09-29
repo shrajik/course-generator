@@ -10,13 +10,14 @@ from app.schemas.blocks import BlockType
 from app.schemas.draft import DraftBlock
 
 
-def _image_draft(image_kind: str) -> DraftBlock:
+def _image_draft(image_kind: str, *, illustration_style: str = "") -> DraftBlock:
     return DraftBlock(
         type=BlockType.IMAGE,
         image_purpose="A purpose",
         image_prompt="A prompt",
         caption="A caption",
         image_kind=image_kind,
+        illustration_style=illustration_style,
     )
 
 
@@ -43,3 +44,13 @@ def test_unrecognised_image_kind_falls_back_to_illustration():
 def test_image_kind_is_case_and_whitespace_insensitive():
     content = draft_to_content(_image_draft("  Concept_Experience  "))
     assert content["kind"] == "concept_experience"
+
+
+def test_illustration_style_textbook_passes_through():
+    content = draft_to_content(_image_draft("illustration", illustration_style="  Textbook  "))
+    assert content["illustration_style"] == "textbook"
+
+
+def test_illustration_style_blank_by_default():
+    content = draft_to_content(_image_draft("illustration"))
+    assert content["illustration_style"] == ""

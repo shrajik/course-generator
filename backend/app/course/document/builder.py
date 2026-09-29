@@ -5,11 +5,14 @@ from __future__ import annotations
 from app.core.ids import block_id as new_block_id
 from app.core.ids import document_id_for_course, page_id, utc_now_iso
 from app.core.logging import get_logger
-from app.course.document.layout import estimate_height, flow_blocks
+from app.course.document.layout import estimate_height, flow_blocks, page_visual_fraction
+from app.course.document.layout_validator import validate_document
 from app.render.toc_renderer import TocChapter, estimate_toc_pixel_size, render_toc_html
 from app.schemas.blocks import BlockType
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.document import (
+    PAGE_HEIGHT,
+    PAGE_MARGIN_BOTTOM,
     Block,
     BlockLayout,
     BlockMeta,
@@ -24,6 +27,64 @@ from app.schemas.template import CourseTemplate
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
+
+
+def _log_visual_balance(pages: list[Page]) -> None:
+    """Observability for the 60/40 text/visual target - a real, measured
+    number from the actual paginated output (see page_visual_fraction), not
+    a claim based on what the writer's prompt asked for. Logs only; never
+    blocks or fails document assembly over this - a thin content page is
+    sometimes genuinely correct (a pure-summary page, a quiz page)."""
+    content_pages = [p for p in pages if p.kind == "content" and p.blocks]
+    if not content_pages:
+        return
+    thin = [p for p in content_pages if page_visual_fraction(p.blocks) == 0.0]
+    if thin:
+        log.info(
+            "%s/%s content pages have no visual content (page numbers: %s)",
+            len(thin), len(content_pages), [p.page_number for p in thin[:10]],
+        )
+
+
+def _log_layout_findings(document: CourseDocument) -> None:
+    """Structural sanity check on the just-paginated document (overflow,
+    overlap, orphaned-fragment pages - see layout_validator). Logs only,
+    same as `_log_visual_balance` - a genuine finding here means the layout
+    math produced something the PDF/editor could mis-render, worth knowing
+    about immediately rather than only when a reader notices, but it must
+    never block a course from finishing generation over it."""
+    findings = validate_document(document)
+    if findings:
+        log.warning(
+            "Document %s has %s content page(s) failing layout validation: %s",
+            document.document_id, len(findings), findings,
+        )
+
+
+def _page_size_for(page_blocks: list[Block]) -> PageSize:
+    """The standard `PageSize()` for every ordinary page - EXCEPT when this
+    page's own blocks genuinely don't fit inside it.
+
+    The rendered `.page` div is `position: relative; overflow: hidden` at a
+    fixed `width`/`height` taken straight from `Page.size` (see
+    app.render.html_renderer / course.html.j2), so a block whose
+    `layout.y + layout.height` exceeds that box's bottom edge is not "grown
+    by the CSS" - it is silently clipped, invisible in the rendered PDF. In
+    practice `flow_blocks` keeps every block's reserved height at or under
+    one page (see MAX_IMAGE_HEIGHT / concept_experience's own `_MAX_HEIGHT`
+    cap), so this only ever fires for the rare, genuinely unsplittable text
+    or code block flagged in `flow_blocks`'s own "Fresh page, unsplittable
+    and taller than a page" fallback - but when it does, growing this ONE
+    page's declared height (never the global default the rest of the
+    document uses) is what actually keeps that content visible instead of
+    quietly losing it."""
+    if not page_blocks:
+        return PageSize()
+    content_bottom = max(b.layout.y + b.layout.height for b in page_blocks)
+    needed_height = content_bottom + PAGE_MARGIN_BOTTOM
+    if needed_height <= PAGE_HEIGHT:
+        return PageSize()
+    return PageSize(height=round(needed_height, 2))
 
 
 def _stack(blocks: list[Block], *, start_y: float, gap: float = 20.0) -> list[Block]:
@@ -213,7 +274,7 @@ def build_document(
                 id=page_id(number),
                 page_number=number,
                 kind="content",
-                size=PageSize(),
+                size=_page_size_for(page_blocks),
                 background=template.theme.page_background,
                 blocks=page_blocks,
             )
@@ -242,6 +303,8 @@ def build_document(
         len(document.pages),
         len(chapters),
     )
+    _log_visual_balance(document.pages)
+    _log_layout_findings(document)
     return document
 
 
@@ -259,7 +322,7 @@ def reflow_document(document: CourseDocument, template: CourseTemplate) -> Cours
                 id=page_id(number),
                 page_number=number,
                 kind="content",
-                size=PageSize(),
+                size=_page_size_for(page_blocks),
                 background=template.theme.page_background,
                 blocks=page_blocks,
             )
@@ -268,4 +331,6 @@ def reflow_document(document: CourseDocument, template: CourseTemplate) -> Cours
         page.page_number = number
         page.id = page_id(number)
     document.pages = pages
+    _log_visual_balance(document.pages)
+    _log_layout_findings(document)
     return document

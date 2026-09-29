@@ -15,7 +15,7 @@ import math
 import re
 from typing import Any
 
-from app.schemas.blocks import BlockType
+from app.schemas.blocks import VISUAL_BLOCK_TYPES, BlockType
 from app.schemas.document import (
     CONTENT_HEIGHT,
     CONTENT_WIDTH,
@@ -27,6 +27,25 @@ from app.schemas.document import (
 BLOCK_GAP = 18.0
 SECTION_GAP = 26.0
 MIN_ORPHAN_SPACE = 140.0  # don't leave a heading alone at the bottom of a page
+
+# A page must already hold at least this much *absolute* content before this
+# module will break it early to keep a visual with its lead-in text (see
+# flow_blocks) - without this floor, a barely-started page (say, just a lone
+# heading) would keep breaking itself almost immediately, producing a string
+# of near-empty pages instead of the rare, deliberate early break this is
+# meant to be. Deliberately a fixed pixel amount, not a fraction of the page:
+# a percentage floor (this used to be 35% of CONTENT_HEIGHT) blocks the break
+# on a page that's already substantially, genuinely full of text just because
+# it hasn't crossed an arbitrary ratio - which is exactly the "text-heavy
+# page can't make room for its visual" gap this module exists to close.
+_MIN_CONTENT_BEFORE_EARLY_BREAK = 150.0
+
+# How many upcoming non-visual blocks this module will bridge over to find a
+# pending visual worth protecting. The writer rarely stacks more than one or
+# two paragraphs before a diagram/image; bounding the scan keeps the check
+# cheap and stops it from pulling in content that has nothing to do with the
+# decision at hand.
+_VISUAL_LOOKAHEAD_LIMIT = 3
 
 # Average glyph advance as a fraction of the font size, calibrated against the
 # metrics of the fonts Chromium actually falls back to (DejaVu / Liberation /
@@ -121,6 +140,19 @@ def _list_height(items: list[Any], *, font_size: float, width: float, lh: float)
 
 
 MAX_IMAGE_HEIGHT = 430.0
+# A deterministic SVG diagram (flow_chart, hierarchy, data_flow_diagram, ...)
+# is not a fixed-aspect decorative photo - a diagram with many nodes
+# genuinely needs real vertical room (a 14-node flow_chart can easily be
+# 800px+ tall at its natural width). Capping it at the same MAX_IMAGE_HEIGHT
+# a small photo uses forces a WIDTH-locked box (CONTENT_WIDTH stays fixed)
+# into a much shorter height, and since the actual `<img>` keeps its aspect
+# ratio (`max-height:100%; width:auto` - see course.html.j2), that shrinks
+# the rendered WIDTH just as drastically - confirmed: a real 880x1904
+# flow_chart rendered at ~199px wide under the old flat cap, unreadably
+# small. This mirrors concept_experience's own ceiling (_MAX_HEIGHT in
+# concept_experience_renderer.py) - "as tall as reasonably fits one page,
+# no more" - rather than a size meant for a small decorative picture.
+MAX_DIAGRAM_IMAGE_HEIGHT = CONTENT_HEIGHT - 100.0
 DEFAULT_IMAGE_ASPECT = 0.5625  # 16:9 until the real asset is measured
 
 
@@ -146,10 +178,15 @@ _UNCAPPED_IMAGE_KINDS = {"concept_experience", "toc"}
 def image_box_height(block: Block) -> float:
     """Height reserved for the picture itself (excluding caption and padding).
 
-    `MAX_IMAGE_HEIGHT` caps a raster/SVG picture's box - reasonable there,
-    since a photo or diagram at a fixed aspect ratio never needs to grow
-    past it. The kinds in `_UNCAPPED_IMAGE_KINDS` are not pictures at a fixed
-    aspect ratio; they manage their own one-page ceiling internally, so the
+    `MAX_IMAGE_HEIGHT` caps a decorative raster picture's box - reasonable
+    there, since a photo at a fixed aspect ratio never needs much vertical
+    room. A `kind == "diagram"` SVG gets the taller `MAX_DIAGRAM_IMAGE_HEIGHT`
+    instead - it's structured content whose real height reflects real node
+    count, not a decorative aspect ratio, so the same small cap would just
+    force its rendered WIDTH down too (both dimensions shrink together to
+    keep the aspect ratio - see MAX_DIAGRAM_IMAGE_HEIGHT's own docstring).
+    The kinds in `_UNCAPPED_IMAGE_KINDS` are not pictures at a fixed aspect
+    ratio at all; they manage their own one-page ceiling internally, so any
     cap here would only double (and wrongly shrink) what they already do.
     """
     pad = _padding(block)
@@ -161,8 +198,11 @@ def image_box_height(block: Block) -> float:
     else:
         aspect = DEFAULT_IMAGE_ASPECT
     height = width * aspect
-    if block.content.get("kind") in _UNCAPPED_IMAGE_KINDS:
+    kind = block.content.get("kind")
+    if kind in _UNCAPPED_IMAGE_KINDS:
         return height
+    if kind == "diagram":
+        return min(height, MAX_DIAGRAM_IMAGE_HEIGHT)
     return min(height, MAX_IMAGE_HEIGHT)
 
 
@@ -398,6 +438,23 @@ def _split_list(block: Block, key: str, available: float) -> tuple[Block, Block]
 # ---------------------------------------------------------------------------
 
 
+def _pending_visual_run(current_block: Block, queue: list[Block]) -> list[Block] | None:
+    """If a visual is coming up within a short, bridgeable run of non-visual
+    blocks starting right after `current_block`, return
+    `[current_block, ...bridged blocks..., visual]` - the whole group that
+    needs to land on the same page together. None when `current_block` is
+    itself a visual (nothing to "keep it with"), or no visual appears within
+    `_VISUAL_LOOKAHEAD_LIMIT` blocks."""
+    if current_block.type in VISUAL_BLOCK_TYPES:
+        return None
+    run = [current_block]
+    for candidate in queue[:_VISUAL_LOOKAHEAD_LIMIT]:
+        run.append(candidate)
+        if candidate.type in VISUAL_BLOCK_TYPES:
+            return run
+    return None
+
+
 def flow_blocks(blocks: list[Block]) -> list[list[Block]]:
     """Position blocks and group them into pages. Mutates layout coordinates."""
     pages: list[list[Block]] = []
@@ -431,6 +488,34 @@ def flow_blocks(blocks: list[Block]) -> list[list[Block]]:
         ):
             start_new_page()
             gap = 0.0
+
+        # Never let a visual (image/table/code) get separated from the text
+        # immediately before it - the writer places that text right next to
+        # the visual specifically because it explains it (see WRITER_SYSTEM's
+        # pacing rule), but plain sequential packing has no notion of that
+        # relationship: it only checks whether *this* block fits, so a
+        # paragraph (or two) can fill a page right up to the edge and leave
+        # the very visual it was building up to stranded alone at the top of
+        # the next page - a genuinely text-only page followed by a visual
+        # with no lead-in, not the 60/40 mix the writer intended. Looking
+        # ahead to find that pending visual (bridging over a short run of
+        # non-visual blocks, not just a single one - see
+        # _pending_visual_run) and breaking early keeps the whole group
+        # together on the same page instead. Bounded so it can't cascade:
+        # the lookahead only bridges a few blocks, and only fires once this
+        # page already holds a reasonable amount of content
+        # (_MIN_CONTENT_BEFORE_EARLY_BREAK) so it can't produce a string of
+        # near-empty pages.
+        if current and (y - PAGE_MARGIN_TOP) >= _MIN_CONTENT_BEFORE_EARLY_BREAK:
+            run = _pending_visual_run(block, queue)
+            if run is not None:
+                run_height = sum(estimate_height(b) for b in run) + BLOCK_GAP * (len(run) - 1)
+                space_here = bottom - (y + gap)
+                would_strand_visual = run_height > space_here
+                fits_a_fresh_page = run_height <= CONTENT_HEIGHT
+                if would_strand_visual and fits_a_fresh_page:
+                    start_new_page()
+                    gap = 0.0
 
         if y + gap + height <= bottom:
             block.layout.y = y + gap
@@ -469,3 +554,17 @@ def flow_blocks(blocks: list[Block]) -> list[list[Block]]:
     if current:
         pages.append(current)
     return pages
+
+
+def page_visual_fraction(page: list[Block]) -> float:
+    """The fraction of `page`'s own rendered height (each block's already-
+    computed `layout.height`, plus the gaps between them) taken up by
+    VISUAL_BLOCK_TYPES blocks - a real, measured 60/40 number computed from
+    the exact same heights the layout engine itself placed, not a proxy like
+    word count. Call only on a page `flow_blocks` has already laid out (every
+    block needs `layout.height` set). Returns 0.0 for an empty page."""
+    if not page:
+        return 0.0
+    visual_height = sum(b.layout.height for b in page if b.type in VISUAL_BLOCK_TYPES)
+    total_height = sum(b.layout.height for b in page) + BLOCK_GAP * (len(page) - 1)
+    return visual_height / total_height if total_height else 0.0

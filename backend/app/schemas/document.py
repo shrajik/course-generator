@@ -161,3 +161,61 @@ class CourseDocument(BaseModel):
     def touch(self) -> None:
         self.version += 1
         self.updated_at = utc_now_iso()
+
+
+class UpdateConceptVisualSpecRequest(BaseModel):
+    """Body for `PUT /api/documents/{id}/blocks/{block_id}/visual-spec` - an
+    editor-only, non-AI edit: the caller already has the block's full
+    `DiagramSpec` (see `content["spec"]`) and is sending back an edited copy
+    (a fixed typo/wording in an entity or step) to be re-rendered
+    deterministically. `spec` is a plain dict here, not `DiagramSpec`
+    itself, so this schema doesn't need to import from `app.schemas.diagram`;
+    the service layer validates it into a real `DiagramSpec`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    spec: dict[str, Any]
+
+
+class UpdateConceptVisualSpecResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    document_id: str
+    version: int
+    block: Block
+
+
+class RegenerateVisualsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # "diagram" | "image" (illustration) | "concept_experience" - blank
+    # means every image-family block. Lets a caller re-render just the
+    # renderer-code-driven kinds (diagram/concept_experience - free, no AI
+    # cost) without also re-spending on every AI-generated illustration.
+    kinds: list[str] = Field(default_factory=list)
+
+
+class RegenerateVisualsResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    document_id: str
+    version: int
+    regenerated: int
+    failed: list[str] = Field(default_factory=list)
+
+
+class RepairVisualsResponse(BaseModel):
+    """See app.course.document.visual_repair.RepairReport - the same report,
+    with document_id/version attached the same way every other document
+    mutation response already reports its own resulting version."""
+
+    model_config = ConfigDict(extra="allow")
+
+    document_id: str
+    version: int
+    passes_run: int
+    repaired: list[dict[str, Any]] = Field(default_factory=list)
+    skipped: list[dict[str, Any]] = Field(default_factory=list)
+    failed: list[dict[str, Any]] = Field(default_factory=list)
+    still_deficient: list[dict[str, Any]] = Field(default_factory=list)
+    validation_findings: dict[int, list[str]] = Field(default_factory=dict)

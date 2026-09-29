@@ -34,34 +34,95 @@ LINE_HEIGHT = 1.35
 BOX_PADDING = 16.0
 BADGE_RADIUS = 15.0
 _SANS_RATIO = 0.56
+# Bold glyphs are noticeably wider than the plain-weight ratio above
+# accounts for - `course.document.layout` already applies an equivalent
+# factor (`_BOLD_FACTOR`) to its own text estimator for exactly this
+# reason. Every node's `label` renders at font-weight 600 (see
+# `_node_block`), so wrapping it with the plain ratio underestimates its
+# real width - confirmed real: a 76-character bold label passed the
+# plain-ratio character budget (78 chars) yet still visually overflowed
+# its box in a real browser render.
+_BOLD_RATIO = _SANS_RATIO * 1.12
 
 # --- schematic panel geometry -------------------------------------------
 PANEL_HEIGHT = 300.0
 PANEL_GAP = 30.0
 PANEL_CAPTION_SIZE = 14.5
 
+# --- flow_chart/process semantic colouring ------------------------------
+# Fixed, not theme-derived - a flowchart's start/end/decision colouring is a
+# universal convention (green = start, red = end, purple = decision), the
+# same reason app.render.concept_experience_renderer's palette is also fixed
+# rather than following the course's brand theme. Role is auto-detected from
+# the node's own in/out-degree (see _flow_role), never a field the model has
+# to set - a linear chain's first node has no incoming edge (start), its
+# last has no outgoing edge (end), and any node with 2+ outgoing edges is
+# inherently a decision, by construction.
+_FLOW_ROLE_COLORS = {
+    "start": ("#bbf7d0", "#16a34a"),  # green
+    "end": ("#fecaca", "#dc2626"),  # red
+    "decision": ("#e9d5ff", "#7e22ce"),  # purple
+    "process": ("#bfdbfe", "#1d4ed8"),  # blue
+}
 
-def _wrap(text: str, *, font_size: float, width: float, max_lines: int = 3) -> list[str]:
+# hierarchy: root = purple, its direct children = teal, everything deeper =
+# a plain neutral fill - same fixed, universal-convention colouring as
+# _FLOW_ROLE_COLORS above, indexed by level (clamped to the last entry for
+# any level deeper than this list covers).
+_HIERARCHY_LEVEL_COLORS = [
+    ("#ddd6fe", "#6d28d9"),  # purple - root
+    ("#99f6e4", "#0f766e"),  # teal - direct children
+    ("#f1f5f9", "#64748b"),  # neutral - everything deeper
+]
+
+
+def _wrap(text: str, *, font_size: float, width: float, max_lines: int = 3, bold: bool = False) -> list[str]:
     """Greedy word wrap; mirrors the ratio `course.document.layout` uses so
-    diagram text density looks consistent with the rest of the page."""
+    diagram text density looks consistent with the rest of the page. Pass
+    `bold=True` for any text that renders at font-weight >= 600 (every
+    node's `label` does) - see `_BOLD_RATIO`'s own docstring for why this
+    matters; wrapping bold text with the plain-weight ratio underestimates
+    its real width and lets it overflow its box even though it "fit" the
+    (wrong) character budget.
+
+    A single "word" longer than one whole line on its own (a long
+    identifier, URL, or hyphen-free compound term with no spaces to break
+    on) is force-broken mid-word across as many lines as it needs, the
+    same safeguard `course.document.layout.wrapped_line_count` already has
+    for ordinary page text - this module's own wrap never had it, and a
+    real 76-character unbroken bold label confirmed the gap: it rendered as
+    one line that overflowed straight past its node's right edge instead of
+    wrapping (caught by `app.services.diagram_render_qa`'s text-overflow
+    check)."""
     text = " ".join((text or "").split())
     if not text:
         return []
-    chars_per_line = max(int(width / (font_size * _SANS_RATIO)), 6)
+    ratio = _BOLD_RATIO if bold else _SANS_RATIO
+    chars_per_line = max(int(width / (font_size * ratio)), 6)
     words = text.split(" ")
     lines: list[str] = []
     current: list[str] = []
     length = 0
+
+    def flush() -> None:
+        nonlocal current, length
+        if current:
+            lines.append(" ".join(current))
+            current, length = [], 0
+
     for word in words:
+        while len(word) > chars_per_line:
+            flush()
+            lines.append(word[:chars_per_line])
+            word = word[chars_per_line:]
         add = len(word) + (1 if current else 0)
         if current and length + add > chars_per_line:
-            lines.append(" ".join(current))
+            flush()
             current, length = [word], len(word)
         else:
             current.append(word)
             length += add
-    if current:
-        lines.append(" ".join(current))
+    flush()
     if len(lines) > max_lines:
         lines = lines[: max_lines - 1] + [lines[max_lines - 1].rstrip() + "…"]
     return lines
@@ -109,13 +170,28 @@ def _node_block(
     theme: TemplateTheme,
     badge: str | None = None,
     emphasis: bool = False,
+    box_shape: str = "rounded",
+    colors: tuple[str, str] | None = None,
 ) -> tuple[str, float]:
-    """One rounded box: label (bold) + wrapped detail. Returns (svg, height).
+    """One box: label (bold) + wrapped detail. Returns (svg, height).
     `emphasis` marks the central/focal subject of a concept map - a heavier,
-    accent-toned box so a reader's eye lands on it first."""
+    accent-toned box so a reader's eye lands on it first. `colors`, when
+    given, is (fill, stroke) and overrides `emphasis`'s own colour choice -
+    for flow_chart's semantic start/end/process colouring (see
+    _FLOW_ROLE_COLORS), which is about the node's ROLE, not focal emphasis.
+    `box_shape` only changes the background's own border - every text/
+    wrapping/tooltip rule below is completely shape-independent, so a new
+    shape can never reintroduce a text-fit bug already solved for the
+    default "rounded" box:
+    "rounded" (default) - a rounded rectangle, same as always.
+    "sharp" - a plain rectangle (data_flow_diagram's external entity,
+    er_diagram's entity).
+    "store" - an open-ended rectangle: top/bottom border only, no left/right
+    sides - the standard notation for a data_flow_diagram data store.
+    "pill" - a fully-rounded stadium shape (flow_chart's start/end nodes)."""
     inner_w = width - 2 * BOX_PADDING - (28.0 if badge else 0.0)
     text_x = x + BOX_PADDING + (28.0 if badge else 0.0)
-    label_lines = _wrap(node.label, font_size=LABEL_SIZE, width=inner_w, max_lines=2) or ["—"]
+    label_lines = _wrap(node.label, font_size=LABEL_SIZE, width=inner_w, max_lines=2, bold=True) or ["—"]
     detail_lines = _wrap(node.detail, font_size=DETAIL_SIZE, width=inner_w, max_lines=3)
 
     content_top = y + BOX_PADDING
@@ -153,14 +229,41 @@ def _node_block(
     if node.detail.strip():
         tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
 
-    fill = theme.accent_soft if emphasis else theme.surface_color
-    stroke = theme.accent_color if emphasis else theme.border_color
-    stroke_width = 2.5 if emphasis else 1.5
+    if colors is not None:
+        fill, stroke = colors
+        stroke_width = 2.0
+    else:
+        fill = theme.accent_soft if emphasis else theme.surface_color
+        stroke = theme.accent_color if emphasis else theme.border_color
+        stroke_width = 2.5 if emphasis else 1.5
     parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
-    parts.append(
-        f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{height:.1f}" '
-        f'rx="10" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>'
-    )
+    if box_shape == "pill":
+        parts.append(
+            f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{height:.1f}" '
+            f'rx="{height / 2:.1f}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>'
+        )
+    elif box_shape == "store":
+        # Open-ended: a borderless fill (for text contrast) plus separate
+        # top/bottom lines only - never left/right, which is what makes this
+        # notation read as "store" rather than "box" at a glance.
+        parts.append(
+            f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{height:.1f}" '
+            f'fill="{fill}" stroke="none"/>'
+        )
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{y:.1f}" x2="{x + width:.1f}" y2="{y:.1f}" '
+            f'stroke="{stroke}" stroke-width="{stroke_width}"/>'
+        )
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{y + height:.1f}" x2="{x + width:.1f}" y2="{y + height:.1f}" '
+            f'stroke="{stroke}" stroke-width="{stroke_width}"/>'
+        )
+    else:
+        rx = 0 if box_shape == "sharp" else 10
+        parts.append(
+            f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{height:.1f}" '
+            f'rx="{rx}" fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width}"/>'
+        )
     if badge is not None:
         cy = y + BOX_PADDING + BADGE_RADIUS - 2
         cx = x + BOX_PADDING + BADGE_RADIUS - 6
@@ -262,6 +365,576 @@ def _layout_vertical(
     return elements, total_height
 
 
+_PILL_W = 200.0
+_PILL_H = 56.0
+_DECISION_W = 210.0
+_DECISION_H = 116.0
+
+
+def _draw_pill(node: DiagramNode, *, cx: float, cy: float, theme: TemplateTheme, colors: tuple[str, str]) -> str:
+    """A flow_chart start/end node - fully centred text via _fit_boxed_text
+    (same shrink-to-fit safety net _draw_diamond/_draw_attribute_oval already
+    rely on), never the free-flowing label+detail block _node_block draws -
+    a pill is small and its rounded ends leave less safe width near the
+    caps, so centring keeps it simple and safe rather than reusing machinery
+    built for a much bigger box. `detail` (rare on a genuine Start/End node)
+    still reaches the hover tooltip, same convention as every other shape."""
+    fill, stroke = colors
+    tooltip = node.label.strip()
+    if node.detail.strip():
+        tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<rect class="diagram-box" x="{cx - _PILL_W / 2:.1f}" y="{cy - _PILL_H / 2:.1f}" '
+        f'width="{_PILL_W:.1f}" height="{_PILL_H:.1f}" rx="{_PILL_H / 2:.1f}" '
+        f'fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+    )
+    parts.append(
+        _fit_boxed_text(
+            cx, cy, node.label, width=_PILL_W * 0.75, height=_PILL_H * 0.7,
+            color=theme.text_color, theme=theme, base_size=15.0,
+        )
+    )
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+
+
+def _flow_degrees(
+    nodes: list[DiagramNode], edges: list[DiagramEdge]
+) -> tuple[dict[str, int], dict[str, list[DiagramEdge]]]:
+    by_id = {n.id for n in nodes if n.id}
+    in_degree = {n.id: 0 for n in nodes if n.id}
+    out_edges: dict[str, list[DiagramEdge]] = {}
+    for edge in edges:
+        if edge.source in by_id and edge.target in by_id:
+            out_edges.setdefault(edge.source, []).append(edge)
+            in_degree[edge.target] = in_degree.get(edge.target, 0) + 1
+    return in_degree, out_edges
+
+
+def _layout_flow_chart(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float]:
+    """flow_chart/process: a vertical spine with semantic start (green
+    pill) / end (red pill) / process (blue box) colouring, auto-detected
+    from each node's own in/out-degree - a node with no incoming edge is
+    the start, one with no outgoing edge is an end, one with 2 outgoing
+    edges is a decision (drawn as a purple diamond, its two branches placed
+    side by side below it, labelled from each edge's own `label`, e.g.
+    "Yes"/"No"). A branch that loops back to a node already drawn earlier
+    on the spine gets a curved return arrow instead of a new box - the
+    classic "flowchart with a loop" shape. A branch may run any number of
+    plain steps deep (no depth limit) before it dead-ends, loops back, or -
+    the common "both outcomes lead to the same next step" pattern -
+    reconverges with the OTHER branch at a shared node, which is then drawn
+    once, continuing the main spine below both columns.
+
+    Still narrower than a fully general graph layout: only symmetric shapes
+    are given real branch geometry - both branches dead-end, both loop back,
+    or both reconverge at the exact same node. Anything more tangled (one
+    branch reconverging while the other dead-ends, a branch running through
+    a second decision, branches reconverging at two different nodes) falls
+    all the way back to plain linear stacking in `nodes`' own order instead
+    of guessing at a layout - the same "never worse than simple, never
+    crash" contract every other fallback in this module already keeps."""
+    in_degree, out_edges = _flow_degrees(nodes, edges)
+    by_id = {n.id: n for n in nodes if n.id}
+    out_degree = {nid: len(es) for nid, es in out_edges.items()}
+    edge_labels = {(e.source, e.target): e.label for e in edges}
+
+    _START_WORDS = {"start", "begin", "initial"}
+    _END_WORDS = {"end", "stop", "finish", "done"}
+
+    def role_of(nid: str) -> str:
+        # Decision is structural (2+ outgoing edges is unambiguous - anything
+        # with two paths forward IS a decision, whatever it's labelled).
+        # Start/end deliberately is NOT structural, unlike an earlier version
+        # of this function: a node with no incoming edge isn't necessarily a
+        # procedure's "Start" - it's just as often the first of two plain
+        # things being related (an eye's "Cornea" pointing to its "Lens"),
+        # which still needs its own visible `detail` line, not a pill that
+        # can only show a short centred label. Matching the label itself
+        # (as the reference flowcharts this mirrors always explicitly do)
+        # only fires the pill styling when the content actually calls for it.
+        if out_degree.get(nid, 0) >= 2:
+            return "decision"
+        label = by_id[nid].label.strip().lower()
+        if label in _START_WORDS:
+            return "start"
+        if label in _END_WORDS:
+            return "end"
+        return "process"
+
+    box_w = CANVAS_WIDTH - 2 * MARGIN
+    x_center = MARGIN + box_w / 2
+    gap = 50.0
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    y = top
+    visited: set[str] = set()
+
+    def draw_arrow_down(x: float, y_from: float, y_to: float, label: str = "") -> None:
+        elements.append(
+            f'<line x1="{x:.1f}" y1="{y_from:.1f}" x2="{x:.1f}" y2="{y_to:.1f}" '
+            f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+        )
+        if label.strip():
+            elements.append(_edge_label(x, (y_from + y_to) / 2, label, theme))
+
+    def draw_main_node(nid: str, y: float) -> float:
+        """Draws node `nid` centred on the spine at `y`; returns its height."""
+        node = by_id[nid]
+        role = role_of(nid)
+        visited.add(nid)
+        if role == "decision":
+            elements.append(
+                _draw_diamond(
+                    node, cx=x_center, cy=y + _DECISION_H / 2,
+                    width=_DECISION_W, height=_DECISION_H, theme=theme,
+                    colors=_FLOW_ROLE_COLORS["decision"],
+                )
+            )
+            return _DECISION_H
+        if role in ("start", "end"):
+            elements.append(_draw_pill(node, cx=x_center, cy=y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[role]))
+            return _PILL_H
+        svg, height = _node_block(node, x=MARGIN, y=y, width=box_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"])
+        elements.append(svg)
+        return height
+
+    def resolve_branch(edge: DiagramEdge, decision_id: str) -> tuple[str, list[str]] | None:
+        """Follows a decision branch forward through plain (out-degree <= 1)
+        nodes, as far as it safely can. Returns ("end", [ids]) if it
+        dead-ends (every id is a new box to draw), ("loop", [ids]) if it
+        eventually points back at the decision itself, or ("continue",
+        [ids]) if it reaches a node that something ELSE also points to
+        (in-degree >= 2) - a reconvergence candidate. For "loop" and
+        "continue", the LAST id is the target/merge node itself - already
+        drawn (loop) or not yet drawn but possibly shared with the other
+        branch (continue) - never a new box in that branch's own column;
+        every id before it is. None if it's more tangled than this function
+        supports: a second decision partway through, a dead/missing
+        reference, or a branch long enough to revisit one of its own nodes
+        (impossible in a real DAG - only a malformed spec could trigger it,
+        and the bound below exists purely so that can never spin forever)."""
+        chain: list[str] = []
+        current = edge.target
+        for _ in range(len(by_id) + 1):
+            if current == decision_id:
+                return ("loop", chain + [current])
+            if current not in by_id or current in chain or current in visited:
+                return None
+            if role_of(current) == "decision":
+                return None
+            if in_degree.get(current, 0) >= 2:
+                return ("continue", chain + [current])
+            chain.append(current)
+            if out_degree.get(current, 0) == 0:
+                return ("end", chain)
+            next_edges = out_edges.get(current, [])
+            if len(next_edges) != 1:
+                return None
+            current = next_edges[0].target
+        return None
+
+    order = [n.id for n in nodes if n.id]
+    idx = 0
+    previous_bottom: float | None = None
+    previous_id: str | None = None
+    while idx < len(order):
+        nid = order[idx]
+        if nid in visited:
+            idx += 1
+            continue
+        role = role_of(nid)
+        if role != "decision":
+            if previous_bottom is not None:
+                draw_arrow_down(x_center, previous_bottom, y, edge_labels.get((previous_id, nid), ""))
+            height = draw_main_node(nid, y)
+            previous_bottom = y + height
+            previous_id = nid
+            y = previous_bottom + gap
+            idx += 1
+            continue
+
+        decision_branches = out_edges.get(nid, [])[:2]
+        resolved = [resolve_branch(edge, nid) for edge in decision_branches]
+        kinds = [r[0] for r in resolved] if all(resolved) else []
+        # Only symmetric shapes get real branch geometry: both dead-end,
+        # both loop back, or both "continue" into the exact same node (the
+        # reconverge pattern). Anything else - one branch reconverging while
+        # the other doesn't, or reconverging at two different nodes - is
+        # more tangled than this function lays out; fall back rather than
+        # guess (see the docstring).
+        merge_id: str | None = None
+        if kinds.count("continue") == 1:
+            valid_shape = False
+        elif kinds == ["continue", "continue"]:
+            merge_id = resolved[0][1][-1]
+            valid_shape = merge_id == resolved[1][1][-1]
+        else:
+            valid_shape = True
+        if len(decision_branches) != 2 or any(r is None for r in resolved) or not valid_shape:
+            # Doesn't match a shape this function knows how to lay out - no
+            # branch geometry for it, but every remaining node still gets
+            # the exact same semantic colouring and plain vertical stacking
+            # as the rest of this diagram (via the same draw_main_node/
+            # draw_arrow_down every other node already goes through) rather
+            # than reusing the old, neutral-coloured, numbered _layout_vertical -
+            # a shape too tangled to branch is not a reason to look like a
+            # different diagram halfway through.
+            for fallback_id in order:
+                if fallback_id in visited:
+                    continue
+                if previous_bottom is not None:
+                    draw_arrow_down(
+                        x_center, previous_bottom, y, edge_labels.get((previous_id, fallback_id), "")
+                    )
+                fallback_height = draw_main_node(fallback_id, y)
+                previous_bottom = y + fallback_height
+                previous_id = fallback_id
+                y = previous_bottom + gap
+            break
+
+        if previous_bottom is not None:
+            draw_arrow_down(x_center, previous_bottom, y, edge_labels.get((previous_id, nid), ""))
+        height = draw_main_node(nid, y)
+        decision_bottom = y + height
+        col_w = box_w / 2 - 16.0
+        col_gap = 32.0
+        left_x = MARGIN
+        right_x = MARGIN + col_w + col_gap
+        branch_y = decision_bottom + gap
+        branch_bottoms: list[float] = []
+        loop_targets: list[tuple[float, float, str, str]] = []  # (from_x, from_y, target_id, label)
+        merge_from: list[tuple[float, float]] = []  # (x, y) of each branch's own last box, into the merge node
+
+        for branch_index, (edge, result) in enumerate(zip(decision_branches, resolved)):
+            col_x = left_x if branch_index == 0 else right_x
+            kind, chain = result
+            col_cx = col_x + col_w / 2
+            draw_arrow_down(col_cx, decision_bottom, branch_y, edge.label)
+            # A branch drawn to the side never shares the shared spine's
+            # full-width boxes - narrower, so two columns can sit side by
+            # side without crowding.
+            if kind == "end":
+                by_hop_y = branch_y
+                for hop_id in chain:
+                    hop_node = by_id[hop_id]
+                    hop_role = role_of(hop_id)
+                    visited.add(hop_id)
+                    if hop_role in ("start", "end"):
+                        elements.append(
+                            _draw_pill(
+                                hop_node, cx=col_cx, cy=by_hop_y + _PILL_H / 2,
+                                theme=theme, colors=_FLOW_ROLE_COLORS[hop_role],
+                            )
+                        )
+                        hop_h = _PILL_H
+                    else:
+                        svg, hop_h = _node_block(
+                            hop_node, x=col_x, y=by_hop_y, width=col_w, theme=theme,
+                            colors=_FLOW_ROLE_COLORS["process"],
+                        )
+                        elements.append(svg)
+                    if hop_id != chain[-1]:
+                        draw_arrow_down(col_cx, by_hop_y + hop_h, by_hop_y + hop_h + gap)
+                    by_hop_y += hop_h + gap
+                branch_bottoms.append(by_hop_y - gap)
+            else:  # "loop"/"continue": every id but the last is a real new box; the last is the target/merge
+                by_hop_y = branch_y
+                for hop_id in chain[:-1]:
+                    hop_node = by_id[hop_id]
+                    visited.add(hop_id)
+                    svg, hop_h = _node_block(
+                        hop_node, x=col_x, y=by_hop_y, width=col_w, theme=theme,
+                        colors=_FLOW_ROLE_COLORS["process"],
+                    )
+                    elements.append(svg)
+                    draw_arrow_down(col_cx, by_hop_y + hop_h, by_hop_y + hop_h + gap)
+                    by_hop_y += hop_h + gap
+                if kind == "loop":
+                    loop_targets.append((col_cx, by_hop_y - gap, chain[-1], ""))
+                else:
+                    merge_from.append((col_cx, by_hop_y - gap))
+                branch_bottoms.append(by_hop_y - gap)
+
+        # Loop-back arrows: routed out to the side and back up to the
+        # decision's own edge, well clear of the branch columns in between.
+        for from_x, from_y, target_id, _label in loop_targets:
+            side_x = MARGIN - 24.0 if from_x < x_center else CANVAS_WIDTH - MARGIN + 24.0
+            target_y = decision_bottom - height / 2  # roughly the decision's own vertical centre
+            elements.append(
+                f'<path d="M{from_x:.1f},{from_y:.1f} L{side_x:.1f},{from_y:.1f} '
+                f'L{side_x:.1f},{target_y:.1f} L{x_center + _DECISION_W / 2:.1f},{target_y:.1f}" '
+                f'fill="none" stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+
+        y = max(branch_bottoms) if branch_bottoms else branch_y
+
+        if merge_id is not None:
+            # Both branches reconverge here - draw the shared node once,
+            # centred back on the main spine, with both columns' arrows
+            # bending in to meet it (an angled line, not the plain vertical
+            # draw_arrow_down every other connector in this function uses -
+            # this is the one place two columns genuinely merge back into
+            # one point, which a straight-down line can't reach from either
+            # side).
+            merge_y = y + gap
+            for from_x, from_y in merge_from:
+                elements.append(
+                    f'<line x1="{from_x:.1f}" y1="{from_y:.1f}" x2="{x_center:.1f}" y2="{merge_y:.1f}" '
+                    f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+                )
+            merge_height = draw_main_node(merge_id, merge_y)
+            previous_bottom = merge_y + merge_height
+            previous_id = merge_id
+            y = previous_bottom + gap
+            idx += 1
+            continue
+
+        # Nothing continues the main spine after a resolved end/loop branch
+        # (see the docstring) - if a well-formed spec somehow still has more
+        # nodes queued up, the next one starts fresh rather than drawing a
+        # stale arrow back to the decision's own position.
+        previous_bottom = None
+        previous_id = None
+        idx += 1
+
+    total_height = y - top
+    return elements, total_height
+
+
+_DFD_COLORS = {
+    "": ("#fecaca", "#dc2626"),  # process - red circle (the reference notation)
+    "entity": ("#bfdbfe", "#1d4ed8"),  # external entity - blue box
+    "store": ("#fef08a", "#ca8a04"),  # data store - yellow open box
+}
+_DFD_PROCESS_R = 68.0
+
+
+def _draw_process_circle(
+    node: DiagramNode, *, cx: float, cy: float, theme: TemplateTheme, colors: tuple[str, str]
+) -> str:
+    """A data_flow_diagram process step - the standard DFD notation draws
+    this as a circle, not a box. Centred text via _fit_boxed_text, same
+    shrink-to-fit safety net as every other non-rectangular shape in this
+    module; the box passed to it (side length == the radius) sits well
+    inside the circle's own true inscribed square (side == radius*sqrt(2))."""
+    fill, stroke = colors
+    tooltip = node.label.strip()
+    if node.detail.strip():
+        tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<ellipse class="diagram-box" cx="{cx:.1f}" cy="{cy:.1f}" rx="{_DFD_PROCESS_R:.1f}" '
+        f'ry="{_DFD_PROCESS_R:.1f}" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+    )
+    parts.append(
+        _fit_boxed_text(
+            cx, cy, node.label, width=_DFD_PROCESS_R, height=_DFD_PROCESS_R,
+            color=theme.text_color, theme=theme, base_size=13.0,
+        )
+    )
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+
+
+def _layout_dfd(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float]:
+    """A data_flow_diagram: the same stacked/connected geometry
+    _layout_vertical already has hardened (arrows, wrapped edge labels, no
+    overlap) - the only real difference is each node's own shape and colour,
+    per `node.shape_role` (see _DFD_COLORS): process (a red circle, the
+    default and the standard DFD notation for one), external entity (a blue
+    sharp-cornered box) or data store (a yellow open-ended box). Not
+    numbered like a process/flow_chart's steps - a DFD's nodes are typed
+    elements, not ordered steps. Deliberately linear (each node connects
+    only to the next) - a genuine feedback/back-edge would need arrows
+    weaving back through the stack, which risks crossing or overlapping the
+    boxes between them; a real course topic that needs one can still name it
+    in an edge label without drawing the loop, or use two adjacent nodes and
+    describe the feedback in the surrounding text instead."""
+    edge_labels = {(e.source, e.target): e.label for e in edges}
+    box_w = CANVAS_WIDTH - 2 * MARGIN
+    gap = 60.0
+    x = MARGIN
+    y = top
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+
+    previous_bottom: float | None = None
+    for index, node in enumerate(nodes):
+        if previous_bottom is not None:
+            mid_x = x + box_w / 2
+            elements.append(
+                f'<line x1="{mid_x:.1f}" y1="{previous_bottom:.1f}" x2="{mid_x:.1f}" '
+                f'y2="{y - 4:.1f}" stroke="{theme.accent_color}" stroke-width="2" '
+                f'marker-end="url(#diagram-arrow)"/>'
+            )
+            key = (nodes[index - 1].id, node.id)
+            elements.append(_edge_label(mid_x, (previous_bottom + y - 4) / 2, edge_labels.get(key, ""), theme))
+
+        role = node.shape_role.strip().lower()
+        colors = _DFD_COLORS.get(role, _DFD_COLORS[""])
+        if role in ("entity", "store"):
+            svg, height = _node_block(
+                node, x=x, y=y, width=box_w, theme=theme,
+                box_shape="sharp" if role == "entity" else "store", colors=colors,
+            )
+            elements.append(svg)
+        else:
+            cy = y + _DFD_PROCESS_R
+            elements.append(_draw_process_circle(node, cx=x + box_w / 2, cy=cy, theme=theme, colors=colors))
+            height = _DFD_PROCESS_R * 2
+        previous_bottom = y + height
+        y = previous_bottom + gap
+
+    total_height = y - gap - top if nodes else 0.0
+    return elements, total_height
+
+
+def _swimlane_rows(nodes: list[DiagramNode], edges: list[DiagramEdge]) -> dict[str, int]:
+    """Each node's row = 1 + the furthest (longest-path) predecessor's own
+    row, 0 for a node with none - the standard DAG "layering" rule, so a
+    node is always drawn after everything that feeds into it, however many
+    hops away. Guarded against a cycle (shouldn't occur in a real swimlane,
+    but this must never hang even on a malformed one) by treating a node
+    already being resolved as row 0 rather than recursing into it again.
+    Once every row is set, nodes sharing both a lane AND a row (parallel
+    branches within one lane at the same step) are bumped down one row at a
+    time until each lane has at most one node per row - the only thing that
+    would otherwise still be able to overlap."""
+    by_id = {n.id: n for n in nodes if n.id}
+    in_edges: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.source in by_id and edge.target in by_id:
+            in_edges.setdefault(edge.target, []).append(edge.source)
+
+    rows: dict[str, int] = {}
+
+    def resolve(nid: str, visiting: set[str]) -> int:
+        if nid in rows:
+            return rows[nid]
+        if nid in visiting:
+            rows[nid] = 0
+            return 0
+        visiting.add(nid)
+        preds = [p for p in in_edges.get(nid, []) if p in by_id]
+        row = 0 if not preds else 1 + max(resolve(p, visiting) for p in preds)
+        visiting.discard(nid)
+        rows[nid] = row
+        return row
+
+    for node in nodes:
+        if node.id:
+            resolve(node.id, set())
+
+    claimed: set[tuple[str, int]] = set()
+    for node in nodes:
+        if not node.id:
+            continue
+        lane = node.lane.strip() or "General"
+        row = rows[node.id]
+        while (lane, row) in claimed:
+            row += 1
+        claimed.add((lane, row))
+        rows[node.id] = row
+
+    return rows
+
+
+_LANE_HEADER_H = 52.0
+_LANE_COLORS = [
+    ("#dbeafe", "#1d4ed8"),  # blue
+    ("#e2e8f0", "#475569"),  # slate/gray
+    ("#fed7aa", "#c2410c"),  # orange
+    ("#dcfce7", "#15803d"),  # green
+    ("#fbcfe8", "#be185d"),  # pink
+]
+
+
+def _layout_swimlane(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float]:
+    """A swimlane: one coloured-header column per distinct `node.lane`
+    (lanes appear left to right in the order first seen). Nodes are grouped
+    into ROWS - step 0 is whichever node(s) have no incoming edge, step N is
+    1 + the furthest predecessor's own step (see `_swimlane_rows`) - so a
+    node in one lane lines up with whatever's happening in every other lane
+    at that same point in the process, with an empty gap in a lane that
+    isn't doing anything that step - the standard swimlane reading. Edges
+    are drawn as direct box-to-box connectors via _shorten_to_box_edge (the
+    same mechanism er_diagram/concept_map already use), whether they cross
+    lanes or stay within one - a swimlane's whole point is showing work
+    crossing role/actor boundaries, so a cross-lane edge is the common case,
+    not a special one."""
+    lanes: list[str] = []
+    for node in nodes:
+        lane = node.lane.strip() or "General"
+        if lane not in lanes:
+            lanes.append(lane)
+    if not lanes:
+        return [], 0.0
+
+    total_w = CANVAS_WIDTH - 2 * MARGIN
+    lane_gap = 20.0
+    lane_w = max((total_w - lane_gap * (len(lanes) - 1)) / len(lanes), 140.0)
+    body_top = top + _LANE_HEADER_H + 24.0
+
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    lane_x: dict[str, float] = {}
+    x = MARGIN
+    for index, lane in enumerate(lanes):
+        fill, stroke = _LANE_COLORS[index % len(_LANE_COLORS)]
+        lane_x[lane] = x
+        elements.append(
+            f'<rect x="{x:.1f}" y="{top:.1f}" width="{lane_w:.1f}" height="{_LANE_HEADER_H:.1f}" '
+            f'rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        elements.append(
+            _fit_boxed_text(
+                x + lane_w / 2, top + _LANE_HEADER_H / 2, lane, width=lane_w * 0.85,
+                height=_LANE_HEADER_H * 0.65, color=stroke, theme=theme, base_size=14.5,
+            )
+        )
+        x += lane_w + lane_gap
+
+    positions: dict[str, tuple[float, float, float, float]] = {}
+    node_w = lane_w - 20.0
+    rows = _swimlane_rows(nodes, edges)
+    rows_grouped: dict[int, list[DiagramNode]] = {}
+    for node in nodes:
+        if node.id:
+            rows_grouped.setdefault(rows[node.id], []).append(node)
+
+    y = body_top
+    for row_index in sorted(rows_grouped):
+        row_height = 0.0
+        for node in rows_grouped[row_index]:
+            lane = node.lane.strip() or "General"
+            node_x = lane_x[lane] + 10.0
+            svg, height = _node_block(node, x=node_x, y=y, width=node_w, theme=theme)
+            elements.append(svg)
+            positions[node.id] = (node_x + node_w / 2, y + height / 2, node_w, height)
+            row_height = max(row_height, height)
+        y += row_height + 24.0
+
+    for edge in edges:
+        a = positions.get(edge.source)
+        b = positions.get(edge.target)
+        if not a or not b:
+            continue
+        start, end = _shorten_to_box_edge((a[0], a[1]), (b[0], b[1]), w1=a[2], h1=a[3], w2=b[2], h2=b[3])
+        elements.append(
+            f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+            f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+        )
+        if edge.label.strip():
+            mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            elements.append(_edge_label(mid[0], mid[1] - 10, edge.label, theme, max_width=110.0))
+
+    max_bottom = y - 24.0 if rows_grouped else body_top
+    return elements, max_bottom - top
+
+
 def _layout_cycle(
     nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
 ) -> tuple[list[str], float, float]:
@@ -309,7 +982,11 @@ def _layout_cycle(
 def _layout_hierarchy(
     nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
 ) -> tuple[list[str], float]:
-    """Nodes grouped into rows by `level`, connected to their parent edge."""
+    """Nodes grouped into rows by `level`, connected to their parent edge.
+    Each row's colour comes from _HIERARCHY_LEVEL_COLORS (root/children/
+    deeper), the same fixed semantic-colour convention flow_chart uses -
+    a hierarchy's depth is exactly what the colour is there to show at a
+    glance, before a reader even reads a single label."""
     rows: dict[int, list[DiagramNode]] = {}
     for node in nodes:
         rows.setdefault(max(node.level, 0), []).append(node)
@@ -329,8 +1006,9 @@ def _layout_hierarchy(
         max_row_width = max(max_row_width, row_width)
         x = MARGIN
         row_height = 0.0
+        row_colors = _HIERARCHY_LEVEL_COLORS[min(level, len(_HIERARCHY_LEVEL_COLORS) - 1)]
         for node in row_nodes:
-            svg, height = _node_block(node, x=x, y=y, width=box_w, theme=theme)
+            svg, height = _node_block(node, x=x, y=y, width=box_w, theme=theme, colors=row_colors)
             elements.append(svg)
             cx = x + box_w / 2
             positions[node.id or node.label] = (cx, y, y + height)
@@ -526,8 +1204,184 @@ def _layout_concept_map(
 
 
 # ---------------------------------------------------------------------------
+# er_diagram: entities (sharp-cornered boxes) and relationships (diamonds) in
+# a row, connected by edges; attributes (ovals) fan out above whichever
+# entity/relationship they belong to (DiagramNode.parent_id). Each entity's
+# own column reserves whichever is wider - its box or its attribute fan - so
+# two neighbouring columns' attribute fans can never collide with each
+# other, the same "reserve by content, never let neighbours overlap"
+# approach the rest of this module already uses elsewhere.
+# ---------------------------------------------------------------------------
+
+_ER_ATTR_W = 108.0
+_ER_ATTR_H = 44.0
+_ER_ATTR_GAP = 14.0
+_ER_COLUMN_GAP = 44.0
+_ER_ENTITY_W = 170.0
+_ER_DIAMOND_W = 128.0
+_ER_DIAMOND_H = 84.0
+_ER_ATTR_ROW_GAP = 30.0  # vertical clearance for the attribute->parent leader line
+
+
+def _draw_diamond(
+    node: DiagramNode, *, cx: float, cy: float, width: float, height: float, theme: TemplateTheme,
+    colors: tuple[str, str] | None = None,
+) -> str:
+    """A relationship (er_diagram) or decision (flow_chart), drawn as a
+    rhombus. Text stays within the middle half of the shape's height (where
+    a rhombus is at least half as wide as its full width), and
+    _fit_boxed_text's own shrink-to-fit is the second, independent safety
+    net - the same belt-and-suspenders approach every other shape in this
+    module already relies on for text it can't fully control the length of.
+    `colors`, when given, overrides the theme-derived default - flow_chart's
+    decision diamonds are always semantic purple (see _FLOW_ROLE_COLORS),
+    regardless of the course's own theme. `detail`, when set (a decision's
+    own condition text, say), reaches the hover tooltip even though the
+    diamond itself only ever shows the short `label`."""
+    tooltip = node.label.strip()
+    if node.detail.strip():
+        tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+    points = (
+        f"{cx:.1f},{cy - height / 2:.1f} {cx + width / 2:.1f},{cy:.1f} "
+        f"{cx:.1f},{cy + height / 2:.1f} {cx - width / 2:.1f},{cy:.1f}"
+    )
+    fill, stroke = colors if colors is not None else (theme.accent_soft, theme.accent_color)
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<polygon class="diagram-box" points="{points}" fill="{fill}" '
+        f'stroke="{stroke}" stroke-width="2"/>'
+    )
+    parts.append(
+        _fit_boxed_text(
+            cx, cy, node.label, width=width * 0.5, height=height * 0.5,
+            color=theme.text_color, theme=theme, base_size=12.5,
+        )
+    )
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+
+
+def _draw_attribute_oval(
+    node: DiagramNode, *, cx: float, cy: float, width: float, height: float, theme: TemplateTheme
+) -> str:
+    """An attribute, drawn as an ellipse. The safe inscribed rectangle for
+    centred text in an ellipse is width/√2 by height/√2 - comfortably wider
+    than the 0.7/0.6 used here, left deliberately smaller as extra margin,
+    plus _fit_boxed_text's own shrink-to-fit underneath."""
+    tooltip = node.label.strip()
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<ellipse class="diagram-box" cx="{cx:.1f}" cy="{cy:.1f}" rx="{width / 2:.1f}" ry="{height / 2:.1f}" '
+        f'fill="{theme.surface_color}" stroke="{theme.border_color}" stroke-width="1.5"/>'
+    )
+    parts.append(
+        _fit_boxed_text(
+            cx, cy, node.label, width=width * 0.7, height=height * 0.6,
+            color=theme.text_color, theme=theme, base_size=11.5, weight=500,
+        )
+    )
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+
+
+def _layout_er(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    is_attribute = lambda n: n.shape_role.strip().lower() == "attribute"  # noqa: E731
+    main_nodes = [n for n in nodes if not is_attribute(n)]
+    if not main_nodes:
+        return [], CANVAS_WIDTH, 0.0
+
+    main_ids = {n.id for n in main_nodes if n.id}
+    attrs_by_parent: dict[str, list[DiagramNode]] = {}
+    for attr in nodes:
+        if is_attribute(attr) and attr.parent_id in main_ids:
+            attrs_by_parent.setdefault(attr.parent_id, []).append(attr)
+
+    def is_relationship(n: DiagramNode) -> bool:
+        return n.shape_role.strip().lower() == "relationship"
+
+    def own_width(n: DiagramNode) -> float:
+        return _ER_DIAMOND_W if is_relationship(n) else _ER_ENTITY_W
+
+    def fan_width(n: DiagramNode) -> float:
+        attrs = attrs_by_parent.get(n.id, [])
+        if not attrs:
+            return 0.0
+        return len(attrs) * _ER_ATTR_W + (len(attrs) - 1) * _ER_ATTR_GAP
+
+    col_widths = [max(own_width(n), fan_width(n)) for n in main_nodes]
+    total_w = sum(col_widths) + _ER_COLUMN_GAP * (len(main_nodes) - 1)
+    canvas_w = max(total_w + 2 * MARGIN, CANVAS_WIDTH)
+
+    has_attrs = any(attrs_by_parent.values())
+    attr_top = top
+    main_top = top + (_ER_ATTR_H + _ER_ATTR_ROW_GAP if has_attrs else 0.0)
+
+    elements = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    x = (canvas_w - total_w) / 2
+    # id -> (centre_x, centre_y, bbox_w, bbox_h) - centre/bbox, not top-left,
+    # since a diamond's own draw call is centre-anchored while a box's is
+    # top-left-anchored; this table normalises both for the edge connectors.
+    positions: dict[str, tuple[float, float, float, float]] = {}
+    main_bottom = main_top
+
+    for node, col_w in zip(main_nodes, col_widths):
+        cx = x + col_w / 2
+        if is_relationship(node):
+            elements.append(
+                _draw_diamond(
+                    node, cx=cx, cy=main_top + _ER_DIAMOND_H / 2,
+                    width=_ER_DIAMOND_W, height=_ER_DIAMOND_H, theme=theme,
+                )
+            )
+            positions[node.id] = (cx, main_top + _ER_DIAMOND_H / 2, _ER_DIAMOND_W, _ER_DIAMOND_H)
+            main_bottom = max(main_bottom, main_top + _ER_DIAMOND_H)
+        else:
+            svg, height = _node_block(
+                node, x=cx - _ER_ENTITY_W / 2, y=main_top, width=_ER_ENTITY_W, theme=theme, box_shape="sharp"
+            )
+            elements.append(svg)
+            positions[node.id] = (cx, main_top + height / 2, _ER_ENTITY_W, height)
+            main_bottom = max(main_bottom, main_top + height)
+
+        attrs = attrs_by_parent.get(node.id, [])
+        if attrs:
+            fan_w = len(attrs) * _ER_ATTR_W + (len(attrs) - 1) * _ER_ATTR_GAP
+            ax = cx - fan_w / 2
+            for attr in attrs:
+                a_cx = ax + _ER_ATTR_W / 2
+                a_cy = attr_top + _ER_ATTR_H / 2
+                elements.append(
+                    _draw_attribute_oval(attr, cx=a_cx, cy=a_cy, width=_ER_ATTR_W, height=_ER_ATTR_H, theme=theme)
+                )
+                elements.append(
+                    f'<line x1="{a_cx:.1f}" y1="{a_cy + _ER_ATTR_H / 2:.1f}" x2="{cx:.1f}" y2="{main_top:.1f}" '
+                    f'stroke="{theme.border_color}" stroke-width="1.5"/>'
+                )
+                ax += _ER_ATTR_W + _ER_ATTR_GAP
+        x += col_w + _ER_COLUMN_GAP
+
+    for edge in edges:
+        a = positions.get(edge.source)
+        b = positions.get(edge.target)
+        if not a or not b:
+            continue
+        start, end = _shorten_to_box_edge(
+            (a[0], a[1]), (b[0], b[1]), w1=a[2], h1=a[3], w2=b[2], h2=b[3]
+        )
+        elements.append(
+            f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+            f'stroke="{theme.accent_color}" stroke-width="2"/>'
+        )
+        if edge.label.strip():
+            mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            elements.append(_edge_label(mid[0], mid[1] - 10, edge.label, theme, max_width=90.0))
+
+    return elements, canvas_w, main_bottom - top
+
+
+# ---------------------------------------------------------------------------
 # schematic: a small, topic-agnostic vocabulary of illustrated primitives
-# (block/coil/gauge/flow/arrow/label) instead of labelled boxes - for a
+# (block/coil/gauge/arrow/label) instead of labelled boxes - for a
 # physical apparatus or mechanism (a magnet and coil, a circuit, a lab
 # setup) that reads better as a simplified textbook illustration than as a
 # node graph. See SchematicShape/SchematicState in app.schemas.diagram.
@@ -567,12 +1421,13 @@ def _fit_boxed_text(
     usable_w = max(width - 2 * padding, 10.0)
     usable_h = max(height - 2 * padding, 10.0)
     size = base_size
+    bold = weight >= 600
     lines: list[str] = []
     while True:
         max_lines = max(int(usable_h // (size * LINE_HEIGHT)), 1)
-        full_lines = _wrap(text, font_size=size, width=usable_w, max_lines=1000)
+        full_lines = _wrap(text, font_size=size, width=usable_w, max_lines=1000, bold=bold)
         if len(full_lines) <= max_lines or size <= min_size:
-            lines = _wrap(text, font_size=size, width=usable_w, max_lines=max_lines)
+            lines = _wrap(text, font_size=size, width=usable_w, max_lines=max_lines, bold=bold)
             break
         size -= 0.75
     line_gap = size * LINE_HEIGHT
@@ -590,7 +1445,7 @@ def _caption_text(
     reasonable width so a long label doesn't run into a neighbouring shape,
     but without `_fit_boxed_text`'s font-shrinking since there's no hard
     height ceiling here the way there is inside a shape's own outline."""
-    lines = _wrap(text, font_size=size, width=max(width, 70.0), max_lines=max_lines)
+    lines = _wrap(text, font_size=size, width=max(width, 70.0), max_lines=max_lines, bold=weight >= 600)
     if not lines:
         return ""
     svg, _ = _text(cx, top_y, lines, font_size=size, weight=weight, color=color, font_family=theme.font_family)
@@ -739,37 +1594,6 @@ def _draw_gauge(shape: SchematicShape, cx: float, cy: float, w: float, h: float,
     return _shape_group(shape, "".join(parts))
 
 
-def _draw_flow(shape: SchematicShape, cx: float, cy: float, w: float, h: float, theme: TemplateTheme) -> str:
-    """A fan of curved lines converging on (cx, cy) from direction
-    `rotation` (0=east, 90=south, 180=west, 270=north) - field lines,
-    current, airflow or liquid flow, generically."""
-    count = max(3, min(7, round(3 + shape.intensity * 5)))
-    length = max(w, h)
-    spread = 64.0
-    line_color = resolve_color_role(shape.color_role).stroke if shape.color_role.strip() else theme.muted_color
-    parts = []
-    for i in range(count):
-        frac = (i / (count - 1) - 0.5) if count > 1 else 0.0
-        angle = math.radians(shape.rotation + frac * spread)
-        sx, sy = cx + length * math.cos(angle), cy + length * math.sin(angle)
-        mx, my = (cx + sx) / 2, (cy + sy) / 2
-        parts.append(
-            f'<path d="M{sx:.1f},{sy:.1f} Q{mx:.1f},{my:.1f} {cx:.1f},{cy:.1f}" fill="none" '
-            f'stroke="{line_color}" stroke-width="1.5" marker-end="url(#diagram-arrow)"/>'
-        )
-    # The label sits to the *side* of the fan (perpendicular to the flow
-    # direction), not further along it - `rotation` points back toward
-    # whatever the lines originate near (e.g. a magnet), so continuing in
-    # that direction routinely lands the label on top of the *other* end of
-    # the flow (e.g. the coil it flows into). A bounded perpendicular offset
-    # keeps it clear of both ends regardless of orientation.
-    perp_angle = math.radians(shape.rotation + 90)
-    label_offset = min(length * 0.5, 90.0) + 14.0
-    lx, ly = cx + label_offset * math.cos(perp_angle), cy + label_offset * math.sin(perp_angle)
-    parts.append(_caption_text(lx, ly, shape.label, width=130, color=line_color, theme=theme, size=11.5))
-    return _shape_group(shape, "".join(parts))
-
-
 def _draw_arrow(
     shape: SchematicShape, cx: float, cy: float, w: float, h: float, theme: TemplateTheme,
     connector: tuple[tuple[float, float], tuple[float, float]] | None = None,
@@ -854,8 +1678,6 @@ def _draw_shape(
     if kind == "gauge":
         return _draw_gauge(shape, cx, cy, w, h, theme)
     resolved = shape.model_copy(update={"rotation": _shape_rotation(shape, cx, cy, positions)})
-    if kind == "flow":
-        return _draw_flow(resolved, cx, cy, w, h, theme)
     if kind == "arrow":
         connector = None
         target_box = boxes.get(shape.target_id) if shape.target_id else None
@@ -1002,7 +1824,7 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
     top = MARGIN
     title_svg = ""
     if spec.title.strip():
-        title_lines = _wrap(spec.title, font_size=21, width=CANVAS_WIDTH - 2 * MARGIN, max_lines=1)
+        title_lines = _wrap(spec.title, font_size=21, width=CANVAS_WIDTH - 2 * MARGIN, max_lines=1, bold=True)
         title_svg, title_h = _text(
             CANVAS_WIDTH / 2,
             top + 21,
@@ -1016,9 +1838,11 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
 
     canvas_w = CANVAS_WIDTH
     if kind in ("flow_chart", "process"):
-        elements, content_h = _layout_vertical(
-            spec.nodes, spec.edges, theme=theme, connected=True, top=top
-        )
+        elements, content_h = _layout_flow_chart(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "data_flow_diagram":
+        elements, content_h = _layout_dfd(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "swimlane":
+        elements, content_h = _layout_swimlane(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "cycle":
         elements, canvas_w, content_h = _layout_cycle(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "hierarchy":
@@ -1027,6 +1851,8 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
         elements, content_h = _layout_comparison(spec.nodes, theme=theme, top=top)
     elif kind in ("concept_map", "conceptual"):
         elements, canvas_w, content_h = _layout_concept_map(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "er_diagram":
+        elements, canvas_w, content_h = _layout_er(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "schematic":
         elements, content_h = _layout_schematic(spec, theme=theme, top=top)
     else:  # smart_art: numbered list, no connecting arrows

@@ -86,6 +86,7 @@ class MockAIClient(AIClient):
         phase: str = "default",
         max_output_tokens: int | None = None,
         on_delta: StreamSink | None = None,
+        image: bytes | None = None,
     ) -> T:
         self.calls.append({"kind": "structured", "schema": schema.__name__, "purpose": purpose})
         await self._simulate("structured", purpose or schema.__name__)
@@ -773,17 +774,12 @@ def _schematic_spec(title: str, brief: str) -> dict[str, Any]:
             {"type": "block", "id": "magnet", "label": "Bar Magnet", "sublabel": "N / S",
              "anchor": "left_of:coil", "role": "secondary", "size": "medium", "color_role": "structure",
              "priority": "critical"},
-            {"type": "flow", "id": "field_lines", "anchor": "orbit:coil", "target_id": "coil",
-             "role": "secondary", "size": "small", "color_role": "magnetic_field", "priority": "important",
-             "intensity": 0.3, "label": "Field lines"},
             {"type": "gauge", "id": "ammeter", "sublabel": "Ammeter", "anchor": "below:coil",
              "role": "secondary", "size": "small", "color_role": "secondary", "priority": "critical",
              "rotation": 0},
         ]
         active_shapes = [
-            {**shape, "intensity": 0.7} if shape["id"] == "field_lines"
-            else {**shape, "rotation": 35} if shape["id"] == "ammeter"
-            else shape
+            {**shape, "rotation": 35} if shape["id"] == "ammeter" else shape
             for shape in rest_shapes
         ]
         return {
@@ -814,9 +810,6 @@ def _schematic_spec(title: str, brief: str) -> dict[str, Any]:
              "role": "secondary", "size": "small", "color_role": "secondary", "priority": "critical"},
             {"type": "block", "id": "brush", "label": "Brush", "anchor": "right_of:commutator",
              "role": "secondary", "size": "small", "color_role": "structure", "priority": "important"},
-            {"type": "flow", "id": "magnetic_field", "anchor": "orbit:coil", "target_id": "coil",
-             "role": "secondary", "size": "small", "color_role": "magnetic_field", "priority": "important",
-             "intensity": 0.6, "label": "Magnetic field"},
         ]
         return {
             "kind": "schematic",
@@ -841,8 +834,8 @@ def _schematic_spec(title: str, brief: str) -> dict[str, Any]:
     shapes = [
         {"type": "block", "id": "source", "role": "primary", "size": "medium", "label": "Source"},
         {
-            "type": "flow", "id": "flow", "anchor": "right_of:source", "target_id": "source",
-            "priority": "important", "size": "small", "intensity": 0.6, "label": "Effect",
+            "type": "arrow", "id": "flow", "anchor": "right_of:source", "target_id": "source",
+            "priority": "important", "size": "small", "label": "Effect",
         },
         {
             "type": "gauge", "id": "reading", "anchor": "below:source", "priority": "important",
@@ -1163,6 +1156,43 @@ def _concept_critique(user: str) -> dict[str, Any]:
     }
 
 
+def _image_text_check(user: str) -> dict[str, Any]:
+    """Offline stand-in for ImageService's vision-based text-accuracy check.
+    The real prompt deliberately never lists the expected labels (see
+    `_verify_generated_text`'s own docstring - showing them primes the
+    model to report what it expects rather than what's actually rendered),
+    so there is nothing for this mock to read them back from either;
+    `detected_text` is always empty, which offline drives every
+    `_generate_with_text_check` call straight to its guaranteed-safe,
+    text-free final attempt - a safe default, not a failure. A test that
+    wants to exercise the "first/retry attempt actually passes" path
+    overrides this builder (or, more directly, `ImageService._verify_generated_text`
+    itself) to return a matching list instead."""
+    return {"detected_text": []}
+
+
+def _page_visual_plan(user: str) -> dict[str, Any]:
+    """Offline stand-in for the post-pagination visual-repair planner (see
+    app.course.document.visual_repair) - always finds a plain process
+    flow_chart worth adding, derived from the page's own first line of
+    text, so an offline "does repair actually insert something" test has a
+    real, non-empty plan by default. A test exercising the "genuinely
+    nothing to illustrate" path overrides this builder to return
+    needs_visual: false instead."""
+    match = re.search(r"PAGE \d+ TEXT:\s*\n(.+)", user, re.DOTALL)
+    first_line = (match.group(1).splitlines()[0] if match and match.group(1).strip() else "this page's topic").strip()
+    return {
+        "needs_visual": True,
+        "purpose": f"Illustrate {first_line}",
+        "prompt": f"A clear diagram explaining {first_line}.",
+        "caption": first_line,
+        "kind": "diagram",
+        "diagram_kind": "flow_chart",
+        "illustration_style": "",
+        "expected_labels": [],
+    }
+
+
 _BUILDERS: dict[str, Any] = {
     "PlannerOutput": _planner_output,
     "PlannedSummaries": _planned_summaries,
@@ -1175,6 +1205,8 @@ _BUILDERS: dict[str, Any] = {
     "DocumentPatch": _document_patch,
     "DiagramSpec": _diagram_spec,
     "ConceptCritique": _concept_critique,
+    "ImageTextCheck": _image_text_check,
+    "PageVisualPlan": _page_visual_plan,
 }
 
 

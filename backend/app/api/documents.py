@@ -11,7 +11,14 @@ from app.api.course_authorization import check_document_owner
 from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.ids import slugify
 from app.db.models import User
-from app.schemas.document import CourseDocument
+from app.schemas.document import (
+    CourseDocument,
+    RegenerateVisualsRequest,
+    RegenerateVisualsResponse,
+    RepairVisualsResponse,
+    UpdateConceptVisualSpecRequest,
+    UpdateConceptVisualSpecResponse,
+)
 from app.schemas.patch import AiEditRequest, AiEditResponse
 from app.services.course_service import CourseService, get_course_service
 from app.services.document_service import DocumentService, get_document_service
@@ -73,6 +80,80 @@ async def ai_edit(
     """Ask the AI to change selected blocks. Returns the patch it produced."""
     await check_document_owner(document_id, current_user, course_service, service)
     return await service.ai_edit(document_id, request)
+
+
+@router.put(
+    "/{document_id}/blocks/{block_id}/visual-spec",
+    response_model=UpdateConceptVisualSpecResponse,
+)
+async def update_concept_visual_spec(
+    document_id: str,
+    block_id: str,
+    request: UpdateConceptVisualSpecRequest,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> UpdateConceptVisualSpecResponse:
+    """Edit the text inside a concept_experience visual (an entity/step
+    label or description) and re-render it deterministically - no AI call,
+    the exported PDF keeps rendering this the same static way it always has.
+    """
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    response = await service.update_concept_visual_spec(document_id, block_id, request.spec)
+    if current_user is not None:
+        await course_service.record_activity(
+            course_id, str(current_user.id), current_user.email, "updated"
+        )
+    return response
+
+
+@router.post("/{document_id}/regenerate-visuals", response_model=RegenerateVisualsResponse)
+async def regenerate_visuals(
+    document_id: str,
+    request: RegenerateVisualsRequest,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> RegenerateVisualsResponse:
+    """Re-render every image block in this document with the current
+    renderer/prompt code, even ones that already have an asset - for an
+    existing course generated before a visual-styling change, since a
+    rendered diagram/image is a static file that never updates on its own.
+    `request.kinds` narrows this to specific image kinds (e.g. ["diagram"]
+    to only touch deterministic, free-to-re-render diagrams, not also
+    re-spend on every AI-generated illustration) - blank means everything.
+    """
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    response = await service.regenerate_all_visuals(document_id, kinds=request.kinds)
+    if current_user is not None:
+        await course_service.record_activity(
+            course_id, str(current_user.id), current_user.email, "updated"
+        )
+    return response
+
+
+@router.post("/{document_id}/repair-visual-coverage", response_model=RepairVisualsResponse)
+async def repair_visual_coverage(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> RepairVisualsResponse:
+    """Audit every page of this EXISTING document for the 60:40 text/visual
+    target and generate+insert a relevant visual for any page that's still
+    deficient - the same post-pagination repair pass a newly generated
+    course already runs, available here for a course generated before this
+    pass existed. Never touches a page that already meets the target;
+    anything that couldn't be repaired within the bounded number of passes
+    is reported by page number and reason, not silently left as-is.
+    """
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    response = await service.repair_visual_coverage(document_id)
+    if current_user is not None:
+        await course_service.record_activity(
+            course_id, str(current_user.id), current_user.email, "updated"
+        )
+    return response
 
 
 @router.post("/{document_id}/export/pdf")

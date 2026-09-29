@@ -51,6 +51,13 @@ TEXTUAL_BLOCK_TYPES = {
     BlockType.STORY,
 }
 
+# A block that carries real visual weight on the page (as opposed to text
+# that merely mentions or introduces a visual) - shared between the reviewer
+# (chapter-level pacing, see app.agents.reviewer) and the layout engine
+# (page-level pagination, see app.course.document.layout) so both mean
+# exactly the same thing by "visual".
+VISUAL_BLOCK_TYPES = {BlockType.IMAGE, BlockType.TABLE, BlockType.CODE}
+
 
 class _Content(BaseModel):
     """Content models tolerate unknown keys so the editor can add metadata."""
@@ -89,6 +96,32 @@ class ImageContent(_Content):
     # Only meaningful when kind == "diagram"; ignored otherwise. Empty means
     # DiagramService free-decides, same as before this field existed.
     diagram_kind: str = ""
+    # Only meaningful when kind == "illustration". "" (default) keeps the
+    # template's own image_guidance (flat/decorative style, unchanged
+    # behaviour). "textbook" is for a companion picture placed ALONGSIDE a
+    # diagram/concept_experience visual for the same concept - an actual
+    # scientifically/technically accurate illustration (anatomy, an
+    # experiment apparatus, a molecular structure) rather than a decorative
+    # or flat-vector graphic - see ImageService.build_prompt.
+    illustration_style: str = ""
+    # Only meaningful when illustration_style == "textbook". The exact short
+    # labels (if any) the image is expected to render as text - the ground
+    # truth ImageService's post-generation text check compares the image's
+    # actual rendered text against (image models garble baked-in text often
+    # enough that this is checked automatically, not assumed correct - see
+    # ImageService._verify_generated_text). Leave empty for an illustration
+    # that isn't meant to have any text in it at all.
+    expected_labels: list[str] = Field(default_factory=list)
+    # The honest, final word on whether the delivered image's text passed
+    # `_verify_generated_text` - `None` means nothing was promised to check
+    # (no expected_labels, or a non-illustration kind), `True` means it
+    # passed a real check, `False` means every bounded attempt (including
+    # the guaranteed-effort text-free ones) still came back with incorrect
+    # text - see ImageService._generate_with_text_check. Never silently
+    # absent just because generation "succeeded" - a caller (the editor, a
+    # future course-quality audit) can tell "verified" from "shipped
+    # anyway" instead of assuming every generated image is correct.
+    text_verified: bool | None = None
 
 
 class QuoteContent(_Content):

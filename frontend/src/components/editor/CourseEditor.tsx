@@ -13,7 +13,13 @@ import { PageSidebar } from "./PageSidebar";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { UploadsPanel } from "./UploadsPanel";
 import { ApiError } from "@/lib/api/client";
-import { aiEdit, exportPdf, getDocument, saveDocument } from "@/lib/api/documents";
+import {
+  aiEdit,
+  exportPdf,
+  getDocument,
+  saveDocument,
+  updateConceptVisualSpec,
+} from "@/lib/api/documents";
 import {
   approveCourse,
   getCourseActivity,
@@ -23,7 +29,7 @@ import {
 } from "@/lib/api/courses";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { useEditor } from "@/lib/editor/store";
-import type { CourseDocument } from "@/lib/types/document";
+import type { ConceptVisualSpec, CourseDocument } from "@/lib/types/document";
 import type { CourseActivityEntry, CourseReview } from "@/lib/types/course";
 
 export function CourseEditor({ documentId }: { documentId: string }) {
@@ -53,6 +59,9 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   const [aiMessage, setAiMessage] = useState<string | null>(null);
   const [aiError, setAiError] = useState<string | null>(null);
   const assistantRef = useRef<HTMLInputElement>(null);
+
+  const [visualSpecBusy, setVisualSpecBusy] = useState(false);
+  const [visualSpecError, setVisualSpecError] = useState<string | null>(null);
 
   const { load, sync, reconcile } = editor;
 
@@ -274,6 +283,37 @@ export function CourseEditor({ documentId }: { documentId: string }) {
     [runAiEdit],
   );
 
+  // --- editable diagram text ------------------------------------------------
+  // No AI call, no patch - a direct server-side re-render (see
+  // DocumentService.update_concept_visual_spec). Adopts the server's copy
+  // afterward the same way runAiEdit does, and for the same reason: the
+  // re-render can reflow every block after this one on the page.
+  const handleUpdateConceptVisualSpec = useCallback(
+    async (blockId: string, spec: ConceptVisualSpec) => {
+      const hadLocalEdits = editor.dirty;
+      setVisualSpecBusy(true);
+      setVisualSpecError(null);
+      try {
+        await updateConceptVisualSpec(documentId, blockId, spec);
+        if (!hadLocalEdits) {
+          const authoritative = await getDocument(documentId);
+          reconcile(authoritative);
+        } else {
+          setVisualSpecError(
+            "Saved, but you have other unsaved edits on this page - reload to see the updated visual.",
+          );
+        }
+      } catch (caught) {
+        setVisualSpecError(
+          caught instanceof ApiError ? caught.message : "Could not save the change.",
+        );
+      } finally {
+        setVisualSpecBusy(false);
+      }
+    },
+    [documentId, editor.dirty, reconcile],
+  );
+
   // --- export -------------------------------------------------------------
   const handleExport = useCallback(async () => {
     setExporting(true);
@@ -411,7 +451,13 @@ export function CourseEditor({ documentId }: { documentId: string }) {
           />
         </div>
 
-        <PropertiesPanel onReplaceImage={handleReplaceImage} busy={aiBusy} />
+        <PropertiesPanel
+          onReplaceImage={handleReplaceImage}
+          busy={aiBusy}
+          onUpdateConceptVisualSpec={handleUpdateConceptVisualSpec}
+          visualSpecBusy={visualSpecBusy}
+          visualSpecError={visualSpecError}
+        />
       </div>
     </div>
   );

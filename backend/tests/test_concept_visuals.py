@@ -85,10 +85,14 @@ def test_representation_types_match_the_universal_taxonomy():
     """Regression guard for the taxonomy rename: `concept_metaphor` ->
     `object`, `annotated_diagram` -> `spatial`; `lifecycle`/`illustration`
     removed; `pipeline`/`code_visualization` added - see the approved plan's
-    section B (11-family taxonomy)."""
+    section B (11-family taxonomy). `timeline`/`before_after` added later,
+    each with a real dedicated renderer; `cycle` (dedicated renderer) and
+    `decision_tree` (alias onto `hierarchy`/`object`) added after that -
+    see concept_experience_renderer."""
     assert REPRESENTATION_TYPES == (
         "object", "data_structure", "process", "sequence", "state_machine", "relationship",
-        "hierarchy", "comparison", "pipeline", "spatial", "code_visualization",
+        "hierarchy", "comparison", "timeline", "before_after", "pipeline", "spatial",
+        "code_visualization", "cycle", "decision_tree",
     )
     for stale in ("concept_metaphor", "annotated_diagram", "lifecycle", "illustration"):
         assert stale not in REPRESENTATION_TYPES
@@ -363,6 +367,63 @@ class TestConceptExperienceRenderer:
         html = render_concept_experience_html(_java_class_and_object_spec(), TemplateTheme()).decode("utf-8")
         used_entity_colors = {_CEV_PALETTE[role].fill for role in ("primary", "accent", "secondary", "fluid")}
         assert used_entity_colors & set(_extract_hex_colors(html))
+
+
+class TestRelationshipChainLayout:
+    """A relationship chain (many entities, each pointing to the next -
+    e.g. a class hierarchy with several implementations per interface) used
+    to be able to strand a connector alone at the start of a wrapped row,
+    with nothing showing what it pointed at. See _entities_row_html's own
+    rationale comment for the fix."""
+
+    @staticmethod
+    def _chain_spec(n: int) -> DiagramSpec:
+        entities = [VisualEntity(id=f"e{i}", label=f"Node {i}", properties={"k": f"v{i}"}) for i in range(n)]
+        relationships = [
+            SchematicRelationship(source=f"e{i}", target=f"e{i + 1}", type="connected_to")
+            for i in range(n - 1)
+        ]
+        return DiagramSpec(
+            kind="concept_experience", representation="hierarchy",
+            entities=entities, relationships=relationships,
+        )
+
+    def test_every_connector_is_paired_with_a_card_in_the_same_unit(self):
+        html = render_concept_experience_html(self._chain_spec(8), TemplateTheme()).decode("utf-8")
+        # Every rel-link div must contain exactly one card - never an empty
+        # or dangling connector.
+        import re
+
+        links = re.findall(r'<div class="cev-rel-link">(.*?)</div></div>', html, re.DOTALL)
+        assert len(links) == 7  # 8 nodes -> 7 relationships
+        for link in links:
+            assert 'class="cev-card' in link
+
+    def test_a_hub_entity_is_not_duplicated_as_a_bare_source_twice(self):
+        """A node reused as source for two relationships renders its bare
+        card once, not once per outgoing edge."""
+        entities = [VisualEntity(id="hub", label="Hub"), VisualEntity(id="a", label="A"), VisualEntity(id="b", label="B")]
+        relationships = [
+            SchematicRelationship(source="hub", target="a", type="connected_to"),
+            SchematicRelationship(source="hub", target="b", type="connected_to"),
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="hierarchy", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert html.count('data-entity-id="hub"') == 1
+
+
+class TestTextNeverOverflowsItsBox:
+    """A long, unbroken token (a function signature, an identifier with no
+    spaces) must wrap inside its card/cell instead of spilling past the
+    edge - see the universal overflow-wrap rule on `.cev-root *`."""
+
+    def test_a_long_unbroken_property_value_does_not_overflow_its_card(self):
+        long_token = "a_" + "very_" * 20 + "long_unbroken_identifier"
+        entity = VisualEntity(id="a", label="A", properties={"field": long_token})
+        spec = DiagramSpec(kind="concept_experience", representation="object", entities=[entity])
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "overflow-wrap:anywhere" in html
+        assert long_token in html
 
 
 def _extract_hex_colors(html: str) -> set[str]:
@@ -890,3 +951,309 @@ class TestImageServiceWiring:
         # the illustration fallback never rewrites `kind` - only `path`/`generated`/etc.
         assert block.content["kind"] == "concept_experience"
         assert not block.content["path"].endswith(".html")
+
+
+# ---------------------------------------------------------------------------
+# "comparison" / "timeline" / "before_after" - three more dedicated
+# renderers alongside object/data_structure/process, added for richer
+# static visual variety (a real table, a chronology, a state contrast)
+# without touching those three existing renderers or their CSS at all.
+# ---------------------------------------------------------------------------
+
+
+def _comparison_spec() -> DiagramSpec:
+    return DiagramSpec(
+        kind="concept_experience", representation="comparison",
+        title="Stack vs Queue",
+        entities=[
+            VisualEntity(
+                id="stack", label="Stack", icon="📚", color_role="primary",
+                properties={"Order": "LIFO", "Removes from": "Top"},
+            ),
+            VisualEntity(
+                id="queue", label="Queue", icon="🚶", color_role="secondary",
+                properties={"Order": "FIFO", "Removes from": "Front"},
+            ),
+        ],
+    )
+
+
+def _timeline_spec() -> DiagramSpec:
+    return DiagramSpec(
+        kind="concept_experience", representation="timeline",
+        title="Docker's History",
+        steps=[
+            VisualStep(id="s1", label="2013 - Initial release", description="dotCloud open-sources Docker.", order=0),
+            VisualStep(id="s2", label="2015 - Docker 1.0", description="First production-ready release.", order=1),
+            VisualStep(id="s3", label="2017 - Swarm mode", description="Built-in orchestration ships.", order=2),
+        ],
+    )
+
+
+def _before_after_spec() -> DiagramSpec:
+    return DiagramSpec(
+        kind="concept_experience", representation="before_after",
+        title="Adding a Cache Layer",
+        entities=[
+            VisualEntity(id="before", label="Without cache", icon="🐢", color_role="negative",
+                         properties={"Latency": "800ms"}),
+            VisualEntity(id="after", label="With cache", icon="⚡", color_role="positive",
+                         properties={"Latency": "40ms"}),
+        ],
+    )
+
+
+class TestComparisonRenderer:
+    def test_renders_a_table_with_one_column_per_entity(self):
+        html = render_concept_experience_html(_comparison_spec(), TemplateTheme()).decode("utf-8")
+        assert "cev-cmp-table" in html
+        assert "Stack" in html and "Queue" in html
+        assert html.count("cev-cmp-col") >= 2  # 2 column headers
+
+    def test_rows_are_the_union_of_property_keys(self):
+        html = render_concept_experience_html(_comparison_spec(), TemplateTheme()).decode("utf-8")
+        assert "Order" in html
+        assert "Removes from" in html
+        assert "LIFO" in html and "FIFO" in html
+
+    def test_a_missing_key_on_one_entity_shows_a_placeholder_not_a_crash(self):
+        spec = DiagramSpec(
+            kind="concept_experience", representation="comparison",
+            entities=[
+                VisualEntity(id="a", label="A", properties={"Speed": "Fast"}),
+                VisualEntity(id="b", label="B", properties={}),
+            ],
+        )
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "—" in html
+
+    def test_renders_as_a_static_picture_with_no_script_or_buttons(self):
+        html = render_concept_experience_html(_comparison_spec(), TemplateTheme()).decode("utf-8")
+        assert "<script" not in html
+        assert "<button" not in html
+
+
+class TestTimelineRenderer:
+    def test_renders_every_milestone_in_order(self):
+        html = render_concept_experience_html(_timeline_spec(), TemplateTheme()).decode("utf-8")
+        assert "2013 - Initial release" in html
+        assert "2015 - Docker 1.0" in html
+        assert "2017 - Swarm mode" in html
+        assert html.index("2013") < html.index("2015") < html.index("2017")
+
+    def test_each_entry_carries_its_own_dot_and_stem(self):
+        """Deliberately per-entry, not a single shared rail across the whole
+        row - a shared rail breaks once entries wrap onto more than one row
+        (see the module's own rationale comment)."""
+        html = render_concept_experience_html(_timeline_spec(), TemplateTheme()).decode("utf-8")
+        assert html.count('class="cev-timeline-dot-wrap"') == 3
+
+    def test_renders_as_a_static_picture_with_no_script_or_buttons(self):
+        html = render_concept_experience_html(_timeline_spec(), TemplateTheme()).decode("utf-8")
+        assert "<script" not in html
+        assert "<button" not in html
+
+
+class TestBeforeAfterRenderer:
+    def test_renders_both_panels_and_an_arrow_between_them(self):
+        html = render_concept_experience_html(_before_after_spec(), TemplateTheme()).decode("utf-8")
+        assert "Without cache" in html
+        assert "With cache" in html
+        assert "cev-ba-arrow" in html
+        assert html.index("Without cache") < html.index("With cache")
+
+    def test_only_the_first_two_entities_are_used(self):
+        spec = _before_after_spec()
+        spec.entities.append(VisualEntity(id="extra", label="Ignored entity"))
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "Ignored entity" not in html
+
+    def test_a_single_entity_renders_only_the_before_panel_no_arrow(self):
+        spec = DiagramSpec(
+            kind="concept_experience", representation="before_after",
+            entities=[VisualEntity(id="only", label="Only state")],
+        )
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "Only state" in html
+        assert '<div class="cev-ba-arrow"' not in html
+
+    def test_renders_as_a_static_picture_with_no_script_or_buttons(self):
+        html = render_concept_experience_html(_before_after_spec(), TemplateTheme()).decode("utf-8")
+        assert "<script" not in html
+        assert "<button" not in html
+
+
+def _cycle_spec(step_count: int = 4) -> DiagramSpec:
+    names = ["Forward pass", "Compute loss", "Backward pass", "Update weights"]
+    return DiagramSpec(
+        kind="concept_experience", representation="cycle",
+        title="Training Loop",
+        steps=[
+            VisualStep(id=f"s{i}", label=names[i % len(names)], description=f"Step {i + 1}.", order=i)
+            for i in range(step_count)
+        ],
+    )
+
+
+class TestCycleRenderer:
+    def test_renders_every_step_in_order(self):
+        html = render_concept_experience_html(_cycle_spec(), TemplateTheme()).decode("utf-8")
+        assert "Forward pass" in html
+        assert "Compute loss" in html
+        assert "Backward pass" in html
+        assert "Update weights" in html
+        assert html.index("Forward pass") < html.index("Compute loss") < html.index("Backward pass")
+
+    def test_shows_a_loop_back_indicator_naming_the_first_step(self):
+        html = render_concept_experience_html(_cycle_spec(), TemplateTheme()).decode("utf-8")
+        marker = '<div class="cev-cycle-loop">'
+        assert marker in html
+        # The loop-back badge names the first step specifically, not a
+        # generic "repeats" label with no real content.
+        assert "Forward pass" in html[html.index(marker):]
+
+    def test_a_single_step_shows_no_loop_back_indicator(self):
+        spec = DiagramSpec(
+            kind="concept_experience", representation="cycle",
+            steps=[VisualStep(id="only", label="Only step", order=0)],
+        )
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert '<div class="cev-cycle-loop">' not in html
+
+    def test_renders_as_a_static_picture_with_no_script_or_buttons(self):
+        html = render_concept_experience_html(_cycle_spec(), TemplateTheme()).decode("utf-8")
+        assert "<script" not in html
+        assert "<button" not in html
+
+
+def _decision_tree_spec() -> DiagramSpec:
+    return DiagramSpec(
+        kind="concept_experience", representation="decision_tree",
+        title="Cache Lookup",
+        entities=[
+            VisualEntity(id="check", label="Is it cached?", color_role="primary"),
+            VisualEntity(id="hit", label="Return cached value", color_role="positive"),
+            VisualEntity(id="miss", label="Query the database", color_role="negative"),
+        ],
+        relationships=[
+            SchematicRelationship(source="check", target="hit", type="yes"),
+            SchematicRelationship(source="check", target="miss", type="no"),
+        ],
+    )
+
+
+class TestDecisionTreeRenderer:
+    def test_renders_every_node_and_its_branch_label(self):
+        html = render_concept_experience_html(_decision_tree_spec(), TemplateTheme()).decode("utf-8")
+        assert "Is it cached?" in html
+        assert "Return cached value" in html
+        assert "Query the database" in html
+        assert "yes" in html
+        assert "no" in html
+
+    def test_every_connector_is_paired_with_its_target_no_orphans(self):
+        """Reuses _entities_row_html's cev-rel-link grouping (same fix as the
+        relationship-chain layout) - a decision tree with several branches
+        must not strand a "yes"/"no" label with nothing next to it."""
+        html = render_concept_experience_html(_decision_tree_spec(), TemplateTheme()).decode("utf-8")
+        assert html.count('<div class="cev-rel-link">') == 2
+
+    def test_renders_as_a_static_picture_with_no_script_or_buttons(self):
+        html = render_concept_experience_html(_decision_tree_spec(), TemplateTheme()).decode("utf-8")
+        assert "<script" not in html
+        assert "<button" not in html
+
+
+class TestNewRepresentationsPixelSizeEstimation:
+    def test_comparison_height_grows_with_criteria_count(self):
+        few = DiagramSpec(
+            kind="concept_experience", representation="comparison",
+            entities=[
+                VisualEntity(id="a", label="A", properties={"k1": "v1"}),
+                VisualEntity(id="b", label="B", properties={"k1": "v2"}),
+            ],
+        )
+        many = DiagramSpec(
+            kind="concept_experience", representation="comparison",
+            entities=[
+                VisualEntity(id="a", label="A", properties={f"k{i}": f"v{i}" for i in range(10)}),
+                VisualEntity(id="b", label="B", properties={f"k{i}": f"v{i}" for i in range(10)}),
+            ],
+        )
+        _, few_height = estimate_pixel_size(few)
+        _, many_height = estimate_pixel_size(many)
+        assert many_height > few_height
+
+    def test_timeline_height_grows_with_milestone_count(self):
+        few = DiagramSpec(
+            kind="concept_experience", representation="timeline",
+            steps=[VisualStep(id=f"s{i}", label=f"20{10+i} - Event {i}", order=i) for i in range(2)],
+        )
+        many = DiagramSpec(
+            kind="concept_experience", representation="timeline",
+            steps=[VisualStep(id=f"s{i}", label=f"20{10+i} - Event {i}", order=i) for i in range(12)],
+        )
+        _, few_height = estimate_pixel_size(few)
+        _, many_height = estimate_pixel_size(many)
+        assert many_height > few_height
+
+    def test_cycle_height_grows_with_step_count_and_the_loop_badge(self):
+        one = DiagramSpec(
+            kind="concept_experience", representation="cycle",
+            steps=[VisualStep(id="s0", label="Only step", order=0)],
+        )
+        many = DiagramSpec(
+            kind="concept_experience", representation="cycle",
+            steps=[VisualStep(id=f"s{i}", label=f"Step {i}", order=i) for i in range(6)],
+        )
+        _, one_height = estimate_pixel_size(one)
+        _, many_height = estimate_pixel_size(many)
+        assert many_height > one_height
+
+    def test_all_stay_within_the_one_page_cap(self):
+        for spec in (
+            DiagramSpec(
+                kind="concept_experience", representation="comparison",
+                entities=[
+                    VisualEntity(id=f"e{i}", label=f"Entity {i}", properties={f"k{j}": f"v{j}" for j in range(15)})
+                    for i in range(5)
+                ],
+            ),
+            DiagramSpec(
+                kind="concept_experience", representation="timeline",
+                steps=[
+                    VisualStep(
+                        id=f"s{i}", label=f"20{10+i} - A long milestone description",
+                        description="Enough detail to wrap onto a couple of lines in the card.", order=i,
+                    )
+                    for i in range(20)
+                ],
+            ),
+            DiagramSpec(
+                kind="concept_experience", representation="cycle",
+                steps=[
+                    VisualStep(
+                        id=f"s{i}", label=f"Step {i}: a fairly descriptive step name",
+                        description="Enough detail to wrap onto a couple of lines in the card.", order=i,
+                    )
+                    for i in range(20)
+                ],
+            ),
+        ):
+            _, height = estimate_pixel_size(spec)
+            assert height <= 863
+
+    def test_scaled_wrapper_height_matches_what_was_reserved_for_a_large_comparison(self):
+        spec = DiagramSpec(
+            kind="concept_experience", representation="comparison",
+            entities=[
+                VisualEntity(id=f"e{i}", label=f"Entity {i}", properties={f"k{j}": f"v{j}" for j in range(15)})
+                for i in range(5)
+            ],
+        )
+        _, reserved_height = estimate_pixel_size(spec)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "transform:scale(" in html
+        match = re.search(r"height:(\d+)px", html)
+        assert match is not None
+        assert int(match.group(1)) == reserved_height

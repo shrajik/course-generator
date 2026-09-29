@@ -88,6 +88,12 @@ class DraftBlock(BaseModel):
     # app.schemas.diagram.DIAGRAM_KINDS (e.g. "concept_map", "flow_chart").
     # Optional: leave blank to let DiagramService decide.
     diagram_kind: str = ""
+    # "" (default) | "textbook" - see ImageContent.illustration_style. Only
+    # meaningful when image_kind == "illustration".
+    illustration_style: str = ""
+    # See ImageContent.expected_labels. Only meaningful when
+    # illustration_style == "textbook".
+    image_expected_labels: list[str] = Field(default_factory=list)
 
 
 class BlockReplacement(BaseModel):

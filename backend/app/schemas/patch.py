@@ -87,6 +87,9 @@ class ReplaceImageOp(BaseModel):
     # with a new prompt - see EDITOR_SYSTEM's replace_image guidance.
     kind: str | None = None
     diagram_kind: str | None = None
+    # "" | "textbook" - see ImageContent.illustration_style. Only meaningful
+    # when the block ends up with kind == "illustration".
+    illustration_style: str | None = None
 
 
 class UpdateStyleOp(BaseModel):

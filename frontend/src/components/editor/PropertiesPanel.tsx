@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/Button";
 import { IconButton } from "@/components/ui/IconButton";
 import { BLOCK_LABELS, isTextBlock } from "@/lib/editor/blocks";
 import { useEditor } from "@/lib/editor/store";
-import type { TextAlign } from "@/lib/types/document";
+import type { ConceptVisualSpec, TextAlign, VisualEntitySpec, VisualStepSpec } from "@/lib/types/document";
 import { cn } from "@/lib/utils/cn";
 
 const FONTS = ["Inter", "Georgia", "Segoe UI", "Helvetica", "JetBrains Mono"];
@@ -58,12 +58,123 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 const inputClass =
   "h-8 w-full rounded-[7px] border border-line bg-white px-2 text-[12px] text-ink outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100";
 
+const textareaClass =
+  "w-full resize-none rounded-[7px] border border-line bg-white px-2 py-1.5 text-[12px] text-ink outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100";
+
+/** A label/description form for a concept_experience visual's own spec -
+ * every representation (object, process, comparison, timeline, ...) is
+ * built from just `entities` and/or `steps` (see
+ * backend/app/render/concept_experience_renderer.py), so one generic editor
+ * covers all of them without branching on `representation`. Saving re-
+ * renders server-side (no AI call) and reflows the page - see
+ * CourseEditor's `handleUpdateConceptVisualSpec`. */
+function ConceptVisualFieldsEditor({
+  spec,
+  busy,
+  onSave,
+}: {
+  spec: ConceptVisualSpec;
+  busy: boolean;
+  onSave: (spec: ConceptVisualSpec) => void;
+}) {
+  const [draft, setDraft] = useState<ConceptVisualSpec>(spec);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(spec);
+
+  const updateEntity = (index: number, patch: Partial<VisualEntitySpec>) => {
+    setDraft((prev) => {
+      const entities = [...(prev.entities ?? [])];
+      entities[index] = { ...entities[index], ...patch };
+      return { ...prev, entities };
+    });
+  };
+  const updateEntityProperty = (entityIndex: number, key: string, value: string) => {
+    setDraft((prev) => {
+      const entities = [...(prev.entities ?? [])];
+      const entity = entities[entityIndex];
+      entities[entityIndex] = {
+        ...entity,
+        properties: { ...(entity.properties ?? {}), [key]: value },
+      };
+      return { ...prev, entities };
+    });
+  };
+  const updateStep = (index: number, patch: Partial<VisualStepSpec>) => {
+    setDraft((prev) => {
+      const steps = [...(prev.steps ?? [])];
+      steps[index] = { ...steps[index], ...patch };
+      return { ...prev, steps };
+    });
+  };
+
+  return (
+    <div className="space-y-2.5">
+      {(draft.entities ?? []).map((entity, index) => (
+        <div key={entity.id || index} className="rounded-[7px] border border-line p-2">
+          <Field label={`Entity ${index + 1}`}>
+            <input
+              className={inputClass}
+              value={entity.label}
+              onChange={(event) => updateEntity(index, { label: event.target.value })}
+            />
+          </Field>
+          {Object.entries(entity.properties ?? {}).map(([key, value]) => (
+            <div className="mt-1.5" key={key}>
+              <Field label={key}>
+                <input
+                  className={inputClass}
+                  value={value}
+                  onChange={(event) => updateEntityProperty(index, key, event.target.value)}
+                />
+              </Field>
+            </div>
+          ))}
+        </div>
+      ))}
+
+      {(draft.steps ?? []).map((step, index) => (
+        <div key={step.id || index} className="rounded-[7px] border border-line p-2">
+          <Field label={`Step ${index + 1}`}>
+            <input
+              className={inputClass}
+              value={step.label}
+              onChange={(event) => updateStep(index, { label: event.target.value })}
+            />
+          </Field>
+          <div className="mt-1.5">
+            <Field label="Description">
+              <textarea
+                rows={2}
+                className={textareaClass}
+                value={step.description ?? ""}
+                onChange={(event) => updateStep(index, { description: event.target.value })}
+              />
+            </Field>
+          </div>
+        </div>
+      ))}
+
+      <Button size="sm" className="w-full" disabled={busy || !dirty} onClick={() => onSave(draft)}>
+        {busy ? "Saving…" : "Save changes"}
+      </Button>
+    </div>
+  );
+}
+
 interface PropertiesPanelProps {
   onReplaceImage: (blockId: string, description: string) => void;
   busy: boolean;
+  onUpdateConceptVisualSpec: (blockId: string, spec: ConceptVisualSpec) => void;
+  visualSpecBusy: boolean;
+  visualSpecError: string | null;
 }
 
-export function PropertiesPanel({ onReplaceImage, busy }: PropertiesPanelProps) {
+export function PropertiesPanel({
+  onReplaceImage,
+  busy,
+  onUpdateConceptVisualSpec,
+  visualSpecBusy,
+  visualSpecError,
+}: PropertiesPanelProps) {
   const editor = useEditor();
   const block = editor.selectedBlocks[0] ?? null;
   const [imagePrompt, setImagePrompt] = useState("");
@@ -248,6 +359,26 @@ export function PropertiesPanel({ onReplaceImage, busy }: PropertiesPanelProps) 
             <ImagePlus size={13} />
             {busy ? "Replacing…" : "Replace Image"}
           </Button>
+        </Section>
+      ) : null}
+
+      {block.type === "image" &&
+      block.content.kind === "concept_experience" &&
+      block.content.spec ? (
+        <Section title="Diagram content">
+          <p className="mb-2 text-[11px] leading-snug text-ink-400">
+            Fix a label or description without regenerating the whole visual - the exported
+            PDF still renders it as a plain picture, this only changes what's in it.
+          </p>
+          <ConceptVisualFieldsEditor
+            key={block.id}
+            spec={block.content.spec as ConceptVisualSpec}
+            busy={visualSpecBusy}
+            onSave={(spec) => onUpdateConceptVisualSpec(block.id, spec)}
+          />
+          {visualSpecError ? (
+            <p className="mt-2 text-[11px] leading-snug text-red-600">{visualSpecError}</p>
+          ) : null}
         </Section>
       ) : null}
 

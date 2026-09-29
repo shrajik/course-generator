@@ -54,10 +54,13 @@ WRONG_RELATIONSHIP = "wrong_relationship"
 _LABEL_LENGTH_CAP = 40  # characters - "short, a few words", not a sentence
 # Representations where a learner comparing concrete instances is central to
 # the whole point - the only ones instance-count/variation checks apply to.
-_INSTANCE_DRIVEN_REPRESENTATIONS = ("object", "comparison", "data_structure")
+_INSTANCE_DRIVEN_REPRESENTATIONS = ("object", "comparison", "data_structure", "before_after")
 _METAPHOR_FRIENDLY_REPRESENTATIONS = ("object", "spatial")
-_SEQUENCE_REPRESENTATIONS = ("process", "sequence", "pipeline")
-_ENTITY_BASED_REPRESENTATIONS = ("object", "data_structure", "comparison", "code_visualization", "spatial")
+_SEQUENCE_REPRESENTATIONS = ("process", "sequence", "pipeline", "timeline", "cycle")
+_ENTITY_BASED_REPRESENTATIONS = (
+    "object", "data_structure", "comparison", "code_visualization", "spatial", "before_after",
+    "decision_tree",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +151,7 @@ def _representation_plausible(spec: DiagramSpec, representation: str) -> list[Di
                 'representation="state_machine" needs at least one `concept_states` entry - none is set.',
             )]
         return []
-    if representation in ("relationship", "hierarchy"):
+    if representation in ("relationship", "hierarchy", "decision_tree"):
         if len(spec.entities) < 2 and not spec.relationships:
             return [DiagramQAIssue(
                 MISSING_ENTITY,

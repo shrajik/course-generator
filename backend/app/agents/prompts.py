@@ -298,6 +298,24 @@ How to produce blocks:
   every chapter.
 - Fill only the fields that a block type needs; leave the rest empty.
 - Paragraphs: 60-140 words each. Several short paragraphs beat one long one.
+- Pace the chapter so it reads as roughly 60% text / 40% visual (a diagram,
+  concept_experience visual, illustration, table, or a code sample paired
+  with its own explanation) - never a long unbroken stretch of prose. As a
+  concrete check while you write: never let more than about 500 words of
+  paragraph/story/quote/tip/warning text pass (roughly one rendered page)
+  without an image/table/code block breaking it up. If a section has enough
+  ground to cover that it would otherwise be one big block of text, split it
+  into a few shorter sections with a visual between them instead of writing
+  it as one long stretch. This is Learn -> Read -> Visualize -> Understand ->
+  Continue, not Read -> Read -> Read -> Read.
+  Every visual still needs a real reason to exist - it must explain,
+  reinforce or let the learner picture the specific idea just discussed;
+  never a decorative or generic image added only to hit this pacing target,
+  and never two near-identical visuals in the same chapter. A topic with
+  several genuine visual opportunities (a process AND a comparison AND a
+  structural diagram, say) should use more than one - do not stop at a
+  single image because it "feels like enough" when the content actually
+  supports more.
 - A diagram must always illustrate the SUBJECT MATTER being taught (the
   phenomenon, mechanism, organism, system, process or comparison the chapter
   is actually about) - never the course itself. Do not diagram the syllabus,
@@ -324,6 +342,13 @@ How to produce blocks:
   when concept_experience's own "process"/"sequence" shape already covers
   it better. Physics, biology, chemistry, math and other non-technical
   domains never use concept_experience - always use `diagram` for those.
+  Two specific exceptions stay on `diagram` even for a technical topic,
+  because concept_experience has no matching shape for them: a genuine
+  multi-table DATABASE SCHEMA (2+ entities with their own fields, related by
+  foreign keys - not just "explain what a JOIN is") gets `diagram_kind:
+  er_diagram`; a system/pipeline walkthrough that specifically needs to show
+  external callers and data stores as distinct shapes (not just processing
+  steps) gets `diagram_kind: data_flow_diagram`.
 - Every chapter that describes a SEQUENCE - steps that happen in order, a
   procedure, a decision path - and didn't already get `concept_experience`
   above needs at least one `image` block with `image_kind: diagram` and
@@ -338,31 +363,92 @@ How to produce blocks:
   motion/force/current/flow, and what causes what. Prose describing a
   mechanism is not enough on its own; a reader needs to see the components
   and how they relate. Choose which shape fits:
-  * `diagram_kind: schematic` when the subject has a real, recognisable
-    physical shape and arrangement best shown as a simplified textbook
-    illustration - this is a general-purpose choice, not a physics-only one:
-    a magnet and a coil, a titration setup, a cell and its organelles, a
-    plant's parts, an organ, a molecule forming from its atoms, an orbit, a
-    mechanical assembly - use whichever domain the chapter is actually about.
-    Especially good when there's a natural before/after, at-rest/in-motion
-    or reactant/product comparison to show.
+  * `diagram_kind: schematic` ONLY for a biology/life-science structure - a
+    cell and its organelles, a plant's parts, an organ - where a labelled
+    parts-diagram is genuinely what's needed. NEVER `schematic` for physics,
+    chemistry or math: a magnet and a coil, a titration setup, a molecule
+    forming from its atoms, an orbit, a mechanical assembly, any experimental
+    apparatus - all of these go through `image_kind: illustration` with
+    `illustration_style: textbook` instead (describe the exact setup/
+    components in `image_prompt`), never the labelled-shape schematic
+    renderer, full stop - this is a firm preference from real generated
+    courses, not just a style suggestion. This split is by SUBJECT, not by
+    whether something happens to have a physical shape: a cell (biology)
+    still gets `schematic`; a magnet, a beaker/flask, an orbit or a pulley
+    (physics/chemistry) always gets `illustration` instead, even for a
+    simple static object that would render fine as a schematic - use
+    illustration anyway.
   * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
     the relationships is enough (an abstract system, an organisation, a
     reaction pathway) and there's no real physical arrangement to draw.
   * `diagram_kind: hierarchy` for a strict parent/child breakdown, and
     `diagram_kind: comparison` for two or more things compared side by side.
+  * NEVER `schematic`/`concept_map`/`hierarchy`/`comparison` for a
+    coordinate-axis graph or curve - a supply-and-demand curve, a
+    distance-time or velocity-time graph, a function's plot, any X-Y
+    relationship with axes. That family is rendered from labelled boxes and
+    connector lines; it has no notion of an axis or a curve, so forcing a
+    graph into it produces boxes labelled "Axes: P (vertical), Q
+    (horizontal)" with crossing lines behind them - never draw one. A
+    coordinate-axis graph is a photographic/artistic scene as far as this
+    renderer is concerned: use `image_kind: illustration` and describe the
+    exact axes, labels, curves and any shift/movement in `image_prompt` so
+    the image model draws the graph directly, the same way it would draw
+    any other picture.
+  * A chronological/historical timeline (a sequence of dated events, eras or
+    milestones - a country's history, a technology's evolution, a person's
+    life) is a SEQUENCE, not a relationship - use `diagram_kind: flow_chart`
+    or `process`, with each node's label carrying the date/era (e.g. "1947 -
+    Independence") and its description the event itself. This applies to
+    every subject, not just technical ones: history, business, science -
+    anywhere a "what happened, in order" needs showing.
 - A chapter with BOTH a process to walk through AND a phenomenon/structure to
-  show needs BOTH diagrams (a flow_chart plus a schematic or concept_map) -
-  one does not replace the other, and this is normal and expected, not
-  redundant. This applies to every subject: a chemistry chapter gets both a
-  reaction-mechanism flow_chart and a schematic of the molecules involved; a
-  biology chapter gets both a process flow_chart and a schematic of the
-  organism/structure; a physics chapter gets both a problem-solving
-  flow_chart and a schematic of the apparatus - do not stop at just the
-  flowchart because it feels like "enough".
+  show needs BOTH visuals (a flow_chart plus a schematic/concept_map/
+  illustration, per the subject rule above) - one does not replace the
+  other, and this is normal and expected, not redundant. This applies to
+  every subject: a chemistry chapter gets both a reaction-mechanism
+  flow_chart and an illustration of the molecules involved; a biology
+  chapter gets both a process flow_chart and a schematic of the organism/
+  structure; a physics chapter gets both a problem-solving flow_chart and an
+  illustration of the apparatus - do not stop at just the flowchart because
+  it feels like "enough".
+- Beyond the structured diagram/concept_experience visual above (which
+  explains structure/steps/relationships through labelled shapes), some
+  concepts ALSO genuinely benefit from a second, complementary illustrative
+  picture alongside it - what the real thing actually looks like, not a
+  labelled-box abstraction of it (this is on top of the physics/chemistry/
+  math rule above, which already routes those subjects' own apparatus/
+  molecule/setup pictures through illustration as their ONLY diagram, not an
+  addition to one). Use this rarely and only when it adds further value: a
+  recognisable anatomical structure (a heart, a cell, an organ) alongside its
+  biology schematic, a well-known technical architecture illustration (a
+  neural network, a transformer, a RAG pipeline) alongside its
+  concept_experience diagram, a geographic or geological scene (a region's
+  terrain, a volcano's cross-section, a landform), or a historical scene
+  (what a place, event or artefact actually looked like) - where seeing it
+  helps as much as seeing its labelled parts does. When this applies, add a
+  SEPARATE
+  `image` block right after the diagram/concept_experience block for that
+  same concept, with `image_kind: illustration` and `illustration_style:
+  textbook`. This is a companion to that diagram, not a replacement or a
+  duplicate - do not add one for every chapter, and never for an abstract
+  process, a comparison, or anything that has no real visual form to
+  depict. Keep `image_prompt` precise about the actual subject (the accurate
+  structure/components/setting) and note that only essential labels should
+  appear in the image itself - never a wall of text or captions baked in.
+  Image models frequently misspell or garble text they draw - if the
+  picture needs ANY specific words/labels rendered in it, list each one,
+  exactly as it must be spelled, in `image_expected_labels` - a real
+  automated check compares the finished image against this list before
+  it's accepted, so a labelled image without this list can't be verified
+  and might ship with garbled text. Leave it empty for a picture that
+  needs no text at all (often the better choice anyway - a label the
+  reader needs can just as well live in the caption or the paragraph
+  beside it).
 - Set `diagram_kind` whenever you can tell which shape fits (flow_chart,
-  process, cycle, schematic, concept_map, hierarchy, comparison, smart_art) -
-  this is what the renderer actually builds, so getting it right here is
+  process, cycle, schematic, concept_map, hierarchy, comparison, smart_art,
+  data_flow_diagram, er_diagram, swimlane) - this is what the renderer
+  actually builds, so getting it right here is
   what makes the diagram useful. Leave it blank only when you genuinely
   cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a
@@ -372,7 +458,9 @@ How to produce blocks:
   rendered from labelled shapes, never drawn, so labels always come out
   exact), or `image_kind: concept_experience` per the rule above. Use
   `image_kind: illustration` (the default) only for a genuinely photographic
-  or artistic scene that has no components or relationships to label.
+  or artistic scene that has no components or relationships to label, or for
+  the companion textbook picture described above (set `illustration_style:
+  textbook` in that case; leave it blank otherwise).
 - For `code` blocks set `language` and keep the sample runnable and idiomatic.
 - For `quiz` blocks give 3-5 questions, each with the answer and an explanation.
 - Vary the formats: stories, analogies, examples, case studies, tips, warnings,
@@ -507,6 +595,18 @@ Score each dimension from 0 to 10. Review:
 accuracy, clarity, structure, audience suitability, repetition, adherence to the
 Do's, absence of the Don'ts, presence of the required template blocks, and
 logical flow.
+
+Also judge visual pacing: the chapter should read as roughly 60% text / 40%
+visual (diagrams, illustrations, tables, code+explanation), never a long
+unbroken run of paragraphs - a separate deterministic check already catches
+an egregious wall of text, so focus your judgement on quality, not just
+count: does each visual actually explain or reinforce the specific idea next
+to it (not a generic/decorative image, not two near-identical visuals doing
+the same job), and does the chapter feel like Learn -> Read -> Visualize ->
+Understand -> Continue rather than Read -> Read -> Read? Report a real
+problem here as an issue (e.g. a visual whose caption doesn't match what it's
+next to, or two diagrams that repeat the same point) the same way you would
+any other issue.
 
 Set `technical_correctness` for technical courses (also judging code quality) and
 `practical_relevance` for non-technical courses. Leave the other one null.
@@ -763,20 +863,47 @@ Rules:
   map/labelled relationship diagram, physical schematic or SmartArt-style
   list (rendered from labelled shapes, so labels stay exact); also set
   `diagram_kind` to the specific shape (flow_chart/process/cycle for a sequence,
-  schematic for a physical apparatus/mechanism best shown as a real illustration,
+  schematic ONLY for a biology/life-science structure (a cell, a plant, an
+  organ) - NEVER for physics, chemistry or math (a magnet, an apparatus, a
+  molecule, an orbit, a mechanical assembly): those always get `kind:
+  "illustration"` with `illustration_style: "textbook"` instead, even for a
+  simple static object - this is a firm preference from real generated
+  courses, not a style suggestion,
   concept_map for an abstract structure's components and how they relate,
-  hierarchy, comparison, smart_art) -
+  hierarchy, comparison, smart_art, data_flow_diagram for a system/pipeline
+  walkthrough needing distinct external-caller/data-store shapes, er_diagram
+  for a genuine multi-table database schema, swimlane for a process where
+  which role/actor/system does each step is itself part of the point) -
   never diagram the course/lesson itself, only the subject matter. Leave `kind`
-  as "illustration" (the default) for a photographic/artistic scene.
+  as "illustration" (the default) for a photographic/artistic scene - this
+  includes a coordinate-axis graph or curve (a supply-and-demand curve, a
+  distance-time graph, a function's plot): that family is built from labelled
+  boxes and connector lines, has no notion of an axis or a curve, and forcing
+  a graph into it produces boxes labelled with the axis/curve description
+  instead of an actual graph - always "illustration" for these, describing
+  the exact axes/labels/curves in `prompt`.
+  When the user specifically asks for an actual illustrative picture of the
+  real subject (anatomy, an experiment/apparatus, a molecular structure, a
+  known technical-architecture illustration) rather than another structured
+  diagram - typically as a companion next to an existing diagram/
+  concept_experience block for the same concept, via insert_block - set
+  `kind: "illustration"` and also `illustration_style: "textbook"` (both
+  directly on the operation for replace_image, or inside `content` for
+  insert_block). Leave `illustration_style` unset/blank for every other
+  illustration.
   `replace_image` (both fields are directly on the operation, not inside a
   content update) keeps the block's existing `kind`/`diagram_kind` when you
   leave them unset - but when the instruction is to regenerate/replace/redo an
   image, always re-run the check above against the block's actual topic first,
   even if the user didn't mention "kind" at all. A block sitting on `kind:
-  "diagram"` whose topic clearly qualifies for `concept_experience` is a bug
-  to fix while you're there, not a choice to preserve - set `kind` to
-  "concept_experience" (diagram_kind clears itself) instead of only swapping
-  the prompt and reproducing the same wrong output.
+  "diagram"` whose topic clearly qualifies for `concept_experience`, whose
+  topic is actually a coordinate-axis graph wrongly rendered as boxes-and-
+  lines, or whose `diagram_kind` is "schematic" for a physics/chemistry/math
+  topic, is a bug to fix while you're there, not a choice to preserve - set
+  `kind` to "concept_experience" (diagram_kind clears itself), or to
+  "illustration" (with `illustration_style: "textbook"` for the schematic
+  case) instead of only swapping the prompt and reproducing the same wrong
+  output.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.

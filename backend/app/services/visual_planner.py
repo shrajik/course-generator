@@ -113,8 +113,23 @@ relationship, or a state machine:
   relationships between them.
 - "hierarchy": parent/child structure (the OSI/TCP-IP layers, class
   inheritance, a file system, an org chart, a Kubernetes cluster's nesting).
-- "comparison": entities compared side by side (stack vs queue, SQL vs
-  NoSQL, HTTP vs HTTPS, two Big-O complexities).
+- "comparison": 2+ things compared side by side on the SAME criteria (stack
+  vs queue, SQL vs NoSQL, HTTP vs HTTPS, two Big-O complexities) - renders as
+  a real table (criteria as rows, the compared things as columns), not a
+  plain row of cards, so give every compared entity the SAME property keys
+  (the criteria) with each one's own value - a criterion only one entity has
+  a value for defeats the whole point of a comparison.
+- "timeline": a chronological sequence of dated/eras milestones (a
+  technology's version history, a project's phases, an era-by-era history of
+  an idea) - NOT for a plain ordered procedure with no real time dimension
+  (that's "process"); the giveaway is whether the content is naturally
+  described with dates/years/"first...then, years later...".
+- "before_after": a single state transformation - exactly one thing shown in
+  its earlier state vs its later state (a variable's value before/after a
+  reassignment, an architecture before/after adding caching, a metric
+  before/after an optimisation) - NOT for a multi-step process (that's
+  "process"/"sequence") and NOT for comparing two DIFFERENT things (that's
+  "comparison") - before_after is always the SAME thing, two moments in time.
 - "pipeline": staged data transformation (a RAG pipeline - query, embed,
   retrieve, generate; an ETL job; a compiler's stages).
 - "spatial": physical/structural layout matters (memory layout, a network
@@ -123,6 +138,18 @@ relationship, or a state machine:
 - "code_visualization": a short technical_signature tied directly to the
   entity it describes - most useful alongside "object" for a programming
   concept.
+- "cycle": a REPEATING sequence - the last step feeds back into the first
+  (an ML training loop - forward pass, loss, backward pass, update, repeat;
+  a software release cycle; a review-revise-repeat editorial loop). The
+  giveaway is whether the process is naturally described as "then it starts
+  over" - NOT for a one-shot procedure that finishes (that's "process").
+- "decision_tree": a branching decision path driven by a condition (an
+  if/else flow, a diagnostic checklist, "is X true? then A, else B") -
+  entities are the decision points and outcomes, connected by labelled
+  `relationships` naming each branch (e.g. type="yes"/"no", or the actual
+  condition). NOT for a plain multi-step procedure with no branching
+  (that's "process") and NOT for an unconditional parent/child breakdown
+  with no decision involved (that's "hierarchy").
 
 Do not blindly trust your own first instinct - double check: does the
 chosen representation actually match what you're about to put in `entities`/
@@ -165,10 +192,14 @@ Fill these fields:
   spend effort perfecting this field - correctness on the fields above
   matters far more.
 - `entities`: for "object"/"comparison"/"data_structure"/"relationship"/
-  "hierarchy"/"spatial"/"code_visualization" - 2-6 named things. For
-  "object", typically one "template"-role entity and 2+ "instance"-role
-  entities with DIFFERENT property values from each other (never give two
-  instances identical properties, that defeats the whole point). For
+  "hierarchy"/"decision_tree"/"spatial"/"code_visualization"/"before_after" -
+  2-6 named things. For "object", typically one "template"-role entity and 2+
+  "instance"-role entities with DIFFERENT property values from each other
+  (never give two instances identical properties, that defeats the whole
+  point). For "before_after", exactly 2 entities in list order - the FIRST
+  is the "before" state, the SECOND is the "after" state; give them the SAME
+  property keys so the change per property is visible (e.g. both have a
+  "value" property, with different values). For
   "data_structure", list entities in the actual structural order (a stack's
   bottom-to-top, a queue's front-to-back) - the list order itself IS the
   structure's order, and it is ALWAYS the individual elements/nodes ONLY -
@@ -194,22 +225,32 @@ Fill these fields:
   meaning (e.g. every instance of the same class); give genuinely different
   things genuinely different roles rather than defaulting every entity to
   "primary".
-  Leave `entities` empty for a pure "process"/"state_machine" representation
-  that doesn't need them.
-- `steps`: for "process"/"sequence"/"pipeline" - ordered steps, each with
-  an `id`, `label`, short `description`, `order` (0-based), `icon`,
-  `color_role`.
+  Leave `entities` empty for a pure "process"/"cycle"/"state_machine"
+  representation that doesn't need them.
+- `steps`: for "process"/"sequence"/"pipeline"/"timeline"/"cycle" - ordered
+  steps, each with an `id`, `label`, short `description`, `order` (0-based),
+  `icon`, `color_role`. For "timeline" specifically, put the date/era at the
+  start of `label` (e.g. "2015 - Docker 1.0 released", "Week 3 - First
+  prototype"), not just a bare event name - the date IS the point of a
+  timeline. For "cycle", `order` still matters (it's the order within ONE
+  pass through the loop) - do not add a fake extra "repeat" step at the end,
+  the renderer already shows the loop-back on its own.
 - `concept_states` + `transitions`: for "state_machine" - named states
   (`id`, `label`, `description`, `entity_ids` it involves, `icon`,
   `color_role`) plus the transitions between them (`from_state`, `to_state`,
   `label`).
-- `relationships`: for "relationship"/"hierarchy"/"spatial" - entities
-  connected by one of: inside, contains, connected_to, attached_to, above,
-  below, left_of, right_of, passes_through, surrounds, contacts, points_to,
-  flows_into, rotates_around, between. For "relationship"/"hierarchy" this
-  is REQUIRED (at least one) unless you set 2+ entities - a SQL JOIN needs a
-  relationship between its two table entities (e.g. `type="connected_to"`
-  labelled by the join type), not just two disconnected boxes.
+- `relationships`: for "relationship"/"hierarchy"/"decision_tree"/"spatial" -
+  entities connected by one of: inside, contains, connected_to, attached_to,
+  above, below, left_of, right_of, passes_through, surrounds, contacts,
+  points_to, flows_into, rotates_around, between - OR, for "decision_tree"
+  specifically, the actual branch condition as `type` (e.g. "yes", "no",
+  "cache hit", "invalid input") since that IS the label the reader needs to
+  see on that connector, not a generic structural word. For
+  "relationship"/"hierarchy"/"decision_tree" this is REQUIRED (at least one)
+  unless you set 2+ entities - a SQL JOIN needs a relationship between its
+  two table entities (e.g. `type="connected_to"` labelled by the join type),
+  a decision tree needs its branches labelled with the actual condition, not
+  just disconnected boxes.
 - `validation_criteria`: 3-7 short, checkable assertions specific to THIS
   concept (not generic boilerplate) that a reviewer could grade pass/fail
   against the spec. Derive these from what actually matters for

@@ -2,7 +2,9 @@ import { apiUrl, request, requestBlob } from "./client";
 import type {
   AiEditRequest,
   AiEditResponse,
+  ConceptVisualSpec,
   CourseDocument,
+  UpdateConceptVisualSpecResponse,
 } from "@/lib/types/document";
 
 export function getDocument(documentId: string, signal?: AbortSignal): Promise<CourseDocument> {
@@ -36,6 +38,20 @@ export function aiEdit(
       ...payload,
     },
   });
+}
+
+/** Fix a label/description inside a concept_experience visual and get back
+ * the re-rendered block - no AI call, instant, and never touches the
+ * exported PDF's static rendering contract. */
+export function updateConceptVisualSpec(
+  documentId: string,
+  blockId: string,
+  spec: ConceptVisualSpec,
+): Promise<UpdateConceptVisualSpecResponse> {
+  return request<UpdateConceptVisualSpecResponse>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec`,
+    { method: "PUT", body: { spec } },
+  );
 }
 
 /** The backend renders the PDF (HTML -> CSS -> Playwright). We only download it. */

@@ -98,19 +98,23 @@ def _header_html(spec: DiagramSpec, theme: TemplateTheme) -> str:
     return "".join(parts)
 
 
+def _entity_icon_char(entity: VisualEntity) -> str:
+    """A card/column/panel is never bare/iconless - if the planner didn't
+    supply an icon, a coloured initial-letter avatar stands in so it still
+    reads as a deliberate, finished piece of UI. Only for an alphabetic
+    label though ("Car (Class)" -> "C") - truncating a numeric/symbolic
+    label (a BST node "10", a stack value "42") to its first character
+    would sit right next to the real value and silently misstate it ("1"
+    next to "10"), which is worse than no icon at all."""
+    first_char = (entity.label.strip() or entity.id)[:1]
+    return entity.icon.strip() or (first_char.upper() if first_char.isalpha() else "◆")
+
+
 def _entity_card_html(entity: VisualEntity, *, extra_class: str = "", index: int = 0) -> str:
     role = _resolve_color_role(entity.color_role)
     css_vars = f"--cev-fill:{role.fill};--cev-stroke:{role.stroke};--cev-text:{role.text};"
     classes = f"cev-card {extra_class}".strip()
-    # A card is never bare/iconless - if the planner didn't supply an icon,
-    # a coloured initial-letter avatar stands in so the card still reads as
-    # a deliberate, finished piece of UI. Only for an alphabetic label
-    # though ("Car (Class)" -> "C") - truncating a numeric/symbolic label
-    # (a BST node "10", a stack value "42") to its first character would
-    # sit right next to the real value and silently misstate it ("1" next
-    # to "10"), which is worse than no icon at all.
-    first_char = (entity.label.strip() or entity.id)[:1]
-    icon_char = entity.icon.strip() or (first_char.upper() if first_char.isalpha() else "◆")
+    icon_char = _entity_icon_char(entity)
     icon_html = f'<div class="cev-icon-badge"><span class="cev-icon">{_esc(icon_char)}</span></div>'
     label_html = f'<div class="cev-label">{_esc(entity.label.strip() or entity.id)}</div>'
     prop_items = "".join(
@@ -154,7 +158,17 @@ def _entities_row_html(entities: list[VisualEntity], relationships, *, extra_cla
     declared, so related entities land adjacent with a real connector
     between them; a plain row (today's exact behaviour) when no
     relationships are set. Each card gets a staggered entrance delay by its
-    position in the rendered row."""
+    position in the rendered row.
+
+    A connector and its target are always grouped into one atomic flex unit
+    (`.cev-rel-link`, see _style_html) - a bare connector can otherwise land
+    alone at the start of a wrapped row (nothing stopping a row-wrap from
+    falling between a connector and the card it's pointing at), which reads
+    as broken. The trade-off: a node that's the target of more than one
+    relationship (a shared hub several things point to) renders its card
+    once per incoming edge rather than once overall - a little repetition,
+    never a dangling connector, which is the one outcome worth avoiding at
+    all costs here."""
     if not relationships:
         return "".join(_entity_card_html(e, extra_class=extra_class, index=i) for i, e in enumerate(entities))
 
@@ -170,11 +184,10 @@ def _entities_row_html(entities: list[VisualEntity], relationships, *, extra_cla
             parts.append(_entity_card_html(source, extra_class=extra_class, index=order))
             rendered.add(source.id)
             order += 1
-        parts.append(_connector_html(rel.type))
-        if target.id not in rendered:
-            parts.append(_entity_card_html(target, extra_class=extra_class, index=order))
-            rendered.add(target.id)
-            order += 1
+        target_html = _entity_card_html(target, extra_class=extra_class, index=order)
+        parts.append(f'<div class="cev-rel-link">{_connector_html(rel.type)}{target_html}</div>')
+        rendered.add(target.id)
+        order += 1
     for entity in entities:
         if entity.id not in rendered:
             parts.append(_entity_card_html(entity, extra_class=extra_class, index=order))
@@ -203,7 +216,12 @@ def _style_html(theme: TemplateTheme) -> str:
   content:"";position:absolute;inset:0 0 auto 0;height:7px;
   background:linear-gradient(90deg, #f472b6, #fb923c, #facc15, #4ade80, #22d3ee, #60a5fa, #c084fc);
 }}
-.cev-root *{{box-sizing:border-box;}}
+/* Any single unbroken "word" (a long function signature, a path, an
+   identifier with no spaces - very common in this domain) must never be
+   allowed to sit wider than its box and spill out past the card/cell edge -
+   this applies everywhere text renders inside a concept_experience visual,
+   not case by case, so a future card type can never reintroduce it. */
+.cev-root *{{box-sizing:border-box;overflow-wrap:anywhere;word-break:break-word;}}
 .cev-title{{font-size:23px;font-weight:800;text-align:center;margin-bottom:8px;letter-spacing:-.01em;}}
 .cev-metaphor{{
   display:flex;align-items:flex-start;gap:9px;justify-content:center;text-align:left;
@@ -222,16 +240,25 @@ def _style_html(theme: TemplateTheme) -> str:
 }}
 .cev-template-row{{display:flex;justify-content:center;margin-bottom:8px;}}
 .cev-flow-cue{{text-align:center;color:{theme.muted_color};font-size:12.5px;margin:2px 0 12px;line-height:1.5;animation:cevFadeUp .4s ease .15s both;}}
-.cev-instances{{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:center;}}
+.cev-instances{{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:stretch;}}
 .cev-card{{
   border-radius:20px;border:3px solid var(--cev-stroke,{theme.border_color});
   background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 45%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 68%, #fff));
   color:var(--cev-text,{theme.text_color});
-  padding:14px 18px;min-width:104px;max-width:200px;text-align:center;
+  padding:14px 18px;min-width:104px;text-align:center;
   box-shadow:0 3px 0 color-mix(in srgb, var(--cev-stroke,{theme.border_color}) 55%, transparent), 0 6px 14px rgba(0,0,0,.08);
   animation:cevFadeUp .4s ease both;
 }}
-.cev-card.cev-template{{min-width:220px;max-width:280px;padding:20px 26px;}}
+/* Cards in an entity row (object instances, or a relationship-shaped
+   data_structure - both use .cev-instances) grow to fill whatever width
+   their row actually has, instead of staying pinned to a narrow fixed size
+   with the whole row then centered in a sea of blank margin - a handful of
+   cards on a wide page should read as a wide, short picture, not a tall,
+   narrow column. A single compact data_structure value (.cev-ds-track,
+   never this rule) stays tight on purpose - see that block below. */
+.cev-instances .cev-card{{flex:1 1 170px;max-width:240px;}}
+.cev-card.cev-template{{min-width:220px;padding:20px 26px;}}
+.cev-instances .cev-card.cev-template{{flex-basis:220px;max-width:300px;}}
 .cev-icon-badge{{
   width:50px;height:50px;border-radius:50%;margin:0 auto 8px;display:flex;align-items:center;justify-content:center;
   background:var(--cev-stroke,{theme.accent_color});
@@ -256,6 +283,13 @@ def _style_html(theme: TemplateTheme) -> str:
 }}
 .cev-connector-arrow{{font-size:17px;line-height:1;color:{theme.accent_color};font-weight:700;}}
 .cev-connector-label{{white-space:nowrap;font-weight:700;}}
+/* A connector plus its target, as one unbreakable flex item (see
+   _entities_row_html) - grows to fill its share of the row the same way a
+   lone card does, with the connector staying its own natural size and the
+   nested card (still matched by ".cev-instances .cev-card" above, since
+   flex-grow only ever looks at a DIRECT parent) absorbing the rest. */
+.cev-rel-link{{display:flex;align-items:center;gap:8px;flex:1 1 260px;max-width:340px;min-width:0;}}
+.cev-rel-link .cev-card{{min-width:0;}}
 /* data_structure renderer */
 .cev-ds-track{{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;align-items:flex-end;}}
 .cev-ds-item-wrap{{display:flex;flex-direction:column;align-items:center;gap:4px;position:relative;}}
@@ -269,8 +303,8 @@ def _style_html(theme: TemplateTheme) -> str:
   margin-top:12px;max-width:420px;margin-left:auto;margin-right:auto;}}
 /* process renderer */
 .cev-step-counter{{font-size:12px;font-weight:700;color:{theme.muted_color};text-align:center;margin-bottom:14px;}}
-.cev-steps{{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;align-items:center;}}
-.cev-step{{min-width:118px;max-width:190px;}}
+.cev-steps{{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;align-items:stretch;}}
+.cev-step{{min-width:118px;flex:1 1 150px;max-width:230px;}}
 .cev-step-number{{
   width:24px;height:24px;border-radius:50%;background:var(--cev-stroke,{theme.accent_color});color:#fff;
   font-size:11.5px;font-weight:800;display:flex;align-items:center;justify-content:center;margin:0 auto 5px;
@@ -278,8 +312,104 @@ def _style_html(theme: TemplateTheme) -> str:
 }}
 .cev-step-desc{{font-size:11px;color:{theme.muted_color};margin-top:5px;}}
 .cev-step-arrow{{color:{theme.accent_color};font-size:22px;font-weight:700;padding:0 2px;}}
+/* comparison renderer */
+.cev-cmp-wrap{{overflow-x:auto;}}
+.cev-cmp-table{{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0;}}
+.cev-cmp-corner{{background:transparent;width:26%;}}
+.cev-cmp-col{{
+  padding:12px 10px;border-radius:16px 16px 0 0;text-align:center;color:var(--cev-text,{theme.text_color});
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 45%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 68%, #fff));
+  border:3px solid var(--cev-stroke,{theme.border_color});border-bottom:none;
+}}
+.cev-cmp-col .cev-icon-badge{{width:38px;height:38px;margin-bottom:6px;}}
+.cev-cmp-col .cev-icon{{font-size:18px;}}
+.cev-cmp-col-label{{font-size:13px;font-weight:800;word-break:break-word;}}
+.cev-cmp-row-label{{
+  text-align:left;padding:9px 12px;font-size:11.5px;font-weight:700;color:{theme.muted_color};
+}}
+.cev-cmp-cell{{
+  padding:9px 10px;text-align:center;font-size:12px;font-weight:600;color:{theme.text_color};
+  border-top:1px solid {theme.border_color};
+}}
+.cev-cmp-table tbody tr:first-child .cev-cmp-cell{{border-top:2px solid {theme.border_color};}}
+/* timeline renderer */
+.cev-timeline-row{{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;align-items:flex-start;}}
+.cev-timeline-entry{{display:flex;flex-direction:column;align-items:center;flex:1 1 150px;max-width:220px;
+  animation:cevFadeUp .4s ease both;}}
+.cev-timeline-dot-wrap{{display:flex;flex-direction:column;align-items:center;}}
+.cev-timeline-dot{{
+  width:18px;height:18px;border-radius:50%;background:var(--cev-stroke,{theme.accent_color});
+  border:3px solid #fff;box-shadow:0 0 0 2px var(--cev-stroke,{theme.accent_color}),0 2px 4px rgba(0,0,0,.15);
+}}
+.cev-timeline-stem{{width:3px;height:14px;background:var(--cev-stroke,{theme.accent_color});}}
+.cev-timeline-card{{margin-top:2px;width:100%;animation:none;}}
+/* before_after renderer */
+.cev-before-after{{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:center;}}
+.cev-ba-panel{{flex:1 1 200px;max-width:250px;display:flex;}}
+.cev-ba-card{{
+  flex:1;border-radius:20px;border:3px solid var(--cev-stroke,{theme.border_color});
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 45%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 68%, #fff));
+  color:var(--cev-text,{theme.text_color});padding:18px;text-align:center;
+  box-shadow:0 3px 0 color-mix(in srgb, var(--cev-stroke,{theme.border_color}) 55%, transparent), 0 6px 14px rgba(0,0,0,.08);
+  animation:cevFadeUp .4s ease both;
+}}
+.cev-ba-tag{{
+  display:inline-block;font-size:10.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;
+  background:var(--cev-stroke,{theme.accent_color});color:#fff;border-radius:999px;padding:3px 12px;margin-bottom:10px;
+}}
+.cev-ba-arrow{{flex:none;font-size:30px;color:{theme.accent_color};font-weight:700;}}
+/* cycle renderer */
+.cev-cycle-loop{{
+  display:flex;align-items:center;justify-content:center;gap:8px;margin-top:16px;
+  font-size:12.5px;font-weight:700;color:{theme.muted_color};
+  background:color-mix(in srgb, {theme.accent_color} 10%, #fff);
+  border:2px dashed color-mix(in srgb, {theme.accent_color} 45%, {theme.border_color});
+  border-radius:999px;padding:8px 18px;max-width:fit-content;margin-left:auto;margin-right:auto;
+}}
+.cev-cycle-loop-icon{{font-size:18px;line-height:1;color:{theme.accent_color};}}
+/* "flow" style (process/sequence/pipeline/state_machine/cycle/decision_tree):
+   a flatter, plainer boxes-and-arrows treatment - closer to a clean
+   textbook/whiteboard flowchart than the colourful sticker-card language
+   the rest of this engine uses for entities. Purely additive overrides
+   scoped under .cev-style-flow (added to the root div only for those
+   representations - see _FLOW_STYLE_REPRESENTATIONS), so every other
+   representation's card styling above is completely untouched. */
+.cev-style-flow::before{{display:none;}}
+.cev-style-flow .cev-card,
+.cev-style-flow .cev-step{{
+  border-radius:14px;border-width:2px;
+  background:color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 16%, #fff);
+  box-shadow:0 1px 3px rgba(0,0,0,.08);
+}}
+.cev-style-flow .cev-icon-badge{{
+  width:auto;height:auto;border-radius:0;background:none;box-shadow:none;margin:0 0 4px;
+}}
+.cev-style-flow .cev-icon{{color:var(--cev-stroke,{theme.accent_color});font-size:20px;}}
+.cev-style-flow .cev-step-number{{
+  background:none;color:var(--cev-stroke,{theme.accent_color});box-shadow:none;
+  border:2px solid var(--cev-stroke,{theme.accent_color});width:22px;height:22px;font-size:11px;
+}}
+.cev-style-flow .cev-step-arrow{{animation:none;}}
+.cev-style-flow .cev-connector-line{{
+  animation:none;background-image:none;background-color:var(--cev-stroke,{theme.accent_color});height:2px;width:22px;
+}}
+.cev-style-flow .cev-connector{{color:{theme.text_color};}}
+.cev-style-flow .cev-connector-label{{
+  text-transform:uppercase;font-size:10px;letter-spacing:.04em;
+  background:color-mix(in srgb, var(--cev-stroke,{theme.accent_color}) 14%, #fff);
+  border:1px solid var(--cev-stroke,{theme.accent_color});border-radius:999px;padding:2px 8px;
+}}
+.cev-style-flow .cev-cycle-loop{{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.06);}}
+/* "process"/"sequence"/"pipeline"/"state_machine" - a top-to-bottom arrow
+   flowchart (see _render_process): one wide card per row instead of the
+   flex-wrap row every other step-card representation uses, so a step's
+   width no longer needs to shrink to share a row with siblings - it always
+   gets the full column width up to its own cap. */
+.cev-steps-vertical{{flex-direction:column;flex-wrap:nowrap;align-items:center;gap:0;}}
+.cev-steps-vertical .cev-step{{width:100%;max-width:420px;flex:none;}}
+.cev-steps-vertical .cev-step-arrow{{padding:2px 0;}}
 @media (prefers-reduced-motion: reduce) {{
-  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line {{
+  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line,.cev-timeline-entry,.cev-ba-card {{
     animation:none !important;
   }}
 }}
@@ -289,7 +419,7 @@ def _style_html(theme: TemplateTheme) -> str:
   finish - without this, a printed page could freeze mid fade-in (a still-
   faded card, a half-drawn connector). Printing always shows the fully
   settled final state instead, with no added export latency. */
-  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line {{
+  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line,.cev-timeline-entry,.cev-ba-card {{
     animation:none !important;
   }}
 }}
@@ -435,15 +565,21 @@ def _effective_steps(spec: DiagramSpec) -> list[VisualStep]:
 
 
 def _render_process(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
+    # "process"/"sequence"/"pipeline"/"state_machine" render as a classic
+    # top-to-bottom arrow flowchart (one step per row, &darr; between) -
+    # "cycle" keeps its own separate renderer/layout (a left-to-right row +
+    # loop-back badge - see _render_cycle), so this vertical arrow is exactly
+    # what every representation reaching this function wants, with no
+    # per-representation branching needed here.
     steps = _effective_steps(spec)
     parts: list[str] = []
     for index, step in enumerate(steps):
         if index:
-            parts.append('<div class="cev-step-arrow">&rarr;</div>')
+            parts.append('<div class="cev-step-arrow">&darr;</div>')
         parts.append(_step_card_html(step, index))
     steps_html = "".join(parts)
     # A plain step count gives a non-technical reader an immediate sense of
-    # scale before reading the row itself.
+    # scale before reading the column itself.
     meta_html = f'<div class="cev-step-counter">{len(steps)} steps</div>' if steps else ""
 
     body = f"""\
@@ -451,30 +587,229 @@ def _render_process(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
 {_style_html(theme)}
 {_header_html(spec, theme)}
 {meta_html}
-<div class="cev-steps">{steps_html}</div>
+<div class="cev-steps cev-steps-vertical">{steps_html}</div>
 </div>"""
     return body.encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
-# dispatch: every REPRESENTATION_TYPES value maps to one of the 3 real
-# renderers above. Adding a 4th real renderer later means adding a function
-# + repointing its own keys here, never touching the other renderers or
-# anything upstream of this table.
+# 4. "comparison" - entities side by side as columns of a table, rows are
+#    the union of every entity's property keys. A real dedicated shape
+#    (previously an alias for _render_object's template-less entity row) -
+#    a proper table reads far more clearly as "these things, compared on
+#    these criteria" than a plain row of cards ever could.
+# ---------------------------------------------------------------------------
+
+
+def _render_comparison(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
+    entities = spec.entities
+    keys: list[str] = []
+    seen: set[str] = set()
+    for entity in entities:
+        for key in entity.properties:
+            if key.strip() and key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+    header_cells = "".join(
+        f'<th class="cev-cmp-col" style="--cev-fill:{_resolve_color_role(e.color_role).fill};'
+        f"--cev-stroke:{_resolve_color_role(e.color_role).stroke};"
+        f'--cev-text:{_resolve_color_role(e.color_role).text};">'
+        f'<div class="cev-icon-badge"><span class="cev-icon">{_esc(_entity_icon_char(e))}</span></div>'
+        f'<div class="cev-cmp-col-label">{_esc(e.label.strip() or e.id)}</div>'
+        f"</th>"
+        for e in entities
+    )
+    body_rows = "".join(
+        f"<tr><th class=\"cev-cmp-row-label\">{_esc(key)}</th>"
+        + "".join(
+            f'<td class="cev-cmp-cell">{_esc(e.properties.get(key, "").strip() or "—")}</td>'
+            for e in entities
+        )
+        + "</tr>"
+        for key in keys
+    )
+    table_html = (
+        f'<table class="cev-cmp-table"><thead><tr><th class="cev-cmp-corner"></th>{header_cells}</tr></thead>'
+        f"<tbody>{body_rows}</tbody></table>"
+    )
+
+    body = f"""\
+<div class="cev-root">
+{_style_html(theme)}
+{_header_html(spec, theme)}
+<div class="cev-cmp-wrap">{table_html}</div>
+</div>"""
+    return body.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 5. "timeline" - a chronological sequence of milestones (reuses `steps`,
+#    same grammar as "process" - a milestone's `label` carries the
+#    date/era, `description` the detail), each its own dot-and-stem marker
+#    over a card so it never depends on siblings' positions - safe to wrap
+#    into any number of rows without a shared rail breaking.
+# ---------------------------------------------------------------------------
+
+
+def _timeline_entry_html(step: VisualStep, index: int) -> str:
+    role = _resolve_color_role(step.color_role)
+    css_vars = f"--cev-fill:{role.fill};--cev-stroke:{role.stroke};--cev-text:{role.text};"
+    icon_html = f'<div class="cev-icon">{_esc(step.icon)}</div>' if step.icon.strip() else ""
+    desc_html = f'<div class="cev-step-desc">{_esc(step.description)}</div>' if step.description.strip() else ""
+    delay = f"{min(index, 8) * 0.07:.2f}s"
+    return (
+        f'<div class="cev-timeline-entry" style="animation-delay:{delay};" data-step-id="{_esc(step.id)}">'
+        f'<div class="cev-timeline-dot-wrap">'
+        f'<div class="cev-timeline-dot" style="{css_vars}"></div>'
+        f'<div class="cev-timeline-stem" style="{css_vars}"></div>'
+        f"</div>"
+        f'<div class="cev-card cev-timeline-card" style="{css_vars}">'
+        f"{icon_html}"
+        f'<div class="cev-label">{_esc(step.label)}</div>'
+        f"{desc_html}"
+        f"</div>"
+        f"</div>"
+    )
+
+
+def _render_timeline(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
+    steps = _effective_steps(spec)
+    entries_html = "".join(_timeline_entry_html(step, index) for index, step in enumerate(steps))
+    meta_html = f'<div class="cev-step-counter">{len(steps)} milestones</div>' if steps else ""
+
+    body = f"""\
+<div class="cev-root">
+{_style_html(theme)}
+{_header_html(spec, theme)}
+{meta_html}
+<div class="cev-timeline-row">{entries_html}</div>
+</div>"""
+    return body.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 6.5 "cycle" - a repeating sequence (a training loop, a release cycle) -
+#    same step-card grammar as "process" (reuses _step_card_html), but the
+#    last step visibly loops back to the first instead of just ending, so
+#    it reads as "this repeats" rather than "this finishes". Deliberately
+#    NOT a geometric ring layout (N cards positioned in a circle needs real
+#    trigonometry and breaks the moment N or a label's length changes) -
+#    the loop-back badge conveys the same idea with zero new failure modes,
+#    reusing every width-fill/overflow/cap-and-scale guarantee "process"
+#    already has.
+# ---------------------------------------------------------------------------
+
+
+def _render_cycle(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
+    steps = _effective_steps(spec)
+    parts: list[str] = []
+    for index, step in enumerate(steps):
+        if index:
+            parts.append('<div class="cev-step-arrow">&rarr;</div>')
+        parts.append(_step_card_html(step, index))
+    loop_html = ""
+    if len(steps) > 1:
+        loop_html = (
+            '<div class="cev-cycle-loop">'
+            '<span class="cev-cycle-loop-icon" aria-hidden="true">&#8635;</span>'
+            f'<span>then back to &ldquo;{_esc(steps[0].label)}&rdquo;</span>'
+            "</div>"
+        )
+    steps_html = "".join(parts)
+    meta_html = f'<div class="cev-step-counter">{len(steps)}-step cycle</div>' if steps else ""
+
+    body = f"""\
+<div class="cev-root">
+{_style_html(theme)}
+{_header_html(spec, theme)}
+{meta_html}
+<div class="cev-steps">{steps_html}</div>
+{loop_html}
+</div>"""
+    return body.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 6. "before_after" - exactly two entities (the first two in `entities`)
+#    shown as a "then vs now" pair either side of an arrow - a state
+#    transformation (a variable's value, a system's architecture, a
+#    process before/after an optimisation), not a sequence or a >2-way
+#    comparison.
+# ---------------------------------------------------------------------------
+
+
+def _before_after_panel_html(entity: VisualEntity, tag_label: str) -> str:
+    role = _resolve_color_role(entity.color_role)
+    css_vars = f"--cev-fill:{role.fill};--cev-stroke:{role.stroke};--cev-text:{role.text};"
+    icon_char = _entity_icon_char(entity)
+    prop_items = "".join(
+        f'<span class="cev-prop"><b>{_esc(key)}</b>{": " + _esc(value) if value.strip() else ""}</span>'
+        for key, value in entity.properties.items()
+        if key.strip()
+    )
+    props_html = f'<div class="cev-props">{prop_items}</div>' if prop_items else ""
+    return (
+        f'<div class="cev-ba-card" style="{css_vars}">'
+        f'<div class="cev-ba-tag">{_esc(tag_label)}</div>'
+        f'<div class="cev-icon-badge"><span class="cev-icon">{_esc(icon_char)}</span></div>'
+        f'<div class="cev-label">{_esc(entity.label.strip() or entity.id)}</div>'
+        f"{props_html}"
+        f"</div>"
+    )
+
+
+def _render_before_after(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
+    entities = spec.entities
+    before = entities[0] if len(entities) > 0 else None
+    after = entities[1] if len(entities) > 1 else None
+    before_html = f'<div class="cev-ba-panel">{_before_after_panel_html(before, "Before")}</div>' if before else ""
+    after_html = f'<div class="cev-ba-panel">{_before_after_panel_html(after, "After")}</div>' if after else ""
+    arrow_html = '<div class="cev-ba-arrow">&rarr;</div>' if before and after else ""
+
+    body = f"""\
+<div class="cev-root">
+{_style_html(theme)}
+{_header_html(spec, theme)}
+<div class="cev-before-after">{before_html}{arrow_html}{after_html}</div>
+</div>"""
+    return body.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# dispatch: every REPRESENTATION_TYPES value maps to one of the 6 real
+# renderers above. Adding another real renderer later means adding a
+# function + repointing its own keys here, never touching the other
+# renderers or anything upstream of this table.
 # ---------------------------------------------------------------------------
 
 _REPRESENTATION_RENDERERS = {
     "object": _render_object,
     "code_visualization": _render_object,   # already ties technical_signature to an entity
-    "comparison": _render_object,            # a template-less row of entities is already this shape
+    "comparison": _render_comparison,
     "relationship": _render_object,          # + relationship connector lines (see _entities_row_html)
     "hierarchy": _render_object,             # + relationship connector lines (contains/above read as tree edges)
+    "decision_tree": _render_object,         # a branching decision is entities + labelled (Yes/No) relationship
+                                              # edges - the exact same shape "hierarchy" already renders correctly
     "spatial": _render_object,               # best-effort; a documented future gap, not a crash
+    "timeline": _render_timeline,
+    "before_after": _render_before_after,
     "data_structure": _render_data_structure,
     "process": _render_process,
     "sequence": _render_process,             # a strict linear walkthrough - same step-chain grammar
     "pipeline": _render_process,             # a staged transformation is an ordered step chain
     "state_machine": _render_process,        # concept_states+transitions adapted into the same grammar
+    "cycle": _render_cycle,
+}
+
+# Representations that get the flatter "flow" card treatment (see
+# .cev-style-flow in _style_html) instead of the default colourful icon-card
+# look. Keyed by representation, not by renderer function, because
+# "decision_tree" shares _render_object with "hierarchy"/"relationship"/
+# "object" (which must keep the icon-card look) - a renderer-identity check
+# couldn't tell those apart.
+_FLOW_STYLE_REPRESENTATIONS = {
+    "process", "sequence", "pipeline", "state_machine", "cycle", "decision_tree",
 }
 
 
@@ -495,8 +830,14 @@ def render_concept_experience_html(spec: DiagramSpec, theme: TemplateTheme) -> b
     the whole fragment is uniformly shrunk - via a CSS transform, not by
     dropping any content - to the exact box `estimate_pixel_size` reserved
     for it, so the two always agree."""
-    renderer = _REPRESENTATION_RENDERERS.get(spec.representation.strip()) or _render_object
+    representation = spec.representation.strip()
+    renderer = _REPRESENTATION_RENDERERS.get(representation) or _render_object
     body = renderer(spec, theme)
+    if representation in _FLOW_STYLE_REPRESENTATIONS:
+        # Every renderer's very first element is literally `<div class="cev-root">`
+        # (see each _render_* function) - a single, one-time, start-anchored
+        # replace is safe and can't collide with anything later in the markup.
+        body = body.replace(b'<div class="cev-root">', b'<div class="cev-root cev-style-flow">', 1)
     width, natural_height, capped_height, scale = _fit_scale(spec)
     if scale >= 1.0:
         return body
@@ -615,6 +956,18 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
     renderer = _REPRESENTATION_RENDERERS.get(representation) or _render_object
 
     if renderer is _render_process:
+        # One step per row (see _render_process/.cev-steps-vertical) - width
+        # no longer limits how many steps share a row, so height instead
+        # grows directly with how much text each step's description wraps
+        # onto within its fixed ~420px column, interpolated the same way
+        # _slot_width interpolates a card's WIDTH elsewhere in this module.
+        steps = _effective_steps(spec)
+        if steps:
+            height += 34.0  # plain step counter
+            busiest = max((_step_chars(s) for s in steps), default=0)
+            per_step = _slot_width(busiest, compact=92, wide=172)  # card height
+            height += len(steps) * (per_step + 30.0)  # + the arrow between
+    elif renderer is _render_cycle:
         steps = _effective_steps(spec)
         if steps:
             height += 34.0  # plain step counter
@@ -622,11 +975,13 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
             slot = _slot_width(busiest, compact=150, wide=226)  # card + ~arrow + gaps
             per_row = max(1, _INNER_WIDTH // slot)
             height += math.ceil(len(steps) / per_row) * 168.0
+            if len(steps) > 1:
+                height += 56.0  # the "loops back to ..." badge
     elif renderer is _render_data_structure:
         if spec.entities:
             busiest = max((_entity_chars(e) for e in spec.entities), default=0)
             if spec.relationships:
-                slot = _slot_width(busiest, compact=140, wide=272)  # + connector
+                slot = _slot_width(busiest, compact=180, wide=340)  # connector + card, one unit
                 per_row = max(1, _INNER_WIDTH // slot)
                 height += math.ceil(len(spec.entities) / per_row) * 175.0
             else:
@@ -634,6 +989,34 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
                 per_row = max(1, _INNER_WIDTH // slot)
                 height += math.ceil(len(spec.entities) / per_row) * 168.0
                 height += 30.0  # front/top end captions
+    elif renderer is _render_comparison:
+        # A fixed-layout table, never more than one "row of columns" - the
+        # columns (entities) share the width evenly (table-layout:fixed, see
+        # _style_html) instead of wrapping, so height only grows with the
+        # number of property-key rows, not the number of things compared.
+        if spec.entities:
+            keys: set[str] = set()
+            for entity in spec.entities:
+                keys.update(k for k in entity.properties if k.strip())
+            height += 95.0  # column headers: icon badge + label + padding
+            height += len(keys) * 40.0
+    elif renderer is _render_timeline:
+        steps = _effective_steps(spec)
+        if steps:
+            height += 34.0  # milestone counter
+            busiest = max((_step_chars(s) for s in steps), default=0)
+            slot = _slot_width(busiest, compact=150, wide=220)  # card + gaps
+            per_row = max(1, _INNER_WIDTH // slot)
+            height += math.ceil(len(steps) / per_row) * 200.0  # dot + stem + card
+    elif renderer is _render_before_after:
+        # Always exactly one row of (at most) two panels - .cev-ba-panel's
+        # own max-width (see _style_html) guarantees they never wrap onto a
+        # second row at the reference width, so this only needs the row's
+        # own height, not a row-count calculation.
+        entities = spec.entities[:2]
+        if entities:
+            busiest = max((_entity_chars(e) for e in entities), default=0)
+            height += _slot_width(busiest, compact=170, wide=260)
     else:  # _render_object and every representation that falls back to it
         template_count = sum(1 for e in spec.entities if e.role == "template")
         instance_count = len(spec.entities) - template_count
@@ -644,7 +1027,7 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
         instances = [e for e in spec.entities if e.role != "template"]
         busiest = max((_entity_chars(e) for e in instances), default=0)
         if spec.relationships:
-            slot = _slot_width(busiest, compact=140, wide=272)  # + connector
+            slot = _slot_width(busiest, compact=180, wide=340)  # connector + card, one unit
         else:
             slot = _slot_width(busiest, compact=120, wide=212)
         per_row = max(1, _INNER_WIDTH // slot)

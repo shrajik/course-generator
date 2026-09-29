@@ -103,7 +103,6 @@ _register(
         ComponentSpec("commutator", "Commutator", color_role="secondary", shape_type="block", anchor="right_of:axle", size="small", priority="critical"),
         ComponentSpec("brush", "Brush", color_role="structure", shape_type="block", anchor="right_of:commutator", size="small", priority="important"),
         ComponentSpec("battery", "Battery", color_role="positive", shape_type="block", anchor="orbit:coil", size="small", priority="optional"),
-        ComponentSpec("magnetic_field", "Magnetic field", color_role="magnetic_field", shape_type="flow", anchor="orbit:coil", size="small", priority="important"),
     ],
     relationships=[
         RelationshipSpec("coil", "inside", "magnet"),
@@ -114,7 +113,7 @@ _register(
         RelationshipSpec("commutator", "connected_to", "coil"),
     ],
     required=["coil", "magnet", "axle", "commutator", "brush"],
-    optional=["battery", "magnetic_field"],
+    optional=["battery"],
 )
 
 _register(
@@ -125,7 +124,6 @@ _register(
     components=[
         ComponentSpec("coil", "Coil", role="primary", color_role="accent", shape_type="coil", size="large", priority="critical"),
         ComponentSpec("magnet", "Bar magnet", color_role="structure", shape_type="block", anchor="left_of:coil", size="medium", priority="critical"),
-        ComponentSpec("field_lines", "Magnetic field lines", color_role="magnetic_field", shape_type="flow", anchor="orbit:coil", size="small", priority="important"),
         ComponentSpec("ammeter", "Ammeter", color_role="secondary", shape_type="gauge", anchor="below:coil", size="small", priority="critical"),
     ],
     relationships=[
@@ -133,7 +131,7 @@ _register(
         RelationshipSpec("coil", "connected_to", "ammeter"),
     ],
     required=["coil", "magnet", "ammeter"],
-    optional=["field_lines"],
+    optional=[],
 )
 
 _register(

@@ -192,3 +192,39 @@ export interface AiEditResponse {
   rejected_operations: Array<{ type: string; block_id: string | null; reason: string }>;
   pages: number;
 }
+
+// --- editable concept_experience visuals ------------------------------------
+// Mirrors backend/app/schemas/diagram.py's VisualEntity/VisualStep - loosely
+// typed (extra keys passed through) since only entities[].label/properties
+// and steps[].label/description are ever edited here; every other field on
+// the spec round-trips untouched.
+
+export interface VisualEntitySpec {
+  id: string;
+  label: string;
+  role?: string;
+  properties?: Record<string, string>;
+  icon?: string;
+  color_role?: string;
+  [key: string]: unknown;
+}
+
+export interface VisualStepSpec {
+  id: string;
+  label: string;
+  description?: string;
+  [key: string]: unknown;
+}
+
+export interface ConceptVisualSpec {
+  representation?: string;
+  entities?: VisualEntitySpec[];
+  steps?: VisualStepSpec[];
+  [key: string]: unknown;
+}
+
+export interface UpdateConceptVisualSpecResponse {
+  document_id: string;
+  version: number;
+  block: Block;
+}

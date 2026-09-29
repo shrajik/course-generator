@@ -37,6 +37,7 @@ from app.core.ids import document_id_for_course, new_id, utc_now_iso
 from app.core.logging import get_logger
 from app.core.metrics import current_metrics, phase as metrics_phase, run_metrics
 from app.course.document.builder import build_document, reflow_document
+from app.course.document.visual_repair import audit_and_repair_visuals
 from app.course.templates.registry import load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import (
@@ -861,6 +862,19 @@ class CourseService:
                 )
                 if images:
                     reflow_document(document, template)
+                # Post-pagination visual repair: only NOW, with every
+                # originally-planned visual generated and the document
+                # paginated with their real (not estimated) heights, can a
+                # page's own page_visual_fraction be measured accurately -
+                # audit every page and top up any still-deficient ones (see
+                # app.course.document.visual_repair for why this can't
+                # happen any earlier in the pipeline).
+                repair = await audit_and_repair_visuals(document, template, images=self.images, ai=self.ai)
+                if repair.repaired:
+                    log.info(
+                        "Visual repair for %s: %s page(s) repaired, %s still deficient",
+                        record.course_id, len(repair.repaired), len(repair.still_deficient),
+                    )
                 await self._save_document(document)
             pages = len(document.pages)
             record.has_document = True

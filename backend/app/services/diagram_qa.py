@@ -58,7 +58,7 @@ INVALID_COLOR_ROLE = "invalid_color_role"
 # footprint the way block/circle/coil/gauge do - excluded from density,
 # balance and focal-dominance maths (a thin arrow shouldn't count as visual
 # weight) but still checked for collisions and clipping.
-_CONNECTOR_TYPES = {"flow", "arrow", "label"}
+_CONNECTOR_TYPES = {"arrow", "label"}
 
 _DENSITY_LIMIT = 0.55  # fraction of panel area objects may occupy before it reads as crowded
 _MIN_MARGIN_FROM_EDGE = 0.03  # panel-fraction clearance a shape must keep from 0/1
@@ -215,8 +215,8 @@ def _evaluate_state(shapes: list[SchematicShape], learning_objective: str) -> li
         ))
 
     # --- arrow_text_collision / leader_line_crossing ------------------------
-    connectors = [s for s in shapes if s.type in ("flow", "arrow")]
-    non_connectors = [s for s in shapes if s.type not in ("flow", "arrow")]
+    connectors = [s for s in shapes if s.type == "arrow"]
+    non_connectors = [s for s in shapes if s.type != "arrow"]
     text_hits: list[str] = []
     for connector in connectors:
         start = (connector.x, connector.y)
@@ -313,7 +313,7 @@ def _evaluate_state(shapes: list[SchematicShape], learning_objective: str) -> li
     known_ids = {s.id for s in shapes if s.id}
     dangling = [
         s for s in shapes
-        if s.type in ("flow", "arrow") and s.target_id and s.target_id not in known_ids
+        if s.type == "arrow" and s.target_id and s.target_id not in known_ids
     ]
     if dangling:
         names = ", ".join(s.label or s.id for s in dangling[:3])

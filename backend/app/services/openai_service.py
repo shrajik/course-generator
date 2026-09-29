@@ -83,12 +83,19 @@ class AIClient(abc.ABC):
         phase: str = "default",
         max_output_tokens: int | None = None,
         on_delta: StreamSink | None = None,
+        image: bytes | None = None,
     ) -> T:
         """Return an instance of `schema` produced by the model.
 
         When `on_delta` is given, the *initial* attempt streams real model
         output to it as it arrives (a retry or the validation-repair pass
         still happen as plain blocking calls - see the real implementation).
+
+        When `image` is given (PNG/JPEG bytes), it's attached to the user
+        message as vision input alongside `user`'s own text - for reading
+        back what a generated image actually contains (see
+        ImageService._check_generated_text), never for anything the model
+        itself needs to draw.
         """
 
     @abc.abstractmethod
@@ -343,6 +350,7 @@ class OpenAIClient(AIClient):
         phase: str = "default",
         max_output_tokens: int | None = None,
         on_delta: StreamSink | None = None,
+        image: bytes | None = None,
     ) -> T:
         requested = model or self.settings.writer_model
         model_name = self._resolve_model(requested)
@@ -354,6 +362,17 @@ class OpenAIClient(AIClient):
             metrics.call_started()
         usage: Any = None
         retries = 0
+        # Built once - every retry/repair attempt below reuses the exact
+        # same vision input, so a garbled first read never becomes a
+        # different (better or worse) read on retry for reasons unrelated
+        # to the prompt itself.
+        user_content: Any = user
+        if image is not None:
+            b64 = base64.b64encode(image).decode("ascii")
+            user_content = [
+                {"type": "text", "text": user},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            ]
 
         async def call(
             response_format: dict[str, Any],
@@ -366,7 +385,7 @@ class OpenAIClient(AIClient):
                 "model": name,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user},
+                    {"role": "user", "content": user_content},
                 ],
                 "response_format": response_format,
             }

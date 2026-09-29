@@ -24,15 +24,34 @@ DIAGRAM_KINDS = (
     "concept_map",
     "schematic",
     "concept_experience",
+    "data_flow_diagram",
+    "er_diagram",
+    "swimlane",
 )
 
 # Kinds that show a SEQUENCE (steps happen in this order) - as opposed to
 # concept_map, which shows a STRUCTURE (things and how they relate, with no
 # implied order). Used to detect when the model picked a sequential kind for
 # what was actually requested as a relationship diagram - see
-# DiagramService._kind_family_matches.
-SEQUENTIAL_KINDS = ("flow_chart", "process", "cycle")
-RELATIONSHIP_KINDS = ("concept_map", "conceptual", "hierarchy", "schematic")
+# DiagramService._kind_family_matches. data_flow_diagram and swimlane are
+# both sequential (data/work moves from node to node, across lanes for
+# swimlane); er_diagram is a structure (entities and their relationships
+# have no inherent order), so it joins RELATIONSHIP_KINDS instead.
+SEQUENTIAL_KINDS = ("flow_chart", "process", "cycle", "data_flow_diagram", "swimlane")
+RELATIONSHIP_KINDS = ("concept_map", "conceptual", "hierarchy", "schematic", "er_diagram")
+
+
+def max_nodes_for(kind: str) -> int:
+    """The node-count ceiling `is_usable()` enforces for a given
+    `normalised_kind()` - shared with `DiagramService` (which needs the same
+    number to tell "too few nodes to be a real diagram" apart from "too many
+    nodes, worth a consolidation retry" - see
+    DiagramService._exceeds_node_cap) so the two never drift apart."""
+    if kind == "er_diagram":
+        return 24
+    if kind in SEQUENTIAL_KINDS:
+        return 14
+    return 9
 
 # The small, topic-agnostic vocabulary of drawable primitives a "schematic"
 # diagram is built from - see SchematicShape. Generic on purpose, and NOT
@@ -41,10 +60,24 @@ RELATIONSHIP_KINDS = ("concept_map", "conceptual", "hierarchy", "schematic")
 # planet, a seed or any round object (with an optional smaller labelled
 # circle inside it - a nucleus, an embryo, a core); "coil" is a wound coil, a
 # spring or a coiled tube/intestine; "gauge" is any dial/meter reading;
-# "flow" is field lines, current, airflow, blood flow or a reaction's
-# particle/energy movement; "arrow" is a motion/direction/reaction-progress
-# indicator; "label" is a standalone annotation.
-SHAPE_TYPES = ("block", "circle", "coil", "gauge", "flow", "arrow", "label")
+# "arrow" is a motion/direction/reaction-progress indicator; "label" is a
+# standalone annotation.
+#
+# Deliberately no "flow" (field lines/current/airflow as a fan of curved
+# lines) - retired after it kept producing overlapping/garbled diagrams in
+# real courses: its label is positioned purely from its own rotation/length
+# with zero awareness of any sibling shape (see the old _draw_flow), so two
+# nearby flow shapes (or a flow shape near a gauge/label) reliably collide,
+# and the QA geometry check (app.services.diagram_qa) only ever validated
+# each shape's own small declared box, never that derived label position -
+# so this failure mode shipped straight through the one bounded retry
+# without ever being caught. A field/flux/current-direction/wave
+# visualization is exactly what image_kind: illustration (illustration_style:
+# "textbook") is for instead - a real picture, not a labelled shape - see
+# app.services.diagram_service/app.agents.prompts. Any shape already
+# persisted with type "flow" from before this change still renders safely:
+# _draw_shape falls back to "block" for anything outside SHAPE_TYPES.
+SHAPE_TYPES = ("block", "circle", "coil", "gauge", "arrow", "label")
 
 
 class DiagramNode(BaseModel):
@@ -57,6 +90,28 @@ class DiagramNode(BaseModel):
     # being explained, >=1 = a labelled component/relationship around it.
     # Ignored by other kinds.
     level: int = 0
+    # Which shape this node draws as - meaning is kind-specific, ignored by
+    # every kind that doesn't mention it below:
+    # data_flow_diagram: "" (default) = process (rounded box), "entity" =
+    #   external entity (sharp-cornered box), "store" = data store (open-
+    #   ended box, top/bottom border only - the standard DFD notation for
+    #   each).
+    # er_diagram: "" (default) = entity (sharp-cornered box), "relationship"
+    #   = a relationship between two entities (diamond), "attribute" = a
+    #   single field belonging to one entity or relationship (oval) - see
+    #   `parent_id`.
+    shape_role: str = ""
+    # er_diagram only, and only meaningful when shape_role == "attribute":
+    # the id of the entity/relationship node this attribute belongs to -
+    # positions it orbiting that node instead of taking a place in the main
+    # entity/relationship row. Ignored by every other kind and shape_role.
+    parent_id: str = ""
+    # swimlane only: which lane/column (a role, actor or system - e.g.
+    # "User", "System", "Database") this node belongs to. Lanes are drawn
+    # left to right in the order they're first seen across `nodes`. Every
+    # node needs one for a sensible layout; a blank lane groups with any
+    # other blank-lane nodes into its own column.
+    lane: str = ""
 
 
 class DiagramEdge(BaseModel):
@@ -159,9 +214,9 @@ class SchematicShape(BaseModel):
     # types.
     sublabel: str = ""
     rotation: float = 0.0  # degrees: arrow direction / gauge needle angle
-    intensity: float = 0.5  # 0..1: flow line count/curvature, gauge deflection magnitude
-    # flow/arrow: id of another shape in the same state to point toward -
-    # takes priority over `rotation` when it resolves.
+    intensity: float = 0.5  # 0..1: gauge deflection magnitude. Unused by other types.
+    # arrow: id of another shape in the same state to point toward - takes
+    # priority over `rotation` when it resolves.
     target_id: str = ""
 
     # --- semantic / blueprint-authored fields (all optional; see docstring) ---
@@ -250,11 +305,17 @@ GENERATION_STRATEGIES = (
 # ("object", "data_structure", "process") - every other value renders
 # through a documented compatibility fallback onto one of those three (see
 # `_REPRESENTATION_RENDERERS` in app.render.concept_experience_renderer),
-# never a failure.
+# never a failure. Four more have their own dedicated renderer too -
+# "comparison" (a real table, not a fallback), "timeline", "before_after"
+# and "cycle" (a repeating "process" that visibly loops back to its first
+# step) - listed separately below for that reason, though they follow the
+# exact same "never a failure" contract. "decision_tree" is a documented
+# alias onto "hierarchy"/"object", not a new renderer - a branching
+# decision is exactly that shape (entities + labelled relationship edges).
 REPRESENTATION_TYPES = (
     "object",              # a template/blueprint entity + real instances (a class and its objects,
-                            # a microservice) - or, for comparison/relationship-style content, a
-                            # template-less row of entities (optionally connected by `relationships`)
+                            # a microservice) - or, for relationship-style content, a template-less
+                            # row of entities (optionally connected by `relationships`)
     "data_structure",      # ordered/structured entities + operations (a stack, a queue, a linked list)
     "process",             # ordered steps, optionally played through (a CI/CD pipeline, an auth flow)
     "sequence",             # a strict linear walkthrough (an algorithm's execution order, a protocol
@@ -264,11 +325,30 @@ REPRESENTATION_TYPES = (
                             # topology, an ER diagram) - renders via "object" + relationship connector lines
     "hierarchy",           # parent/child structure (OSI layers, class inheritance, an org chart) -
                             # renders via "object" + relationship connector lines
-    "comparison",          # entities compared side by side (stack vs queue, SQL vs NoSQL)
+    "comparison",          # 2+ entities compared side by side as a real table (stack vs queue, SQL vs
+                            # NoSQL) - rows are the union of every entity's `properties` keys, so give
+                            # every compared entity the SAME property keys (the criteria)
+    "timeline",            # a chronological sequence of milestones/eras (a technology's history, a
+                            # project's phases) - uses `steps`, same grammar as "process"/"sequence":
+                            # put the date/era in `label` (e.g. "2015 - Docker 1.0"), the detail in
+                            # `description`. Only for content that is genuinely dated/chronological -
+                            # a plain ordered procedure with no time dimension is still "process"
+    "before_after",        # a state transformation, not a sequence or a many-way comparison (a
+                            # variable's value, a system's architecture, a metric) shown as exactly
+                            # two entities: the FIRST entity in `entities` is "before", the SECOND is
+                            # "after" - only set when there is a genuine, single before/after contrast
     "pipeline",            # staged data transformation (RAG, ETL, a compiler pipeline) - renders like a process
     "spatial",             # physical/structural layout matters (memory layout, network topology, CPU
                             # architecture) - best-effort via "object", a documented future gap
     "code_visualization",  # a short technical_signature tied directly to the entity it describes
+    "cycle",               # a REPEATING sequence (an ML training loop, a release cycle, a review
+                            # cadence) - uses `steps`, same grammar as "process", but the last step
+                            # visibly loops back to the first instead of just ending. Only for content
+                            # that genuinely repeats; a one-shot procedure is still "process"
+    "decision_tree",       # a branching decision path (if/else logic, a diagnostic flow) - entities
+                            # are the decision points/outcomes, `relationships` are the branches, each
+                            # one's `type` naming the condition (e.g. "yes"/"no", "if cache hit") -
+                            # same grammar as "hierarchy", just branch-labelled
 )
 
 # A VisualEntity's role - "template" is the one class/blueprint object,
@@ -485,9 +565,28 @@ class DiagramSpec(BaseModel):
             )
 
         labelled = [n for n in self.nodes if n.label.strip()]
-        if not (2 <= len(labelled) <= 9):
+        # See max_nodes_for: er_diagram's node count includes attributes,
+        # which multiply fast; a SEQUENTIAL kind earns a higher ceiling too
+        # (a real technical pipeline can legitimately need more than 9
+        # distinct steps to stay faithful to the brief - rejecting it here
+        # was pushing genuinely complex-but-valid technical content onto the
+        # raster illustration fallback, which has no reliable way to render
+        # that many text labels); a relationship/structural kind keeps the
+        # original, tighter cap.
+        max_nodes = max_nodes_for(kind)
+        if not (2 <= len(labelled) <= max_nodes):
             return False
         if kind == "concept_map":
             has_labelled_edge = any(e.label.strip() for e in self.edges)
             return bool(self.edges) and (has_labelled_edge or len(labelled) >= 3)
+        if kind in ("er_diagram", "data_flow_diagram"):
+            # A relationship/data-flow diagram is exactly its connections - a
+            # bare list of entities or processes with nothing joining them
+            # isn't one, the same reasoning concept_map already uses above.
+            return bool(self.edges)
+        if kind == "swimlane":
+            # The whole point is showing work crossing roles/actors - at
+            # least 2 distinct lanes, connected by something.
+            lanes = {n.lane.strip() for n in self.nodes if n.lane.strip()}
+            return bool(self.edges) and len(lanes) >= 2
         return True

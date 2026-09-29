@@ -196,6 +196,64 @@ async def test_reviewer_detects_missing_required_blocks():
     assert "quiz" in missing and "summary" in missing and "exercise" in missing
 
 
+def _paragraph(word_count: int) -> Block:
+    return Block(type=BlockType.PARAGRAPH, content={"text": " ".join(["word"] * word_count)})
+
+
+def _image() -> Block:
+    return Block(type=BlockType.IMAGE, content={"purpose": "diagram", "prompt": "a diagram"})
+
+
+async def test_reviewer_flags_a_long_text_only_run_with_no_visual():
+    template = load_template("technical_v1")
+    review = ChapterReview(approved=True, issues=[])
+    # Five paragraphs of 120 words each = 600 words of unbroken prose, no
+    # image/table/code between them - well past the ~500-word "one page" limit.
+    blocks = [_paragraph(120) for _ in range(5)]
+    ReviewerAgent._apply_structural_checks(review, template, blocks)
+    assert any("visual balance" in m for m in review.missing_required_blocks)
+
+
+async def test_reviewer_does_not_flag_a_short_chapter_with_no_visuals():
+    """A chapter genuinely short enough to need no visual at all must not be
+    punished just for being short."""
+    template = load_template("technical_v1")
+    review = ChapterReview(approved=True, issues=[])
+    blocks = [_paragraph(80), _paragraph(80)]
+    ReviewerAgent._apply_structural_checks(review, template, blocks)
+    assert not any("visual balance" in m for m in review.missing_required_blocks)
+
+
+async def test_reviewer_does_not_flag_text_broken_up_by_visuals():
+    template = load_template("technical_v1")
+    review = ChapterReview(approved=True, issues=[])
+    # Same 600 words of text as the failing case above, but with an image
+    # breaking up every run - never more than ~200 words unbroken.
+    blocks = [
+        _paragraph(200), _image(), _paragraph(200), _image(), _paragraph(200),
+    ]
+    ReviewerAgent._apply_structural_checks(review, template, blocks)
+    assert not any("visual balance" in m for m in review.missing_required_blocks)
+
+
+async def test_reviewer_flags_a_long_chapter_that_is_thin_on_visuals_overall():
+    """No single run is egregious - every paragraph is followed by an image,
+    so no run ever exceeds 480 words, well under the wall-of-text limit -
+    but the chapter as a whole (2400 words, 4 images) is still thinner than
+    its length calls for on average."""
+    template = load_template("technical_v1")
+    review = ChapterReview(approved=True, issues=[])
+    blocks = [
+        _paragraph(480), _image(), _paragraph(480), _image(),
+        _paragraph(480), _image(), _paragraph(480), _image(),
+        _paragraph(480),
+    ]
+    ReviewerAgent._apply_structural_checks(review, template, blocks)
+    messages = review.missing_required_blocks
+    assert any("spread through it" in m for m in messages)
+    assert not any("full page of text-only reading" in m for m in messages)
+
+
 async def test_reviewer_passes_a_complete_chapter(service, technical_input):
     record = await service.create_course(technical_input)
     await service.generate(record.course_id, GenerateRequest(mode="sync"))

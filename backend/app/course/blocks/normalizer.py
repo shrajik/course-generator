@@ -40,6 +40,8 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
             "alt": _first(draft.alt_text, draft.caption, draft.title),
             "kind": kind if kind in ("diagram", "concept_experience") else "illustration",
             "diagram_kind": draft.diagram_kind.strip().lower().replace(" ", "_"),
+            "illustration_style": draft.illustration_style.strip().lower(),
+            "expected_labels": [label.strip() for label in draft.image_expected_labels if label.strip()],
         }
 
     if t is BlockType.QUOTE:

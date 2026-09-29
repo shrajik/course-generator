@@ -5,10 +5,12 @@ from __future__ import annotations
 import pytest
 
 from app.course.document.layout import (
+    MAX_DIAGRAM_IMAGE_HEIGHT,
     MAX_IMAGE_HEIGHT,
     estimate_height,
     flow_blocks,
     image_box_height,
+    page_visual_fraction,
     split_block,
     text_height,
     wrapped_line_count,
@@ -166,11 +168,27 @@ def _image_block(kind: str, *, width: int | None = None, height: int | None = No
     return Block(type=BlockType.IMAGE, content=content)
 
 
-def test_diagram_image_height_stays_capped():
-    """Unchanged, tested behaviour: a raster/SVG picture never needs a box
-    taller than MAX_IMAGE_HEIGHT - its content is a fixed aspect ratio."""
-    block = _image_block("diagram", width=800, height=4000)
+def test_illustration_image_height_stays_capped():
+    """A decorative raster illustration never needs a box taller than
+    MAX_IMAGE_HEIGHT - its content is a fixed aspect ratio, not structured
+    content whose real height matters."""
+    block = _image_block("illustration", width=800, height=4000)
     assert image_box_height(block) == MAX_IMAGE_HEIGHT
+
+
+def test_diagram_image_height_gets_a_taller_cap_than_a_decorative_picture():
+    """A real, previously-confirmed bug: a tall, many-node flow_chart SVG
+    (e.g. 880x1904 for a 14-step pipeline) was capped at the same
+    MAX_IMAGE_HEIGHT a small decorative photo uses. Since the box's width
+    stays fixed at the content width, that flat height cap forced the
+    rendered image down to a fraction of its real size (confirmed: ~199px
+    wide out of 666px available) - unreadably small, exactly the "flowcharts
+    are too small" complaint. A diagram is structured content, not a
+    decorative aspect ratio, so it earns the taller, concept_experience-like
+    ceiling instead (MAX_DIAGRAM_IMAGE_HEIGHT)."""
+    block = _image_block("diagram", width=800, height=4000)
+    assert image_box_height(block) == MAX_DIAGRAM_IMAGE_HEIGHT
+    assert MAX_DIAGRAM_IMAGE_HEIGHT > MAX_IMAGE_HEIGHT
 
 
 def test_concept_experience_image_height_is_not_capped():
@@ -191,3 +209,68 @@ def test_concept_experience_without_intrinsic_size_falls_back_uncapped():
     for this kind, since a future re-render could still exceed 430px."""
     block = _image_block("concept_experience")
     assert image_box_height(block) > 0
+
+
+# ---------------------------------------------------------------------------
+# keeping a visual with the text that leads into it (60/40 page balance)
+# ---------------------------------------------------------------------------
+
+
+def test_a_visual_is_never_stranded_alone_on_a_page_with_no_lead_in_text():
+    """The reported gap: plain sequential packing only asks "does *this*
+    block fit", so a paragraph can fill a page right up to the edge and
+    leave the image it was building up to stranded alone at the top of the
+    next page - a genuinely text-only page followed by an image with no
+    lead-in. Calibrated so page 0 fills past the early-break floor
+    (_MIN_FILL_BEFORE_EARLY_BREAK) before the last paragraph, and that last
+    paragraph would fit on page 0 by itself but would leave less room than
+    the image needs (confirmed against the un-patched behaviour while
+    writing this test: without the fix, this exact scenario put the image
+    alone on page 1 with the paragraph left behind on page 0)."""
+    lead_in = _paragraph(100)  # the paragraph immediately explaining the image
+    blocks = [_paragraph(110), lead_in, _image_block("illustration", width=800, height=300)]
+    pages = flow_blocks(blocks)
+
+    image_page = next(page for page in pages if page[-1].type is BlockType.IMAGE)
+    assert lead_in in image_page, "the image's lead-in paragraph was left behind on the previous page"
+
+
+def test_keep_together_rule_does_not_fire_on_a_nearly_empty_page():
+    """Regression guard: the early-break rule must not trigger before the
+    page holds a reasonable amount of content, or it would produce a string
+    of near-empty pages instead of a rare, deliberate early break."""
+    tiny_lead_in = _paragraph(15)
+    blocks = [tiny_lead_in, _image_block("illustration", width=800, height=300)]
+    pages = flow_blocks(blocks)
+    assert len(pages) == 1
+    assert pages[0][0] is tiny_lead_in
+    assert pages[0][1].type is BlockType.IMAGE
+
+
+def test_keep_together_rule_never_fires_when_the_visual_already_fits():
+    """Regression guard: plenty of room on the page - no early break needed,
+    natural packing already keeps them together."""
+    blocks = [_paragraph(20), _image_block("illustration", width=800, height=300)]
+    pages = flow_blocks(blocks)
+    assert len(pages) == 1
+
+
+def test_page_visual_fraction_of_an_all_text_page_is_zero():
+    pages = flow_blocks([_paragraph(30), _paragraph(30)])
+    assert page_visual_fraction(pages[0]) == 0.0
+
+
+def test_page_visual_fraction_reflects_real_rendered_heights():
+    pages = flow_blocks([_paragraph(20), _image_block("illustration", width=800, height=300)])
+    page = pages[0]
+    text_block, image_block_ = page
+    fraction = page_visual_fraction(page)
+    expected = image_block_.layout.height / (
+        text_block.layout.height + image_block_.layout.height + 18.0
+    )
+    assert fraction == pytest.approx(expected)
+    assert 0.0 < fraction < 1.0
+
+
+def test_page_visual_fraction_of_an_empty_page_is_zero():
+    assert page_visual_fraction([]) == 0.0

@@ -1,0 +1,29 @@
+[
+  {
+    "id": "block_0e2d1eb8533d",
+    "kind": "illustration",
+    "illustration_style": "textbook",
+    "expected_labels": [
+      "Photosynthesis",
+      "light energy",
+      "chemical energy (glucose)"
+    ],
+    "prompt": "Create a clean, textbook-style vector illustration that communicates the single idea: plants convert light energy into chemical energy stored in glucose. Composition: a simple green potted plant or leaf on the right, a stylized yellow sun on the left with visible rays. Draw a bold arrow from the sun to the plant; label that arrow exactly: \"light energy\". Inside or just next to the plant, show a clear icon representing stored chemical energy \u2014 e.g., a labeled sugar-cube or simple rounded box \u2014 with the label exactly: \"chemical energy (glucose)\". Add a small, unobtrusive title above the scene: \"Photosynthesis\". Use flat, high-contrast colors, minimal detail, clear legible sans-serif labels. Do NOT depict or label other inputs/outputs or biochemical steps (no CO2, H2O, O2, chloroplast diagrams, reaction arrows, or equations). Leave a lot of white space so the single message is obvious.\nProfessional educational textbook illustration. Clean, technically or scientifically accurate, structured composition suitable for a modern textbook or educational platform - not generic AI art, not a stock photo. Depict the real subject clearly (the apparatus, organism, structure or mechanism itself), not a diagram of boxes and arrows. Avoid unnecessary or excessive text - include a label only when it is essential for understanding, never paragraphs or captions baked into the image. Do not render any title, heading or course/subject name as text anywhere in the image - a caption is shown separately outside the picture. Consistent, polished, uncluttered style.\nDo not include watermarks, signatures or lorem ipsum text."
+  },
+  {
+    "id": "block_1eb2369c20ba",
+    "kind": "illustration",
+    "illustration_style": "textbook",
+    "expected_labels": [
+      "Sunlight",
+      "Chlorophyll",
+      "Chloroplast",
+      "Carbon dioxide (CO2)",
+      "Water (H2O)",
+      "Glucose (C6H12O6)",
+      "Oxygen (O2)",
+      "6 CO2 + 6 H2O \u2192 C6H12O6 + 6 O2"
+    ],
+    "prompt": "Textbook-style scientific illustration, clear and simple, showing a cross-section of a green leaf (cutaway) with labeled elements: 1) Sunlight \u2014 yellow rays striking the top surface of the leaf. 2) Carbon dioxide (CO2) \u2014 arrows entering the leaf through an open stomata on the lower surface. 3) Water (H2O) \u2014 arrow entering the leaf from a vein (representing water transport from roots). 4) Inside the leaf show a few mesophyll cells containing several green oval chloroplasts. Highlight one chloroplast with a magnified inset (simple green oval) and label inside or next to it: \"Chlorophyll\" and \"Chloroplast\". 5) Show arrows from CO2, H2O and Sunlight pointing toward the chloroplast area and a result arrow showing production of Glucose (C6H12O6) inside the leaf cells and Oxygen (O2) leaving through the stomata. Place the chemical equation \"6 CO2 + 6 H2O \u2192 C6H12O6 + 6 O2\" clearly at the bottom or side. Use clean vector lines, high contrast labels, muted natural colors (greens for leaf, blue for water, gray for veins, yellow for sunlight). Keep labels exactly as specified in expected_labels. No extra mechanistic details beyond these labels.\nProfessional educational textbook illustration. Clean, technically or scientifically accurate, structured composition suitable for a modern textbook or educational platform - not generic AI art, not a stock photo. Depict the real subject clearly (the apparatus, organism, structure or mechanism itself), not a diagram of boxes and arrows. Avoid unnecessary or excessive text - include a label only when it is essential for understanding, never paragraphs or captions baked into the image. Do not render any title, heading or course/subject name as text anywhere in the image - a caption is shown separately outside the picture. Consistent, polished, uncluttered style.\nDo not include watermarks, signatures or lorem ipsum text."
+  }
+]

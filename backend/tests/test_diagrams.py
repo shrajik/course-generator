@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 
 import pytest
 
@@ -51,8 +52,26 @@ def test_diagram_spec_usability_requires_two_to_nine_labelled_nodes():
     assert not DiagramSpec(nodes=[]).is_usable()
     assert not DiagramSpec(nodes=[DiagramNode(label="Solo")]).is_usable()
     assert DiagramSpec(nodes=[DiagramNode(label="A"), DiagramNode(label="B")]).is_usable()
+    # A relationship/structural kind (not in SEQUENTIAL_KINDS) keeps the
+    # original, tighter 9-node cap.
     assert not DiagramSpec(
-        nodes=[DiagramNode(label=f"n{i}") for i in range(10)]
+        kind="concept_map",
+        nodes=[DiagramNode(label=f"n{i}") for i in range(10)],
+        edges=[DiagramEdge(source="n0", target="n1", label="relates to")],
+    ).is_usable()
+
+
+def test_sequential_diagram_kinds_tolerate_up_to_fourteen_nodes():
+    """A genuinely multi-stage technical pipeline (flow_chart/process/
+    data_flow_diagram/swimlane/cycle) earns a higher node ceiling than a
+    relationship diagram - see max_nodes_for. Rejecting a real 10-14 step
+    process as "unusable" pushed it onto the raster illustration fallback,
+    which cannot reliably spell that many labels (see ImageService)."""
+    assert DiagramSpec(
+        kind="flow_chart", nodes=[DiagramNode(label=f"n{i}") for i in range(14)]
+    ).is_usable()
+    assert not DiagramSpec(
+        kind="flow_chart", nodes=[DiagramNode(label=f"n{i}") for i in range(15)]
     ).is_usable()
 
 
@@ -119,6 +138,227 @@ def test_flow_chart_long_transition_labels_never_overlap_the_stacked_boxes():
     assert boxes and labels
     offenders = [(label, box) for label in labels for box in boxes if _bboxes_overlap(label, box)]
     assert not offenders, f"flow_chart transition label(s) overlap a box: {offenders}"
+
+
+def test_flow_chart_process_boxes_use_the_semantic_blue_not_a_neutral_fill():
+    """A plain chain with no literal Start/End labels is every node
+    "process" - blue, not the old neutral theme.surface_color fill."""
+    nodes = [DiagramNode(id=f"n{i}", label=f"Stage {i}") for i in range(3)]
+    edges = [DiagramEdge(source=f"n{i}", target=f"n{i+1}") for i in range(2)]
+    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert text.count('fill="#bfdbfe"') == 3
+
+
+def test_flow_chart_literal_start_end_labels_render_as_coloured_pills():
+    nodes = [
+        DiagramNode(id="a", label="Start"),
+        DiagramNode(id="b", label="Do the work"),
+        DiagramNode(id="c", label="End"),
+    ]
+    edges = [DiagramEdge(source="a", target="b"), DiagramEdge(source="b", target="c")]
+    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert 'fill="#bbf7d0"' in text  # start = green
+    assert 'fill="#fecaca"' in text  # end = red
+    assert 'fill="#bfdbfe"' in text  # the one process box in between
+
+
+def test_flow_chart_decision_branches_render_side_by_side_and_converge():
+    """The "Decision Flowchart" shape: a node with 2 outgoing edges is a
+    decision (purple diamond); its two branches, each a single dead-end
+    node here, land side by side below it."""
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="check", label="Is number > 0?"),
+        DiagramNode(id="pos", label="Positive number"),
+        DiagramNode(id="neg", label="Negative number"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="check"),
+        DiagramEdge(source="check", target="pos", label="Yes"),
+        DiagramEdge(source="check", target="neg", label="No"),
+    ]
+    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    ET.fromstring(svg_bytes)
+
+    assert "<polygon" in text  # the decision diamond
+    assert "Is number &gt; 0?" in text or "Is number > 0?" in text
+    assert "Yes" in text and "No" in text
+    assert "Positive number" in text and "Negative number" in text
+    boxes = _rects_by_class(text, "diagram-box")
+    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
+    assert not offenders, f"flow_chart decision branches overlap: {offenders}"
+    assert width > 0 and height > 0
+
+
+def test_flow_chart_loop_back_edge_draws_a_return_path_not_a_box():
+    """The "Flowchart with Loops" shape: one branch of a decision loops back
+    to the decision itself (a classic while-loop) instead of ending - it
+    must draw a return path, never try to render the decision a second
+    time as a new box."""
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="init", label="Initialize i = 1"),
+        DiagramNode(id="check", label="Is i <= 5?"),
+        DiagramNode(id="print", label="Print i"),
+        DiagramNode(id="incr", label="i = i + 1"),
+        DiagramNode(id="end", label="End"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="init"),
+        DiagramEdge(source="init", target="check"),
+        DiagramEdge(source="check", target="print", label="Yes"),
+        DiagramEdge(source="print", target="incr"),
+        DiagramEdge(source="incr", target="check"),  # the loop-back
+        DiagramEdge(source="check", target="end", label="No"),
+    ]
+    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    ET.fromstring(svg_bytes)
+
+    for label in ("Initialize i = 1", "Is i &lt;= 5?", "Print i", "i = i + 1"):
+        assert label in text or label.replace("&lt;", "<") in text
+    # exactly one diamond drawn - the loop-back must never re-render "Is i <= 5?"
+    assert text.count("<polygon") == 1
+    boxes = _rects_by_class(text, "diagram-box")
+    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
+    assert not offenders, f"flow_chart loop overlaps: {offenders}"
+    assert width > 0 and height > 0
+
+
+def test_flow_chart_a_deep_branch_still_gets_real_branch_geometry_not_a_fallback():
+    """A branch has no depth limit any more - a long chain of plain steps
+    before it dead-ends must still render as a real side column (with its
+    own diamond and both columns), not silently degrade to the plain
+    linear fallback just because it's several boxes deep."""
+    nodes = [DiagramNode(id="start", label="Start"), DiagramNode(id="check", label="Check")]
+    chain_ids = [f"deep{i}" for i in range(6)]
+    nodes += [DiagramNode(id=cid, label=f"Step {i}") for i, cid in enumerate(chain_ids)]
+    nodes.append(DiagramNode(id="other", label="Other branch"))
+    edges = [
+        DiagramEdge(source="start", target="check"),
+        DiagramEdge(source="check", target=chain_ids[0], label="Yes"),
+        DiagramEdge(source="check", target="other", label="No"),
+    ]
+    edges += [DiagramEdge(source=chain_ids[i], target=chain_ids[i + 1]) for i in range(len(chain_ids) - 1)]
+
+    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    ET.fromstring(svg_bytes)
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text, f"{node.label} missing"
+    assert text.count("<polygon") == 1  # exactly one decision diamond - real branch geometry, not a fallback
+    boxes = _rects_by_class(text, "diagram-box")
+    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
+    assert not offenders, f"deep branch overlaps: {offenders}"
+    assert width > 0 and height > 0
+
+
+def test_flow_chart_branches_reconverging_at_the_same_node_continue_the_spine():
+    """The common "both outcomes lead to the same next step" pattern: two
+    branches that each dead-end into the SAME later node must merge into
+    one shared box, drawn once, with the main spine continuing below it -
+    not two separate copies of that node."""
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="check", label="Is number > 0?"),
+        DiagramNode(id="pos", label="Positive number"),
+        DiagramNode(id="neg", label="Negative number"),
+        DiagramNode(id="log", label="Log the result"),
+        DiagramNode(id="end", label="End"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="check"),
+        DiagramEdge(source="check", target="pos", label="Yes"),
+        DiagramEdge(source="check", target="neg", label="No"),
+        DiagramEdge(source="pos", target="log"),
+        DiagramEdge(source="neg", target="log"),
+        DiagramEdge(source="log", target="end"),
+    ]
+    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    ET.fromstring(svg_bytes)
+    text = svg_bytes.decode("utf-8")
+
+    for node in nodes:
+        label = node.label
+        assert label in text or escape(label) in text, label
+    assert text.count("<polygon") == 1  # exactly one diamond
+    # "Log the result" must appear exactly once as a real node (its own
+    # title tooltip), not once per branch.
+    assert text.count("<title>Log the result</title>") == 1
+    boxes = _rects_by_class(text, "diagram-box")
+    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
+    assert not offenders, f"reconverging branches overlap: {offenders}"
+    assert width > 0 and height > 0
+
+
+def test_flow_chart_asymmetric_reconvergence_falls_back_to_linear_not_a_crash():
+    """One branch reconverging while the other dead-ends separately is more
+    tangled than this function gives real geometry to - must still render
+    every node via the safe linear fallback, never drop content or crash."""
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="check", label="Check"),
+        DiagramNode(id="a", label="Branch A"),
+        DiagramNode(id="b", label="Branch B"),
+        DiagramNode(id="shared", label="Shared next step"),
+        DiagramNode(id="after_shared", label="After shared"),
+        DiagramNode(id="isolated", label="Other trigger"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="check"),
+        DiagramEdge(source="check", target="a", label="Yes"),  # dead-ends alone
+        DiagramEdge(source="check", target="b", label="No"),  # reaches "shared"
+        DiagramEdge(source="b", target="shared"),
+        # An unrelated inbound edge (from a node outside either branch and
+        # outside the main spine entirely), so "shared" has in-degree 2 - a
+        # reconvergence candidate - without branch A ever reaching it too:
+        # the asymmetry this test is actually about.
+        DiagramEdge(source="isolated", target="shared"),
+        DiagramEdge(source="shared", target="after_shared"),
+    ]
+    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    ET.fromstring(svg_bytes)
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text, f"{node.label} missing after fallback"
+    assert width > 0 and height > 0
+
+
+def test_flow_chart_fallback_nodes_still_use_semantic_colours_not_the_old_neutral_style():
+    """Regression guard for a real reported bug: everything BEFORE the
+    unresolvable decision used the new green/blue/purple/red colours, but
+    the fallback used to reuse the old _layout_vertical - plain neutral
+    boxes with numbered badges - producing one diagram that visibly
+    switched styles halfway through. The fallback must colour its nodes
+    exactly like every other node in this function: process boxes blue,
+    a literal "Start"/"End" a coloured pill, a decision (even one this
+    function can't branch) still a purple diamond - and never a numbered
+    badge, which only the old smart_art-style renderer uses."""
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="check", label="Check"),
+        DiagramNode(id="a", label="Branch A"),
+        DiagramNode(id="b", label="Branch B"),
+        DiagramNode(id="shared", label="Shared next step"),
+        DiagramNode(id="after_shared", label="After shared"),
+        DiagramNode(id="isolated", label="Other trigger"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="check"),
+        DiagramEdge(source="check", target="a", label="Yes"),
+        DiagramEdge(source="check", target="b", label="No"),
+        DiagramEdge(source="b", target="shared"),
+        DiagramEdge(source="isolated", target="shared"),
+        DiagramEdge(source="shared", target="after_shared"),
+    ]
+    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert 'fill="#bbf7d0"' in text  # Start pill still green
+    assert text.count('fill="#bfdbfe"') >= 5  # every plain node, including the fallback ones, still blue
+    assert f'r="{15.0:.1f}"' not in text  # BADGE_RADIUS - the old numbered-badge circle never appears
 
 
 def test_render_diagram_svg_escapes_untrusted_text():
@@ -267,6 +507,75 @@ async def test_diagram_with_too_few_nodes_falls_back_to_illustration(service, mo
 
     assert ok is True
     assert block.content["path"].endswith(".png")
+
+
+async def test_diagram_with_too_many_nodes_gets_a_consolidation_retry(service, monkeypatch):
+    """A genuinely rich technical brief can legitimately produce more nodes
+    than a flow_chart's cap (14, see max_nodes_for) - rather than discarding
+    the whole structured attempt for the unreliable raster fallback, one
+    retry asks the model to consolidate down to the budget it actually has."""
+    template = load_template("technical")
+    block = _diagram_block()
+    original_structured = service.ai.structured
+    calls: list[str] = []
+
+    async def sequenced_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        calls.append(kwargs.get("user", ""))
+        if len(calls) == 1:
+            return DiagramSpec(
+                kind="flow_chart",
+                nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(16)],
+                edges=[
+                    DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(15)
+                ],
+            )
+        # the consolidation retry: a properly shrunk spec.
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[DiagramNode(id=f"m{i}", label=f"Merged step {i}") for i in range(6)],
+            edges=[DiagramEdge(source=f"m{i}", target=f"m{i + 1}") for i in range(5)],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", sequenced_structured)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_consolidate", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert len(calls) == 2, "expected exactly one consolidation retry"
+    assert "more than a flow_chart diagram can clearly show" in calls[1]
+    assert block.content["path"].endswith(".svg")  # the structured path succeeded, no raster fallback
+    svg_text = service.storage.asset_abs_path("course_diagram_consolidate", block.content["path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "Merged step 0" in svg_text
+    assert "Step 0" not in svg_text  # the over-budget attempt was discarded, not rendered
+
+
+async def test_diagram_falls_back_when_consolidation_retry_still_exceeds_the_cap(service, monkeypatch):
+    template = load_template("technical")
+    block = _diagram_block()
+    original_structured = service.ai.structured
+
+    async def always_too_many(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(20)],
+            edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(19)],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", always_too_many)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_still_too_many", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is False  # caller falls back to illustration, never a silently truncated diagram
 
 
 async def test_diagram_generation_can_be_disabled_via_settings(service):
@@ -711,7 +1020,7 @@ async def test_generic_non_science_topic_also_gets_a_concept_map(service):
 
 
 def _em_induction_states() -> list[SchematicState]:
-    def state(caption: str, magnet_x: float, needle_angle: float, intensity: float) -> SchematicState:
+    def state(caption: str, magnet_x: float, needle_angle: float) -> SchematicState:
         return SchematicState(
             caption=caption,
             shapes=[
@@ -721,10 +1030,6 @@ def _em_induction_states() -> list[SchematicState]:
                     label="N", sublabel="S",
                 ),
                 SchematicShape(
-                    type="flow", id="field", x=0.5, y=0.42, width=0.18, height=0.18,
-                    rotation=180, intensity=intensity, label="Field lines",
-                ),
-                SchematicShape(
                     type="gauge", id="meter", x=0.28, y=0.82, width=0.16, height=0.16,
                     rotation=needle_angle, sublabel="Ammeter",
                 ),
@@ -732,8 +1037,8 @@ def _em_induction_states() -> list[SchematicState]:
         )
 
     return [
-        state("No current", magnet_x=0.85, needle_angle=0, intensity=0.3),
-        state("Current flows through the circuit", magnet_x=0.62, needle_angle=35, intensity=0.9),
+        state("No current", magnet_x=0.85, needle_angle=0),
+        state("Current flows through the circuit", magnet_x=0.62, needle_angle=35),
     ]
 
 
@@ -760,8 +1065,8 @@ def test_schematic_spec_requires_shapes_in_every_state():
 
 def test_render_schematic_svg_reproduces_the_em_induction_reference_layout():
     """The exact scenario from the reported bug: a magnet moving toward a
-    coil, field lines, an ammeter, and a before/after state change - the
-    kind of labelled physical illustration a concept_map cannot draw."""
+    coil, an ammeter, and a before/after state change - the kind of
+    labelled physical illustration a concept_map cannot draw."""
     spec = DiagramSpec(kind="schematic", title="Electromagnetic Induction", states=_em_induction_states())
     svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
 
@@ -773,31 +1078,6 @@ def test_render_schematic_svg_reproduces_the_em_induction_reference_layout():
     assert "diagram-node" in text  # every shape is still hoverable/interactive
     assert text.count("<title>") >= 6
     assert width > 0 and height > 0
-
-
-def test_schematic_flow_label_never_lands_inside_the_shape_it_points_at():
-    """Regression test: the flow shape's own label (e.g. "Field lines") was
-    being projected along the flow's source direction, which for a coil/
-    magnet layout routinely lands it back inside the coil it flows into."""
-    spec = DiagramSpec(kind="schematic", title="Electromagnetic Induction", states=_em_induction_states())
-    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    ellipses = [
-        tuple(float(v) for v in match.groups())
-        for match in re.finditer(r'<ellipse cx="([\d.]+)" cy="([\d.]+)" rx="([\d.]+)" ry="([\d.]+)"', text)
-    ]
-    labels = [
-        tuple(float(v) for v in match.groups())
-        for match in re.finditer(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*><tspan[^>]*>Field lines</tspan></text>', text)
-    ]
-    assert ellipses and len(labels) == 2  # one per state panel
-
-    for lx, ly in labels:
-        inside_coil = any(
-            abs(lx - cx) < rx and abs(ly - cy) < ry for cx, cy, rx, ry in ellipses
-        )
-        assert not inside_coil, f"'Field lines' label at ({lx}, {ly}) overlaps a coil loop"
 
 
 def test_render_schematic_svg_single_static_illustration_without_states():
@@ -815,9 +1095,31 @@ def test_render_schematic_svg_single_static_illustration_without_states():
     assert width > 0 and height > 0
 
 
+def test_a_stray_legacy_flow_shape_still_renders_safely_as_a_block():
+    """"flow" (a fan of field/current lines) was retired from SHAPE_TYPES -
+    it kept producing overlapping/garbled diagrams (its label is positioned
+    from its own rotation alone, with zero awareness of any sibling shape or
+    label) - see SHAPE_TYPES' docstring in app.schemas.diagram. A course
+    persisted before this change can still have a "flow"-typed shape in its
+    stored spec; it must degrade to the existing generic "unrecognised kind"
+    fallback (render as a block) rather than crash or silently vanish."""
+    spec = DiagramSpec(
+        kind="schematic",
+        title="Legacy diagram",
+        shapes=[
+            SchematicShape(type="coil", id="coil", x=0.3, y=0.5, width=0.3, height=0.3, label="Coil"),
+            SchematicShape(type="flow", id="field", x=0.7, y=0.5, width=0.2, height=0.2, label="Field lines"),
+        ],
+    )
+    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)  # valid XML, no crash
+    assert "Field lines" in svg_bytes.decode("utf-8")
+    assert width > 0 and height > 0
+
+
 # ---------------------------------------------------------------------------
 # schematic generalises beyond physics: chemistry, biology, ... via the same
-# small shape vocabulary (block/circle/coil/gauge/flow/arrow/label)
+# small shape vocabulary (block/circle/coil/gauge/arrow/label)
 # ---------------------------------------------------------------------------
 
 
@@ -962,7 +1264,7 @@ def _pmsm_shapes() -> list[SchematicShape]:
             priority="important", size="small",
         ),
         SchematicShape(
-            type="flow", id="flux", label="Air-gap flux", anchor="left_of:rotor",
+            type="arrow", id="flux", label="Air-gap flux", anchor="left_of:rotor",
             target_id="rotor", priority="important", size="small",
         ),
     ]
@@ -1442,13 +1744,11 @@ class TestTextbookColorSystem:
     def test_color_role_is_never_the_only_carrier_of_meaning(self):
         """Grayscale/CVD safety: a schematic conveys direction/relationship
         through shapes the renderer already draws regardless of color - an
-        arrow shape still has a `rotation`/`target_id`, a flow still has
-        `intensity`, a gauge still has a needle angle - none of that
-        depends on `color_role` being set or resolvable."""
+        arrow shape still has a `rotation`/`target_id`, a gauge still has a
+        needle angle - none of that depends on `color_role` being set or
+        resolvable."""
         arrow = SchematicShape(type="arrow", id="a", label="Current", color_role="current", target_id="b")
         assert arrow.target_id  # direction is encoded structurally, not only by color
-        flow = SchematicShape(type="flow", id="f", label="Field", color_role="magnetic_field", intensity=0.8)
-        assert flow.intensity > 0  # visible line density independent of color
 
     def test_important_blueprint_components_get_a_valid_color_role(self):
         for blueprint in BLUEPRINT_REGISTRY.values():
@@ -1775,3 +2075,296 @@ async def test_invalid_first_attempt_produces_targeted_combined_feedback_and_a_s
         encoding="utf-8"
     )
     assert "Load" in svg_text
+
+
+# ---------------------------------------------------------------------------
+# data_flow_diagram: process/entity/store shapes in a linear chain
+# ---------------------------------------------------------------------------
+
+
+def _dfd_spec() -> DiagramSpec:
+    nodes = [
+        DiagramNode(id="user", label="User", shape_role="entity"),
+        DiagramNode(id="login", label="Validate credentials"),  # blank shape_role = process
+        DiagramNode(id="db", label="User accounts", shape_role="store"),
+    ]
+    edges = [
+        DiagramEdge(source="user", target="login", label="Login request"),
+        DiagramEdge(source="login", target="db", label="Lookup"),
+    ]
+    return DiagramSpec(kind="data_flow_diagram", title="Login Flow", nodes=nodes, edges=edges)
+
+
+def test_data_flow_diagram_is_usable_with_labelled_edges():
+    assert _dfd_spec().is_usable()
+    assert not DiagramSpec(kind="data_flow_diagram", nodes=_dfd_spec().nodes, edges=[]).is_usable()
+
+
+def test_data_flow_diagram_renders_all_three_shape_kinds():
+    spec = _dfd_spec()
+    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)  # valid XML
+    text = svg_bytes.decode("utf-8")
+
+    assert "User" in text and "Validate credentials" in text and "User accounts" in text
+    assert "Login request" in text and "Lookup" in text
+    # the data store draws its own open-ended border as two separate <line>
+    # elements instead of a bordered <rect> - confirms the "store" shape
+    # actually took effect, not just a plain box with this label.
+    assert text.count("<line") >= 2
+    assert width > 0 and height > 0
+
+
+def test_data_flow_diagram_unknown_shape_role_falls_back_to_process():
+    spec = DiagramSpec(
+        kind="data_flow_diagram",
+        nodes=[
+            DiagramNode(id="a", label="A", shape_role="nonsense"),
+            DiagramNode(id="b", label="B"),
+        ],
+        edges=[DiagramEdge(source="a", target="b", label="x")],
+    )
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)  # never a hard failure on an unrecognised role
+
+
+# ---------------------------------------------------------------------------
+# er_diagram: entities, a relationship diamond, and attribute ovals
+# ---------------------------------------------------------------------------
+
+
+def _er_spec() -> DiagramSpec:
+    nodes = [
+        DiagramNode(id="student", label="Student"),
+        DiagramNode(id="course", label="Course"),
+        DiagramNode(id="enrolled", label="Enrolled in", shape_role="relationship"),
+        DiagramNode(id="sid", label="student_id", shape_role="attribute", parent_id="student"),
+        DiagramNode(id="sname", label="name", shape_role="attribute", parent_id="student"),
+        DiagramNode(id="cid", label="course_id", shape_role="attribute", parent_id="course"),
+        DiagramNode(id="edate", label="enroll_date", shape_role="attribute", parent_id="enrolled"),
+    ]
+    edges = [
+        DiagramEdge(source="student", target="enrolled", label="1"),
+        DiagramEdge(source="enrolled", target="course", label="N"),
+    ]
+    return DiagramSpec(kind="er_diagram", title="Student-Course Schema", nodes=nodes, edges=edges)
+
+
+def test_er_diagram_is_usable_with_edges_only():
+    assert _er_spec().is_usable()
+    assert not DiagramSpec(kind="er_diagram", nodes=_er_spec().nodes, edges=[]).is_usable()
+
+
+def test_er_diagram_allows_more_than_nine_nodes_once_attributes_are_counted():
+    """Regression guard: the generic 2-9 node cap (see DiagramSpec.is_usable)
+    would reject any realistic ER diagram the moment attributes are added -
+    er_diagram gets its own, higher cap specifically because of this."""
+    spec = _er_spec()
+    assert len(spec.nodes) > 6
+    assert spec.is_usable()
+
+
+def test_er_diagram_renders_entities_relationship_and_attributes():
+    spec = _er_spec()
+    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)
+    text = svg_bytes.decode("utf-8")
+
+    for label in ("Student", "Course", "Enrolled in", "student_id", "name", "course_id", "enroll_date"):
+        assert label in text, label
+    assert "<polygon" in text  # the relationship diamond
+    assert text.count("<ellipse") == 4  # one per attribute node
+    assert width > 0 and height > 0
+
+
+def test_er_diagram_attribute_pointing_at_an_unknown_parent_is_skipped_not_crashed():
+    spec = DiagramSpec(
+        kind="er_diagram",
+        nodes=[
+            DiagramNode(id="a", label="Entity A"),
+            DiagramNode(id="b", label="Entity B"),
+            DiagramNode(id="orphan", label="Stray field", shape_role="attribute", parent_id="does_not_exist"),
+        ],
+        edges=[DiagramEdge(source="a", target="b", label="relates to")],
+    )
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)
+    assert "Stray field" not in svg_bytes.decode("utf-8")
+
+
+def test_er_diagram_two_attribute_fans_never_overlap_each_other():
+    """Neighbouring entities' attribute fans reserve their own column width
+    (max of the entity's own box or its fan) - two entities each with several
+    attributes must not crowd into each other's fan."""
+    nodes = [
+        DiagramNode(id="a", label="Entity A"),
+        DiagramNode(id="b", label="Entity B"),
+    ]
+    for i in range(4):
+        nodes.append(DiagramNode(id=f"a{i}", label=f"a_field_{i}", shape_role="attribute", parent_id="a"))
+        nodes.append(DiagramNode(id=f"b{i}", label=f"b_field_{i}", shape_role="attribute", parent_id="b"))
+    spec = DiagramSpec(
+        kind="er_diagram", nodes=nodes, edges=[DiagramEdge(source="a", target="b", label="relates to")]
+    )
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    ellipses = [
+        tuple(float(v) for v in match.groups())
+        for match in re.finditer(
+            r'<ellipse class="diagram-box" cx="([\d.]+)" cy="([\d.]+)" rx="([\d.]+)" ry="([\d.]+)"', text
+        )
+    ]
+    assert len(ellipses) == 8
+    a_cxs = sorted(cx for cx, cy, rx, ry in ellipses[:4])
+    b_cxs = sorted(cx for cx, cy, rx, ry in ellipses[4:])
+    # every A attribute must sit strictly left of every B attribute - proof
+    # the two fans landed in separate columns, not interleaved/overlapping.
+    assert max(a_cxs) < min(b_cxs)
+
+
+# ---------------------------------------------------------------------------
+# swimlane: one column per lane, cross-lane connectors
+# ---------------------------------------------------------------------------
+
+
+def _swimlane_spec() -> DiagramSpec:
+    nodes = [
+        DiagramNode(id="req", label="Submit ticket", lane="Customer"),
+        DiagramNode(id="triage", label="Triage the issue", lane="Support Agent"),
+        DiagramNode(id="bill", label="Check billing status", lane="Billing System"),
+        DiagramNode(id="reply", label="Reply to customer", lane="Support Agent"),
+    ]
+    edges = [
+        DiagramEdge(source="req", target="triage", label="New ticket"),
+        DiagramEdge(source="triage", target="bill", label="Verify account"),
+        DiagramEdge(source="bill", target="reply", label="Account status"),
+    ]
+    return DiagramSpec(kind="swimlane", title="Support Ticket Flow", nodes=nodes, edges=edges)
+
+
+def test_swimlane_is_usable_with_two_or_more_lanes_and_edges():
+    assert _swimlane_spec().is_usable()
+    one_lane = DiagramSpec(
+        kind="swimlane",
+        nodes=[DiagramNode(id="a", label="A", lane="X"), DiagramNode(id="b", label="B", lane="X")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    assert not one_lane.is_usable()
+    no_edges = DiagramSpec(kind="swimlane", nodes=_swimlane_spec().nodes, edges=[])
+    assert not no_edges.is_usable()
+
+
+def test_swimlane_renders_one_header_per_lane_and_all_nodes():
+    spec = _swimlane_spec()
+    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)
+    text = svg_bytes.decode("utf-8")
+
+    for lane in ("Customer", "Support Agent", "Billing System"):
+        assert lane in text
+    for node in spec.nodes:
+        assert node.label in text
+    assert width > 0 and height > 0
+
+
+def test_swimlane_cross_lane_edges_never_overlap_a_box():
+    spec = _swimlane_spec()
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    boxes = _rects_by_class(text, "diagram-box")
+    # lane header bars are also "diagram-box" rects - exclude anything at
+    # the very top margin (the header row) from the node-only overlap check.
+    node_boxes = [b for b in boxes if b[1] > MARGIN + 60]
+    offenders = [(a, b) for i, a in enumerate(node_boxes) for b in node_boxes[i + 1 :] if _bboxes_overlap(a, b)]
+    assert not offenders, f"swimlane node boxes overlap: {offenders}"
+
+
+def test_swimlane_nodes_without_a_lane_group_into_a_general_column():
+    spec = DiagramSpec(
+        kind="swimlane",
+        nodes=[
+            DiagramNode(id="a", label="A", lane="Known"),
+            DiagramNode(id="b", label="B"),  # no lane set
+        ],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    ET.fromstring(svg_bytes)
+    assert "General" in svg_bytes.decode("utf-8")
+
+
+def _node_center_y(svg_text: str, label: str) -> float:
+    """The vertical centre of whichever "diagram-box" rect most likely
+    belongs to `label` - the one whose own <title> (which always leads its
+    <g class="diagram-node">) is exactly that label, found by locating the
+    <title> and reading the first rect that follows it."""
+    marker = f"<title>{escape(label)}</title>"
+    start = svg_text.index(marker)
+    match = re.search(r'<rect class="diagram-box" x="[\d.]+" y="([\d.]+)" width="[\d.]+" height="([\d.]+)"', svg_text[start:])
+    assert match, f"no diagram-box rect found after {label}'s title"
+    y, height = float(match.group(1)), float(match.group(2))
+    return y + height / 2
+
+
+def test_swimlane_same_step_nodes_align_into_the_same_row_across_lanes():
+    """The reported gap: three nodes at the same point in the process, each
+    in a different lane, must land at (roughly) the same height - not just
+    stack independently per lane, which could put them anywhere relative
+    to each other."""
+    nodes = [
+        DiagramNode(id="req", label="Login Request", lane="User"),
+        DiagramNode(id="validate", label="Validate Credentials", lane="System"),
+        DiagramNode(id="checkdb", label="Check User Data", lane="Database"),
+    ]
+    edges = [
+        DiagramEdge(source="req", target="validate"),
+        DiagramEdge(source="validate", target="checkdb"),
+    ]
+    # None of these three are at the same row by hop-count (0, 1, 2) - this
+    # test instead confirms the *different*-row case lands at genuinely
+    # different heights, complementing the same-row case below.
+    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="swimlane", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    y0 = _node_center_y(text, "Login Request")
+    y1 = _node_center_y(text, "Validate Credentials")
+    y2 = _node_center_y(text, "Check User Data")
+    assert y0 < y1 < y2
+
+
+def test_swimlane_two_branches_from_one_node_align_at_the_same_row():
+    """Two different lanes both fed directly from the same upstream node
+    (a genuine "same step, different lane" case) must land at the same
+    row - this is the actual alignment guarantee the previous version of
+    this function didn't provide."""
+    nodes = [
+        DiagramNode(id="start", label="Ticket Created", lane="Customer"),
+        DiagramNode(id="notify_agent", label="Notify Agent", lane="Support Agent"),
+        DiagramNode(id="notify_billing", label="Notify Billing", lane="Billing System"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="notify_agent"),
+        DiagramEdge(source="start", target="notify_billing"),
+    ]
+    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="swimlane", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    y_agent = _node_center_y(text, "Notify Agent")
+    y_billing = _node_center_y(text, "Notify Billing")
+    assert abs(y_agent - y_billing) < 1.0
+
+
+def test_swimlane_parallel_nodes_in_the_same_lane_and_row_never_overlap():
+    """Two nodes that would otherwise land in the same (lane, row) cell -
+    a genuine edge case (parallel branches within one lane at the same
+    step) - must be bumped apart, never drawn on top of each other."""
+    nodes = [
+        DiagramNode(id="start", label="Start", lane="A"),
+        DiagramNode(id="x", label="Path X", lane="B"),
+        DiagramNode(id="y", label="Path Y", lane="B"),
+    ]
+    edges = [DiagramEdge(source="start", target="x"), DiagramEdge(source="start", target="y")]
+    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="swimlane", nodes=nodes, edges=edges), TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    boxes = _rects_by_class(text, "diagram-box")
+    node_boxes = [b for b in boxes if b[1] > MARGIN + 60]
+    offenders = [(a, b) for i, a in enumerate(node_boxes) for b in node_boxes[i + 1 :] if _bboxes_overlap(a, b)]
+    assert not offenders, f"parallel same-lane nodes overlap: {offenders}"

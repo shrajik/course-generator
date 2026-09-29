@@ -11,10 +11,19 @@ from app.core.ids import course_id_for_document, utc_now_iso
 from app.core.logging import get_logger
 from app.course.document.builder import reflow_document
 from app.course.document.patcher import apply_patch
+from app.course.document.visual_repair import audit_and_repair_visuals
 from app.course.templates.registry import load_template
 from app.db.service import get_database_service
+from app.render.concept_experience_renderer import estimate_pixel_size, render_concept_experience_html
+from app.schemas.blocks import BlockType, merge_content
 from app.schemas.course import CourseRecord
-from app.schemas.document import CourseDocument
+from app.schemas.diagram import DiagramSpec
+from app.schemas.document import (
+    CourseDocument,
+    RegenerateVisualsResponse,
+    RepairVisualsResponse,
+    UpdateConceptVisualSpecResponse,
+)
 from app.schemas.patch import AiEditRequest, AiEditResponse
 from app.services.image_service import ImageService
 from app.services.openai_service import AIClient, get_ai_client
@@ -172,6 +181,141 @@ class DocumentService:
             applied_operations=result.applied,
             rejected_operations=result.rejected,
             pages=len(document.pages),
+        )
+
+    # --- bulk visual regeneration -------------------------------------------
+    async def regenerate_all_visuals(
+        self, document_id: str, kinds: list[str] | None = None
+    ) -> RegenerateVisualsResponse:
+        """Re-render every image block in an EXISTING document with today's
+        renderer/prompt code, regardless of whether it already has a `path` -
+        the missing mechanism this document's whole visual-consistency
+        problem traces back to: a rendered diagram is a static SVG/PNG file
+        saved once at generation time, so a later renderer change (new
+        colours, new shapes, a fixed layout bug) never touches a course
+        that was already generated - only a fresh generation, or an explicit
+        regenerate like this one, does. Reuses `ImageService.generate_missing`
+        with `force=True` (the exact mechanism `ai_edit` already uses per-block
+        after a patch), just scoped to every matching block in the whole
+        document instead of a specific patch's own block ids - same
+        concurrency limiting, same per-block failure isolation (one bad
+        regeneration never aborts the rest)."""
+        document = await self.load(document_id)
+        template = load_template(document.template_id)
+
+        wanted_kinds = {k.strip() for k in (kinds or []) if k.strip()}
+        target_ids = [
+            block.id
+            for _, block in document.iter_blocks()
+            if block.type is BlockType.IMAGE
+            and (not wanted_kinds or block.content.get("kind", "illustration") in wanted_kinds)
+        ]
+
+        regenerated = await self.images.generate_missing(
+            document=document, template=template, only_block_ids=target_ids, force=True
+        )
+        if regenerated:
+            reflow_document(document, template)
+            await self._save_document(document)
+
+        failed = [
+            block.id
+            for _, block in document.iter_blocks()
+            if block.id in target_ids and block.content.get("error")
+        ]
+        return RegenerateVisualsResponse(
+            document_id=document.document_id,
+            version=document.version,
+            regenerated=regenerated,
+            failed=failed,
+        )
+
+    # --- post-pagination visual audit and repair ----------------------------
+    async def repair_visual_coverage(self, document_id: str) -> RepairVisualsResponse:
+        """Runs the same post-pagination visual audit/repair every newly
+        generated course already gets (see
+        app.course.document.visual_repair.audit_and_repair_visuals) against
+        an EXISTING document - the explicit "repair a course I already
+        generated" mechanism: loads it, audits every page, generates and
+        inserts a relevant visual for each one that's still deficient,
+        re-paginates, and saves - never touching a page that already meets
+        the target, never silently claiming success on one that couldn't be
+        repaired within the bounded number of passes."""
+        document = await self.load(document_id)
+        template = load_template(document.template_id)
+
+        report = await audit_and_repair_visuals(document, template, images=self.images, ai=self.ai)
+        if report.repaired:
+            await self._save_document(document)
+            log.info(
+                "Visual repair for %s: %s page(s) repaired, %s still deficient",
+                document_id, len(report.repaired), len(report.still_deficient),
+            )
+
+        return RepairVisualsResponse(
+            document_id=document.document_id,
+            version=document.version,
+            passes_run=report.passes_run,
+            repaired=report.repaired,
+            skipped=report.skipped,
+            failed=report.failed,
+            still_deficient=report.still_deficient,
+            validation_findings=report.validation_findings,
+        )
+
+    # --- editable diagram text (no AI call) --------------------------------
+    async def update_concept_visual_spec(
+        self, document_id: str, block_id: str, spec_update: dict
+    ) -> UpdateConceptVisualSpecResponse:
+        """Re-render a `concept_experience` block from an edited copy of its
+        own spec - a typo/wording fix, not a new concept, so this never
+        calls the AI planner. Same renderer + estimator
+        `ConceptVisualService.generate_for_block` uses, so the result is
+        exactly as reliable (no overflow, no overlap - see
+        `render_concept_experience_html`'s own cap-and-scale contract);
+        `reflow_document` repositions any later block if this one's height
+        changed, the same way a regenerated image already does today.
+        """
+        document = await self.load(document_id)
+        template = load_template(document.template_id)
+
+        found = document.find_block(block_id)
+        if found is None:
+            raise NotFoundError(f"Block '{block_id}' not found in document '{document_id}'")
+        _, block = found
+        if block.type is not BlockType.IMAGE or block.content.get("kind") != "concept_experience":
+            raise ValidationFailedError(
+                f"Block '{block_id}' is not an editable concept_experience visual"
+            )
+
+        try:
+            spec = DiagramSpec.model_validate(spec_update)
+        except Exception as exc:  # noqa: BLE001 - surfaced as a 422, not a 500
+            raise ValidationFailedError(f"Invalid visual spec: {exc}") from exc
+
+        html_bytes = render_concept_experience_html(spec, template.theme)
+        relative = self.storage.save_asset(document.course_id, html_bytes, extension="html")
+        width, height = estimate_pixel_size(spec)
+        block.content = merge_content(
+            block.type,
+            block.content,
+            {
+                "path": relative,
+                "asset_id": relative.rsplit("/", 1)[-1],
+                "generated": True,
+                "error": None,
+                "width": width,
+                "height": height,
+                "spec": spec.model_dump(mode="json"),
+            },
+        )
+        reflow_document(document, template)
+        document.touch()
+        await self._save_document(document)
+        log.info("Updated concept_visual spec for block %s in %s", block_id, document_id)
+
+        return UpdateConceptVisualSpecResponse(
+            document_id=document.document_id, version=document.version, block=block
         )
 
     # --- export -----------------------------------------------------------

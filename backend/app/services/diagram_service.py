@@ -28,10 +28,11 @@ from app.render.diagram_renderer import render_diagram_svg
 from app.render.schematic_layout import resolve_schematic_layout
 from app.render.visual_blueprints import apply_blueprint_defaults
 from app.schemas.blocks import merge_content
-from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec
+from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
 from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
+from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.storage_service import StorageService, get_storage
@@ -92,14 +93,78 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   root, 1 = its children, ...) and add one edge per parent -> child link.
 - The brief compares two or more things side by side -> comparison. Each
   node is one thing being compared; leave `edges` empty.
+- The brief is specifically about how DATA moves through a system - a
+  request/response pipeline, a pipeline of processing stages with an
+  external caller and a data store, a system-design walkthrough -> data_flow_diagram.
+  This is still a SEQUENCE (order `nodes` the way data actually flows,
+  one edge per consecutive step, labelled with what's being sent - "Login
+  request", "Query result"), but each node also gets a `shape_role`:
+  the outside actor that starts/receives the flow is `"entity"`, a place
+  data is written to or read from is `"store"`, everything else (the
+  actual processing) is left blank (a plain process step). Only a strictly
+  linear chain is supported - never describe a step that loops back to an
+  earlier one.
+- The brief is specifically about a DATABASE's entities and how they
+  relate (tables, records, a schema) -> er_diagram. Each real-world entity
+  (a table) is a node with `shape_role` left blank; each relationship
+  between two entities (e.g. "enrolled in") is its OWN node with
+  `shape_role: "relationship"`, connected to both entities it relates via
+  two edges (entity -> relationship -> entity), each edge's `label` giving
+  that side's cardinality ("1", "N", "0..1"). A field/column belonging to
+  one entity (or to a relationship, e.g. a join table's own column) is a
+  node with `shape_role: "attribute"` and `parent_id` set to that entity's
+  or relationship's `id` - do not connect an attribute via `edges`, only
+  `parent_id`. Keep attribute labels to just the field name.
+- The brief is specifically about a process that crosses roles/actors/
+  systems, and which one does WHICH step actually matters (a support
+  ticket moving between a customer, a support agent and a billing system;
+  a request crossing a frontend, a backend and a database) -> swimlane.
+  Every node needs `lane` set to the role/actor/system it belongs to
+  (short, consistent names - the same lane name across nodes groups them
+  into one column, in the order lanes first appear). Order `nodes` the way
+  the work actually flows and add one edge per handoff, whether it stays
+  in the same lane or crosses into another - a crossing edge is normal and
+  expected, that's the whole point of this shape. Do NOT use swimlane just
+  because a process has multiple steps - only when WHO/WHAT SYSTEM does
+  each step is itself part of what the brief needs to teach.
 - Anything else - a short list of steps, pillars, principles or ideas with
   no real relationships between them -> smart_art. Leave `edges` empty.
 
-Rules for flow_chart/process/cycle/concept_map/hierarchy/comparison/smart_art:
-- Produce between 2 and 8 `nodes`. Give each one a short, unique `id`, a
-  `label` (2-6 words) and, only when it adds real information, a one-sentence
-  `detail`. Keep labels and details this concise on purpose - the renderer
-  gives every node a fixed box, and a textbook-clean diagram never has text
+For `flow_chart`/`process` specifically: if the sequence has a genuine
+bounded start and end (a bounded procedure, not an ongoing pipeline), add
+explicit nodes literally labelled "Start" and "End" as the first and last
+node - the renderer recognises those exact words and draws them as
+coloured start/end markers (green/red), the standard flowchart convention.
+Leave them out for a sequence with no natural bookends (an ongoing data
+pipeline, a cycle). A node with 2 outgoing edges (e.g. a Yes/No decision) is
+automatically drawn as a decision diamond - just add both edges, each with
+its own `label` ("Yes"/"No" or whatever the two outcomes are called); a
+loop is a branch whose edge points back at the decision node's own `id`.
+
+Rules for flow_chart/process/cycle/concept_map/hierarchy/comparison/smart_art/
+data_flow_diagram/er_diagram/swimlane:
+- Produce between 2 and 8 `nodes` for concept_map/hierarchy/comparison/
+  smart_art - those are meant to stay a small, scannable set of
+  relationships. For flow_chart/process/cycle/data_flow_diagram/swimlane
+  you may go up to 14 nodes when the brief genuinely describes that many
+  distinct steps (e.g. a real request pipeline with its error branches, an
+  agent's decide/call-tool/observe loop) - never pad a simple sequence with
+  extra steps just to look more thorough, but never compress a genuinely
+  multi-stage technical process down to 8 boxes either; a rejected,
+  too-small diagram falls back to a raster illustration that cannot
+  reliably render that many text labels, which is worse than a few extra
+  boxes. Give each node a short, unique `id`, a
+  `label` (2-6 words - the concept/action/decision itself, e.g. "Check
+  saturation current", never "Screen hard limits (Isat, SRF)" with the
+  reasoning folded in) and, only when it adds real information, a `detail`
+  of AT MOST 6-8 words - a short qualifying phrase, never a full sentence
+  and never the label's own reasoning restated. If what you'd put in
+  `detail` doesn't fit in well under 10 words, it belongs in the
+  surrounding paragraph text instead, not crammed into the node - a reader
+  can hover any node for its full label+detail in a tooltip, so the box
+  itself only ever needs to name the thing, not explain it. Keep labels and
+  details this concise on purpose - the renderer gives every node a fixed,
+  often narrow box, and a textbook-clean diagram never has text
   overflowing, wrapping badly or crowding its neighbours.
 - Base every label and detail only on the brief below. Do not invent facts,
   numbers or names that were not given to you. No markdown, no quotes.
@@ -120,20 +185,23 @@ a biology structure or a mechanical device as it is for an electrical one:
     intestine, a spring).
   * "gauge" - a dial/meter reading (`rotation` degrees = needle angle, 0 =
     resting/vertical; `sublabel` = its caption, e.g. "Ammeter", "pH meter").
-  * "flow" - a fan of curved lines showing movement: field lines, current,
-    airflow, blood flow, heat, or a reaction's particle/electron movement
-    (`rotation` degrees = the direction it flows *toward*, 0 = east, 90 =
-    south, 180 = west, 270 = north, only used if `target_id` is unset;
-    `intensity` 0-1 = how many/strong the lines look).
   * "arrow" - a straight motion/direction/reaction-progress arrow
-    (`rotation` as above, only used if `target_id` is unset).
+    (`rotation` degrees = the direction it points, 0 = east, 90 = south,
+    180 = west, 270 = north, only used if `target_id` is unset).
   * "label" - a standalone text annotation for anything the other shapes
     don't cover.
   Pick whichever combination fits the actual subject - e.g. two "block"
-  reactants connected by an "arrow" with a "flow" of heat/electrons for a
-  chemical reaction; a "circle" cell with a "circle" nucleus inside plus
-  "label" shapes for other organelles for a biology diagram; "block"/"coil"/
-  "gauge"/"flow" for an electrical or mechanical apparatus.
+  reactants connected by an "arrow" for a chemical reaction; a "circle" cell
+  with a "circle" nucleus inside plus "label" shapes for other organelles for
+  a biology diagram; "block"/"coil"/"gauge" for an electrical or mechanical
+  apparatus. There is deliberately no shape for field lines, current flow,
+  airflow or any other multi-line "fan" of movement radiating from a point -
+  that geometry has no single correct position for its own label once
+  anything else sits nearby, so it reads as accurate for exactly one layout
+  and overlapping/garbled for every other. A field/flux/current-direction/
+  wave visualization belongs to `image_kind: illustration` with
+  `illustration_style: textbook` instead (an actual picture, not a labelled
+  shape) - describe the exact field/flow pattern in `image_prompt`.
 - Do NOT set `x`/`y`/`width`/`height` yourself - a layout engine positions
   every shape automatically from the semantic fields below, the same way you
   never compute pixel coordinates for any other diagram kind. Describe the
@@ -158,7 +226,7 @@ a biology structure or a mechanical device as it is for an electrical one:
   * `size`: `"small"`, `"medium"` (default), or `"large"` - relative to
     other shapes, not a measurement. The primary object is usually
     `"large"` or `"medium"`; a minor annotation is usually `"small"`.
-  * `target_id`: for a "flow"/"arrow" shape, the `id` of the shape it points
+  * `target_id`: for an "arrow" shape, the `id` of the shape it points
     at - this both draws the connection and tells the layout engine these
     two shapes are related, so keep using it exactly as before.
 - One learning objective per diagram. Set `learning_objective` to the single
@@ -441,6 +509,41 @@ class DiagramService:
 
         spec = self._normalise(spec)
 
+        # A genuinely complex technical topic can legitimately need more
+        # nodes than this diagram kind's cap allows (see max_nodes_for) -
+        # rather than immediately giving up on the structured path (which
+        # falls back to an unreliable raster illustration - see
+        # ImageService._generate_illustration), ask the model to consolidate
+        # closely related steps into the budget it actually has, once.
+        labelled_count = len([n for n in spec.nodes if n.label.strip()])
+        cap = max_nodes_for(spec.normalised_kind())
+        if labelled_count > cap:
+            log.info(
+                "Diagram for %s has %s nodes (max %s for %s) - retrying with a consolidation request",
+                block.id, labelled_count, cap, spec.normalised_kind(),
+            )
+            try:
+                consolidated = await self._request_spec(
+                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
+                    memory=memory_text, kind_hint=spec.normalised_kind(), pin_kind=True, block_id=block.id,
+                    qa_feedback=(
+                        f"Your previous attempt had {labelled_count} nodes, more than a "
+                        f"{spec.normalised_kind()} diagram can clearly show (maximum {cap}). "
+                        "Consolidate closely related steps so the total is at most "
+                        f"{cap} nodes, while keeping the sequence faithful to the brief - "
+                        "merge an action with its immediate follow-up rather than dropping "
+                        "any genuinely distinct stage."
+                    ),
+                )
+                consolidated = self._normalise(consolidated)
+                consolidated_count = len([n for n in consolidated.nodes if n.label.strip()])
+                if consolidated.normalised_kind() == spec.normalised_kind() and consolidated_count <= cap:
+                    spec = consolidated
+                # Still over budget after asking nicely - is_usable() below
+                # will reject it and the caller falls back, same as before.
+            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
+                log.warning("Diagram consolidation retry failed for %s: %s", block.id, exc)
+
         # The writer asked for a specific shape (e.g. a relationship diagram)
         # but the model reached for a sequential one anyway - one corrective
         # retry with the kind pinned explicitly, never a silent flowchart.
@@ -480,6 +583,58 @@ class DiagramService:
             svg_bytes, width, height = render_diagram_svg(spec, template.theme)
         except Exception as exc:  # noqa: BLE001 - rendering must not fail the block
             log.warning("Diagram rendering failed for %s: %s", block.id, exc)
+            return False
+
+        # Validate the ACTUAL rendered geometry - node overlap, an edge
+        # crossing through an unrelated node's text, text overflowing its
+        # own node, anything outside the canvas. This renderer's placement
+        # is sequential/systematic by construction, so a real collision is
+        # rare, but "rare" isn't "never" (a pathological label length, an
+        # edge case in a kind's own layout math) - never silently ship one
+        # when caught. One retry, feeding back exactly what collided, same
+        # shape as every other QA retry in this module; still rendered on a
+        # persistent failure would ship a known-bad diagram, so this falls
+        # back to illustration instead, same as an unusable spec does.
+        #
+        # Schematic is exempt: it already went through its own dedicated,
+        # purpose-built geometry QA above (`_resolve_and_check_schematic` /
+        # `evaluate_schematic`), and its shapes are text-fitted by
+        # `_fit_boxed_text`/`_caption_text` - different padding/centering
+        # conventions than `_node_block`'s, which this generic check
+        # assumes. Running it on schematic produced real false positives
+        # (confirmed: several passing electric-motor/pulley tests started
+        # failing) rather than catching anything real.
+        issues = [] if spec.normalised_kind() == "schematic" else validate_rendered_svg(svg_bytes)
+        if issues:
+            log.info(
+                "Rendered diagram QA failed for %s (%s) - retrying with targeted feedback",
+                block.id, [issue.kind for issue in issues],
+            )
+            try:
+                retried = await self._request_spec(
+                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
+                    memory=memory_text, kind_hint=spec.normalised_kind(), pin_kind=True, block_id=block.id,
+                    qa_feedback=(
+                        "The rendered diagram had layout problems: "
+                        + "; ".join(issue.detail for issue in issues[:5])
+                        + ". Use noticeably shorter labels and fewer nodes so everything has room to lay "
+                        "out cleanly."
+                    ),
+                )
+                retried = self._normalise(retried)
+                if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
+                    retried_svg, retried_w, retried_h = render_diagram_svg(retried, template.theme)
+                    retried_issues = validate_rendered_svg(retried_svg)
+                    if len(retried_issues) < len(issues):
+                        spec, svg_bytes, width, height, issues = retried, retried_svg, retried_w, retried_h, retried_issues
+            except Exception as exc:  # noqa: BLE001 - keep the first render, don't fail the block
+                log.warning("Diagram render-QA retry failed for %s: %s", block.id, exc)
+
+        if issues:
+            log.info(
+                "Diagram for %s still has %s rendered layout issue(s) after retry - falling back",
+                block.id, len(issues),
+            )
             return False
 
         relative = self.storage.save_asset(course_id, svg_bytes, extension="svg")
