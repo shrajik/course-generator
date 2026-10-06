@@ -18,13 +18,14 @@ from app.api import (
     documents,
     health,
     memory,
+    pedagogy,
     templates,
     visual_knowledge,
 )
 from app.core.config import get_settings
 from app.core.errors import CourseCreatorError
 from app.core.logging import configure_logging, get_logger
-from app.course.templates.registry import refresh_db_templates
+from app.course.templates.registry import refresh_db_templates, refresh_uploaded_templates
 from app.db.engine import dispose_engine
 
 settings = get_settings()
@@ -52,6 +53,9 @@ async def lifespan(app: FastAPI):
     # it just means DB-backed templates aren't available until the next write
     # or a manual refresh (see app.course.templates.registry).
     await refresh_db_templates()
+    # Same best-effort contract: an unavailable database just means uploaded
+    # templates resolve again after the next upload or restart.
+    await refresh_uploaded_templates()
     yield
     if settings.use_database:
         await dispose_engine()
@@ -97,3 +101,4 @@ app.include_router(visual_knowledge.router)
 app.include_router(course_samples.router)
 app.include_router(course_templates.router)
 app.include_router(memory.router)
+app.include_router(pedagogy.router)

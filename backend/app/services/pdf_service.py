@@ -12,7 +12,7 @@ from pathlib import Path
 from app.core.config import Settings, get_settings
 from app.core.errors import RenderError
 from app.core.logging import get_logger
-from app.course.templates.registry import load_template
+from app.course.templates.registry import is_uploaded_template_id, load_template
 from app.render.html_renderer import render_document_html
 from app.schemas.document import PAGE_HEIGHT, PAGE_WIDTH, CourseDocument
 from app.services.storage_service import StorageService, get_storage
@@ -45,6 +45,14 @@ class PdfService:
 
     def render_html(self, document: CourseDocument) -> str:
         template = load_template(document.template_id)
+        log.info(
+            "TEMPLATE_SENT_TO_RENDERER template_id=%s source=%s font=%s page=%sx%s",
+            template.template_id,
+            "uploaded" if is_uploaded_template_id(template.template_id) else "built_in",
+            template.theme.font_family,
+            template.theme.geometry().width,
+            template.theme.geometry().height,
+        )
         return render_document_html(
             document, template, asset_prefix="../", inline_fragments=self._inline_fragments(document)
         )

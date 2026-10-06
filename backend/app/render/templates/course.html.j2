@@ -27,8 +27,12 @@
   .block > :last-child { margin-bottom: 0; }
 
   /* Headings inherit the block's font-size so the layout engine stays authoritative. */
-  h1, h2, h3, h4 { margin: 0; font-size: inherit; font-weight: inherit; letter-spacing: -0.01em; }
-  p { margin: 0 0 0.4em 0; }
+  h1, h2, h3, h4 {
+    margin: 0; font-size: inherit; font-weight: inherit; letter-spacing: -0.01em;
+    font-family: {{ theme.heading_family }};
+    color: {{ theme.heading_ink }};
+  }
+  p { margin: 0 0 {{ theme.paragraph_spacing_em }}em 0; }
   ul, ol { margin: 0; padding-left: 20px; }
   li { margin-bottom: 4px; }
 
@@ -50,9 +54,9 @@
   table { width: 100%; border-collapse: collapse; }
   th, td {
     text-align: left; padding: 8px 10px; vertical-align: top;
-    border-bottom: 1px solid {{ theme.border_color }};
+    border-bottom: 1px solid {{ theme.table_border }};
   }
-  th { font-weight: 700; }
+  th { font-weight: 700; background: {{ theme.table_header_bg }}; }
 
   .quiz-q { margin-bottom: 12px; }
   .quiz-q .q { font-weight: 600; }
@@ -60,6 +64,16 @@
   .quiz-answer { font-size: 0.92em; color: {{ theme.muted_color }}; }
 
   .divider-rule { height: 100%; min-height: 3px; border-radius: 3px; }
+  /* Running header/footer come from the template's own DOCX header/footer
+     (app.course.templates.docx_parser.style). They are drawn inside the page
+     box rather than through Playwright's header/footer templates, because
+     those require a non-zero @page margin and this document is full-bleed
+     with absolutely positioned blocks. */
+  .runhead {
+    position: absolute; left: {{ margin_x }}px; right: {{ margin_x }}px;
+    top: 28px; font-size: 11px; color: {{ theme.muted_color }};
+    border-bottom: 1px solid {{ theme.border_color }}; padding-bottom: 6px;
+  }
   .footer {
     position: absolute; left: {{ margin_x }}px; right: {{ margin_x }}px;
     bottom: 34px; font-size: 11px; color: {{ theme.muted_color }};
@@ -189,8 +203,11 @@
     {%- endif -%}
   </div>
   {% endfor %}
+  {% if page.show_footer and theme.header_line %}
+  <div class="runhead">{{ theme.header_line }}</div>
+  {% endif %}
   {% if page.show_footer %}
-  <div class="footer"><span>{{ document.course_title }}</span><span>{{ page.number }} / {{ pages|length }}</span></div>
+  <div class="footer"><span>{{ theme.footer_line or document.course_title }}</span><span>{{ page.number }} / {{ pages|length }}</span></div>
   {% endif %}
 </div>
 {% endfor %}

@@ -1,10 +1,20 @@
 """Upload/list/detail for admin-uploaded course template documents.
 
-Markdown is the internal source of truth (see CourseTemplateDocument in
-app/db/models.py). A `.docx` upload is converted to Markdown once, here, at
-upload time; a `.md` upload is validated and stored as-is. Nothing else in
-the app ever parses DOCX, and the generation pipeline does not read this
-table at all yet - this service only backs upload/listing/selection.
+A `.docx` upload is processed twice at upload time, for two different
+purposes:
+
+* **Structure + style** - `app.course.templates.docx_parser` re-opens the
+  original file and extracts a normalized `CourseTemplate` (sections in
+  document order, inferred block types, and a `TemplateTheme` carrying fonts,
+  colours, page geometry and running header/footer). This is what generation
+  and rendering actually consume, addressed as `uploaded:{id}` through the
+  template registry.
+* **Semantic text** - mammoth/markdownify produce Markdown for human reading
+  and reference. It carries no visual information by design and is never used
+  as the template.
+
+A `.md` upload has no DOCX to extract from, so it stores Markdown only and
+falls back to the built-in template for its `template_type`.
 """
 
 from __future__ import annotations
@@ -19,6 +29,9 @@ from markdownify import markdownify
 
 from app.core.config import get_settings
 from app.core.errors import NotFoundError, ValidationFailedError
+from app.core.logging import get_logger
+from app.course.templates.docx_parser import parse_docx_template
+from app.course.templates.registry import UPLOADED_PREFIX, register_uploaded_template
 from app.db.models import CourseTemplateDocument
 from app.db.repositories.course_template_documents import CourseTemplateDocumentRepository
 from app.db.session import get_session_factory
@@ -29,6 +42,8 @@ from app.schemas.course_template_document import (
     TemplateTypeClassification,
 )
 from app.services.openai_service import get_ai_client
+
+log = get_logger(__name__)
 
 _CLASSIFY_SYSTEM = (
     "You classify a course as either \"technical\" or \"non_technical\" from its "
@@ -122,10 +137,22 @@ class CourseTemplateDocumentService:
             created_at=now,
             updated_at=now,
         )
+
+        # The row id is the template id, so it is generated before the parse
+        # rather than after the insert.
+        row.id = uuid.uuid4()
+        parsed = None
+        if source_format == "docx":
+            parsed = self._parse(data, row)
+
         async with get_session_factory()() as session:
             async with session.begin():
                 await CourseTemplateDocumentRepository(session).create(row)
-            return self._to_detail(row)
+        # Registered only after the transaction commits, so a failed insert
+        # can never leave a template resolvable that no row backs.
+        if parsed is not None:
+            register_uploaded_template(parsed.template)
+        return self._to_detail(row)
 
     async def list_active(self) -> list[CourseTemplateDocumentSummary]:
         async with get_session_factory()() as session:
@@ -156,6 +183,50 @@ class CourseTemplateDocumentService:
         )
 
     @staticmethod
+    def _parse(data: bytes, row: CourseTemplateDocument):
+        """Extract structure + style, writing the result onto `row`.
+
+        A parse failure never fails the upload: the document is still stored
+        and still listable, it just cannot be used as a template. Rejecting
+        the upload instead would lose the user's file over a styling quirk.
+        """
+        template_id = f"{UPLOADED_PREFIX}{row.id}"
+        try:
+            parsed = parse_docx_template(
+                data,
+                template_id=template_id,
+                name=row.name,
+                kind=row.template_type,
+                description=row.description,
+            )
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            log.warning("Could not parse uploaded template %s: %s", template_id, exc)
+            row.parse_report_json = {
+                "parser_version": None,
+                "detected": {},
+                "warnings": [
+                    "This document could not be parsed for structure or styling, so it "
+                    "cannot be used as a template. The file is still stored."
+                ],
+                "unsupported_placeholders": [],
+                "supported_placeholders": [],
+                "sections": [],
+            }
+            return None
+
+        row.template_json = parsed.template.model_dump(mode="json")
+        row.parse_report_json = parsed.report()
+        row.parser_version = parsed.parser_version
+        log.info(
+            "TEMPLATE_STRUCTURE_EXTRACTED template_id=%s sections=%s | "
+            "TEMPLATE_STYLE_EXTRACTED fields=%s",
+            template_id,
+            len(parsed.template.sections),
+            parsed.detected.get("style", {}).get("changed_fields", []),
+        )
+        return parsed
+
+    @staticmethod
     def _store_source_file(data: bytes, extension: str) -> str:
         """Best-effort retention of the original DOCX for reference/re-download
         only - never read back by conversion or the generation pipeline."""
@@ -175,6 +246,8 @@ class CourseTemplateDocumentService:
             description=row.description,
             source_format=row.source_format,
             content_format=row.content_format,
+            template_id=f"{UPLOADED_PREFIX}{row.id}" if row.template_json else None,
+            parse_report=row.parse_report_json,
             created_by=row.created_by_email or (str(row.created_by) if row.created_by else None),
             created_at=row.created_at,
             updated_at=row.updated_at,

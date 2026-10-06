@@ -28,6 +28,7 @@ from app.schemas.course import (
     WorkspaceActivityEntry,
 )
 from app.schemas.document import CourseDocument
+from app.schemas.learner import LearnerProfile
 from app.schemas.memory import GenerationRunEntry
 
 log = get_logger(__name__)
@@ -127,6 +128,15 @@ def _coerce_course_input(raw: object, course_id: str) -> CourseInput:
             "language": source.get("language") if isinstance(source.get("language"), str) else "en",
             "tone": source.get("tone") if isinstance(source.get("tone"), str) else "",
         }
+        # Validated independently so an unrelated failure above (a missing TOC,
+        # say) doesn't silently discard the learner profile, and a malformed
+        # profile doesn't take the whole row down with it.
+        profile = source.get("learner_profile")
+        if profile is not None:
+            try:
+                fallback["learner_profile"] = LearnerProfile.model_validate(profile).model_dump()
+            except ValidationError:
+                log.warning("Course %s has an invalid learner_profile; dropping it", course_id)
         return CourseInput.model_validate(fallback)
 
 

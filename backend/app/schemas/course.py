@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.learner import LearnerProfile
+
 TemplateKind = Literal["technical", "non_technical"]
 
 TEMPLATE_IDS: dict[str, str] = {
@@ -52,6 +54,11 @@ class CourseInput(BaseModel):
     # app.course.templates.registry for how it's resolved and
     # app.services.template_service for how such an id comes to exist.
     template_id_override: str | None = None
+    # Structured learner demographics/sliders (app/schemas/learner.py). Optional
+    # and absent on every course created before the pedagogy layer existed; when
+    # it is None the generation prompts are byte-identical to what they were.
+    # See app/course/pedagogy.py for how it becomes a constraints brief.
+    learner_profile: LearnerProfile | None = None
 
     @field_validator("toc", mode="before")
     @classmethod

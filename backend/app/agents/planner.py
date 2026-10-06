@@ -6,7 +6,7 @@ from app.agents import prompts
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
-from app.course.templates.registry import load_template
+from app.course.templates.registry import is_uploaded_template_id, load_template
 from app.schemas.blueprint import (
     BlueprintChapter,
     ChapterSection,
@@ -35,6 +35,12 @@ class PlannerAgent:
     # --- blueprint --------------------------------------------------------
     async def plan(self, course_input: CourseInput) -> CourseBlueprint:
         template = load_template(course_input.template_id)
+        log.info(
+            "TEMPLATE_SENT_TO_PLANNER template_id=%s source=%s sections=%s",
+            template.template_id,
+            "uploaded" if is_uploaded_template_id(template.template_id) else "built_in",
+            len(template.sections),
+        )
         memory = await self.memory.build_context(
             stage="planner", course_title=course_input.course_title, template=template
         )

@@ -2,7 +2,16 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { ArrowRight, CheckCircle2, FileText, Layers3, Loader2, Sparkles, Upload } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  FileText,
+  Layers3,
+  Loader2,
+  Sparkles,
+  Upload,
+} from "lucide-react";
 import { ApiError } from "@/lib/api/client";
 import {
   classifyTemplateType,
@@ -52,7 +61,12 @@ export default function TemplatesPage() {
 
   const handleUse = (template: CourseTemplateDocumentSummary) => {
     update({
-      selectedTemplate: { id: template.id, name: template.name, templateType: template.template_type },
+      selectedTemplate: {
+        id: template.id,
+        name: template.name,
+        templateType: template.template_type,
+        templateId: template.template_id,
+      },
       template: template.template_type,
     });
     router.push("/");
@@ -205,6 +219,7 @@ export default function TemplatesPage() {
                 ) : (
                   <p className="text-[12px] italic leading-5 text-ink-400">No description provided.</p>
                 )}
+                <TemplateParseSummary template={template} />
                 <div className="mt-auto flex items-center justify-between pt-1">
                   <span className="text-[11px] text-ink-400">
                     Source: {template.source_format === "docx" ? "DOCX" : "Markdown"}
@@ -230,6 +245,61 @@ export default function TemplatesPage() {
             load();
           }}
         />
+      ) : null}
+    </div>
+  );
+}
+
+/** What the DOCX parser actually detected, and what it could not reproduce.
+ * Shown per card so the user can tell a template that will drive generation
+ * and styling apart from one that was only stored - the difference is
+ * invisible otherwise. */
+function TemplateParseSummary({ template }: { template: CourseTemplateDocumentSummary }) {
+  const report = template.parse_report;
+
+  if (!template.template_id) {
+    return (
+      <p className="rounded-lg bg-cream-100 px-2.5 py-2 text-[11px] leading-4 text-ink-500">
+        {template.source_format === "md"
+          ? "Markdown upload: carries no structure or styling, so courses use the built-in template."
+          : "This document could not be parsed, so courses use the built-in template."}
+      </p>
+    );
+  }
+
+  const detected = (report?.detected ?? {}) as Record<string, unknown>;
+  const style = (detected.style ?? {}) as Record<string, unknown>;
+  const pageSize = (style.page_size_px as number[] | undefined) ?? [];
+  const facts = [
+    detected.sections ? `${detected.sections as number} sections` : null,
+    report?.supported_placeholders.length
+      ? `${report.supported_placeholders.length} placeholders`
+      : null,
+    detected.tables ? `${detected.tables as number} tables` : null,
+    pageSize.length === 2 ? `${Math.round(pageSize[0])}×${Math.round(pageSize[1])}px page` : null,
+    style.header_text ? "header" : null,
+    style.footer_text ? "footer" : null,
+  ].filter(Boolean) as string[];
+
+  const warnings = report?.warnings ?? [];
+  const unsupported = report?.unsupported_placeholders.length ?? 0;
+
+  return (
+    <div className="space-y-1.5">
+      {facts.length ? (
+        <p className="text-[11px] leading-4 text-ink-500">Detected: {facts.join(" · ")}</p>
+      ) : null}
+      {warnings.length || unsupported ? (
+        <p className="flex items-start gap-1.5 text-[11px] leading-4 text-amber-700">
+          <AlertTriangle size={12} className="mt-0.5 shrink-0" aria-hidden />
+          <span>
+            {warnings.length ? warnings[0] : null}
+            {warnings.length && unsupported ? " " : null}
+            {unsupported
+              ? `${unsupported} placeholder${unsupported === 1 ? "" : "s"} not recognised; left as written.`
+              : null}
+          </span>
+        </p>
       ) : null}
     </div>
   );

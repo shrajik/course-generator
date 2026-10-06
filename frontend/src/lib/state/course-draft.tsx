@@ -15,7 +15,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import type { TemplateKind, TocItem } from "@/lib/types/course";
+import type { LearnerProfile, TemplateKind, TocItem } from "@/lib/types/course";
 import type { CourseTemplateType } from "@/lib/api/course-templates";
 
 /** The uploaded reference document (or the hardcoded "Default Template")
@@ -33,6 +33,11 @@ export interface SelectedCourseTemplate {
   id: string;
   name: string;
   templateType: CourseTemplateType | "auto";
+  /** The registry id (`uploaded:{uuid}`) sent to the backend as
+   * template_id_override. Null for the Default Template, and for an upload
+   * the parser could not turn into a usable template - both fall back to the
+   * built-in template for `templateType`. */
+  templateId?: string | null;
 }
 
 /** The inputs a drafted TOC was generated from - lets the Create Course
@@ -42,6 +47,9 @@ export interface TocDraftedFor {
   courseTitle: string;
   targetAudience: string;
   template: TemplateKind;
+  /** Serialized learner profile: changing the archetype changes the
+   * instructional model, so the drafted outline is no longer current. */
+  learnerProfile: string;
 }
 
 export interface CourseDraft {
@@ -52,6 +60,9 @@ export interface CourseDraft {
   template: TemplateKind;
   /** Null means "Start from Scratch" (or nothing chosen yet). */
   selectedTemplate: SelectedCourseTemplate | null;
+  /** Panels A-C of the creator interface. Null until the designer opens the
+   * Learner Profile section, which keeps it genuinely optional end to end. */
+  learnerProfile: LearnerProfile | null;
   toc: TocItem[];
   /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
    * a previous course) - see CreateCourseForm's regeneration check. */
@@ -82,6 +93,7 @@ export const EMPTY_DRAFT: CourseDraft = {
   donts: DEFAULT_DONTS,
   template: "technical",
   selectedTemplate: null,
+  learnerProfile: null,
   toc: [],
   tocDraftedFor: null,
   courseId: null,

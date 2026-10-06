@@ -14,7 +14,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app.course.document.layout import image_box_height
 from app.schemas.blocks import BlockType
-from app.schemas.document import PAGE_HEIGHT, PAGE_MARGIN_X, PAGE_WIDTH, Block, CourseDocument
+from app.course.templates.docx_parser.placeholders import resolve
+from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -120,6 +121,41 @@ def _css(block: Block, theme: dict[str, Any]) -> str:
     return ";".join(rules) + ";"
 
 
+# `<jargon term="...">term</jargon>` is a *content* marker: the interactive
+# course player turns it into a tappable term with a definition, so it stays
+# in the stored Course Document. A PDF has no such affordance, and Jinja's
+# autoescaping would render the tag as visible text, so it is stripped here -
+# at the render boundary only, leaving the document itself untouched.
+#
+# Deliberately tolerant: a malformed, unclosed or otherwise unexpected jargon
+# tag is removed too, so nothing of this shape can reach a PDF again whatever
+# the writer emits.
+# Attribute-aware rather than a plain `[^>]*`: a term can legitimately
+# contain ">" (for example term="Focus > Busyness"), and a naive match would
+# stop at that character and leave the rest of the tag visible.
+_JARGON_TAG = re.compile(
+    r"""</?\s*jargon\b(?:[^>"']|"[^"]*"|'[^']*')*>""",
+    re.IGNORECASE,
+)
+
+
+def strip_jargon(value: Any) -> Any:
+    """Remove jargon tags from a string, or from every string nested inside a
+    list or dict.
+
+    Returns new objects rather than editing in place, so the caller's
+    `Block.content` - which the course player still needs the tags in - is
+    never mutated.
+    """
+    if isinstance(value, str):
+        return _JARGON_TAG.sub("", value)
+    if isinstance(value, list):
+        return [strip_jargon(item) for item in value]
+    if isinstance(value, dict):
+        return {key: strip_jargon(item) for key, item in value.items()}
+    return value
+
+
 def _paragraphs(block: Block) -> list[str]:
     text = str(block.content.get("text") or "")
     return [part.strip() for part in _PARAGRAPH_SPLIT.split(text) if part.strip()]
@@ -142,6 +178,26 @@ def render_document_html(
 ) -> str:
     theme = template.theme.model_dump(mode="json")
     theme.update(document.meta.theme or {})
+    # Resolved values, so the stylesheet never has to express a fallback: an
+    # uploaded template that specified no heading face still gets the body
+    # face here rather than an empty font-family declaration.
+    theme["heading_family"] = theme.get("heading_font_family") or theme["font_family"]
+    theme["heading_ink"] = theme.get("heading_color") or theme["text_color"]
+    theme["table_border"] = theme.get("table_border_color") or theme["border_color"]
+    theme["table_header_bg"] = theme.get("table_header_background") or "transparent"
+    theme.setdefault("paragraph_spacing_em", 0.4)
+    # A DOCX header/footer usually contains placeholders ("{{COURSE_TITLE}} |
+    # {{CHAPTER_TITLE}}"). Resolve the ones this renderer can actually know;
+    # anything unsupported stays visible as written rather than becoming an
+    # empty string (see docx_parser.placeholders.resolve).
+    context = {
+        "course_title": document.course_title,
+        "audience": document.meta.audience or "",
+        "language": language,
+    }
+    theme["header_line"] = resolve(theme.get("header_text") or "", context)
+    theme["footer_line"] = resolve(theme.get("footer_text") or "", context)
+    geometry = template.theme.geometry()
     inline_fragments = inline_fragments or {}
 
     pages: list[dict[str, Any]] = []
@@ -157,13 +213,19 @@ def render_document_html(
             inline_html = None
             path = block.content.get("path")
             if block.content.get("kind") in ("concept_experience", "toc") and path in inline_fragments:
-                inline_html = inline_fragments[path]
+                # Generated fragments are built from the same AI text, so they
+                # can carry the marker too.
+                inline_html = strip_jargon(inline_fragments[path])
             blocks.append(
                 {
                     "type": block.type.value,
-                    "content": block.content,
+                    # One choke point: every block type reads its text from
+                    # `content` or `paragraphs`, so stripping both covers
+                    # headings, tables, quizzes, lists, exercises and captions
+                    # without touching each branch of the Jinja template.
+                    "content": strip_jargon(block.content),
                     "css": _css(block, theme),
-                    "paragraphs": _paragraphs(block),
+                    "paragraphs": strip_jargon(_paragraphs(block)),
                     "image_src": _image_src(block, asset_prefix),
                     "inline_html": inline_html,
                     "image_box": round(image_box_height(block), 2),
@@ -192,7 +254,7 @@ def render_document_html(
         pages=pages,
         theme=theme,
         language=language,
-        page_width=PAGE_WIDTH,
-        page_height=PAGE_HEIGHT,
-        margin_x=PAGE_MARGIN_X,
+        page_width=geometry.width,
+        page_height=geometry.height,
+        margin_x=geometry.margin_x,
     )

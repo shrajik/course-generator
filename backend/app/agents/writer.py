@@ -56,6 +56,9 @@ class WriterAgent:
         on_delta: StreamSink | None = None,
     ) -> tuple[list[Block], str]:
         """Returns (validated blocks, compact chapter summary)."""
+        log.info(
+            "TEMPLATE_SENT_TO_WRITER template_id=%s chapter=%s", template.template_id, chapter.id
+        )
         memory = await self.memory.build_context(
             stage="writer",
             course_title=blueprint.course_title,

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils/cn";
+import { JargonText } from "./JargonText";
 
 interface EditableTextProps {
   value: string;
@@ -38,11 +39,15 @@ export function EditableText({
     if (node.innerText !== value) node.innerText = value;
   }, [value]);
 
+  // Display mode renders the *resolved* content: a `<jargon>` term shows as
+  // the term itself with its definition on hover. Edit mode below keeps the
+  // raw source in the DOM, so `onBlur` commits the original markup and the
+  // stored document never loses it.
   if (!editable) {
     return (
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       <Tag className={className} style={style} {...({} as any)}>
-        {value}
+        <JargonText value={value} />
       </Tag>
     );
   }

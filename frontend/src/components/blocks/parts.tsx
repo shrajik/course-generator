@@ -1,6 +1,7 @@
 "use client";
 
 import { EditableText } from "./EditableText";
+import { JargonText } from "./JargonText";
 import { asString, asStringArray } from "@/lib/editor/blocks";
 import type { BlockContent } from "@/lib/types/document";
 import { cn } from "@/lib/utils/cn";
@@ -27,7 +28,7 @@ export function BlockLabel({
   if (!editable || !onCommit) {
     return (
       <div className={classes} style={{ color }}>
-        {text}
+        <JargonText value={text} />
       </div>
     );
   }
@@ -119,7 +120,11 @@ export function EditableList({
 }
 
 export function SubHeading({ text }: { text: string }) {
-  return <p className="mb-1 mt-2 text-[13px] font-semibold text-ink">{text}</p>;
+  return (
+    <p className="mb-1 mt-2 text-[13px] font-semibold text-ink">
+      <JargonText value={text} />
+    </p>
+  );
 }
 
 export function readText(content: BlockContent, key: string): string {

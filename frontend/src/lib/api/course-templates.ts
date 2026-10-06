@@ -9,6 +9,17 @@ import { request, requestForm } from "./client";
 
 export type CourseTemplateType = "technical" | "non_technical";
 
+/** What the DOCX parser detected, could not reproduce, and did not
+ * recognise. Mirrors docx_parser.parser.TemplateParseResult.report(). */
+export interface TemplateParseReport {
+  parser_version: number | null;
+  detected: Record<string, unknown>;
+  warnings: string[];
+  unsupported_placeholders: string[];
+  supported_placeholders: string[];
+  sections: { key: string; label: string; required: boolean; block_types: string[] }[];
+}
+
 export interface CourseTemplateDocumentSummary {
   id: string;
   name: string;
@@ -16,6 +27,10 @@ export interface CourseTemplateDocumentSummary {
   description: string;
   source_format: "docx" | "md";
   content_format: "markdown";
+  /** Registry id (`uploaded:{uuid}`) to send as template_id_override, or null
+   * when the document has no usable parse and cannot drive generation. */
+  template_id: string | null;
+  parse_report: TemplateParseReport | null;
   created_by: string | null;
   created_at: string;
   updated_at: string;

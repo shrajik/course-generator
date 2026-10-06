@@ -66,6 +66,35 @@ def test_coerce_course_input_passes_through_a_valid_record():
     assert result == CourseInput.model_validate(raw)
 
 
+def test_coerce_course_input_keeps_the_learner_profile_on_the_fallback_path():
+    """The fallback builds its dict key by key, so a newly added field is
+    silently dropped unless it is handled explicitly. Here the row is invalid
+    for an unrelated reason (no `toc`), which must not cost it its profile."""
+    raw = {
+        "course_title": "RAG Fundamentals",
+        "target_audience": "Backend engineers",
+        "template": "technical",
+        "learner_profile": {"age_group": "KG_PRIMARY", "chunk_word_cap": 180},
+    }
+    result = _coerce_course_input(raw, "crs_legacy_profile")
+    assert result.learner_profile is not None
+    assert result.learner_profile.age_group == "KG_PRIMARY"
+    assert result.learner_profile.chunk_word_cap == 180
+
+
+def test_coerce_course_input_drops_only_an_invalid_learner_profile():
+    """A malformed profile must not take the rest of the row down with it."""
+    raw = {
+        "course_title": "RAG Fundamentals",
+        "target_audience": "Backend engineers",
+        "template": "technical",
+        "learner_profile": {"age_group": "NOT_A_REAL_GROUP"},
+    }
+    result = _coerce_course_input(raw, "crs_bad_profile")
+    assert result.learner_profile is None
+    assert result.course_title == "RAG Fundamentals"
+
+
 def test_coerce_course_input_backfills_a_legacy_incomplete_record():
     """The exact shape from the bug report: only `course_title` present."""
     raw = {"course_title": "RAG Fundamentals"}

@@ -6,6 +6,7 @@ import { ArrowRight, CheckCircle2, FileText, Layers3, Loader2, Save } from "luci
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { CoursePreviewArt } from "./CoursePreviewArt";
+import { LearnerProfilePanel } from "./LearnerProfilePanel";
 import { RuleList } from "./RuleList";
 import { improveToc } from "@/lib/api/courses";
 import { classifyTemplateType } from "@/lib/api/course-templates";
@@ -68,12 +69,16 @@ export function CreateCourseForm() {
       }
     }
 
+    // The learner profile changes which instructional model the outline is
+    // built for, so it invalidates a drafted TOC the same way the title does.
+    const learnerProfile = JSON.stringify(draft.learnerProfile);
     const staleOrMissing =
       draft.toc.length === 0 ||
       !draft.tocDraftedFor ||
       draft.tocDraftedFor.courseTitle !== courseTitle ||
       draft.tocDraftedFor.targetAudience !== targetAudience ||
-      draft.tocDraftedFor.template !== template;
+      draft.tocDraftedFor.template !== template ||
+      draft.tocDraftedFor.learnerProfile !== learnerProfile;
     try {
       let toc: TocItem[] = draft.toc;
       if (staleOrMissing) {
@@ -90,7 +95,7 @@ export function CreateCourseForm() {
           sections: item.sections ?? [],
           notes: item.notes ?? "",
         }));
-        update({ toc, tocDraftedFor: { courseTitle, targetAudience, template } });
+        update({ toc, tocDraftedFor: { courseTitle, targetAudience, template, learnerProfile } });
       }
       router.push("/toc");
     } catch (caught) {
@@ -159,6 +164,11 @@ export function CreateCourseForm() {
               placeholder="Beginners to intermediate developers who want to master Python."
             />
           </div>
+
+          <LearnerProfilePanel
+            value={draft.learnerProfile}
+            onChange={(learnerProfile) => update({ learnerProfile })}
+          />
 
           <div className="grid gap-4 sm:grid-cols-2">
             <RuleList

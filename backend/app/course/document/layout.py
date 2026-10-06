@@ -16,6 +16,7 @@ import re
 from typing import Any
 
 from app.schemas.blocks import VISUAL_BLOCK_TYPES, BlockType
+from app.schemas.template import PageGeometry
 from app.schemas.document import (
     CONTENT_HEIGHT,
     CONTENT_WIDTH,
@@ -455,25 +456,37 @@ def _pending_visual_run(current_block: Block, queue: list[Block]) -> list[Block]
     return None
 
 
-def flow_blocks(blocks: list[Block]) -> list[list[Block]]:
-    """Position blocks and group them into pages. Mutates layout coordinates."""
+def flow_blocks(
+    blocks: list[Block], *, geometry: PageGeometry | None = None
+) -> list[list[Block]]:
+    """Position blocks and group them into pages. Mutates layout coordinates.
+
+    `geometry` is the page box to flow into - an uploaded template can carry
+    its own (see app.course.templates.docx_parser.style). Omitting it uses the
+    built-in box, so every existing caller and both built-in templates
+    paginate exactly as they always have.
+    """
+    box = geometry or PageGeometry()
+    margin_top = box.margin_top
+    margin_x = box.margin_x
+    content_width = box.content_width
     pages: list[list[Block]] = []
     current: list[Block] = []
-    y = PAGE_MARGIN_TOP
-    bottom = PAGE_MARGIN_TOP + CONTENT_HEIGHT
+    y = margin_top
+    bottom = margin_top + box.content_height
 
     def start_new_page() -> None:
         nonlocal current, y
         if current:
             pages.append(current)
         current = []
-        y = PAGE_MARGIN_TOP
+        y = margin_top
 
     queue = list(blocks)
     while queue:
         block = queue.pop(0)
-        block.layout.x = PAGE_MARGIN_X
-        block.layout.width = CONTENT_WIDTH
+        block.layout.x = margin_x
+        block.layout.width = content_width
         height = estimate_height(block)
 
         gap = 0.0
@@ -506,13 +519,13 @@ def flow_blocks(blocks: list[Block]) -> list[list[Block]]:
         # page already holds a reasonable amount of content
         # (_MIN_CONTENT_BEFORE_EARLY_BREAK) so it can't produce a string of
         # near-empty pages.
-        if current and (y - PAGE_MARGIN_TOP) >= _MIN_CONTENT_BEFORE_EARLY_BREAK:
+        if current and (y - margin_top) >= _MIN_CONTENT_BEFORE_EARLY_BREAK:
             run = _pending_visual_run(block, queue)
             if run is not None:
                 run_height = sum(estimate_height(b) for b in run) + BLOCK_GAP * (len(run) - 1)
                 space_here = bottom - (y + gap)
                 would_strand_visual = run_height > space_here
-                fits_a_fresh_page = run_height <= CONTENT_HEIGHT
+                fits_a_fresh_page = run_height <= box.content_height
                 if would_strand_visual and fits_a_fresh_page:
                     start_new_page()
                     gap = 0.0
@@ -529,8 +542,8 @@ def flow_blocks(blocks: list[Block]) -> list[list[Block]]:
         pieces = split_block(block, available)
         if pieces is not None:
             head, tail = pieces
-            head.layout.x = PAGE_MARGIN_X
-            head.layout.width = CONTENT_WIDTH
+            head.layout.x = margin_x
+            head.layout.width = content_width
             head.layout.y = y + gap
             head.layout.height = round(estimate_height(head), 2)
             current.append(head)

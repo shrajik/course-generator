@@ -29,6 +29,22 @@ export interface TocItem {
   notes: string;
 }
 
+export type AgeGroup = "KG_PRIMARY" | "MIDDLE_SECONDARY" | "HIGHER_ED" | "PROFESSIONAL";
+export type EduLevel = "PRIMARY" | "SECONDARY" | "BACHELORS" | "MASTERS_PHD";
+
+/** Mirrors backend/app/schemas/learner.py - keep the two in sync. */
+export interface LearnerProfile {
+  age_group: AgeGroup;
+  edu_level: EduLevel;
+  source_domain: string;
+  target_domain: string;
+  jargon_density: number;
+  scaffolding_depth: number;
+  gamification_index: number;
+  chunk_word_cap: number;
+  manual_override: boolean;
+}
+
 export interface CourseInput {
   course_title: string;
   toc: TocItem[];
@@ -38,6 +54,12 @@ export interface CourseInput {
   template: TemplateKind;
   language: string;
   tone: string;
+  /** Optional: courses created before the pedagogy layer have no profile. */
+  learner_profile?: LearnerProfile | null;
+  /** Registry template id. Omitted for the built-in technical/non_technical
+   * pair (resolved from `template`); set to `uploaded:{uuid}` when the user
+   * picked an uploaded DOCX template. */
+  template_id_override?: string | null;
 }
 
 export interface CreateCourseRequest extends CourseInput {

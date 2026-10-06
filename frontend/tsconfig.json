@@ -11,6 +11,10 @@
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
+    // Lets a *.test.ts import its subject as "./x.ts", which Node's
+    // built-in runner requires (ESM needs an explicit extension).
+    // Safe here because noEmit is already true; app code is unaffected.
+    "allowImportingTsExtensions": true,
     "jsx": "preserve",
     "incremental": true,
     "plugins": [{ "name": "next" }],

@@ -19,6 +19,7 @@ from app.schemas.course import CourseInput, ImproveTocRequest
 from app.schemas.document import Block
 from app.schemas.research import ChapterResearch
 from app.schemas.review import ChapterReview
+from app.course.pedagogy import learner_brief, pedagogy_rules_brief
 from app.schemas.template import CourseTemplate
 
 
@@ -96,6 +97,16 @@ def memory_section(memory: str) -> str:
     )
 
 
+def _appended(section: str) -> str:
+    """Render an optional prompt section as a blank-line-separated block.
+
+    Empty in, empty out (no stray newline), so a prompt built for a course
+    without the optional material is byte-identical to one built before that
+    material existed - the same contract `memory_section` relies on.
+    """
+    return f"\n{section}\n" if section else ""
+
+
 def _course_context(course_input: CourseInput, template: CourseTemplate) -> str:
     toc_lines = []
     for index, item in enumerate(course_input.toc, start=1):
@@ -120,7 +131,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-"""
+{_appended(learner_brief(course_input.learner_profile))}"""
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +505,7 @@ ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE WRITING GUIDANCE: {template.writer_guidance}
 IMAGE STYLE GUIDANCE: {template.image_guidance}
-"""
+{_appended(pedagogy_rules_brief(course_input.learner_profile))}"""
 
 
 def writer_user(
@@ -704,7 +715,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-
+{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}
 REQUIRED TEMPLATE SECTIONS: {", ".join(s.key for s in template.required_sections())}
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE REVIEW FOCUS:
@@ -776,7 +787,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-
+{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}
 REVIEWER ISSUES TO FIX:
 {chr(10).join(issues) or "(see summary)"}
 REVIEWER SUMMARY: {review.summary}

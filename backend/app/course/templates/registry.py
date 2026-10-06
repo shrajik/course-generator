@@ -43,6 +43,18 @@ _FILES = {
 # byte-identical when no custom templates exist.
 _db_templates: dict[str, tuple[CourseTemplate, bool, bool]] = {}
 
+# Uploaded DOCX templates, addressed as `uploaded:{uuid}`. Same in-process
+# cache strategy as _db_templates above (refreshed explicitly, never on the
+# read path) so `load_template` stays synchronous and a slow database can
+# never block a template lookup. Empty until something is uploaded, so
+# behaviour with no uploads is byte-identical to before.
+UPLOADED_PREFIX = "uploaded:"
+_uploaded_templates: dict[str, CourseTemplate] = {}
+
+
+def is_uploaded_template_id(template_id: str) -> bool:
+    return template_id.startswith(UPLOADED_PREFIX)
+
 
 @lru_cache(maxsize=64)
 def load_template(template_id: str) -> CourseTemplate:
@@ -50,12 +62,24 @@ def load_template(template_id: str) -> CourseTemplate:
     DB-backed versioned id (`my_template_v3`)."""
     resolved = TEMPLATE_IDS.get(template_id, template_id)
 
+    uploaded = _uploaded_templates.get(resolved)
+    if uploaded is not None:
+        return uploaded
+
     cached = _db_templates.get(resolved)
     if cached is not None:
         return cached[0]
 
     filename = _FILES.get(resolved)
     if filename is None:
+        if is_uploaded_template_id(resolved):
+            # Distinct message: the row exists but has no usable parse (a
+            # Markdown-only upload, or one that predates the parser), which
+            # is a different problem from a typo'd id.
+            raise NotFoundError(
+                f"Uploaded template '{template_id}' has no parsed configuration. "
+                "Re-upload the .docx file to regenerate it."
+            )
         raise NotFoundError(
             f"Unknown template '{template_id}'. Available: {sorted(available_template_ids())}"
         )
@@ -130,3 +154,75 @@ async def refresh_db_templates() -> None:
 
 def clear_cache() -> None:
     load_template.cache_clear()
+
+
+def register_uploaded_template(template: CourseTemplate) -> None:
+    """Make a just-parsed uploaded template resolvable immediately.
+
+    Called straight after an upload commits so the user can select and use it
+    in the same session, without waiting for a restart-time refresh.
+    """
+    _uploaded_templates[template.template_id] = template
+    load_template.cache_clear()
+    log.info(
+        "TEMPLATE_LOADED template_id=%s source=uploaded sections=%s",
+        template.template_id,
+        len(template.sections),
+    )
+
+
+def is_known_template_id(template_id: str) -> bool:
+    """Whether `load_template` can resolve this id right now.
+
+    Used to validate `template_id_override` on course creation. Deliberately
+    separate from `available_templates()`, which backs the built-in picker and
+    must not be flooded with every uploaded document.
+    """
+    resolved = TEMPLATE_IDS.get(template_id, template_id)
+    return (
+        resolved in _FILES
+        or resolved in _uploaded_templates
+        or resolved in _db_templates
+    )
+
+
+async def refresh_uploaded_templates() -> None:
+    """Load every active uploaded template that has a stored parse.
+
+    Same contract as `refresh_db_templates`: best-effort, never raises, and a
+    single unparseable row is skipped rather than breaking the rest.
+    """
+    from app.core.config import get_settings
+
+    if not get_settings().use_database:
+        return
+    try:
+        from sqlalchemy import select
+
+        from app.db.models import CourseTemplateDocument
+        from app.db.session import get_session_factory
+
+        async with get_session_factory()() as session:
+            rows = (
+                await session.scalars(
+                    select(CourseTemplateDocument).where(
+                        CourseTemplateDocument.is_active.is_(True),
+                        CourseTemplateDocument.template_json.isnot(None),
+                    )
+                )
+            ).all()
+    except Exception as exc:  # noqa: BLE001 - never fatal, mirrors refresh_db_templates
+        log.warning("Could not refresh uploaded templates: %s", exc)
+        return
+
+    fresh: dict[str, CourseTemplate] = {}
+    for row in rows:
+        try:
+            fresh[f"{UPLOADED_PREFIX}{row.id}"] = CourseTemplate.model_validate(row.template_json)
+        except Exception as exc:  # noqa: BLE001 - one bad row must not break the rest
+            log.warning("Skipping invalid uploaded template '%s': %s", row.id, exc)
+
+    _uploaded_templates.clear()
+    _uploaded_templates.update(fresh)
+    load_template.cache_clear()
+    log.info("Loaded %s uploaded template(s)", len(fresh))

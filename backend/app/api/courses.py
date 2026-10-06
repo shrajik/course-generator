@@ -12,9 +12,15 @@ from fastapi.responses import StreamingResponse
 from app.api.course_authorization import get_course_for_author_action, get_owned_course
 from app.api.dependencies import get_current_user, get_current_user_if_db_enabled, require_roles
 from app.core.errors import NotFoundError, ValidationFailedError
+from app.core.logging import get_logger
 from app.core.generation_stream import get_stream_hub
 from app.core.roles import Role
-from app.course.templates.registry import available_templates, load_template
+from app.course.templates.registry import (
+    available_templates,
+    is_known_template_id,
+    is_uploaded_template_id,
+    load_template,
+)
 from app.db.models import User
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.course import (
@@ -36,6 +42,8 @@ from app.services.course_service import CourseService, get_course_service
 from app.services.storage_service import StorageService, get_storage
 
 router = APIRouter(prefix="/api/courses", tags=["courses"])
+
+log = get_logger(__name__)
 
 
 def _service() -> CourseService:
@@ -81,12 +89,19 @@ async def create_course(
     """
     course_input = CourseInput.model_validate(request.model_dump(exclude={"run_planner"}))
     if request.template_id_override:
-        known_ids = {t.template_id for t in available_templates()}
-        if request.template_id_override not in known_ids:
+        # `is_known_template_id` also resolves uploaded templates
+        # (`uploaded:{uuid}`), which `available_templates()` deliberately
+        # excludes so the built-in picker is not flooded with them.
+        if not is_known_template_id(request.template_id_override):
             raise ValidationFailedError(
                 f"Unknown template_id_override '{request.template_id_override}'",
-                details={"available": sorted(known_ids)},
+                details={"available": sorted(t.template_id for t in available_templates())},
             )
+        log.info(
+            "TEMPLATE_SELECTED template_id=%s source=%s",
+            request.template_id_override,
+            "uploaded" if is_uploaded_template_id(request.template_id_override) else "built_in",
+        )
     owner_id = str(current_user.id) if current_user is not None else None
     record = await service.create_course(course_input, run_planner=request.run_planner, owner_id=owner_id)
     if current_user is not None:

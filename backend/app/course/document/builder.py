@@ -61,7 +61,7 @@ def _log_layout_findings(document: CourseDocument) -> None:
         )
 
 
-def _page_size_for(page_blocks: list[Block]) -> PageSize:
+def _page_size_for(page_blocks: list[Block], geometry=None) -> PageSize:
     """The standard `PageSize()` for every ordinary page - EXCEPT when this
     page's own blocks genuinely don't fit inside it.
 
@@ -78,13 +78,17 @@ def _page_size_for(page_blocks: list[Block]) -> PageSize:
     page's declared height (never the global default the rest of the
     document uses) is what actually keeps that content visible instead of
     quietly losing it."""
+    from app.schemas.template import PageGeometry
+
+    box = geometry or PageGeometry()
+    default = PageSize(width=box.width, height=box.height)
     if not page_blocks:
-        return PageSize()
+        return default
     content_bottom = max(b.layout.y + b.layout.height for b in page_blocks)
-    needed_height = content_bottom + PAGE_MARGIN_BOTTOM
-    if needed_height <= PAGE_HEIGHT:
-        return PageSize()
-    return PageSize(height=round(needed_height, 2))
+    needed_height = content_bottom + box.margin_bottom
+    if needed_height <= box.height:
+        return default
+    return PageSize(width=box.width, height=round(needed_height, 2))
 
 
 def _stack(blocks: list[Block], *, start_y: float, gap: float = 20.0) -> list[Block]:
@@ -102,6 +106,9 @@ def _cover_page(
     blueprint: CourseBlueprint, template: CourseTemplate, chapter_count: int
 ) -> Page:
     theme = template.theme
+    # Front matter shares the content pages' physical box, or the exported
+    # PDF would mix two page sizes.
+    geometry = theme.geometry()
     blocks = [
         Block(
             id=new_block_id(),
@@ -174,7 +181,7 @@ def _cover_page(
         id=page_id(1),
         page_number=1,
         kind="cover",
-        size=PageSize(),
+        size=PageSize(width=geometry.width, height=geometry.height),
         background=template.theme.page_background,
         blocks=blocks,
     )
@@ -192,6 +199,7 @@ def _toc_page(
     "one motionless picture" contract as a concept_experience visual (see
     app.render.toc_renderer), stored and inlined the exact same way so the
     editor/preview/PDF all render it identically without any new plumbing."""
+    geometry = template.theme.geometry()
     toc_chapters = [
         TocChapter(number=chapter.chapter_number, title=chapter.title, summary=chapter.summary)
         for chapter in chapters
@@ -221,7 +229,7 @@ def _toc_page(
         id=page_id(2),
         page_number=2,
         kind="toc",
-        size=PageSize(),
+        size=PageSize(width=geometry.width, height=geometry.height),
         background=template.theme.page_background,
         blocks=[block],
     )
@@ -250,6 +258,9 @@ def build_document(
     existing: CourseDocument | None = None,
     storage: StorageService | None = None,
 ) -> CourseDocument:
+    # The template's own page box - built-ins declare none and therefore get
+    # exactly the box the layout engine has always used.
+    geometry = template.theme.geometry()
     content_blocks = blocks_from_chapters(chapters)
     pages: list[Page] = []
 
@@ -267,14 +278,14 @@ def build_document(
             )
 
     offset = len(pages)
-    for index, page_blocks in enumerate(flow_blocks(content_blocks), start=1):
+    for index, page_blocks in enumerate(flow_blocks(content_blocks, geometry=geometry), start=1):
         number = offset + index
         pages.append(
             Page(
                 id=page_id(number),
                 page_number=number,
                 kind="content",
-                size=_page_size_for(page_blocks),
+                size=_page_size_for(page_blocks, geometry),
                 background=template.theme.page_background,
                 blocks=page_blocks,
             )
@@ -310,19 +321,20 @@ def build_document(
 
 def reflow_document(document: CourseDocument, template: CourseTemplate) -> CourseDocument:
     """Re-paginate content pages after an edit, preserving front matter."""
+    geometry = template.theme.geometry()
     front = [page for page in document.pages if page.kind in {"cover", "toc"}]
     content_blocks = [
         block for page in document.pages if page.kind == "content" for block in page.blocks
     ]
     pages = list(front)
-    for index, page_blocks in enumerate(flow_blocks(content_blocks), start=1):
+    for index, page_blocks in enumerate(flow_blocks(content_blocks, geometry=geometry), start=1):
         number = len(front) + index
         pages.append(
             Page(
                 id=page_id(number),
                 page_number=number,
                 kind="content",
-                size=_page_size_for(page_blocks),
+                size=_page_size_for(page_blocks, geometry),
                 background=template.theme.page_background,
                 blocks=page_blocks,
             )

@@ -13,16 +13,20 @@ Two performance decisions live here:
 
 from __future__ import annotations
 
+import re
+
 from app.agents import prompts
 from app.agents.prompts import ContinuityContext
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
+from app.course.pedagogy import BANNED_OBJECTIVE_VERBS
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, VISUAL_BLOCK_TYPES, BlockType
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
 from app.schemas.document import Block
-from app.schemas.review import ChapterReview, ContinuityReport
+from app.schemas.learner import LearnerProfile
+from app.schemas.review import ChapterReview, ContinuityReport, ReviewIssue
 from app.schemas.template import CourseTemplate
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
@@ -74,6 +78,12 @@ class ReviewerAgent:
         blocks: list[Block],
         continuity: ContinuityContext,
     ) -> ChapterReview:
+        log.info(
+            "TEMPLATE_SENT_TO_REVIEWER template_id=%s chapter=%s required_sections=%s",
+            template.template_id,
+            chapter.id,
+            len(template.required_sections()),
+        )
         payload = [block.model_dump(mode="json") for block in blocks]
         memory = await self.memory.build_context(
             stage="reviewer",
@@ -99,7 +109,9 @@ class ReviewerAgent:
             phase="reviewer",
         )
         review.reviewed_at = utc_now_iso()
-        self._apply_structural_checks(review, template, blocks)
+        self._apply_structural_checks(
+            review, template, blocks, course_input.learner_profile
+        )
         # Keep the reviewer honest: structural gaps always block approval.
         if review.missing_required_blocks:
             review.approved = False
@@ -135,7 +147,10 @@ class ReviewerAgent:
 
     @staticmethod
     def _apply_structural_checks(
-        review: ChapterReview, template: CourseTemplate, blocks: list[Block]
+        review: ChapterReview,
+        template: CourseTemplate,
+        blocks: list[Block],
+        profile: LearnerProfile | None = None,
     ) -> None:
         present_types = {block.type for block in blocks}
         present_sections = {block.meta.section_key for block in blocks if block.meta.section_key}
@@ -152,11 +167,102 @@ class ReviewerAgent:
         # Deduplicate while preserving order.
         review.missing_required_blocks = list(dict.fromkeys(missing))
 
+        # Pedagogy/style violations carry a block_index, so they route to the
+        # surgical revision path (writer.revise_chapter) rather than forcing a
+        # whole-chapter rewrite the way `missing_required_blocks` does.
+        review.issues.extend(_pedagogy_issues(blocks, profile))
+
 
 def _block_word_count(block: Block) -> int:
     if block.type not in TEXTUAL_BLOCK_TYPES:
         return 0
     return len(str(block.content.get("text", "")).split())
+
+
+# An objective's verb is the word the learner is measured on, so a banned verb
+# only counts in that position - "understand" inside explanatory prose is
+# perfectly fine. Matches "...will be able to understand..." and an item that
+# opens with the verb outright.
+_BANNED_VERB_RE = re.compile(
+    r"(?:\b(?:able to|will|shall|can|should|to)\s+|^)"
+    r"(" + "|".join(re.escape(verb) for verb in BANNED_OBJECTIVE_VERBS) + r")\b",
+    re.IGNORECASE,
+)
+
+# House-style slips worth reporting but not worth a rewrite (severity minor,
+# so they never trigger `needs_revision` on their own).
+_STYLE_SLIPS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(?:e\.g\.|i\.e\.)", re.IGNORECASE), 'write "for example" or "that is"'),
+    (re.compile(r"\bclick on\b", re.IGNORECASE), 'write "click", not "click on"'),
+    (re.compile(r"\bplease\b", re.IGNORECASE), 'drop "please" from instructional copy'),
+)
+
+
+def _pedagogy_issues(blocks: list[Block], profile: LearnerProfile | None) -> list[ReviewIssue]:
+    """Deterministic checks for the rules the pedagogy brief states.
+
+    Only runs when the course carries a learner profile: courses created
+    before that feature never asked for these rules, so holding their content
+    to them would raise issues the author never agreed to.
+    """
+    if profile is None:
+        return []
+
+    issues: list[ReviewIssue] = []
+    for index, block in enumerate(blocks):
+        if block.type is BlockType.LEARNING_OBJECTIVES:
+            for item in block.content.get("items", []) or []:
+                match = _BANNED_VERB_RE.search(str(item).strip())
+                if match is None:
+                    continue
+                issues.append(
+                    ReviewIssue(
+                        severity="major",
+                        category="pedagogy",
+                        block_index=index,
+                        description=(
+                            f'Learning objective uses the unmeasurable verb '
+                            f'"{match.group(1)}": {str(item).strip()[:160]}'
+                        ),
+                        suggestion=(
+                            "Rewrite it with one verb from the approved Bloom's bank that "
+                            "matches the cognitive level the task actually requires."
+                        ),
+                    )
+                )
+
+        words = _block_word_count(block)
+        if words > profile.chunk_word_cap:
+            issues.append(
+                ReviewIssue(
+                    severity="major",
+                    category="chunk_size",
+                    block_index=index,
+                    description=(
+                        f"This {block.type.value} block runs to {words} words, over the "
+                        f"{profile.chunk_word_cap}-word delivery chunk cap."
+                    ),
+                    suggestion=(
+                        "Split it into separate blocks, each with its own descriptive "
+                        "heading, so no single block exceeds the cap."
+                    ),
+                )
+            )
+
+        if block.type in TEXTUAL_BLOCK_TYPES:
+            text = str(block.content.get("text", ""))
+            remedies = [remedy for pattern, remedy in _STYLE_SLIPS if pattern.search(text)]
+            if remedies:
+                issues.append(
+                    ReviewIssue(
+                        severity="minor",
+                        category="style",
+                        block_index=index,
+                        description="House style (Microsoft Writing Style Guide) slip.",
+                        suggestion="; ".join(remedies) + ".",
+                    )
+                )
+    return issues
 
 
 def _visual_balance_issues(blocks: list[Block]) -> list[str]:

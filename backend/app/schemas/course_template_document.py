@@ -9,7 +9,7 @@ either shape.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,6 +28,14 @@ class CourseTemplateDocumentSummary(BaseModel):
     description: str
     source_format: Literal["docx", "md"]
     content_format: Literal["markdown"]
+    # The registry id to pass as `template_id_override` on course creation.
+    # None when the document has no usable parse (a Markdown upload, or a
+    # DOCX the parser could not read) - the UI uses this to tell the two
+    # apart rather than offering a template that cannot be loaded.
+    template_id: str | None = None
+    # What the DOCX parser detected, could not reproduce, and did not
+    # recognise. See app.course.templates.docx_parser.parser.report().
+    parse_report: dict[str, Any] | None = None
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime
