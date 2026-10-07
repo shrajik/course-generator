@@ -472,6 +472,52 @@ How to produce blocks:
   or artistic scene that has no components or relationships to label, or for
   the companion textbook picture described above (set `illustration_style:
   textbook` in that case; leave it blank otherwise).
+- Every section in this chapter - including a numbered sub-section like
+  1.2.1 - must contain exactly one `image_kind: illustration` block with
+  `illustration_style: section_intro`, and it must be the very FIRST block
+  of that section's own content: immediately after that section's own
+  heading block (or, for the chapter's opening section, right after the
+  chapter title heading) and BEFORE that section's first paragraph. The
+  block that follows it must be that section's first paragraph - the
+  ordering of the blocks list is itself what pairs the picture with the
+  text it will appear beside in the finished page; never add any marker or
+  placeholder text inside a paragraph for this. This is separate from, and
+  can sit alongside, any `diagram`/`concept_experience` visual or textbook
+  companion picture the section also needs - they serve different purposes.
+  For THIS block's `image_prompt`: at most 40 words, one single clear
+  subject with no clutter or background detail, always in the style "clean
+  modern digital illustration, dark-blue/teal tones with soft glow accents"
+  (the exact same palette phrase every time, for every section_intro image
+  in this chapter), and the prompt text must end with the exact words "no
+  text, no letters, no labels". The SUBJECT must be genuinely tied to what
+  this specific section actually teaches, never the section's own NAME -
+  "Learning Objectives"/"Summary"/"Concept"/"Overview" are headings, not
+  visual subjects, and must never be illustrated literally (a trophy for
+  "objectives", a ribbon for "summary", a generic glowing orb for
+  "concept"). Before writing the prompt, work out: (1) what this section's
+  own content actually says (its real objectives/takeaways/steps, not the
+  heading), (2) the 2-4 most concrete entities, components, stages or
+  relationships that content actually names, and (3) which of those -
+  never a stand-in metaphor - to put in the picture. This applies to every
+  subject the chapter could be about, not just technical ones: a Python
+  setup section's objectives are about a terminal/interpreter, an isolated
+  project folder, installed dependency blocks and a smoke-test check, not
+  a target; a photosynthesis section is about sunlight reaching a
+  chloroplast with CO2/H2O becoming glucose/O2, not a leaf icon; an
+  economics section on supply and demand is about the two curves and
+  their equilibrium point, not coins; a history section's overview is the
+  actual sequence of events/figures involved, not a generic scroll. A
+  purely structural/meta section still needs one of ITS OWN chapter's real
+  anchors from step (2) above, never a universal stand-in for what the
+  heading is called in the abstract. Before finalizing, apply both checks:
+  would this image still look at home pasted in front of a completely
+  different chapter (if yes, it's too generic - pick a more specific
+  anchor), and could a student, shown only the picture with no caption or
+  heading, guess roughly what this section teaches (if no, it isn't
+  concrete enough yet). Never repeat the same visual concept for two
+  different sections in this chapter - look at the full set of sections
+  above and pick a genuinely distinct, genuinely relevant subject for each
+  one.
 - For `code` blocks set `language` and keep the sample runnable and idiomatic.
 - For `quiz` blocks give 3-5 questions, each with the answer and an explanation.
 - Vary the formats: stories, analogies, examples, case studies, tips, warnings,

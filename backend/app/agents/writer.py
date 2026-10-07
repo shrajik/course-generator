@@ -17,7 +17,7 @@ from app.agents.prompts import ContinuityContext
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
-from app.course.blocks.normalizer import build_block, normalize_draft_blocks
+from app.course.blocks.normalizer import build_block, normalize_draft_blocks, tag_section_intro_illustrations
 from app.schemas.blocks import BlockType
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
@@ -204,6 +204,12 @@ class WriterAgent:
         if applied == 0:
             log.info("Surgical revision produced nothing usable for %s", chapter.id)
             return None
+        # A replaced image/paragraph can otherwise lose or gain the
+        # section_intro float pairing purely as a side effect of which
+        # indices this particular revision happened to touch - re-deriving
+        # it from the FULL updated list (idempotent, cheap) keeps it correct
+        # regardless of what got surgically replaced.
+        tag_section_intro_illustrations(updated)
         log.info("Revised %s block(s) in %s surgically", applied, chapter.id)
         return updated, revision.chapter_summary
 

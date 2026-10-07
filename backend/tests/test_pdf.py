@@ -99,6 +99,59 @@ def test_html_renderer_escapes_content():
     assert "&lt;script&gt;" in html
 
 
+def test_section_intro_image_and_its_paragraph_render_as_one_floating_pair():
+    """A section_intro image immediately followed by a paragraph renders as
+    ONE combined wrapper with a real CSS float - not two separate
+    absolutely-positioned divs (which would defeat float entirely, since it
+    only affects normal-flow siblings) - while an ordinary (non-section_intro)
+    image right next to a paragraph is completely unaffected."""
+    from app.course.document.layout import flow_blocks
+
+    image = Block(
+        type=BlockType.IMAGE,
+        content={"kind": "illustration", "illustration_style": "section_intro", "path": "assets/pic.png"},
+    )
+    paragraph = Block(type=BlockType.PARAGRAPH, content={"text": "Some intro text."})
+    flow_blocks([image, paragraph])  # assigns real layout coordinates, same as production
+    document = CourseDocument(
+        document_id="d",
+        course_id="c",
+        course_title="T",
+        template_id="technical_v1",
+        pages=[Page(blocks=[image, paragraph])],
+    )
+    html = render_document_html(document, load_template("technical_v1"))
+
+    # Exactly one combined wrapper, never a second, separately-positioned
+    # div for the now-consumed paragraph.
+    assert html.count('class="block b-section_intro_pair"') == 1
+    assert html.count('class="block b-image"') == 0
+    assert html.count('class="block b-paragraph"') == 0
+    assert "section-intro-img" in html
+    assert 'src="../assets/pic.png"' in html
+    assert "Some intro text." in html
+
+
+def test_an_ordinary_image_next_to_a_paragraph_is_not_paired():
+    from app.course.document.layout import flow_blocks
+
+    image = Block(type=BlockType.IMAGE, content={"kind": "illustration", "path": "assets/pic.png"})
+    paragraph = Block(type=BlockType.PARAGRAPH, content={"text": "Some text."})
+    flow_blocks([image, paragraph])
+    document = CourseDocument(
+        document_id="d",
+        course_id="c",
+        course_title="T",
+        template_id="technical_v1",
+        pages=[Page(blocks=[image, paragraph])],
+    )
+    html = render_document_html(document, load_template("technical_v1"))
+
+    assert 'class="block b-section_intro_pair"' not in html
+    assert html.count('class="block b-image"') == 1
+    assert html.count('class="block b-paragraph"') == 1
+
+
 def test_html_uses_layout_coordinates():
     block = Block(
         type=BlockType.PARAGRAPH,

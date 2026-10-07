@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 
+from app.schemas.blocks import BlockType
 from app.schemas.document import PAGE_MARGIN_BOTTOM, Block, CourseDocument, Page
 
 # `_clone` (layout.py) gives a split block's tail fragment an id of
@@ -73,15 +74,30 @@ def page_overflow(page: Page) -> float:
     return max((_bottom(b) - limit for b in page.blocks), default=0.0)
 
 
+def _is_section_intro_pair(a: Block, b: Block) -> bool:
+    """A section_intro image and the paragraph it floats beside (see
+    app.course.document.layout.flow_blocks) are the ONE deliberate,
+    by-design exception to "blocks never overlap" - they share the exact
+    same `layout.y` on purpose, since the image sits INSIDE the paragraph's
+    own vertical span via CSS float in the PDF export. Every other overlap
+    is still a real regression and still gets flagged."""
+    return (
+        a.type is BlockType.IMAGE
+        and (a.content.get("illustration_style") or "") == "section_intro"
+        and b.type is BlockType.PARAGRAPH
+    )
+
+
 def overlapping_pairs(page_blocks: list[Block]) -> list[tuple[str, str]]:
     """Block id pairs whose vertical extents genuinely intersect.
     `flow_blocks` stacks blocks sequentially top-down, so this should never
     happen by construction - this exists to CATCH a regression in that
-    invariant, not to fix one."""
+    invariant, not to fix one (see `_is_section_intro_pair` for the one
+    deliberate exception)."""
     ordered = sorted(page_blocks, key=lambda b: b.layout.y)
     pairs = []
     for a, b in zip(ordered, ordered[1:]):
-        if _bottom(a) - _TOLERANCE > b.layout.y:
+        if _bottom(a) - _TOLERANCE > b.layout.y and not _is_section_intro_pair(a, b):
             pairs.append((a.id, b.id))
     return pairs
 

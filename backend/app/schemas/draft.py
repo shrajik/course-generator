@@ -88,8 +88,12 @@ class DraftBlock(BaseModel):
     # app.schemas.diagram.DIAGRAM_KINDS (e.g. "concept_map", "flow_chart").
     # Optional: leave blank to let DiagramService decide.
     diagram_kind: str = ""
-    # "" (default) | "textbook" - see ImageContent.illustration_style. Only
-    # meaningful when image_kind == "illustration".
+    # "" (default) | "textbook" | "section_intro" - see
+    # ImageContent.illustration_style. Only meaningful when
+    # image_kind == "illustration". "section_intro" is the small (~4:3)
+    # illustration that opens a section and floats left of its first
+    # paragraph in the PDF export - the writer sets this directly, same as
+    # it already does for "textbook".
     illustration_style: str = ""
     # See ImageContent.expected_labels. Only meaningful when
     # illustration_style == "textbook".

@@ -203,7 +203,50 @@ def render_document_html(
     pages: list[dict[str, Any]] = []
     for page in document.pages:
         blocks: list[dict[str, Any]] = []
-        for block in page.blocks:
+        page_blocks = page.blocks
+        index = 0
+        while index < len(page_blocks):
+            block = page_blocks[index]
+            # A section_intro image (see app.course.document.layout.
+            # flow_blocks/_section_intro_pair_height) and the paragraph it
+            # was paired with share ONE combined reserved box - rendered
+            # here as ONE dict (not two) so the template can put them both
+            # in real document flow inside that one box, letting Chromium's
+            # actual CSS float wrap the paragraph's text around the image -
+            # real per-block `position:absolute` (every other block's own
+            # scheme) would defeat float entirely, since float only affects
+            # normal-flow siblings. The now-consumed paragraph is skipped
+            # (index += 2) so it's never ALSO emitted as its own block.
+            next_block = page_blocks[index + 1] if index + 1 < len(page_blocks) else None
+            is_section_intro_pair = (
+                block.type is BlockType.IMAGE
+                and (block.content.get("illustration_style") or "") == "section_intro"
+                and next_block is not None
+                and next_block.type is BlockType.PARAGRAPH
+            )
+            if is_section_intro_pair:
+                paragraph = next_block
+                blocks.append(
+                    {
+                        "type": "section_intro_pair",
+                        "content": {},
+                        "css": _css(paragraph, theme),
+                        "paragraphs": _paragraphs(paragraph),
+                        "image_src": _image_src(block, asset_prefix),
+                        "image_width": round(block.layout.width, 2),
+                        "image_height": round(block.layout.height, 2),
+                        "alt": block.content.get("alt_text") or block.content.get("purpose") or "",
+                        "inline_html": None,
+                        "image_box": round(block.layout.height, 2),
+                        "panel_css": "",
+                        "accent": paragraph.style.accent_color or theme.get("accent_color"),
+                        "accent_soft": theme.get("surface_color"),
+                        "divider_color": paragraph.style.border_color or theme.get("border_color"),
+                    }
+                )
+                index += 2
+                continue
+
             # A concept_experience or toc block is a self-contained static
             # fragment (inline <style>, no script) - an <img src="foo.html">
             # cannot render it at all, so its own markup is inlined straight
@@ -237,6 +280,7 @@ def render_document_html(
                     "divider_color": block.style.border_color or theme.get("border_color"),
                 }
             )
+            index += 1
         pages.append(
             {
                 "number": page.page_number,

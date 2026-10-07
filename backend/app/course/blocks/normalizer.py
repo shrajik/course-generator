@@ -186,6 +186,33 @@ def build_block(
     )
 
 
+def tag_section_intro_illustrations(blocks: list[Block]) -> None:
+    """Structural fallback for the writer's own `illustration_style:
+    section_intro` instruction (see WRITER_SYSTEM): re-derives the SAME
+    signal from block position when the model forgets to set the field
+    explicitly, rather than dropping the section down to an ordinary
+    full-width illustration. Every untagged `illustration`-kind image block
+    that opens a section (the first content block, or immediately after a
+    heading) and is immediately followed by a paragraph gets tagged here -
+    exactly the shape `app.course.document.layout.flow_blocks` and
+    `app.render.html_renderer.render_document_html` look for to float the
+    two together. Mutates `blocks` in place; never re-tags a block the
+    writer (or an earlier pass) already gave an explicit style, so a
+    deliberate `textbook` companion image is never overwritten."""
+    for index, block in enumerate(blocks):
+        if block.type != BlockType.IMAGE:
+            continue
+        content = block.content
+        if (content.get("kind") or "illustration") != "illustration":
+            continue
+        if (content.get("illustration_style") or "").strip():
+            continue
+        opens_a_section = index == 0 or blocks[index - 1].type == BlockType.HEADING
+        followed_by_paragraph = index + 1 < len(blocks) and blocks[index + 1].type == BlockType.PARAGRAPH
+        if opens_a_section and followed_by_paragraph:
+            block.content = {**content, "illustration_style": "section_intro"}
+
+
 def normalize_draft_blocks(
     drafts: list[DraftBlock],
     *,
@@ -210,4 +237,5 @@ def normalize_draft_blocks(
         )
         if block is not None:
             blocks.append(block)
+    tag_section_intro_illustrations(blocks)
     return blocks

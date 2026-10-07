@@ -118,6 +118,158 @@ def test_the_background_rect_is_never_mistaken_for_a_node():
 
 
 # ---------------------------------------------------------------------------
+# shared segments, border-hugging edges, duplicate arrowheads, font minimums
+# ---------------------------------------------------------------------------
+
+
+def test_two_edges_sharing_a_long_vertical_segment_are_caught():
+    """Two entirely different connectors both routed through the exact same
+    margin line - the reported bug: "Keep task -> End" and "Escalate ->
+    Assess request" were indistinguishable where they overlapped."""
+    body = (
+        '<line x1="800" y1="50" x2="800" y2="500"/>'
+        '<line x1="800" y1="200" x2="800" y2="650"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=900, height=700, body=body))
+    assert any(i.kind == "shared_edge_segment" for i in issues)
+
+
+def test_two_edges_merely_touching_at_a_shared_endpoint_are_clean():
+    """Two DIFFERENT edges converging on the same point (an ordinary
+    reconvergence) share only a short stub near that point, not a real
+    parallel stretch for any meaningful distance - not the same defect as
+    two edges running alongside each other for a real distance."""
+    body = (
+        '<line x1="600" y1="50" x2="600" y2="300"/>'
+        '<line x1="600" y1="280" x2="600" y2="300"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=900, height=400, body=body))
+    assert not any(i.kind == "shared_edge_segment" for i in issues)
+
+
+def test_an_edge_hugging_an_unrelated_nodes_border_is_caught():
+    """An edge segment running directly ALONG an unrelated node's border -
+    distinct from `edge_crosses_node` (passing through the INTERIOR): this
+    reads as if the line were part of that node's own outline rather than
+    a distinct arrow, even though it never technically enters the box. The
+    edge's own two real endpoints (500,200) and (500,50) sit nowhere near
+    the unrelated box, so it is never mistaken for one of the edge's own
+    connected nodes - only the path's own middle stretch, 8px outside the
+    box's right edge, is the actual violation."""
+    body = (
+        '<rect class="diagram-box" x="100" y="10" width="200" height="400"/>'
+        '<path d="M500,200 L308,200 L308,50 L500,50"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=900, height=500, body=body))
+    assert any(i.kind == "edge_collinear_with_node_border" for i in issues)
+
+
+def test_an_edge_only_touching_its_own_connected_nodes_border_is_clean():
+    """The same near-border geometry as above, but this time the node it
+    runs close to genuinely IS one of the edge's own two connected
+    nodes - touching your own endpoint's boundary is not a collision."""
+    body = (
+        '<rect class="diagram-box" x="100" y="10" width="200" height="40"/>'
+        '<rect class="diagram-box" x="100" y="200" width="200" height="40"/>'
+        '<line x1="200" y1="50" x2="200" y2="200"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=500, height=300, body=body))
+    assert not any(i.kind == "edge_collinear_with_node_border" for i in issues)
+
+
+def test_two_arrowheads_landing_on_the_same_node_side_are_caught():
+    """The reported bug: an ordinary spine arrow and an unrelated loop-back
+    both entered the same node at its top - visually indistinguishable,
+    a single ambiguous connection rather than two distinct real edges."""
+    body = (
+        '<rect class="diagram-box" x="100" y="100" width="200" height="60"/>'
+        '<line x1="200" y1="20" x2="200" y2="100"/>'
+        '<line x1="500" y1="20" x2="203" y2="100"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=600, height=200, body=body))
+    assert any(i.kind == "duplicate_arrowhead_side" for i in issues)
+
+
+def test_two_arrowheads_on_different_sides_of_the_same_node_are_clean():
+    body = (
+        '<rect class="diagram-box" x="100" y="100" width="200" height="60"/>'
+        '<line x1="200" y1="20" x2="200" y2="100"/>'
+        '<line x1="500" y1="130" x2="300" y2="130"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=600, height=200, body=body))
+    assert not any(i.kind == "duplicate_arrowhead_side" for i in issues)
+
+
+def test_title_text_below_the_14px_floor_after_scaling_is_caught():
+    """A flow_chart/process node's own title, rendered small enough that
+    once scaled to the page's real display width it drops under the
+    14px minimum - checked directly against `font_size_issues` (not
+    `validate_rendered_svg`, which only runs this check for
+    kind="flow_chart"/"process")."""
+    from app.services.diagram_render_qa import font_size_issues
+
+    body = (
+        '<g class="diagram-node"><rect class="diagram-box" x="10" y="10" width="200" height="60"/>'
+        '<text x="20" y="40" font-size="15" font-weight="600">A Node Title</text></g>'
+    )
+    root = ET.fromstring(_svg(body=body))
+    issues = font_size_issues(root, canvas_w=880, display_width=666)  # 15 * 666/880 = 11.35px
+    assert any(i.kind == "font_below_minimum" and "title" in i.detail for i in issues)
+
+
+def test_title_text_at_the_14px_floor_after_scaling_is_clean():
+    from app.services.diagram_render_qa import font_size_issues
+
+    body = (
+        '<g class="diagram-node"><rect class="diagram-box" x="10" y="10" width="200" height="60"/>'
+        '<text x="20" y="40" font-size="19" font-weight="600">A Node Title</text></g>'
+    )
+    root = ET.fromstring(_svg(body=body))
+    issues = font_size_issues(root, canvas_w=880, display_width=666)  # 19 * 666/880 = 14.38px
+    assert issues == []
+
+
+def test_diamond_text_below_the_12px_floor_after_scaling_is_caught():
+    from app.services.diagram_render_qa import font_size_issues
+
+    body = (
+        '<g class="diagram-node"><polygon class="diagram-box" points="100,10 200,60 100,110 0,60"/>'
+        '<text x="100" y="65" font-size="12" font-weight="700">Decide?</text></g>'
+    )
+    root = ET.fromstring(_svg(body=body))
+    issues = font_size_issues(root, canvas_w=880, display_width=666)  # 12 * 666/880 = 9.08px
+    assert any(i.kind == "font_below_minimum" and "diamond" in i.detail for i in issues)
+
+
+def test_edge_label_below_the_12px_floor_after_scaling_is_caught():
+    from app.services.diagram_render_qa import font_size_issues
+
+    body = (
+        '<rect class="diagram-edge-label" x="40" y="40" width="60" height="18"/>'
+        '<text x="70" y="53" font-size="12">Yes</text>'
+    )
+    root = ET.fromstring(_svg(body=body))
+    issues = font_size_issues(root, canvas_w=880, display_width=666)  # 12 * 666/880 = 9.08px
+    assert any(i.kind == "font_below_minimum" and "edge label" in i.detail for i in issues)
+
+
+def test_font_size_issues_is_scoped_to_flow_chart_and_process_kinds():
+    """A concept_map/hierarchy diagram can legitimately grow wide for
+    benign structural reasons (see MIN_READABLE_PX's own docstring) -
+    this stricter per-role floor only applies when `kind` is
+    "flow_chart"/"process", whose own font-size constants are
+    specifically calibrated to clear it (see LABEL_SIZE's docstring)."""
+    body = (
+        '<g class="diagram-node"><rect class="diagram-box" x="10" y="10" width="200" height="60"/>'
+        '<text x="20" y="40" font-size="15" font-weight="600">A Node Title</text></g>'
+    )
+    svg_bytes = _svg(width=880, body=body)
+    assert any(i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes, kind="flow_chart"))
+    assert not any(i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes, kind="concept_map"))
+    assert not any(i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes))
+
+
+# ---------------------------------------------------------------------------
 # readability (effective font size after page-scaling) and occupancy
 # ---------------------------------------------------------------------------
 
@@ -133,7 +285,7 @@ def test_effective_font_size_shrinks_for_a_canvas_wider_than_the_page():
     from app.services.diagram_render_qa import effective_font_size
 
     # confirmed real case: an 8-child hierarchy's canvas grew to 1768px
-    assert effective_font_size(1768, display_width=666) == pytest.approx(6.57, abs=0.05)
+    assert effective_font_size(1768, display_width=666) == pytest.approx(7.16, abs=0.05)
 
 
 def test_readability_issues_is_clean_for_a_canvas_within_the_page_width():
@@ -213,7 +365,7 @@ def test_a_branching_and_reconverging_flow_chart_renders_clean():
             DiagramEdge(source="process", target="end"),
         ],
     )
-    assert validate_rendered_svg(_render(spec)) == []
+    assert validate_rendered_svg(_render(spec), kind="flow_chart") == []
 
 
 def test_a_five_lane_swimlane_with_long_labels_renders_clean():
@@ -283,7 +435,7 @@ def test_a_maximum_fourteen_node_flow_chart_renders_clean():
     edges = [DiagramEdge(source=f"n{i - 1}", target=f"n{i}") for i in range(1, len(nodes))]
     spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
     assert len(nodes) == 14
-    assert validate_rendered_svg(_render(spec)) == []
+    assert validate_rendered_svg(_render(spec), kind="flow_chart") == []
 
 
 # ---------------------------------------------------------------------------

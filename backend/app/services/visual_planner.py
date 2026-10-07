@@ -99,7 +99,13 @@ relationship, or a state machine:
   reason to switch to "relationship".
 - "process": ordered steps shown together as one sequence (a CI/CD
   pipeline, an authentication flow, a sorting algorithm's passes, a training
-  loop's epochs).
+  loop's epochs). Also the right choice for a NUMBERED list of distinct
+  items under one shared theme presented together (common pitfalls/
+  mistakes, best practices, a checklist) even when the items don't actually
+  depend on or cause each other - being numbered and gathered under one
+  theme is enough to read as "steps"; don't force these into "relationship"
+  just because you could technically connect them (see "relationship"'s own
+  warning about that below).
 - "sequence": a strict linear walkthrough, distinct from a looping process
   (a TCP three-way handshake, a single request-response cycle) - renders
   the same way as "process".
@@ -110,7 +116,14 @@ relationship, or a state machine:
   services, an entity-relationship diagram, a database's foreign keys). NOT
   for a single ordered collection's own items (that's "data_structure" -
   see above), even if you're tempted to label index/slice/points-to
-  relationships between them.
+  relationships between them. NOT for a set of PEER/SIBLING things that
+  don't actually act on, contain, or connect to each other at all (e.g.
+  list vs tuple vs set vs dict, or any other "these are the N options, pick
+  one" content) - that's "comparison" below, even though each pair could
+  technically be given a throwaway relationship like "connected_to"; a
+  relationship line implies a REAL link the reader should learn, so
+  inventing one between things that merely sit next to each other on the
+  page is worse than no relationship at all.
 - "hierarchy": parent/child structure (the OSI/TCP-IP layers, class
   inheritance, a file system, an org chart, a Kubernetes cluster's nesting).
 - "comparison": 2+ things compared side by side on the SAME criteria (stack
@@ -211,7 +224,13 @@ Fill these fields:
   belong in `core_message` or `technical_signature`, not as an extra entity.
   Each entity has an `id` (short, stable), `label`,
   `role`, `properties` (a dict of short property-name to short value, e.g.
-  {"color": "Red"} - never a full sentence as a value), `actions` (short
+  {"color": "Red"} - never a full sentence as a value). Every key must be a
+  real, specific attribute name a reader would want to know (e.g. "color",
+  "mutability", "average case lookup") - NEVER a generic placeholder like
+  "bullet1"/"point2"/"line1" (meaningless once rendered as a label) and
+  NEVER "style" or any property describing how the card itself should look
+  (fill, border, shadow, font) - visual styling is this renderer's own job,
+  never a fact about the entity. Each entity also has `actions` (short
   behaviour/capability labels, e.g. "start()" for a Java method, "commit()"
   for a Git repo - only for entities where that's meaningful), `icon`, and
   `color_role`. The renderer is deliberately colorful and playful, closer
@@ -241,11 +260,19 @@ Fill these fields:
   `label`).
 - `relationships`: for "relationship"/"hierarchy"/"decision_tree"/"spatial" -
   entities connected by one of: inside, contains, connected_to, attached_to,
-  above, below, left_of, right_of, passes_through, surrounds, contacts,
-  points_to, flows_into, rotates_around, between - OR, for "decision_tree"
-  specifically, the actual branch condition as `type` (e.g. "yes", "no",
-  "cache hit", "invalid input") since that IS the label the reader needs to
-  see on that connector, not a generic structural word. For
+  passes_through, surrounds, contacts, points_to, flows_into, rotates_around
+  - OR, for "decision_tree" specifically, the actual branch condition as
+  `type` (e.g. "yes", "no", "cache hit", "invalid input") since that IS the
+  label the reader needs to see on that connector, not a generic structural
+  word. Every connector's `type` renders as a VISIBLE label on the line
+  between the two cards, so it must always name something a reader actually
+  learns (what connects them, or why) - never a purely spatial description
+  of where one sits relative to the other ("above", "below", "left of",
+  "right of", "between"); those are meaningless once a reader can already
+  see the two cards' positions on the page, and this renderer (unlike
+  `schematic`) has no separate layout channel to hide them in. If two
+  entities genuinely have no real relationship worth naming, that's a sign
+  `relationship` is the wrong representation - see "comparison" above. For
   "relationship"/"hierarchy"/"decision_tree" this is REQUIRED (at least one)
   unless you set 2+ entities - a SQL JOIN needs a relationship between its
   two table entities (e.g. `type="connected_to"` labelled by the join type),

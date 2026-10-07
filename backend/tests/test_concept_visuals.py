@@ -370,11 +370,16 @@ class TestConceptExperienceRenderer:
 
 
 class TestRelationshipChainLayout:
-    """A relationship chain (many entities, each pointing to the next -
-    e.g. a class hierarchy with several implementations per interface) used
-    to be able to strand a connector alone at the start of a wrapped row,
-    with nothing showing what it pointed at. See _entities_row_html's own
-    rationale comment for the fix."""
+    """A relationship CHAIN (every entity pointing to exactly the next one,
+    one straight path start-to-end - e.g. a five-step handoff) renders as
+    one flowing left-to-right series (`_is_linear_chain`/`_chain_row_html`),
+    not the hub-style card row with a per-relationship "connected to"
+    connector: real, confirmed case - a genuine chain wrapped into a
+    multi-row grid with each row's own connector no longer read as ONE
+    continuous sequence. A HUB (one entity with several independent
+    targets) is a different shape and keeps the existing card-row
+    rendering - each spoke genuinely IS its own independent connection to
+    the hub, which that layout already shows correctly."""
 
     @staticmethod
     def _chain_spec(n: int) -> DiagramSpec:
@@ -384,20 +389,30 @@ class TestRelationshipChainLayout:
             for i in range(n - 1)
         ]
         return DiagramSpec(
-            kind="concept_experience", representation="hierarchy",
+            # "relationship", not "hierarchy" - hierarchy now has its own
+            # dedicated top-down tree renderer (see TestHierarchyTreeRenderer)
+            # that this chain/hub detection logic doesn't run through at all.
+            kind="concept_experience", representation="relationship",
             entities=entities, relationships=relationships,
         )
 
-    def test_every_connector_is_paired_with_a_card_in_the_same_unit(self):
+    def test_a_genuine_chain_renders_as_one_flowing_series_not_per_link_connectors(self):
         html = render_concept_experience_html(self._chain_spec(8), TemplateTheme()).decode("utf-8")
-        # Every rel-link div must contain exactly one card - never an empty
-        # or dangling connector.
-        import re
-
-        links = re.findall(r'<div class="cev-rel-link">(.*?)</div></div>', html, re.DOTALL)
-        assert len(links) == 7  # 8 nodes -> 7 relationships
-        for link in links:
-            assert 'class="cev-card' in link
+        # Only the body (past the <style> block, which always DEFINES every
+        # class name regardless of use) is checked for actual element usage.
+        body = html.split("</style>", 1)[1]
+        # The old hub-style per-relationship connector markup must NOT
+        # appear - a genuine chain no longer routes through it at all.
+        assert 'class="cev-rel-link"' not in body
+        assert 'class="cev-connector"' not in body
+        # Every consecutive pair is joined by a plain arrow, and the whole
+        # thing gets the flatter, whiteboard-flowchart "flow" treatment
+        # `_render_process` already uses for an explicit step sequence.
+        assert body.count('class="cev-step-arrow"') == 7  # 8 nodes -> 7 arrows
+        assert body.count('data-entity-id="e') == 8  # every node still rendered, once each
+        assert 'class="cev-root cev-style-flow"' in html
+        # Order is preserved start-to-end, not just "all present somewhere".
+        assert body.index('data-entity-id="e0"') < body.index('data-entity-id="e1"') < body.index('data-entity-id="e7"')
 
     def test_a_hub_entity_is_not_duplicated_as_a_bare_source_twice(self):
         """A node reused as source for two relationships renders its bare
@@ -410,6 +425,45 @@ class TestRelationshipChainLayout:
         spec = DiagramSpec(kind="concept_experience", representation="hierarchy", entities=entities, relationships=relationships)
         html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
         assert html.count('data-entity-id="hub"') == 1
+
+    def test_a_hub_still_gets_the_existing_card_row_not_the_chain_layout(self):
+        """The same hub shape as above, checked from the chain-layout side:
+        a hub must NOT be mistaken for a chain (`_is_linear_chain` returns
+        None for it) - it keeps the per-relationship connector rendering."""
+        entities = [VisualEntity(id="hub", label="Hub"), VisualEntity(id="a", label="A"), VisualEntity(id="b", label="B")]
+        relationships = [
+            SchematicRelationship(source="hub", target="a", type="connected_to"),
+            SchematicRelationship(source="hub", target="b", type="connected_to"),
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-rel-link"' in body
+        assert 'class="cev-root cev-style-flow"' not in html  # the root div never gets this class for a hub
+
+    def test_is_linear_chain_helper_directly(self):
+        """The detection helper itself, on the shapes it must tell apart:
+        a straight path (chain), a hub (one source, several targets), a
+        merge (several sources, one target), and a cycle (loops back to an
+        earlier node) - only the straight path is a chain."""
+        from app.render.concept_experience_renderer import _is_linear_chain
+
+        e = lambda *ids: [VisualEntity(id=i, label=i) for i in ids]  # noqa: E731
+        rel = lambda s, t: SchematicRelationship(source=s, target=t, type="connected_to")  # noqa: E731
+
+        chain = e("a", "b", "c", "d")
+        assert _is_linear_chain(chain, [rel("a", "b"), rel("b", "c"), rel("c", "d")]) == ["a", "b", "c", "d"]
+
+        hub = e("a", "b", "c")
+        assert _is_linear_chain(hub, [rel("a", "b"), rel("a", "c")]) is None
+
+        merge = e("a", "b", "c")
+        assert _is_linear_chain(merge, [rel("a", "c"), rel("b", "c")]) is None
+
+        cycle = e("a", "b", "c")
+        assert _is_linear_chain(cycle, [rel("a", "b"), rel("b", "c"), rel("c", "a")]) is None
+
+        assert _is_linear_chain(chain, []) is None  # no relationships at all
 
 
 class TestTextNeverOverflowsItsBox:
@@ -1151,17 +1205,84 @@ class TestDecisionTreeRenderer:
         assert "yes" in html
         assert "no" in html
 
-    def test_every_connector_is_paired_with_its_target_no_orphans(self):
-        """Reuses _entities_row_html's cev-rel-link grouping (same fix as the
-        relationship-chain layout) - a decision tree with several branches
-        must not strand a "yes"/"no" label with nothing next to it."""
+    def test_renders_as_a_branching_tree_not_a_flat_connected_row(self):
+        """A decision tree is a dedicated shape (see _render_tree), distinct
+        from "relationship"'s flat per-link connector row - both branches
+        get their own stem cell under one shared rail, each with its own
+        branch label, never the old cev-rel-link markup."""
         html = render_concept_experience_html(_decision_tree_spec(), TemplateTheme()).decode("utf-8")
-        assert html.count('<div class="cev-rel-link">') == 2
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-rel-link"' not in body
+        assert body.count('class="cev-tree-link-cell"') == 2
+        assert "cev-tree-links-fanned" in body
+        assert body.count('class="cev-tree-link-label"') == 2
 
     def test_renders_as_a_static_picture_with_no_script_or_buttons(self):
         html = render_concept_experience_html(_decision_tree_spec(), TemplateTheme()).decode("utf-8")
         assert "<script" not in html
         assert "<button" not in html
+
+
+class TestHierarchyTreeRenderer:
+    """`hierarchy` shares `_render_tree` with `decision_tree` (see
+    TestDecisionTreeRenderer) - these tests cover what's specific to a
+    multi-level hierarchy: 3+ levels, and the fallback for data that isn't
+    one clean tree."""
+
+    def _three_level_spec(self) -> DiagramSpec:
+        entities = [VisualEntity(id=eid, label=eid.replace("_", " ").title()) for eid in
+                    ("root", "left", "right", "left_child")]
+        relationships = [
+            SchematicRelationship(source="root", type="contains", target="left"),
+            SchematicRelationship(source="root", type="contains", target="right"),
+            SchematicRelationship(source="left", type="contains", target="left_child"),
+        ]
+        return DiagramSpec(
+            kind="concept_experience", representation="hierarchy",
+            entities=entities, relationships=relationships,
+        )
+
+    def test_renders_every_level_in_top_down_order(self):
+        html = render_concept_experience_html(self._three_level_spec(), TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert body.count('class="cev-tree-level"') == 3
+        # root before its children before its grandchild, not just "all present somewhere".
+        assert body.index('data-entity-id="root"') < body.index('data-entity-id="left"')
+        assert body.index('data-entity-id="left"') < body.index('data-entity-id="left_child"')
+
+    def test_a_generic_structural_edge_label_is_not_shown_as_a_branch_label(self):
+        """"contains" is redundant once two entities are already drawn as
+        parent/child (position alone says that) - unlike decision_tree's
+        real "yes"/"no" condition labels, which DO show (see
+        TestDecisionTreeRenderer)."""
+        html = render_concept_experience_html(self._three_level_spec(), TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-tree-link-label"' not in body
+
+    def test_entities_with_no_relationships_fall_back_to_a_flat_row(self):
+        spec = DiagramSpec(
+            kind="concept_experience", representation="hierarchy",
+            entities=[VisualEntity(id="a", label="A"), VisualEntity(id="b", label="B")],
+        )
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-tree"' not in body
+        assert 'class="cev-instances"' in body
+
+    def test_a_cycle_falls_back_to_a_flat_row_instead_of_crashing(self):
+        entities = [VisualEntity(id=eid, label=eid) for eid in ("a", "b", "c")]
+        relationships = [
+            SchematicRelationship(source="a", type="contains", target="b"),
+            SchematicRelationship(source="b", type="contains", target="c"),
+            SchematicRelationship(source="c", type="contains", target="a"),  # loops back - not a tree
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="hierarchy", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-tree"' not in body
+        assert 'class="cev-instances"' in body
+        for eid in ("a", "b", "c"):
+            assert f'data-entity-id="{eid}"' in body
 
 
 class TestNewRepresentationsPixelSizeEstimation:

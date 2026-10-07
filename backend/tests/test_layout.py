@@ -274,3 +274,96 @@ def test_page_visual_fraction_reflects_real_rendered_heights():
 
 def test_page_visual_fraction_of_an_empty_page_is_zero():
     assert page_visual_fraction([]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# section_intro float pairing (small illustration + its paragraph)
+# ---------------------------------------------------------------------------
+
+
+def _section_intro_image(*, width: int = 400, height: int = 300) -> Block:
+    return Block(
+        type=BlockType.IMAGE,
+        content={"kind": "illustration", "illustration_style": "section_intro", "path": "assets/x", "width": width, "height": height},
+    )
+
+
+def test_a_section_intro_image_and_its_paragraph_share_one_combined_box():
+    from app.course.document.layout import SECTION_INTRO_IMAGE_WIDTH
+
+    image, paragraph = _section_intro_image(), _paragraph(40)
+    pages = flow_blocks([image, paragraph])
+    assert len(pages) == 1
+    assert pages[0] == [image, paragraph]
+    # Narrow, not the full content width - it floats beside the text, never
+    # spans the page the way an ordinary illustration would.
+    assert image.layout.width == SECTION_INTRO_IMAGE_WIDTH
+    assert image.layout.width < CONTENT_WIDTH
+    # Same starting y - the PDF export puts both in one flowed container at
+    # this shared position (see html_renderer.py's "section_intro_pair").
+    assert image.layout.y == paragraph.layout.y
+    # The image keeps its OWN small height (so the non-floating editor
+    # canvas still shows a sane box) while the FULL combined reserved
+    # height sits on the paragraph.
+    assert image.layout.height < paragraph.layout.height
+    assert image.layout.z_index == 1  # paints over the paragraph in the editor
+
+
+def test_a_section_intro_pair_height_is_at_least_the_images_own_height():
+    image, paragraph = _section_intro_image(), _paragraph(3)  # a very short paragraph
+    flow_blocks([image, paragraph])
+    assert paragraph.layout.height >= image.layout.height
+
+
+def test_a_section_intro_pair_grows_taller_for_a_longer_paragraph():
+    """Short enough that the paragraph fits entirely within the image's own
+    height (no page split); long enough to overflow past it into the
+    "wraps at full width below the image" branch of
+    _section_intro_pair_height."""
+    short_image, short_para = _section_intro_image(), _paragraph(10)
+    long_image, long_para = _section_intro_image(), _paragraph(60)
+    flow_blocks([short_image, short_para])
+    flow_blocks([long_image, long_para])
+    assert long_para.layout.height > short_para.layout.height
+
+
+def test_a_section_intro_pair_moves_together_to_a_fresh_page_when_it_doesnt_fit():
+    """Never split across the page boundary - the whole pair retries
+    together at the top of a fresh page."""
+    filler = _paragraph(200)  # fills most of a page by itself
+    image, paragraph = _section_intro_image(), _paragraph(60)
+    pages = flow_blocks([filler, image, paragraph])
+    assert len(pages) == 2
+    assert pages[0] == [filler]
+    assert pages[1] == [image, paragraph]
+    assert image.layout.y == PAGE_MARGIN_TOP
+    assert image.layout.y == paragraph.layout.y
+
+
+def test_an_ordinary_illustration_followed_by_a_paragraph_is_not_paired():
+    """Only illustration_style == "section_intro" triggers pairing - the
+    existing plain/decorative and textbook illustration behaviour (its own
+    full-width block, stacked above the text) is completely unaffected."""
+    image = _image_block("illustration", width=800, height=300)
+    paragraph = _paragraph(20)
+    pages = flow_blocks([image, paragraph])
+    assert image.layout.width == CONTENT_WIDTH
+    assert paragraph.layout.y > image.layout.y  # stacked, not sharing a y
+    assert pages == [[image, paragraph]]
+
+
+def test_a_section_intro_image_with_no_following_paragraph_renders_standalone():
+    """No paragraph immediately after it (e.g. it's followed by another
+    heading, or it's the last block) - falls back to an ordinary full-width
+    standalone image rather than silently dropping it or crashing."""
+    from app.course.document.layout import SECTION_INTRO_IMAGE_WIDTH
+
+    image = _section_intro_image()
+    heading = _heading_block("Next section")
+    flow_blocks([image, heading])
+    assert image.layout.width == CONTENT_WIDTH
+    assert image.layout.width != SECTION_INTRO_IMAGE_WIDTH
+
+
+def _heading_block(text: str) -> Block:
+    return Block(type=BlockType.HEADING, content={"text": text, "level": 2})

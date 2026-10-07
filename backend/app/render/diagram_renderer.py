@@ -24,12 +24,18 @@ from app.schemas.template import TemplateTheme
 
 CANVAS_WIDTH = 880.0
 MARGIN = 40.0
-# Bumped up from 15/12.5 - a course document renders this SVG scaled down to
-# fit its block width (often noticeably narrower than this diagram's own
-# intrinsic canvas), so the on-page text ends up smaller than these numbers
-# look in isolation. Sized here so it still reads clearly after that shrink.
-LABEL_SIZE = 17.5
-DETAIL_SIZE = 14.0
+# A course document renders this SVG scaled down to fit its block width -
+# CONTENT_WIDTH (666px) at this canvas's own 880px, a ~0.757x scale even
+# for a perfectly ordinary, non-oversized diagram (see
+# app.services.diagram_render_qa.readability_issues, which computes this
+# exact ratio). Sized so the ON-PAGE, POST-SCALE result meets a firm
+# minimum: >= 14px for a node title, >= 12px for a subtitle/detail line,
+# working backward from that scale factor (14 / 0.757 = 18.5, 12 / 0.757 =
+# 15.9) - not just "looks reasonable in isolation" the way the previous
+# 17.5/14.0 values were picked, which left the DETAIL line at an
+# effective ~10.6px post-scale, under even a lenient reading-size floor.
+LABEL_SIZE = 19.0
+DETAIL_SIZE = 16.0
 LINE_HEIGHT = 1.35
 BOX_PADDING = 16.0
 BADGE_RADIUS = 15.0
@@ -279,7 +285,8 @@ def _node_block(
     return group, height
 
 
-EDGE_LABEL_FONT_SIZE = 13.0
+# Same post-scale reasoning as LABEL_SIZE/DETAIL_SIZE above - 12 / 0.757 = 15.9.
+EDGE_LABEL_FONT_SIZE = 16.0
 EDGE_LABEL_MAX_WIDTH = 200.0
 EDGE_LABEL_LINE_GAP = 14.0  # vertical distance between wrapped lines
 
@@ -367,8 +374,17 @@ def _layout_vertical(
 
 _PILL_W = 200.0
 _PILL_H = 56.0
-_DECISION_W = 210.0
-_DECISION_H = 116.0
+
+
+# A pill's label is a flowchart "title" (Start/End) - same >= 14px
+# post-scale floor as LABEL_SIZE (see its own comment for the 0.757
+# standard-canvas scale factor this assumes: 14 / 0.757 = 18.5). min_size
+# is pinned to the same value (no shrinking) rather than left at
+# _fit_boxed_text's own lenient default - Start/End labels are always
+# short by convention, so the fixed pill width never actually needs the
+# shrink-to-fit escape hatch, and pinning it means one never silently
+# fires and drops below the floor.
+_PILL_LABEL_SIZE = 19.0
 
 
 def _draw_pill(node: DiagramNode, *, cx: float, cy: float, theme: TemplateTheme, colors: tuple[str, str]) -> str:
@@ -392,7 +408,7 @@ def _draw_pill(node: DiagramNode, *, cx: float, cy: float, theme: TemplateTheme,
     parts.append(
         _fit_boxed_text(
             cx, cy, node.label, width=_PILL_W * 0.75, height=_PILL_H * 0.7,
-            color=theme.text_color, theme=theme, base_size=15.0,
+            color=theme.text_color, theme=theme, base_size=_PILL_LABEL_SIZE, min_size=_PILL_LABEL_SIZE,
         )
     )
     return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
@@ -413,33 +429,52 @@ def _flow_degrees(
 
 def _layout_flow_chart(
     nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
-) -> tuple[list[str], float]:
-    """flow_chart/process: a vertical spine with semantic start (green
-    pill) / end (red pill) / process (blue box) colouring, auto-detected
-    from each node's own in/out-degree - a node with no incoming edge is
-    the start, one with no outgoing edge is an end, one with 2 outgoing
-    edges is a decision (drawn as a purple diamond, its two branches placed
-    side by side below it, labelled from each edge's own `label`, e.g.
-    "Yes"/"No"). A branch that loops back to a node already drawn earlier
-    on the spine gets a curved return arrow instead of a new box - the
-    classic "flowchart with a loop" shape. A branch may run any number of
-    plain steps deep (no depth limit) before it dead-ends, loops back, or -
-    the common "both outcomes lead to the same next step" pattern -
-    reconverges with the OTHER branch at a shared node, which is then drawn
-    once, continuing the main spine below both columns.
+) -> tuple[list[str], float, float]:
+    """flow_chart/process: a single vertical spine with semantic start
+    (green pill) / end (red pill) / process (blue box) / decision (purple
+    diamond) colouring, auto-detected from each node's own in/out-degree.
+    A decision's two branches are never drawn as two equal-weight columns -
+    one (whichever leads deeper into the procedure: through another
+    decision, or the longer plain chain) stays ON the spine, directly
+    below the decision, so every consecutive pair of steps in the
+    procedure's own main line connects with a short straight arrow; the
+    other (the quicker exit - a dead end, or a branch that loops back to
+    an earlier step) is drawn once, in a single column beside the spine,
+    fed by a short connector off the decision's own right vertex. This is
+    the classic flowchart convention (a decision's primary path continues
+    down, its alternate exits to the side) and it is what a real reported
+    case needed: "Select assignee" chained through three more steps into a
+    SECOND decision before finally reaching an "End" three decisions of
+    branching later - forcing it into a side column (the previous
+    version's design) left it visibly misaligned with everything below it,
+    since only the spine's own column width and position are shared by
+    every ordinary hop.
 
-    Still narrower than a fully general graph layout: only symmetric shapes
-    are given real branch geometry - both branches dead-end, both loop back,
-    or both reconverge at the exact same node. Anything more tangled (one
-    branch reconverging while the other dead-ends, a branch running through
-    a second decision, branches reconverging at two different nodes) falls
-    all the way back to plain linear stacking in `nodes`' own order instead
-    of guessing at a layout - the same "never worse than simple, never
-    crash" contract every other fallback in this module already keeps."""
+    A side branch's own further edge (to a node not yet drawn - a shared
+    "End" fed by more than one branch - or one already drawn earlier - a
+    loop back to reassess) is deferred to the final sweep at the bottom of
+    this function, which finds it once its target's position is known and
+    routes it through its own dedicated margin lane (see `_next_lane_x`) -
+    never sharing a vertical run with any other deferred edge, and always
+    entering its target from the side (never the top, which is reserved
+    for the spine's own incoming arrow).
+
+    Only a decision whose SIDE branch resolves to a simple, single
+    "column" outcome (a dead end, or a loop/reconvergence with at least one
+    real step of its own) gets this treatment; anything more tangled (a
+    missing target, a side branch that itself runs into further branching)
+    falls back to drawing just the decision and its two immediate branch
+    targets, one on the spine and one beside it, and lets the outer walk's
+    own predecessor lookup (`connect_real`) and the final sweep pick up
+    whatever comes after - the same "never worse than simple, never crash"
+    contract every other fallback in this module already keeps."""
     in_degree, out_edges = _flow_degrees(nodes, edges)
     by_id = {n.id: n for n in nodes if n.id}
     out_degree = {nid: len(es) for nid, es in out_edges.items()}
-    edge_labels = {(e.source, e.target): e.label for e in edges}
+    in_edges: dict[str, list[DiagramEdge]] = {}
+    for edge in edges:
+        if edge.source in by_id and edge.target in by_id:
+            in_edges.setdefault(edge.target, []).append(edge)
 
     _START_WORDS = {"start", "begin", "initial"}
     _END_WORDS = {"end", "stop", "finish", "done"}
@@ -464,20 +499,304 @@ def _layout_flow_chart(
             return "end"
         return "process"
 
-    box_w = CANVAS_WIDTH - 2 * MARGIN
-    x_center = MARGIN + box_w / 2
+    # One shared width for every "process" box (main-spine AND side-column
+    # alike), sized to the longest label/detail actually present - not a
+    # fixed fraction of the canvas. A real reported case: a side-column
+    # box sat directly above a main-spine box with neither its left edge
+    # nor its own width matching - visibly misaligned, since the two
+    # widths came from two entirely different formulas. Clamped so a short
+    # label doesn't produce a cramped, barely-wider-than-text box, and a
+    # very long one wraps onto more lines instead of stretching the whole
+    # diagram to fit a single outlier.
+    _MIN_PROCESS_W = 240.0
+    _MAX_PROCESS_W = 420.0
+
+    def _ideal_process_width(node: DiagramNode) -> float:
+        label_w = len(node.label.strip()) * LABEL_SIZE * _BOLD_RATIO
+        detail_w = len(node.detail.strip()) * DETAIL_SIZE * _SANS_RATIO if node.detail.strip() else 0.0
+        return max(label_w, detail_w) + 2 * BOX_PADDING
+
+    # >= 12px effective post-scale (see LABEL_SIZE's own comment for the
+    # 0.757 standard-canvas scale factor this assumes: 12 / 0.757 = 15.9).
+    # base_size == min_size (passed to _draw_diamond below) so this never
+    # shrinks below that floor - the diamond is sized to fit it instead
+    # (see _ideal_decision_size), the same "enlarge the shape, don't
+    # shrink the text" rule every other size in this module now follows.
+    _DIAMOND_LABEL_SIZE = 16.0
+    _MIN_DECISION_W = 220.0
+    _MAX_DECISION_W = 420.0
+    _MIN_DECISION_H = 130.0
+
+    def _ideal_decision_size(node: DiagramNode) -> tuple[float, float]:
+        # _draw_diamond gives the label a usable box of (width * 0.5,
+        # height * 0.5) - a rhombus is only that wide/tall at its own
+        # horizontal/vertical midline - so size the diamond so a 2-line
+        # wrap at _DIAMOND_LABEL_SIZE fits inside that half-box without
+        # _fit_boxed_text ever needing to shrink or truncate it.
+        label = node.label.strip() or "?"
+        lines = _wrap(label, font_size=_DIAMOND_LABEL_SIZE, width=260.0, max_lines=2, bold=True) or [label]
+        longest = max(len(line) for line in lines)
+        line_w = longest * _DIAMOND_LABEL_SIZE * _BOLD_RATIO
+        text_h = len(lines) * _DIAMOND_LABEL_SIZE * LINE_HEIGHT
+        width = max(_MIN_DECISION_W, min(_MAX_DECISION_W, (line_w + 24.0) / 0.5))
+        height = max(_MIN_DECISION_H, (text_h + 24.0) / 0.5)
+        return width, height
+
+    process_ids = [nid for nid in by_id if role_of(nid) == "process"]
+    process_w = (
+        max(_MIN_PROCESS_W, min(_MAX_PROCESS_W, max(_ideal_process_width(by_id[nid]) for nid in process_ids)))
+        if process_ids
+        else _MIN_PROCESS_W
+    )
+    decision_sizes: dict[str, tuple[float, float]] = {
+        nid: _ideal_decision_size(by_id[nid]) for nid in by_id if role_of(nid) == "decision"
+    }
+    # The spine's own column must be at least as wide as the widest
+    # decision diamond too, or a long question would overflow it.
+    if decision_sizes:
+        process_w = max(process_w, max(w for w, _h in decision_sizes.values()))
+
     gap = 50.0
+    col_gap = 40.0
+    # The side column holds a decision's quick-exit branch - in practice a
+    # short label ("Keep Task", "Escalate issue"), never the longest thing
+    # in the diagram. Capped independently, and MUCH narrower than the
+    # spine's own `process_w` ceiling - giving it the SAME width as the
+    # spine (this function's own earlier design) meant a long spine label
+    # doubled the canvas's total width even when nothing in the side
+    # column needed anywhere near that much room, which - confirmed real -
+    # pushed the effective on-page font size for EVERY node below its own
+    # 14px floor even for an ordinary-looking flowchart. A side label
+    # longer than this still renders correctly; it simply wraps onto more
+    # lines instead of growing the canvas, the same trade-off `process_w`
+    # itself makes once IT hits its own ceiling.
+    _MAX_SIDE_W = 260.0
+    side_w = min(process_w, _MAX_SIDE_W)
+    # Grow the canvas (never shrink the boxes back down to fit a fixed
+    # width - see the user's own "increase the viewBox if needed so
+    # nothing shrinks when scaled") whenever the content-sized columns
+    # would need more than the standard canvas provides.
+    needed_w = process_w + col_gap + side_w + 2 * MARGIN
+    canvas_w = max(CANVAS_WIDTH, needed_w)
+    x_center = MARGIN + process_w / 2
+    side_left_x = x_center + process_w / 2 + col_gap
+    side_cx = side_left_x + side_w / 2
     elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
     y = top
     visited: set[str] = set()
+    # Every drawn node's own (centre-x, top-y, bottom-y, width), updated
+    # the instant it's drawn - the authoritative source `connect_real` (and
+    # the final sweep below) look a node's real predecessor up in, rather
+    # than assuming "whatever was drawn immediately before this" is that
+    # predecessor. Width is carried alongside so a long-distance connector
+    # can leave/enter at the exact centre of a box's own left/right edge
+    # (see `_route_lane`) instead of guessing at one shared column width.
+    positions: dict[str, tuple[float, float, float, float]] = {}
+    # Every (source, target) pair that has ALREADY had its arrow drawn by
+    # any of this function's specialised paths (a spine hop, a decision's
+    # side branch, an inner side-chain hop) - the final sweep below uses
+    # this to add only the edges nothing else accounted for, never a
+    # duplicate line on top of one already drawn.
+    drawn_edges: set[tuple[str, str]] = set()
+
+    # Dedicated margin lanes for every long-distance connector (a side
+    # branch's own deferred edge, or the rare cross-column fallback
+    # connection) - each call to `_next_lane_x` hands out the NEXT unused
+    # lane, so two connectors can never share a vertical run (a real
+    # reported case: "Keep task -> End" and "Escalate -> Assess request"
+    # both routed through the exact same margin line, making the two
+    # arrows visually indistinguishable). Anchored to this function's own
+    # base canvas width - if more lanes end up used than that width
+    # comfortably fits, the canvas is simply widened at the very end (see
+    # `final_canvas_w` below); every lane's own x only ever depends on its
+    # index, never on the final width, so nothing already drawn needs to move.
+    _LANE_GAP = 18.0
+    _lane_start_x = canvas_w - MARGIN + 16.0
+    _lane_count = [0]
+    # Whether any far lane ended up with a label - most never do (a side
+    # branch's own DEFERRED merge/loop edge, the only kind that reaches a
+    # far lane, rarely carries its own label; a decision's own immediate
+    # branch label lives on the short LOCAL connector instead - see
+    # `_decision_to_side_connector`). The canvas only needs to reserve
+    # real room for a label's own width when one is actually drawn.
+    _lane_label_used = [False]
+
+    def _next_lane_x() -> float:
+        lane_x = _lane_start_x + _lane_count[0] * _LANE_GAP
+        _lane_count[0] += 1
+        return lane_x
+
+    # A dedicated x within the gap between the spine and the side column
+    # for EACH local elbow's own vertical run - never one shared constant
+    # for every one of them (a real, confirmed case: two entirely
+    # different local elbows, reaching the same target from different
+    # entry sides, both turned at the exact same x, and their vertical
+    # runs overlapped for a real stretch even though their entry POINTS
+    # differed). Spaced closely (the gap itself is narrow) but never
+    # closer than the clearance rule, and never past the side column's
+    # own left edge - `min()` below reuses the last lane rather than
+    # overflow into it on a rare 4th+ call.
+    _LOCAL_LANE_GAP = 10.0
+    _local_lane_start_x = x_center + process_w / 2 + 16.0
+    _local_lane_max_x = side_left_x - 16.0
+    _local_lane_count = [0]
+
+    def _next_local_mid_x() -> float:
+        mid_x = _local_lane_start_x + _local_lane_count[0] * _LOCAL_LANE_GAP
+        _local_lane_count[0] += 1
+        return min(mid_x, _local_lane_max_x)
+
+    # Which side of a given target node each deferred/side connector has
+    # already claimed - shared by every long-distance routing helper below
+    # so a node fed by more than one such connector (a real, legitimate
+    # case: two entirely different decisions' own quick-exit branches both
+    # reaching a shared "End", or two edges both reconverging on the same
+    # side-column box) always spreads them across DIFFERENT sides, never
+    # stacking two arrowheads on the one side both would naturally prefer.
+    _entry_sides_used: dict[str, set[str]] = {}
+
+    def _claim_entry_side(target_id: str, preference: list[str]) -> str:
+        used = _entry_sides_used.setdefault(target_id, set())
+        for side in preference:
+            if side not in used:
+                used.add(side)
+                return side
+        # Every preferred side already taken (a rare 3+-way convergence) -
+        # reuse the last one rather than crash; a visually crowded but
+        # still-correct arrow beats a missing one.
+        used.add(preference[-1])
+        return preference[-1]
+
+    # Every edge label is placed BESIDE its line, never on top of it (a
+    # real reported case: a loop-back's label sat centred ON its own
+    # line, which then visibly struck through the text). Vertical lines
+    # (ordinary spine hops, and the long margin lanes) offset the label to
+    # the right, where the rest of that row is empty by construction -
+    # nothing else is ever drawn at that height between two adjacent
+    # columns/lanes. Short decision-to-side connectors instead place their
+    # label just past the decision's own edge and above the line (see
+    # `_decision_to_side_connector`) - the gap between the spine and the
+    # side column is comfortable vertically but too narrow, for a short
+    # branch, to safely offset a label sideways within it.
+    _LABEL_OFFSET = 46.0
+
+    def _place_label_vertical(line_x: float, mid_y: float, label: str) -> None:
+        if label.strip():
+            elements.append(_edge_label(line_x + _LABEL_OFFSET, mid_y, label, theme, max_width=110.0))
 
     def draw_arrow_down(x: float, y_from: float, y_to: float, label: str = "") -> None:
         elements.append(
             f'<line x1="{x:.1f}" y1="{y_from:.1f}" x2="{x:.1f}" y2="{y_to:.1f}" '
             f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
         )
+        _place_label_vertical(x, (y_from + y_to) / 2, label)
+
+    # How many long-distance connectors have already been routed into a
+    def _route_lane(
+        target_id: str,
+        source_pos: tuple[float, float, float, float], target_pos: tuple[float, float, float, float], label: str
+    ) -> None:
+        """A long-distance connector between two boxes that don't share a
+        centre-x: out to a fresh dedicated lane from the SOURCE's own
+        right edge, down (or up) the lane to the target's row, then in to
+        the TARGET's own right (or, for a second connector into the same
+        target - see `_claim_entry_side` - bottom) side - never the top,
+        which is reserved for that box's own straight-down spine arrow.
+        Every node this function ever routes a long-distance connector to
+        sits at or right of the main spine (there is no column further
+        left than the spine itself in this layout), so routing via the
+        right margin is always the shorter, always-clear choice - never a
+        raw diagonal, and never sharing a lane with any other connector.
+
+        The final run into the target can still land on a row some OTHER
+        already-drawn box happens to share with the target - not reserved
+        for the target alone (a real case: a decision's dead-end side box
+        ended up on the exact same row as "End", purely because "End" was
+        next in the spec's own node order right after that decision, and
+        the lane's straight run into End's own centre cut straight
+        through that side box sitting between the lane and End on that
+        row). When that happens, the run detours below (or above,
+        whichever needs less of a detour) whatever blocks it, with one
+        extra short hop - still entering the target at the exact centre
+        of its own side, the final segment either way."""
+        entry_side = _claim_entry_side(target_id, ["right", "bottom"])
+
+        source_cx, source_top, source_bottom, source_w = source_pos
+        target_cx, target_top, target_bottom, target_w = target_pos
+        lane_x = _next_lane_x()
+        source_cy = (source_top + source_bottom) / 2
+        target_cy = (target_top + target_bottom) / 2
+        exit_x = source_cx + source_w / 2
+        entry_x = target_cx + target_w / 2 if entry_side == "right" else target_cx
+        entry_y = target_cy if entry_side == "right" else target_bottom
+
+        lo_x, hi_x = (entry_x, lane_x) if entry_x < lane_x else (lane_x, entry_x)
+        blockers = [
+            pos for pos in positions.values()
+            if pos is not source_pos and pos is not target_pos
+            and pos[1] < entry_y < pos[2]
+            and pos[0] - pos[3] / 2 < hi_x and pos[0] + pos[3] / 2 > lo_x
+        ]
+        if entry_side == "right":
+            if not blockers:
+                elements.append(
+                    f'<path d="M{exit_x:.1f},{source_cy:.1f} L{lane_x:.1f},{source_cy:.1f} '
+                    f'L{lane_x:.1f},{entry_y:.1f} L{entry_x:.1f},{entry_y:.1f}" fill="none" '
+                    f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+                )
+            else:
+                below_y = max(pos[2] for pos in blockers) + 16.0
+                above_y = min(pos[1] for pos in blockers) - 16.0
+                detour_y = below_y if abs(below_y - entry_y) <= abs(above_y - entry_y) else above_y
+                elements.append(
+                    f'<path d="M{exit_x:.1f},{source_cy:.1f} L{lane_x:.1f},{source_cy:.1f} '
+                    f'L{lane_x:.1f},{detour_y:.1f} L{entry_x:.1f},{detour_y:.1f} '
+                    f'L{entry_x:.1f},{entry_y:.1f}" fill="none" '
+                    f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+                )
+        else:
+            # Bottom entry: the lane runs on past the target's own bottom
+            # edge, then in - never level with the target's own row, so
+            # it never needs a same-row detour the way a right-side entry
+            # sometimes does.
+            past_y = target_bottom + 24.0
+            elements.append(
+                f'<path d="M{exit_x:.1f},{source_cy:.1f} L{lane_x:.1f},{source_cy:.1f} '
+                f'L{lane_x:.1f},{past_y:.1f} L{entry_x:.1f},{past_y:.1f} '
+                f'L{entry_x:.1f},{entry_y:.1f}" fill="none" '
+                f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
         if label.strip():
-            elements.append(_edge_label(x, (y_from + y_to) / 2, label, theme))
+            _lane_label_used[0] = True
+        _place_label_vertical(lane_x, (source_cy + target_cy) / 2, label)
+
+    def connect_real(nid: str, target_cx: float, target_y: float) -> None:
+        """Draws the arrow into `nid` from whichever of its real SAME-
+        COLUMN predecessors (per the spec's own edges) has already been
+        drawn - never fabricated, and never dependent on drawing order
+        matching spec order. Only handles a same-column predecessor
+        (`nid` isn't drawn yet, so only its own top y is known - not
+        enough to attach a cross-column connector at the precise centre
+        of a real side); any cross-column predecessor, drawn or not, is
+        left for the final sweep once `nid` itself has a full position
+        (top AND bottom). Draws nothing when no same-column predecessor
+        has been drawn yet: an honest gap, not a guess - a real, confirmed
+        case: a side branch's own deferred merge edge (e.g. "Close ->
+        End") had ALREADY been drawn (its source, the side box, comes
+        first in the spec's own edge order) by the time "End" - the
+        target, reached separately via the spine's own straight-down
+        continuation - was processed here, so this used to seize it and
+        draw a top-centre entry for it, indistinguishable from the
+        spine's own genuine top-centre arrow into the very same node."""
+        for edge in in_edges.get(nid, []):
+            source_pos = positions.get(edge.source)
+            if source_pos is None:
+                continue
+            source_cx, _source_top, source_bottom, _source_w = source_pos
+            if abs(source_cx - target_cx) < 0.5:
+                draw_arrow_down(target_cx, source_bottom, target_y, edge.label)
+                drawn_edges.add((edge.source, nid))
+                return
 
     def draw_main_node(nid: str, y: float) -> float:
         """Draws node `nid` centred on the spine at `y`; returns its height."""
@@ -485,45 +804,181 @@ def _layout_flow_chart(
         role = role_of(nid)
         visited.add(nid)
         if role == "decision":
+            dw, dh = decision_sizes[nid]
             elements.append(
                 _draw_diamond(
-                    node, cx=x_center, cy=y + _DECISION_H / 2,
-                    width=_DECISION_W, height=_DECISION_H, theme=theme,
-                    colors=_FLOW_ROLE_COLORS["decision"],
+                    node, cx=x_center, cy=y + dh / 2, width=dw, height=dh, theme=theme,
+                    colors=_FLOW_ROLE_COLORS["decision"], base_size=_DIAMOND_LABEL_SIZE, min_size=_DIAMOND_LABEL_SIZE,
                 )
             )
-            return _DECISION_H
+            positions[nid] = (x_center, y, y + dh, dw)
+            return dh
         if role in ("start", "end"):
             elements.append(_draw_pill(node, cx=x_center, cy=y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[role]))
+            positions[nid] = (x_center, y, y + _PILL_H, _PILL_W)
             return _PILL_H
-        svg, height = _node_block(node, x=MARGIN, y=y, width=box_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"])
+        svg, height = _node_block(
+            node, x=x_center - process_w / 2, y=y, width=process_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"]
+        )
         elements.append(svg)
+        positions[nid] = (x_center, y, y + height, process_w)
         return height
 
-    def resolve_branch(edge: DiagramEdge, decision_id: str) -> tuple[str, list[str]] | None:
-        """Follows a decision branch forward through plain (out-degree <= 1)
-        nodes, as far as it safely can. Returns ("end", [ids]) if it
-        dead-ends (every id is a new box to draw), ("loop", [ids]) if it
-        eventually points back at the decision itself, or ("continue",
-        [ids]) if it reaches a node that something ELSE also points to
-        (in-degree >= 2) - a reconvergence candidate. For "loop" and
-        "continue", the LAST id is the target/merge node itself - already
-        drawn (loop) or not yet drawn but possibly shared with the other
-        branch (continue) - never a new box in that branch's own column;
-        every id before it is. None if it's more tangled than this function
-        supports: a second decision partway through, a dead/missing
-        reference, or a branch long enough to revisit one of its own nodes
-        (impossible in a real DAG - only a malformed spec could trigger it,
-        and the bound below exists purely so that can never spin forever)."""
+    def draw_side_chain(
+        start_y: float, chain: list[str], kind: str
+    ) -> tuple[tuple[float, float, float, float] | None, float]:
+        """Draws a side branch's own new boxes, stacked in the single side
+        column beside the spine: every id in `chain` for a genuine dead
+        end ("end" - there is no merge/loop target, the last id IS a real
+        box), or every id but the last for "loop"/"continue" (the last id
+        is the target already-drawn-earlier or not-yet-drawn node this
+        branch eventually reaches - never a new box here; the final sweep
+        finds and connects it once both ends are known). Returns the first
+        new box's own (cx, top, bottom, width) - or None when this branch
+        has no new box of its own at all - and the bottom y of the last
+        one drawn."""
+        new_ids = chain if kind == "end" else chain[:-1]
+        by_y = start_y
+        first_pos: tuple[float, float, float, float] | None = None
+        prev_id: str | None = None
+        for hop_id in new_ids:
+            hop_node = by_id[hop_id]
+            hop_role = role_of(hop_id)
+            visited.add(hop_id)
+            if hop_role in ("start", "end"):
+                elements.append(
+                    _draw_pill(hop_node, cx=side_cx, cy=by_y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[hop_role])
+                )
+                hop_h, hop_w = _PILL_H, _PILL_W
+            else:
+                svg, hop_h = _node_block(
+                    hop_node, x=side_left_x, y=by_y, width=side_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"]
+                )
+                elements.append(svg)
+                hop_w = side_w
+            positions[hop_id] = (side_cx, by_y, by_y + hop_h, hop_w)
+            if first_pos is None:
+                first_pos = positions[hop_id]
+            if prev_id is not None:
+                draw_arrow_down(side_cx, by_y - gap, by_y)
+                drawn_edges.add((prev_id, hop_id))
+            prev_id = hop_id
+            by_y += hop_h + gap
+        bottom = by_y - gap if new_ids else start_y
+        return first_pos, bottom
+
+    def _decision_to_side_connector(
+        target_id: str,
+        decision_pos: tuple[float, float, float, float], target_pos: tuple[float, float, float, float], label: str
+    ) -> None:
+        """The short connector from a decision's own right vertex (or, for
+        the rare fallback/final-sweep case, any spine box's own right
+        edge) to its side branch's box: normally entering the target's
+        own LEFT side - a straight horizontal line when the side box sits
+        at the source's own row, or a small right-then-down (or up) elbow
+        when it sits a row below/above (both orthogonal, never a raw
+        diagonal). A SECOND connector into the same target (see
+        `_claim_entry_side`) - a real, legitimate case: two different
+        real edges both reconverging on the same side-column box - enters
+        from the TOP instead, never stacking a second arrowhead on the
+        left side the first one already claimed. The label sits just past
+        the source's own edge, above the line - not offset sideways along
+        it, since the gap between the spine and the side column is often
+        too narrow to fit a label beside a line without it spilling into
+        the neighbouring column.
+
+        Every elbow turns in the MIDDLE OF THE GAP between the spine's
+        own full column width and the side column - never merely between
+        the source's own edge and the target, which can be much narrower
+        than the spine's process boxes (a diamond is sized to its own
+        question text, not to the widest box on the spine) and so land
+        the turn INSIDE a wider spine box drawn below it (a real,
+        confirmed case: the turn for "Delegate? -> Keep Task" cut
+        straight through "Select Assignee", the spine's own next box,
+        because the diamond's right vertex sat well left of that box's
+        own right edge)."""
+        d_cx, d_top, d_bottom, d_w = decision_pos
+        t_cx, t_top, t_bottom, t_w = target_pos
+        d_cy = (d_top + d_bottom) / 2
+        t_cy = (t_top + t_bottom) / 2
+        exit_x = d_cx + d_w / 2
+        entry_side = _claim_entry_side(target_id, ["left", "top"])
+        if entry_side == "left":
+            entry_x = t_cx - t_w / 2
+            if abs(d_cy - t_cy) < 0.5:
+                elements.append(
+                    f'<line x1="{exit_x:.1f}" y1="{d_cy:.1f}" x2="{entry_x:.1f}" y2="{t_cy:.1f}" '
+                    f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+                )
+            else:
+                mid_x = _next_local_mid_x()
+                elements.append(
+                    f'<path d="M{exit_x:.1f},{d_cy:.1f} L{mid_x:.1f},{d_cy:.1f} '
+                    f'L{mid_x:.1f},{t_cy:.1f} L{entry_x:.1f},{t_cy:.1f}" fill="none" '
+                    f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+                )
+        else:
+            mid_x = _next_local_mid_x()
+            stub_y = t_top - 20.0
+            elements.append(
+                f'<path d="M{exit_x:.1f},{d_cy:.1f} L{mid_x:.1f},{d_cy:.1f} '
+                f'L{mid_x:.1f},{stub_y:.1f} L{t_cx:.1f},{stub_y:.1f} '
+                f'L{t_cx:.1f},{t_top:.1f}" fill="none" '
+                f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+        if label.strip():
+            elements.append(_edge_label(exit_x + 26.0, d_cy - 22.0, label, theme, max_width=120.0))
+
+    def _route_cross_column(
+        target_id: str,
+        source_pos: tuple[float, float, float, float], target_pos: tuple[float, float, float, float], label: str
+    ) -> None:
+        """Dispatches a deferred cross-column edge to whichever routing is
+        actually safe for it. Spine -> side stays LOCAL, turning in the
+        gap between the two columns exactly like `_decision_to_side_connector`
+        (safe at any row, since nothing is ever drawn in that gap) - a real
+        confirmed case: two SIBLING branches on the very same row (one on
+        the spine, one beside it) sent this out to the far margin lane
+        instead, and the straight run out to that lane cut right through
+        the sibling side box sitting between the spine and the lane.
+        Anything else (most commonly side -> spine, e.g. a side branch's
+        own deferred merge/loop edge) genuinely needs the far lane -
+        going the short way would cut through every spine box in
+        between."""
+        if abs(source_pos[0] - x_center) < 0.5 and abs(target_pos[0] - side_cx) < 0.5:
+            _decision_to_side_connector(target_id, source_pos, target_pos, label)
+        else:
+            _route_lane(target_id, source_pos, target_pos, label)
+
+    _BRANCH_KIND_RANK = {"decision": 3, "continue": 2, "end": 1, "loop": 0}
+
+    def _classify_branch(edge: DiagramEdge, decision_id: str) -> tuple[str, list[str]] | None:
+        """Follows a decision branch forward through plain nodes, as far as
+        it safely can. Returns ("end", [ids]) if it dead-ends (every id,
+        INCLUDING the terminal one, is a new box to draw), ("loop", [ids])
+        if it reaches a node ALREADY drawn earlier on the page (a backward
+        loop - e.g. "escalate and reassess"), ("continue", [ids]) if it
+        reaches a node that something ELSE also points to (in-degree >= 2)
+        and that ISN'T drawn yet (a forward reconvergence, e.g. a shared
+        "End" fed by more than one branch), or ("decision", [ids]) if it
+        runs into ANOTHER decision - a chain of decisions is exactly as
+        supported as a single one; that next decision is left for the
+        outer walk to give its own full treatment in its own turn, never
+        drawn here. For "loop"/"continue"/"decision" the last id is the
+        target itself (omitted for "decision", since that decision draws
+        itself); every id before it is a new box. None only for a
+        genuinely malformed spec (a dangling edge, or a branch long enough
+        to revisit one of its own nodes - impossible in a real DAG; the
+        bound below exists purely so that can never spin forever)."""
         chain: list[str] = []
         current = edge.target
         for _ in range(len(by_id) + 1):
-            if current == decision_id:
+            if current not in by_id or current in chain:
+                return None
+            if current in visited:
                 return ("loop", chain + [current])
-            if current not in by_id or current in chain or current in visited:
-                return None
             if role_of(current) == "decision":
-                return None
+                return ("decision", chain)
             if in_degree.get(current, 0) >= 2:
                 return ("continue", chain + [current])
             chain.append(current)
@@ -535,10 +990,50 @@ def _layout_flow_chart(
             current = next_edges[0].target
         return None
 
+    def draw_decision_fallback(nid: str, decision_branches: list[DiagramEdge], y: float) -> float:
+        """A decision too tangled for the clean spine/side split (see the
+        docstring): draws the diamond and just its two immediate branch
+        targets - the first on the spine, the second beside it - then lets
+        the outer walk's own predecessor lookup and the final sweep pick
+        up whatever comes after either one. Returns the y to resume at."""
+        connect_real(nid, x_center, y)
+        height = draw_main_node(nid, y)
+        decision_pos = positions[nid]
+        decision_bottom = y + height
+        branch_y = decision_bottom + gap
+        bottoms = [branch_y]
+        for branch_index, edge in enumerate(decision_branches):
+            if edge.target not in by_id or edge.target in visited:
+                continue
+            target = by_id[edge.target]
+            target_role = role_of(edge.target)
+            on_spine = branch_index == 0
+            col_cx = x_center if on_spine else side_cx
+            col_x = (x_center - process_w / 2) if on_spine else side_left_x
+            col_w = process_w if on_spine else side_w
+            if target_role in ("start", "end"):
+                elements.append(
+                    _draw_pill(target, cx=col_cx, cy=branch_y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[target_role])
+                )
+                target_h, target_w = _PILL_H, _PILL_W
+            else:
+                svg, target_h = _node_block(
+                    target, x=col_x, y=branch_y, width=col_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"]
+                )
+                elements.append(svg)
+                target_w = col_w
+            positions[edge.target] = (col_cx, branch_y, branch_y + target_h, target_w)
+            visited.add(edge.target)
+            if on_spine:
+                draw_arrow_down(x_center, decision_bottom, branch_y, edge.label)
+            else:
+                _decision_to_side_connector(edge.target, decision_pos, positions[edge.target], edge.label)
+            drawn_edges.add((nid, edge.target))
+            bottoms.append(branch_y + target_h)
+        return max(bottoms) + gap
+
     order = [n.id for n in nodes if n.id]
     idx = 0
-    previous_bottom: float | None = None
-    previous_id: str | None = None
     while idx < len(order):
         nid = order[idx]
         if nid in visited:
@@ -546,161 +1041,95 @@ def _layout_flow_chart(
             continue
         role = role_of(nid)
         if role != "decision":
-            if previous_bottom is not None:
-                draw_arrow_down(x_center, previous_bottom, y, edge_labels.get((previous_id, nid), ""))
+            connect_real(nid, x_center, y)
             height = draw_main_node(nid, y)
-            previous_bottom = y + height
-            previous_id = nid
-            y = previous_bottom + gap
+            y = y + height + gap
             idx += 1
             continue
 
         decision_branches = out_edges.get(nid, [])[:2]
-        resolved = [resolve_branch(edge, nid) for edge in decision_branches]
-        kinds = [r[0] for r in resolved] if all(resolved) else []
-        # Only symmetric shapes get real branch geometry: both dead-end,
-        # both loop back, or both "continue" into the exact same node (the
-        # reconverge pattern). Anything else - one branch reconverging while
-        # the other doesn't, or reconverging at two different nodes - is
-        # more tangled than this function lays out; fall back rather than
-        # guess (see the docstring).
-        merge_id: str | None = None
-        if kinds.count("continue") == 1:
-            valid_shape = False
-        elif kinds == ["continue", "continue"]:
-            merge_id = resolved[0][1][-1]
-            valid_shape = merge_id == resolved[1][1][-1]
-        else:
-            valid_shape = True
-        if len(decision_branches) != 2 or any(r is None for r in resolved) or not valid_shape:
-            # Doesn't match a shape this function knows how to lay out - no
-            # branch geometry for it, but every remaining node still gets
-            # the exact same semantic colouring and plain vertical stacking
-            # as the rest of this diagram (via the same draw_main_node/
-            # draw_arrow_down every other node already goes through) rather
-            # than reusing the old, neutral-coloured, numbered _layout_vertical -
-            # a shape too tangled to branch is not a reason to look like a
-            # different diagram halfway through.
-            for fallback_id in order:
-                if fallback_id in visited:
-                    continue
-                if previous_bottom is not None:
-                    draw_arrow_down(
-                        x_center, previous_bottom, y, edge_labels.get((previous_id, fallback_id), "")
-                    )
-                fallback_height = draw_main_node(fallback_id, y)
-                previous_bottom = y + fallback_height
-                previous_id = fallback_id
-                y = previous_bottom + gap
-            break
+        results = [_classify_branch(e, nid) for e in decision_branches] if len(decision_branches) == 2 else []
+        usable = len(decision_branches) == 2 and all(r is not None for r in results)
+        usable = usable and all(e.target not in visited for e in decision_branches)
+        side_i = 0
+        side_new_ids: list[str] = []
+        if usable:
+            ranked = sorted(range(2), key=lambda i: _BRANCH_KIND_RANK[results[i][0]] * 1000 + len(results[i][1]))
+            side_i = ranked[0]
+            side_kind, side_chain = results[side_i]
+            side_new_ids = side_chain if side_kind == "end" else side_chain[:-1]
+            # A side branch that itself runs into further branching, or
+            # points DIRECTLY at a merge/loop target with no box of its
+            # own to anchor the short decision->side connector to, is more
+            # tangled than this layout handles cleanly - fall back.
+            if side_kind == "decision" or not side_new_ids:
+                usable = False
 
-        if previous_bottom is not None:
-            draw_arrow_down(x_center, previous_bottom, y, edge_labels.get((previous_id, nid), ""))
-        height = draw_main_node(nid, y)
-        decision_bottom = y + height
-        col_w = box_w / 2 - 16.0
-        col_gap = 32.0
-        left_x = MARGIN
-        right_x = MARGIN + col_w + col_gap
-        branch_y = decision_bottom + gap
-        branch_bottoms: list[float] = []
-        loop_targets: list[tuple[float, float, str, str]] = []  # (from_x, from_y, target_id, label)
-        merge_from: list[tuple[float, float]] = []  # (x, y) of each branch's own last box, into the merge node
-
-        for branch_index, (edge, result) in enumerate(zip(decision_branches, resolved)):
-            col_x = left_x if branch_index == 0 else right_x
-            kind, chain = result
-            col_cx = col_x + col_w / 2
-            draw_arrow_down(col_cx, decision_bottom, branch_y, edge.label)
-            # A branch drawn to the side never shares the shared spine's
-            # full-width boxes - narrower, so two columns can sit side by
-            # side without crowding.
-            if kind == "end":
-                by_hop_y = branch_y
-                for hop_id in chain:
-                    hop_node = by_id[hop_id]
-                    hop_role = role_of(hop_id)
-                    visited.add(hop_id)
-                    if hop_role in ("start", "end"):
-                        elements.append(
-                            _draw_pill(
-                                hop_node, cx=col_cx, cy=by_hop_y + _PILL_H / 2,
-                                theme=theme, colors=_FLOW_ROLE_COLORS[hop_role],
-                            )
-                        )
-                        hop_h = _PILL_H
-                    else:
-                        svg, hop_h = _node_block(
-                            hop_node, x=col_x, y=by_hop_y, width=col_w, theme=theme,
-                            colors=_FLOW_ROLE_COLORS["process"],
-                        )
-                        elements.append(svg)
-                    if hop_id != chain[-1]:
-                        draw_arrow_down(col_cx, by_hop_y + hop_h, by_hop_y + hop_h + gap)
-                    by_hop_y += hop_h + gap
-                branch_bottoms.append(by_hop_y - gap)
-            else:  # "loop"/"continue": every id but the last is a real new box; the last is the target/merge
-                by_hop_y = branch_y
-                for hop_id in chain[:-1]:
-                    hop_node = by_id[hop_id]
-                    visited.add(hop_id)
-                    svg, hop_h = _node_block(
-                        hop_node, x=col_x, y=by_hop_y, width=col_w, theme=theme,
-                        colors=_FLOW_ROLE_COLORS["process"],
-                    )
-                    elements.append(svg)
-                    draw_arrow_down(col_cx, by_hop_y + hop_h, by_hop_y + hop_h + gap)
-                    by_hop_y += hop_h + gap
-                if kind == "loop":
-                    loop_targets.append((col_cx, by_hop_y - gap, chain[-1], ""))
-                else:
-                    merge_from.append((col_cx, by_hop_y - gap))
-                branch_bottoms.append(by_hop_y - gap)
-
-        # Loop-back arrows: routed out to the side and back up to the
-        # decision's own edge, well clear of the branch columns in between.
-        for from_x, from_y, target_id, _label in loop_targets:
-            side_x = MARGIN - 24.0 if from_x < x_center else CANVAS_WIDTH - MARGIN + 24.0
-            target_y = decision_bottom - height / 2  # roughly the decision's own vertical centre
-            elements.append(
-                f'<path d="M{from_x:.1f},{from_y:.1f} L{side_x:.1f},{from_y:.1f} '
-                f'L{side_x:.1f},{target_y:.1f} L{x_center + _DECISION_W / 2:.1f},{target_y:.1f}" '
-                f'fill="none" stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
-            )
-
-        y = max(branch_bottoms) if branch_bottoms else branch_y
-
-        if merge_id is not None:
-            # Both branches reconverge here - draw the shared node once,
-            # centred back on the main spine, with both columns' arrows
-            # bending in to meet it (an angled line, not the plain vertical
-            # draw_arrow_down every other connector in this function uses -
-            # this is the one place two columns genuinely merge back into
-            # one point, which a straight-down line can't reach from either
-            # side).
-            merge_y = y + gap
-            for from_x, from_y in merge_from:
-                elements.append(
-                    f'<line x1="{from_x:.1f}" y1="{from_y:.1f}" x2="{x_center:.1f}" y2="{merge_y:.1f}" '
-                    f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
-                )
-            merge_height = draw_main_node(merge_id, merge_y)
-            previous_bottom = merge_y + merge_height
-            previous_id = merge_id
-            y = previous_bottom + gap
+        if not usable:
+            y = draw_decision_fallback(nid, decision_branches, y)
             idx += 1
             continue
 
-        # Nothing continues the main spine after a resolved end/loop branch
-        # (see the docstring) - if a well-formed spec somehow still has more
-        # nodes queued up, the next one starts fresh rather than drawing a
-        # stale arrow back to the decision's own position.
-        previous_bottom = None
-        previous_id = None
+        side_edge = decision_branches[side_i]
+        side_kind, side_chain = results[side_i]
+
+        connect_real(nid, x_center, y)
+        height = draw_main_node(nid, y)
+        decision_pos = positions[nid]
+        decision_bottom = y + height
+        branch_y = decision_bottom + gap
+
+        first_side_pos, _side_bottom = draw_side_chain(branch_y, side_chain, side_kind)
+        assert first_side_pos is not None  # guaranteed by the `side_new_ids` guard above
+        _decision_to_side_connector(side_edge.target, decision_pos, first_side_pos, side_edge.label)
+        drawn_edges.add((nid, side_edge.target))
+
+        # The centre branch is deliberately NOT drawn here: its first hop
+        # (and everything after it, including a second decision) is picked
+        # up by this same outer walk in the spec's own node order, via
+        # `connect_real` finding this decision as its real predecessor -
+        # exactly the ordinary plain-node path above, giving it a plain
+        # straight-down arrow for free, on the spine's own shared column.
+        y = branch_y
         idx += 1
 
+    # Final sweep: any real edge whose source AND target both ended up
+    # drawn, but whose arrow no specialised path above accounted for -
+    # every side branch's own deferred edge (to a not-yet-drawn merge
+    # target, or an already-drawn loop target) lands here, plus the rare
+    # decision-fallback leftover. Routed through its own dedicated lane
+    # (see `_route_lane`), entering the target from the side, never the
+    # top - so a node fed by both the spine and a side branch always shows
+    # two arrowheads on two different sides of itself, never the same spot
+    # twice (a real reported case: a loop-back and the spine's own
+    # incoming arrow both entering at a node's top, indistinguishable).
+    for edge in edges:
+        if (edge.source, edge.target) in drawn_edges:
+            continue
+        source_pos = positions.get(edge.source)
+        target_pos = positions.get(edge.target)
+        if source_pos is None or target_pos is None:
+            continue
+        source_cx, _source_top, source_bottom, _source_w = source_pos
+        target_cx, target_top, _target_bottom, _target_w = target_pos
+        if abs(source_cx - target_cx) < 0.5:
+            draw_arrow_down(target_cx, source_bottom, target_top, edge.label)
+        else:
+            _route_cross_column(edge.target, source_pos, target_pos, edge.label)
+        drawn_edges.add((edge.source, edge.target))
+
+    # Lanes are anchored to this function's OWN base canvas_w (see
+    # `_next_lane_x`) - if more ended up used than that width comfortably
+    # fits, the canvas (and the caller's viewBox) is simply widened here;
+    # every lane's own x only ever depended on its index, never on the
+    # final width, so nothing already drawn needs to move.
+    if _lane_count[0] > 0:
+        rightmost_lane_x = _lane_start_x + (_lane_count[0] - 1) * _LANE_GAP
+        padding = 116.0 if _lane_label_used[0] else 16.0
+        canvas_w = max(canvas_w, rightmost_lane_x + padding)
+
     total_height = y - top
-    return elements, total_height
+    return elements, canvas_w, total_height
 
 
 _DFD_COLORS = {
@@ -1225,7 +1654,7 @@ _ER_ATTR_ROW_GAP = 30.0  # vertical clearance for the attribute->parent leader l
 
 def _draw_diamond(
     node: DiagramNode, *, cx: float, cy: float, width: float, height: float, theme: TemplateTheme,
-    colors: tuple[str, str] | None = None,
+    colors: tuple[str, str] | None = None, base_size: float = 12.5, min_size: float = 9.5,
 ) -> str:
     """A relationship (er_diagram) or decision (flow_chart), drawn as a
     rhombus. Text stays within the middle half of the shape's height (where
@@ -1254,7 +1683,7 @@ def _draw_diamond(
     parts.append(
         _fit_boxed_text(
             cx, cy, node.label, width=width * 0.5, height=height * 0.5,
-            color=theme.text_color, theme=theme, base_size=12.5,
+            color=theme.text_color, theme=theme, base_size=base_size, min_size=min_size,
         )
     )
     return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
@@ -1838,7 +2267,7 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
 
     canvas_w = CANVAS_WIDTH
     if kind in ("flow_chart", "process"):
-        elements, content_h = _layout_flow_chart(spec.nodes, spec.edges, theme=theme, top=top)
+        elements, canvas_w, content_h = _layout_flow_chart(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "data_flow_diagram":
         elements, content_h = _layout_dfd(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "swimlane":

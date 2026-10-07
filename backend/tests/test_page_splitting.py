@@ -314,3 +314,42 @@ def test_content_integrity_after_a_heavy_multi_split_reflow():
 
     findings = validate_document(document, original_block_order=original_ids)
     assert findings == {}
+
+
+# ---------------------------------------------------------------------------
+# section_intro float pairing doesn't false-positive as an overlap
+# ---------------------------------------------------------------------------
+
+
+def _section_intro_image() -> Block:
+    return Block(
+        type=BlockType.IMAGE,
+        content={"kind": "illustration", "illustration_style": "section_intro", "path": "assets/x", "width": 400, "height": 300},
+    )
+
+
+def test_a_section_intro_pair_is_not_flagged_as_an_overlap():
+    """flow_blocks deliberately gives a section_intro image and its paired
+    paragraph the same y (see layout.py) - overlapping_pairs must not
+    mistake that intentional sharing for the real regression it otherwise
+    exists to catch."""
+    heading = _heading("Delegation")
+    image, paragraph = _section_intro_image(), _paragraph(60)
+    document = _document_from([heading, image, paragraph])
+    reflow_document(document, TEMPLATE)
+
+    page = document.pages[0]
+    assert overlapping_pairs(page.blocks) == []
+    assert validate_document(document) == {}
+
+
+def test_an_unrelated_genuine_overlap_is_still_flagged():
+    """The section_intro exception is narrow - two blocks sharing a y for
+    any OTHER reason (a real regression, not the deliberate float pairing)
+    must still be caught."""
+    a = _paragraph(20)
+    b = _paragraph(20)
+    a.layout.y = 100.0
+    a.layout.height = 60.0
+    b.layout.y = 100.0  # genuinely overlaps a, no section_intro involved
+    assert overlapping_pairs([a, b]) == [(a.id, b.id)]

@@ -102,7 +102,15 @@ class ImageContent(_Content):
     # diagram/concept_experience visual for the same concept - an actual
     # scientifically/technically accurate illustration (anatomy, an
     # experiment apparatus, a molecular structure) rather than a decorative
-    # or flat-vector graphic - see ImageService.build_prompt.
+    # or flat-vector graphic - see ImageService.build_prompt. "section_intro"
+    # is the small (~4:3, 400x300) illustration that opens a section - the
+    # writer places it as that section's first block, immediately before its
+    # first paragraph, and app.course.document.layout pairs the two so the
+    # PDF export floats the image left of that paragraph's own text (see
+    # layout.flow_blocks and render_document_html); the in-app editor has no
+    # float/wrap concept, so it simply renders it as an ordinary small block,
+    # stacked on top of the paragraph via a higher z_index rather than beside
+    # it.
     illustration_style: str = ""
     # Only meaningful when illustration_style == "textbook". The exact short
     # labels (if any) the image is expected to render as text - the ground

@@ -27,9 +27,18 @@ from app.schemas.document import CONTENT_WIDTH
 _SVG_NS = "{http://www.w3.org/2000/svg}"
 
 # Below this, a label's SVG-unit font size, once scaled down to the page's
-# real display width, would render smaller than is comfortably readable -
-# a widely-used minimum body-text floor (print and screen alike).
-MIN_READABLE_PX = 9.0
+# real display width, would render uncomfortably small. Not the full 14px
+# node-title minimum itself (that's what diagram_renderer.LABEL_SIZE is
+# now sized to hit AT THE STANDARD 880px canvas - see its own docstring) -
+# this is the safety-net floor for the GENERAL render-QA gate, shared
+# across every diagram kind, including concept_map/hierarchy whose radial/
+# tree layouts can legitimately grow somewhat wider than 880px for benign
+# structural reasons (a handful of spokes or siblings) that aren't the
+# "diagram genuinely became unreadable" case this check exists to catch
+# (confirmed real: an 8-child hierarchy's canvas grew to 1768px, dropping
+# well under even this floor). A stricter 14px floor here made ordinary,
+# moderate diagrams retry/fall back unnecessarily.
+MIN_READABLE_PX = 11.0
 
 # Below this fraction of its own canvas actually covered by drawn content, a
 # diagram reads as mostly accidental empty space rather than deliberate
@@ -290,7 +299,213 @@ def text_overflow_issues(root: ET.Element) -> list[RenderQAIssue]:
     return issues
 
 
-def validate_rendered_svg(svg_bytes: bytes) -> list[RenderQAIssue]:
+# Minimum on-page font size by role, once this diagram's canvas is scaled
+# to the page's real display width (same scale factor `effective_font_size`
+# uses) - the user's own explicit per-role minimums, distinct from the
+# single MIN_READABLE_PX safety-net floor above (that one exists to catch
+# a diagram that's ACCIDENTALLY too small overall via the LABEL_SIZE
+# constant; this checks every ACTUAL rendered font-size attribute against
+# its own role's floor, so a smaller role - a subtitle, an edge label, a
+# decision diamond's question text - can never quietly render under its
+# own minimum even when the node title itself is fine).
+_FONT_FLOOR_TITLE = 14.0
+_FONT_FLOOR_SUBTITLE = 12.0
+_FONT_FLOOR_EDGE_LABEL = 12.0
+_FONT_FLOOR_DIAMOND = 12.0
+
+
+def font_size_issues(root: ET.Element, canvas_w: float, *, display_width: float = CONTENT_WIDTH) -> list[RenderQAIssue]:
+    """Every `<text>` element actually drawn, checked against its own
+    role's minimum once scaled to the page's real display width. A
+    `diagram-node` group containing a `<polygon>` is a decision diamond
+    (>= 12px); within any other `diagram-node` group, `font-weight >= 600`
+    is a title/label (>= 14px) and anything lighter is a subtitle/detail
+    line (>= 12px). An edge label - a `<rect class="diagram-edge-label">`
+    immediately followed by its own `<text>`, siblings rather than a
+    group (see `diagram_renderer._edge_label`) - is checked separately
+    (>= 12px)."""
+    if canvas_w <= 0:
+        return []
+    scale = min(display_width / canvas_w, 1.0)
+    issues: list[RenderQAIssue] = []
+    for group in root.iter():
+        if _local(group.tag) != "g" or "diagram-node" not in (group.get("class") or "").split():
+            continue
+        is_diamond = any(_local(el.tag) == "polygon" for el in group)
+        for text_el in group.iter():
+            if _local(text_el.tag) != "text":
+                continue
+            font_size = _f(text_el, "font-size", 0.0)
+            weight = int(_f(text_el, "font-weight", 400))
+            effective = font_size * scale
+            if is_diamond:
+                category, floor = "diamond", _FONT_FLOOR_DIAMOND
+            elif weight >= 600:
+                category, floor = "title", _FONT_FLOOR_TITLE
+            else:
+                category, floor = "subtitle", _FONT_FLOOR_SUBTITLE
+            if effective < floor - 0.05:
+                preview = "".join(t.text or "" for t in text_el).strip()[:40]
+                issues.append(RenderQAIssue(
+                    "font_below_minimum",
+                    f"{category} text '{preview}' renders at {effective:.1f}px, below the {floor:.0f}px minimum",
+                ))
+    children = list(root)
+    for i, el in enumerate(children):
+        if _local(el.tag) != "rect" or "diagram-edge-label" not in (el.get("class") or "").split():
+            continue
+        if i + 1 >= len(children) or _local(children[i + 1].tag) != "text":
+            continue
+        text_el = children[i + 1]
+        font_size = _f(text_el, "font-size", 0.0)
+        effective = font_size * scale
+        if effective < _FONT_FLOOR_EDGE_LABEL - 0.05:
+            preview = "".join(t.text or "" for t in text_el).strip()[:40]
+            issues.append(RenderQAIssue(
+                "font_below_minimum",
+                f"edge label '{preview}' renders at {effective:.1f}px, below the {_FONT_FLOOR_EDGE_LABEL:.0f}px minimum",
+            ))
+    return issues
+
+
+_SHARED_SEGMENT_MIN_OVERLAP = 28.0
+_COLLINEAR_TOLERANCE = 1.0
+
+
+def shared_segment_issues(root: ET.Element) -> list[RenderQAIssue]:
+    """Two DIFFERENT edges must never run along the same line for any real
+    stretch - a reader can't tell which arrow is which where they overlap
+    (a real reported case: a loop-back connector and an unrelated
+    long-distance connector both routed through the exact same margin
+    line). Decomposes every edge into its own axis-aligned sub-segments
+    (this renderer only ever draws orthogonal lines, never a diagonal) and
+    flags any two, from DIFFERENT edges, that are collinear with a real
+    overlapping stretch - not merely touching at a shared endpoint, which
+    is an ordinary elbow joint, not a collision."""
+    edges = _edge_segments(root)
+    verticals: list[tuple[int, float, float, float]] = []
+    horizontals: list[tuple[int, float, float, float]] = []
+    for idx, points in enumerate(edges):
+        for p0, p1 in zip(points, points[1:]):
+            if abs(p0[0] - p1[0]) < 0.5 and abs(p0[1] - p1[1]) >= 0.5:
+                verticals.append((idx, p0[0], min(p0[1], p1[1]), max(p0[1], p1[1])))
+            elif abs(p0[1] - p1[1]) < 0.5 and abs(p0[0] - p1[0]) >= 0.5:
+                horizontals.append((idx, p0[1], min(p0[0], p1[0]), max(p0[0], p1[0])))
+    issues: list[RenderQAIssue] = []
+    for group, axis in ((verticals, "vertical"), (horizontals, "horizontal")):
+        for i in range(len(group)):
+            idx_a, line_a, a0, a1 = group[i]
+            for j in range(i + 1, len(group)):
+                idx_b, line_b, b0, b1 = group[j]
+                if idx_a == idx_b or abs(line_a - line_b) > _COLLINEAR_TOLERANCE:
+                    continue
+                overlap = min(a1, b1) - max(a0, b0)
+                if overlap > _SHARED_SEGMENT_MIN_OVERLAP:
+                    issues.append(RenderQAIssue(
+                        "shared_edge_segment",
+                        f"two different edges both run {axis} along {line_a:.1f} for {overlap:.0f}px",
+                    ))
+    return issues
+
+
+# How close a segment may run to a node's border before it reads as
+# "running along" that border rather than merely passing near it - the
+# user's own explicit 12px.
+_BORDER_CLEARANCE = 12.0
+_BORDER_OVERLAP_MIN = 4.0
+# How close a point must be to a box to count as "this edge's own
+# endpoint touching its own connected node" - generous enough to cover
+# every shape this renderer draws (a pill's rounded cap, a diamond's
+# vertex) sitting slightly outside the shape's own straight bounding box.
+_OWN_NODE_TOLERANCE = 8.0
+
+
+def _touches_box(point: tuple[float, float], box: BBox, tol: float = _OWN_NODE_TOLERANCE) -> bool:
+    x0, y0, x1, y1 = box
+    return (x0 - tol) <= point[0] <= (x1 + tol) and (y0 - tol) <= point[1] <= (y1 + tol)
+
+
+def border_collinear_issues(root: ET.Element) -> list[RenderQAIssue]:
+    """No edge segment may run along - or within the required clearance of
+    - the border of a node it ISN'T actually connected to (a real reported
+    case: a connector's own approach ran directly along an unrelated
+    node's border, reading as part of that node's own outline rather than
+    a distinct arrow). A node the edge legitimately starts or ends AT (its
+    own two connected boxes) is exempt - an edge always touches its own
+    endpoints' borders by definition, and that's not a collision."""
+    boxes = _node_boxes(root)
+    edges = _edge_segments(root)
+    issues: list[RenderQAIssue] = []
+    for edge in edges:
+        if len(edge) < 2:
+            continue
+        own_boxes = [b for b in boxes if _touches_box(edge[0], b) or _touches_box(edge[-1], b)]
+        for p0, p1 in zip(edge, edge[1:]):
+            vertical = abs(p0[0] - p1[0]) < 0.5 and abs(p0[1] - p1[1]) >= 0.5
+            horizontal = abs(p0[1] - p1[1]) < 0.5 and abs(p0[0] - p1[0]) >= 0.5
+            if not (vertical or horizontal):
+                continue
+            seg_x0, seg_x1 = min(p0[0], p1[0]), max(p0[0], p1[0])
+            seg_y0, seg_y1 = min(p0[1], p1[1]), max(p0[1], p1[1])
+            for box in boxes:
+                if box in own_boxes:
+                    continue
+                bx0, by0, bx1, by1 = box
+                if vertical:
+                    dist = min(abs(p0[0] - bx0), abs(p0[0] - bx1))
+                    overlap = min(seg_y1, by1) - max(seg_y0, by0)
+                else:
+                    dist = min(abs(p0[1] - by0), abs(p0[1] - by1))
+                    overlap = min(seg_x1, bx1) - max(seg_x0, bx0)
+                if dist < _BORDER_CLEARANCE and overlap > _BORDER_OVERLAP_MIN:
+                    issues.append(RenderQAIssue(
+                        "edge_collinear_with_node_border",
+                        f"edge segment runs within {dist:.1f}px of an unrelated node's border {box} for {overlap:.0f}px",
+                    ))
+    return issues
+
+
+_ARROWHEAD_SIDE_TOLERANCE = 6.0
+
+
+def duplicate_arrowhead_issues(root: ET.Element) -> list[RenderQAIssue]:
+    """Every node side (top/bottom/left/right) may receive at most ONE
+    arrowhead - two arrows landing on the same spot are visually
+    indistinguishable, reading as a single ambiguous connection rather
+    than two distinct ones (a real reported case: an ordinary spine arrow
+    and an unrelated loop-back both entered the same node at its top)."""
+    boxes = _node_boxes(root)
+    edges = _edge_segments(root)
+    side_hits: dict[tuple[int, str], int] = {}
+    for edge in edges:
+        if len(edge) < 2:
+            continue
+        end = edge[-1]
+        for i, box in enumerate(boxes):
+            x0, y0, x1, y1 = box
+            tol = _ARROWHEAD_SIDE_TOLERANCE
+            if abs(end[1] - y0) < tol and x0 - tol <= end[0] <= x1 + tol:
+                side = "top"
+            elif abs(end[1] - y1) < tol and x0 - tol <= end[0] <= x1 + tol:
+                side = "bottom"
+            elif abs(end[0] - x0) < tol and y0 - tol <= end[1] <= y1 + tol:
+                side = "left"
+            elif abs(end[0] - x1) < tol and y0 - tol <= end[1] <= y1 + tol:
+                side = "right"
+            else:
+                continue
+            side_hits[(i, side)] = side_hits.get((i, side), 0) + 1
+            break
+    issues: list[RenderQAIssue] = []
+    for (box_i, side), count in side_hits.items():
+        if count > 1:
+            issues.append(RenderQAIssue(
+                "duplicate_arrowhead_side", f"node {boxes[box_i]} has {count} arrowheads on its {side} side"
+            ))
+    return issues
+
+
+def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAIssue]:
     """Parses `svg_bytes` (exactly what `render_diagram_svg` produced) and
     checks the geometry a reader will actually see:
     - two node shapes overlapping each other,
@@ -302,7 +517,22 @@ def validate_rendered_svg(svg_bytes: bytes) -> list[RenderQAIssue]:
     - label text that would render too small to read once the diagram is
       scaled to the page's real display width (see `readability_issues`),
     - drawn content occupying too little of its own canvas (see
-      `occupancy_issues`).
+      `occupancy_issues`),
+    - two different edges running along the same segment (see
+      `shared_segment_issues`),
+    - an edge running collinear with an unrelated node's border (see
+      `border_collinear_issues`),
+    - a node side receiving more than one arrowhead (see
+      `duplicate_arrowhead_issues`),
+    - any rendered text below its own role's minimum font size (see
+      `font_size_issues`) - only for `kind="flow_chart"`/`"process"`,
+      whose own font-size constants (`diagram_renderer.LABEL_SIZE` etc.)
+      are specifically calibrated to clear these floors (see their own
+      comments); other kinds' layouts can legitimately grow wide for
+      benign structural reasons this stricter, per-role floor would
+      otherwise flag unnecessarily (the same tension `MIN_READABLE_PX`'s
+      own docstring explains) - they still get the general, more lenient
+      `readability_issues` check above.
     Returns an empty list for a clean diagram. Never raises on malformed
     SVG - a parse failure is reported as a single issue, not a crash."""
     try:
@@ -318,6 +548,10 @@ def validate_rendered_svg(svg_bytes: bytes) -> list[RenderQAIssue]:
         *text_overflow_issues(root),
         *readability_issues(canvas_w),
         *occupancy_issues(root, canvas_w, canvas_h),
+        *shared_segment_issues(root),
+        *border_collinear_issues(root),
+        *duplicate_arrowhead_issues(root),
+        *(font_size_issues(root, canvas_w) if kind in ("flow_chart", "process") else []),
     ]
 
     for i, a in enumerate(nodes):

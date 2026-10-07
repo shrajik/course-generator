@@ -44,6 +44,23 @@ class Settings(BaseSettings):
     #  reasoning-tier model is enough - the same tier as the planner/reviewer.
     diagram_model: str = "gpt-5-mini"
 
+    # --- image provider ------------------------------------------------------
+    #  "openai" (default) keeps the existing gpt-image-1 behaviour exactly as
+    #  before. "azure" routes raster image generation through Microsoft Azure
+    #  AI Foundry's FLUX.2-flex instead (see app.services.azure_image_provider)
+    #  - selected explicitly via configuration; OpenAIClient.image() never
+    #  silently falls back from one to the other, since that could mask a
+    #  real production misconfiguration rather than surface it.
+    image_provider: str = "openai"
+    #  Azure AI Foundry FLUX.2-flex. Both are required only when
+    #  image_provider == "azure" - validated at call time (in
+    #  azure_image_provider.generate_image), not here, so constructing
+    #  Settings never fails just because Azure isn't configured. Never
+    #  logged, never returned to a caller, never exposed to the frontend -
+    #  read server-side only, exactly like openai_api_key above.
+    azure_flux_endpoint: str = ""
+    azure_flux_api_key: str = ""
+
     # --- pipeline behaviour -------------------------------------------------
     research_mode: ResearchMode = "fast"
     #  parallel  - chapters are written concurrently against the blueprint's

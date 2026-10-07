@@ -92,6 +92,13 @@
     color: {{ theme.muted_color }}; background: {{ theme.surface_color }};
     border: 1px dashed {{ theme.border_color }}; border-radius: 8px; padding: 16px;
   }
+  /* A section_intro image + its paired paragraph (see html_renderer.py's
+     "section_intro_pair" block) are the one place this document uses real
+     CSS float instead of absolute positioning for every child - `overflow:
+     hidden` is the float clearfix, so this wrapper's own height (set by the
+     outer .block's min-height) still accounts for the floated image. */
+  .section-intro-figure { overflow: hidden; }
+  .section-intro-img { float: left; margin: 0 16px 10px 0; border-radius: 8px; display: block; }
 </style>
 </head>
 <body>
@@ -119,12 +126,26 @@
           <img class="figure" src="{{ b.image_src }}" alt="{{ c.get('alt', '') }}">
         </div>
       {% else %}
+        {#- A failed/pending generation NEVER shows its internal error here -
+           that detail (provider name, HTTP status, raw response body) is
+           diagnostic information for course authors, not educational
+           content a student should ever see. See c.error for the real
+           message, surfaced only in the editor/admin views, never here. -#}
         <div class="img-missing" style="min-height:{{ b.image_box }}px">
-          Image not generated yet<br>{{ c.get('purpose', '') or c.get('caption', '') }}
-          {% if c.get('error') %}<br><em>{{ c.get('error') }}</em>{% endif %}
+          Visual unavailable
+          {% if c.get('purpose') or c.get('caption') %}<br>{{ c.get('purpose', '') or c.get('caption', '') }}{% endif %}
         </div>
       {% endif %}
       {% if c.get('caption') %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+
+    {%- elif b.type == 'section_intro_pair' -%}
+      <div class="section-intro-figure">
+        {% if b.image_src %}
+        <img class="section-intro-img" src="{{ b.image_src }}" alt="{{ b.alt }}"
+             style="width:{{ b.image_width }}px;height:{{ b.image_height }}px">
+        {% endif %}
+        {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
+      </div>
 
     {%- elif b.type == 'quote' -%}
       <div class="quote-bar">

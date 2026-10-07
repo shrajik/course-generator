@@ -11,7 +11,15 @@ import pytest
 from app.agents.writer import WriterAgent
 from app.core.errors import AIServiceError
 from app.course.templates.registry import load_template
-from app.render.diagram_renderer import CANVAS_WIDTH, MARGIN, PANEL_HEIGHT, render_diagram_svg
+from app.render.diagram_renderer import (
+    CANVAS_WIDTH,
+    DETAIL_SIZE,
+    EDGE_LABEL_FONT_SIZE,
+    LABEL_SIZE,
+    MARGIN,
+    PANEL_HEIGHT,
+    render_diagram_svg,
+)
 from app.render.schematic_layout import resolve_schematic_layout
 from app.render.textbook_palette import COLOR_ROLES, TEXTBOOK_PALETTE, resolve_color_role
 from app.render.visual_blueprints import BLUEPRINT_REGISTRY, apply_blueprint_defaults, get_blueprint
@@ -25,8 +33,9 @@ from app.schemas.diagram import (
     SchematicShape,
     SchematicState,
 )
-from app.schemas.document import Block
+from app.schemas.document import CONTENT_WIDTH, Block
 from app.schemas.template import TemplateTheme
+from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.diagram_qa import (
     CANVAS_CLIPPING,
     DANGLING_RELATIONSHIP,
@@ -226,6 +235,334 @@ def test_flow_chart_loop_back_edge_draws_a_return_path_not_a_box():
     offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
     assert not offenders, f"flow_chart loop overlaps: {offenders}"
     assert width > 0 and height > 0
+
+
+def _delegation_workflow_spec() -> DiagramSpec:
+    """A real, user-reported case: one branch of a decision ("Delegate")
+    runs through several plain steps before reaching a SECOND decision
+    ("Monitor & Close or Escalate") partway through - out-of-scope for
+    `resolve_branch` (a second decision mid-chain), which used to make the
+    OUTER decision ("Decide") dump the entire rest of the diagram into
+    flat, unbranched stacking: "Delegate" and "Keep" appeared as if
+    sequential steps with a fabricated arrow between them, and worse, the
+    INNER decision's own two branches ("End" and "Escalate") also lost
+    their branch geometry, with "Escalate" ending up stacked AFTER "End"
+    joined by a fabricated "End -> Escalate" arrow that was never a real
+    edge (the real edge is "Monitor & Close or Escalate -> Escalate")."""
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="assess", label="Assess Request", detail="Value, cost, urgency, skill, authority"),
+        DiagramNode(id="decide", label="Decide"),
+        DiagramNode(id="delegate", label="Delegate"),
+        DiagramNode(id="keep", label="Keep"),
+        DiagramNode(id="select", label="Select Assignee"),
+        DiagramNode(id="scope", label="Define Scope", detail="Outcome, constraints, authority"),
+        DiagramNode(id="criteria", label="Add Criteria & Checkpoints", detail="Acceptance criteria and checkpoints"),
+        DiagramNode(id="confirm", label="Confirm Handoff", detail="Assignee accepts"),
+        DiagramNode(id="monitor", label="Monitor & Close or Escalate", detail="Monitor checkpoints, close or escalate"),
+        DiagramNode(id="end", label="End"),
+        DiagramNode(id="escalate", label="Escalate"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="assess"),
+        DiagramEdge(source="assess", target="decide"),
+        DiagramEdge(source="decide", target="delegate", label="Delegate"),
+        DiagramEdge(source="decide", target="keep", label="Keep"),
+        DiagramEdge(source="delegate", target="select"),
+        DiagramEdge(source="select", target="scope"),
+        DiagramEdge(source="scope", target="criteria"),
+        DiagramEdge(source="criteria", target="confirm"),
+        DiagramEdge(source="confirm", target="monitor"),
+        DiagramEdge(source="monitor", target="end"),
+        DiagramEdge(source="keep", target="end"),
+        DiagramEdge(source="monitor", target="escalate", label="Escalate"),
+    ]
+    return DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+
+
+def test_flow_chart_never_draws_more_arrows_than_real_edges_exist():
+    """The confirmed root cause, checked as a structural invariant rather
+    than by eyeballing the picture: the old fallback connected whatever was
+    drawn immediately before to whatever came next in spec order,
+    regardless of whether a real edge existed between them (confirmed real
+    case: a fabricated "End -> Escalate" arrow, when the real edge is
+    "Monitor & Close or Escalate -> Escalate"). It is structurally
+    impossible to fabricate an arrow without ALSO drawing more arrow
+    elements than the spec has real edges - so this count can never exceed
+    `len(spec.edges)`, on a spec specifically shaped to trigger the
+    fallback path that used to violate it."""
+    spec = _delegation_workflow_spec()
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow\)"', text))
+    assert arrow_count <= len(spec.edges)
+    assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
+
+
+def test_flow_chart_a_decision_interrupted_mid_branch_still_lets_a_later_decision_branch_cleanly():
+    """The core fix: "Decide"'s branches don't form a shape this layout
+    resolves (the "Delegate" chain runs into a second decision partway
+    through), but that must not prevent the LATER, independently
+    well-formed "Monitor & Close or Escalate" decision from getting its
+    own proper side-by-side branch geometry - it must not be dragged into
+    the outer decision's fallback just for coming later in the document."""
+    spec = _delegation_workflow_spec()
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    ET.fromstring(svg_bytes)
+
+    # two diamonds: "Decide" and "Monitor & Close or Escalate".
+    assert text.count("<polygon") == 2
+
+    # "End" and "Escalate" (Monitor's two branches) sit at different X
+    # centres (side by side), not stacked one under the other.
+    end_x = re.search(r'<title>End</title><rect class="diagram-box" x="([\d.]+)"', text)
+    escalate_x = re.search(r'<title>Escalate</title><rect class="diagram-box" x="([\d.]+)"', text)
+    assert end_x is not None and escalate_x is not None
+    assert float(end_x.group(1)) != float(escalate_x.group(1))
+
+    # every original label survives exactly once - nothing lost, nothing
+    # duplicated, despite the fallback path for "Decide".
+    for label in (
+        "Assess Request", "Delegate", "Keep", "Select Assignee", "Define Scope",
+        "Add Criteria &amp; Checkpoints", "Confirm Handoff", "Monitor &amp;", "End", "Escalate",
+    ):
+        assert text.count(label) >= 1, f"missing: {label}"
+
+
+# ---------------------------------------------------------------------------
+# regression tests for the 4 remaining issues from the delegation-workflow
+# report: a missing edge between consecutive real nodes, misaligned columns,
+# multiple/unconnected End nodes, and font-size minimums. `_real_delegation_spec`
+# is the EXACT structure a real API call produced (captured directly, not
+# hand-guessed) for "a manager's delegation decision workflow" - the spec
+# that first exposed all four problems together.
+# ---------------------------------------------------------------------------
+
+
+def _real_delegation_spec() -> DiagramSpec:
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="assess_request", label="Assess Request"),
+        DiagramNode(id="decide_delegate", label="Delegate?"),
+        DiagramNode(id="select_assignee", label="Select Assignee"),
+        DiagramNode(id="define_scope", label="Define Scope"),
+        DiagramNode(id="add_criteria", label="Add Criteria & Checkpoints"),
+        DiagramNode(id="confirm_handoff", label="Confirm Handoff"),
+        DiagramNode(id="monitor_decision", label="Monitor"),
+        DiagramNode(id="close", label="Close"),
+        DiagramNode(id="escalate", label="Escalate"),
+        DiagramNode(id="keep_task", label="Keep Task"),
+        DiagramNode(id="end", label="End"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="assess_request"),
+        DiagramEdge(source="assess_request", target="decide_delegate"),
+        DiagramEdge(source="decide_delegate", target="select_assignee", label="Yes"),
+        DiagramEdge(source="decide_delegate", target="keep_task", label="No"),
+        DiagramEdge(source="select_assignee", target="define_scope"),
+        DiagramEdge(source="define_scope", target="add_criteria"),
+        DiagramEdge(source="add_criteria", target="confirm_handoff"),
+        DiagramEdge(source="confirm_handoff", target="monitor_decision"),
+        DiagramEdge(source="monitor_decision", target="close", label="Close"),
+        DiagramEdge(source="monitor_decision", target="escalate", label="Escalate"),
+        DiagramEdge(source="close", target="end"),
+        DiagramEdge(source="escalate", target="end"),
+        DiagramEdge(source="keep_task", target="end"),
+    ]
+    return DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+
+
+def test_flow_chart_every_real_edge_gets_exactly_one_arrow():
+    """Regression test for the reported bug: no arrow between "Select
+    Assignee" and "Define Scope" despite a real edge connecting them -
+    caused by a decision's fallback handling resetting the layout's single
+    "previous node" cursor, so the very next real connection had nothing
+    to draw from. Checked as an exact count (not just an upper bound): the
+    real spec has 13 edges, so the render must have exactly 13 arrows."""
+    spec = _real_delegation_spec()
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow\)"', text))
+    assert arrow_count == len(spec.edges)
+    assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
+
+
+def test_flow_chart_select_assignee_connects_to_define_scope():
+    """The exact reported case, checked geometrically rather than just via
+    the aggregate arrow count above: "Select Assignee" leads onward through
+    three more steps into a SECOND decision, so it's the branch that stays
+    on the main spine (see _layout_flow_chart's own docstring) - directly
+    above "Define Scope", joined by a plain straight `<line>`, not a
+    routed `<path>` at all. A prior version of this renderer put "Select
+    Assignee" in a side column instead, which needed a margin-routed
+    connector and visibly misaligned it from "Define Scope" below - this
+    checks the improved connection is the SIMPLEST possible shape, not
+    just that some connector exists."""
+    spec = _real_delegation_spec()
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+
+    def box(label: str) -> tuple[float, float, float, float]:
+        m = re.search(
+            rf'<title>{re.escape(label)}</title><rect class="diagram-box" '
+            r'x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"',
+            text,
+        )
+        assert m is not None, f"box not found: {label}"
+        x, y, w, h = (float(g) for g in m.groups())
+        return x, y, w, h
+
+    sx, sy, sw, sh = box("Select Assignee")
+    dx, dy, dw, dh = box("Define Scope")
+    assert (sx, sw) == (dx, dw)  # same spine column
+
+    select_bottom_x, select_bottom_y = sx + sw / 2, sy + sh
+    scope_top_x, scope_top_y = dx + dw / 2, dy
+
+    lines = re.findall(
+        r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*marker-end="url\(#diagram-arrow\)"', text
+    )
+    matching = [
+        (x1, y1, x2, y2)
+        for x1, y1, x2, y2 in lines
+        if abs(float(x1) - select_bottom_x) < 1.0
+        and abs(float(y1) - select_bottom_y) < 1.0
+        and abs(float(x2) - scope_top_x) < 1.0
+        and abs(float(y2) - scope_top_y) < 1.0
+    ]
+    assert matching, (
+        f"no straight connector found from Select Assignee's bottom ({select_bottom_x}, {select_bottom_y}) "
+        f"to Define Scope's top ({scope_top_x}, {scope_top_y}); lines were: {lines}"
+    )
+
+
+def test_flow_chart_process_boxes_in_the_same_chain_share_x_and_width():
+    """Regression test for the reported misalignment: every node on the
+    main spine - including "Select Assignee", which used to sit in its own
+    side column, misaligned from "Define Scope" below it - shares one
+    consistent centre-x and width; the decision's OTHER (quicker-exit)
+    branch, drawn in the single side column, likewise shares one
+    consistent centre-x and width with any other side-column box, even one
+    fed by a completely different decision."""
+    spec = _real_delegation_spec()
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+
+    def box(label: str) -> tuple[float, float]:
+        m = re.search(rf'<title>{re.escape(label)}</title><rect class="diagram-box" x="([\d.]+)" '
+                       r'y="[\d.]+" width="([\d.]+)"', text)
+        assert m is not None, f"box not found: {label}"
+        return float(m.group(1)), float(m.group(2))
+
+    define_scope = box("Define Scope")
+    add_criteria = box("Add Criteria &amp; Checkpoints")
+    confirm_handoff = box("Confirm Handoff")
+    select_assignee = box("Select Assignee")
+    escalate = box("Escalate")
+    # main-spine chain: identical x AND width throughout, including
+    # "Select Assignee" (it leads onward into a second decision, so it
+    # stays on the spine - see the docstring) and "Escalate" ("Monitor"'s
+    # two branches - "Close" and "Escalate" - are tied in priority, both
+    # simply reaching the shared "End"; the tie-break keeps whichever is
+    # listed FIRST as the SIDE branch, and "Close" is listed first, so
+    # "Escalate" - listed second - is the one that stays on the spine).
+    assert define_scope == add_criteria == confirm_handoff == select_assignee == escalate
+
+    close = box("Close")
+    keep_task = box("Keep Task")
+    # the single side column, fed by two different decisions: same x and
+    # width as each other - narrower than the spine's own column width by
+    # design (see _MAX_SIDE_W's own comment: a decision's quick-exit
+    # branch is never the widest content in the diagram, and giving it
+    # the spine's own full width needlessly doubled the canvas).
+    assert close == keep_task
+    assert close[1] < define_scope[1]
+    assert close[0] != define_scope[0]  # a genuinely different column
+
+
+def test_flow_chart_connectivity_issues_flags_multiple_disconnected_ends():
+    """Spec-level validation (before rendering) for the requested rule:
+    fails if more than one node has no outgoing edge - three separate
+    terminal paths (Close, Escalate, Keep) that never converge on a single
+    shared End."""
+    from app.services.diagram_service import _flow_chart_connectivity_issues
+
+    nodes = [
+        DiagramNode(id="start", label="Start"),
+        DiagramNode(id="decide", label="Route"),
+        DiagramNode(id="close", label="Close"),
+        DiagramNode(id="escalate", label="Escalate"),
+    ]
+    edges = [
+        DiagramEdge(source="start", target="decide"),
+        DiagramEdge(source="decide", target="close", label="A"),
+        DiagramEdge(source="decide", target="escalate", label="B"),
+        # neither "close" nor "escalate" leads anywhere - two disconnected ends.
+    ]
+    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+    issues = _flow_chart_connectivity_issues(spec)
+    assert len(issues) == 1
+    assert "no outgoing edge" in issues[0]
+
+
+def test_flow_chart_connectivity_issues_is_clean_for_the_real_spec():
+    from app.services.diagram_service import _flow_chart_connectivity_issues
+
+    assert _flow_chart_connectivity_issues(_real_delegation_spec()) == []
+
+
+def test_flow_chart_connectivity_issues_ignores_process_kind():
+    """"process" (an ongoing pipeline) legitimately has no Start/End
+    bookends - this rule is specific to "flow_chart" (a bounded procedure)."""
+    from app.services.diagram_service import _flow_chart_connectivity_issues
+
+    nodes = [DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B"), DiagramNode(id="c", label="C")]
+    edges = [DiagramEdge(source="a", target="b"), DiagramEdge(source="b", target="c"), DiagramEdge(source="c", target="a")]
+    spec = DiagramSpec(kind="process", nodes=nodes, edges=edges)
+    assert _flow_chart_connectivity_issues(spec) == []
+
+
+async def test_diagram_service_retries_once_on_disconnected_ends_then_renders_anyway(service, monkeypatch):
+    """The full production path: a spec with multiple disconnected ends
+    triggers exactly one retry with targeted feedback; if the retry can't
+    fix it either (as here, since the mock always returns the same
+    structure), the diagram still renders - render_diagram_svg's own
+    connectivity guarantees mean it's never silently discarded for the
+    unreliable raster fallback over this alone."""
+    template = load_template("technical")
+    block = _diagram_block(diagram_kind="flow_chart")
+    calls: list[str] = []
+
+    def _disconnected_spec() -> DiagramSpec:
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[
+                DiagramNode(id="start", label="Start"),
+                DiagramNode(id="decide", label="Route"),
+                DiagramNode(id="close", label="Close"),
+                DiagramNode(id="escalate", label="Escalate"),
+            ],
+            edges=[
+                DiagramEdge(source="start", target="decide"),
+                DiagramEdge(source="decide", target="close", label="A"),
+                DiagramEdge(source="decide", target="escalate", label="B"),
+            ],
+        )
+
+    async def fake_request_spec(self, **kwargs):
+        calls.append(kwargs.get("qa_feedback", ""))
+        return _disconnected_spec()
+
+    monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_disconnected_ends", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True  # still rendered - real edges are guaranteed regardless
+    assert len(calls) == 2  # exactly one retry, never unbounded
+    assert "outgoing edge" in calls[1]
 
 
 def test_flow_chart_a_deep_branch_still_gets_real_branch_geometry_not_a_fallback():
@@ -2368,3 +2705,37 @@ def test_swimlane_parallel_nodes_in_the_same_lane_and_row_never_overlap():
     node_boxes = [b for b in boxes if b[1] > MARGIN + 60]
     offenders = [(a, b) for i, a in enumerate(node_boxes) for b in node_boxes[i + 1 :] if _bboxes_overlap(a, b)]
     assert not offenders, f"parallel same-lane nodes overlap: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# regression test: font-size minimums, checked at the ACTUAL post-scale size
+# a reader sees, not the raw SVG-unit numbers in isolation - a course
+# document renders this SVG at CONTENT_WIDTH (666px), narrower than this
+# renderer's own CANVAS_WIDTH (880px), so a font size that looks fine in the
+# SVG's own coordinate space can still end up smaller than required once
+# displayed.
+# ---------------------------------------------------------------------------
+
+
+def test_flow_chart_font_sizes_meet_minimums_after_page_scaling():
+    scale = CONTENT_WIDTH / CANVAS_WIDTH
+    effective_label = LABEL_SIZE * scale
+    effective_detail = DETAIL_SIZE * scale
+    effective_edge_label = EDGE_LABEL_FONT_SIZE * scale
+    assert effective_label >= 14.0, f"node title would render at {effective_label:.1f}px, under the 14px minimum"
+    assert effective_detail >= 12.0, f"subtitle would render at {effective_detail:.1f}px, under the 12px minimum"
+    assert effective_edge_label >= 12.0, (
+        f"edge label would render at {effective_edge_label:.1f}px, under the 12px minimum"
+    )
+
+
+def test_flow_chart_rendered_font_size_attributes_match_the_source_constants():
+    """The SVG's own `font-size` attributes must actually use the sized-up
+    constants - a real, confirmed prior gap: raising a module constant
+    doesn't help if a rendering call site hardcodes its own number instead
+    of referencing it."""
+    spec = _real_delegation_spec()
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert f'font-size="{LABEL_SIZE:.1f}"' in text
+    assert f'font-size="{EDGE_LABEL_FONT_SIZE:.1f}"' in text

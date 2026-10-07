@@ -21,7 +21,6 @@ from app.schemas.document import (
     CONTENT_HEIGHT,
     CONTENT_WIDTH,
     PAGE_MARGIN_TOP,
-    PAGE_MARGIN_X,
     Block,
 )
 
@@ -205,6 +204,53 @@ def image_box_height(block: Block) -> float:
     if kind == "diagram":
         return min(height, MAX_DIAGRAM_IMAGE_HEIGHT)
     return min(height, MAX_IMAGE_HEIGHT)
+
+
+# A section_intro illustration (see app.schemas.blocks.ImageContent's own
+# docstring on illustration_style) is deliberately small and float:left in
+# the PDF export, with its section's first paragraph wrapping around its
+# right/bottom edge - never the full CONTENT_WIDTH an ordinary image gets.
+# 4:3 to match the exact size ImageService generates/crops these to.
+SECTION_INTRO_IMAGE_WIDTH = 210.0
+SECTION_INTRO_IMAGE_ASPECT = 0.75  # 4:3
+SECTION_INTRO_FLOAT_GAP = 16.0  # matches the PDF template's own float margin-right
+
+
+def _section_intro_pair_height(image: Block, paragraph: Block, image_h: float) -> float:
+    """The ONE combined reserved height for a section_intro image and the
+    paragraph it floats beside in the PDF export - an estimate, not real
+    two-region text shaping (this module's whole philosophy: estimates err
+    high, `min-height` in the CSS tolerates it - see this file's own
+    docstring). Assumes as many of the paragraph's lines as fit within the
+    image's own height wrap in the narrower space beside it; anything left
+    over wraps at the full content width below the image, once its height
+    is exhausted - matching how the real float actually behaves in
+    Chromium."""
+    font_size = _font_size(paragraph)
+    lh = _line_height(paragraph)
+    pad = _padding(paragraph)
+    text = str(paragraph.content.get("text") or "")
+    if not text.strip():
+        return image_h
+    narrow_width = max(CONTENT_WIDTH - SECTION_INTRO_IMAGE_WIDTH - SECTION_INTRO_FLOAT_GAP - 2 * pad, 60.0)
+    full_width = max(CONTENT_WIDTH - 2 * pad, 60.0)
+    narrow_cpl = max(int(narrow_width / (font_size * _SANS_RATIO)), 8)
+    full_cpl = max(int(full_width / (font_size * _SANS_RATIO)), 8)
+    max_lines_beside = max(int(image_h / (font_size * lh)), 1)
+    lines_if_narrow_only = wrapped_line_count(text, narrow_cpl)
+    if lines_if_narrow_only <= max_lines_beside:
+        # The whole paragraph fits beside the image at the narrow width.
+        text_h = lines_if_narrow_only * font_size * lh * _SAFETY
+        return max(image_h, text_h)
+    # Overflows past the image's own height - the first max_lines_beside
+    # narrow-width lines sit beside it; a rough character budget estimates
+    # how much text that covers, and the remainder wraps at the full width
+    # below it.
+    consumed_chars = max_lines_beside * narrow_cpl
+    remainder = text[consumed_chars:]
+    remainder_lines = wrapped_line_count(remainder, full_cpl) if remainder.strip() else 0
+    text_h = (max_lines_beside + remainder_lines) * font_size * lh * _SAFETY
+    return max(image_h, text_h)
 
 
 def estimate_height(block: Block) -> float:
@@ -485,6 +531,55 @@ def flow_blocks(
     queue = list(blocks)
     while queue:
         block = queue.pop(0)
+
+        # A section_intro image and the paragraph it floats beside (see
+        # SECTION_INTRO_IMAGE_WIDTH's own docstring) get ONE combined
+        # reserved box instead of two separate ones - the image sits INSIDE
+        # the paragraph's own vertical span via CSS float in the PDF export,
+        # so it must never also add its own separate slot above/below it.
+        # Scoped deliberately narrow (retry on a fresh page, or give up and
+        # fall back to an ordinary standalone image; never attempt to split
+        # the paragraph across a page boundary) - see this module's own
+        # "estimates err high, min-height tolerates it" philosophy; a rare
+        # edge case landing a line or two off is harmless, a broken pair
+        # isn't.
+        if (
+            block.type is BlockType.IMAGE
+            and (block.content.get("illustration_style") or "") == "section_intro"
+            and queue
+            and queue[0].type is BlockType.PARAGRAPH
+        ):
+            paragraph = queue[0]
+            block.layout.x = margin_x
+            block.layout.width = SECTION_INTRO_IMAGE_WIDTH
+            image_h = image_box_height(block) + 2 * _padding(block)
+            paragraph.layout.x = margin_x
+            paragraph.layout.width = content_width
+            combined_h = _section_intro_pair_height(block, paragraph, image_h)
+            gap = (BLOCK_GAP if current else 0.0)
+
+            if y + gap + combined_h <= bottom:
+                block.layout.y = y + gap
+                block.layout.height = round(image_h, 2)
+                block.layout.z_index = 1  # paints over the paragraph in the (non-floating) editor canvas
+                paragraph.layout.y = y + gap
+                paragraph.layout.height = round(combined_h, 2)
+                current.append(block)
+                current.append(paragraph)
+                y = paragraph.layout.y + combined_h
+                queue.pop(0)  # consume the paragraph - it's part of this pair
+                continue
+            if current:
+                start_new_page()
+                queue.insert(0, block)  # retry the whole pair together, at the top of a fresh page
+                continue
+            # Doesn't fit even alone on a fresh page - give up on pairing and
+            # fall through to the default handling below, which will lay
+            # this image out as an ordinary full-width standalone picture
+            # (block.layout.width gets overwritten to content_width just
+            # below); the paragraph stays queued and is processed normally
+            # on the next iteration.
+
         block.layout.x = margin_x
         block.layout.width = content_width
         height = estimate_height(block)

@@ -342,6 +342,50 @@ def _kind_conflicts(hint: str, actual: str) -> bool:
     return False
 
 
+def _flow_chart_connectivity_issues(spec: DiagramSpec) -> list[str]:
+    """A bounded procedure ("flow_chart" specifically - "process"/"cycle"
+    legitimately have no bookends for an ongoing pipeline, so this doesn't
+    apply to them) must have exactly one node with no incoming edge (the
+    Start) and exactly one with no outgoing edge (the End) - every other
+    node needs at least one real edge in and out. Checked on the SPEC
+    itself, before rendering ever gets a chance to paper over it: the
+    renderer's own connectivity fixes (see diagram_renderer.py's
+    `connect_real`/final sweep) make sure no real edge is ever silently
+    dropped, but they can't invent an edge the model never wrote, and they
+    can't merge two genuinely separate terminal nodes into the single
+    shared End a bounded procedure needs. Returns human-readable issues
+    for the retry-feedback channel; empty means the spec is well-formed."""
+    if spec.normalised_kind() != "flow_chart":
+        return []
+    node_ids = {n.id for n in spec.nodes if n.id}
+    if len(node_ids) < 2:
+        return []
+    out_degree = {nid: 0 for nid in node_ids}
+    in_degree = {nid: 0 for nid in node_ids}
+    for edge in spec.edges:
+        if edge.source in node_ids and edge.target in node_ids:
+            out_degree[edge.source] += 1
+            in_degree[edge.target] += 1
+    by_id = {n.id: n for n in spec.nodes if n.id}
+    sources = [nid for nid in node_ids if in_degree[nid] == 0]
+    sinks = [nid for nid in node_ids if out_degree[nid] == 0]
+    issues: list[str] = []
+    if len(sources) > 1:
+        labels = ", ".join(by_id[nid].label or nid for nid in sources)
+        issues.append(f"{len(sources)} nodes have no incoming edge at all ({labels}) - there must be exactly one Start")
+    elif len(sources) == 0:
+        issues.append("every node has an incoming edge - there is no valid Start (a bounded procedure needs one)")
+    if len(sinks) > 1:
+        labels = ", ".join(by_id[nid].label or nid for nid in sinks)
+        issues.append(
+            f"{len(sinks)} different nodes have no outgoing edge ({labels}) - every terminal path (Close, "
+            "Escalate, Keep, etc.) must lead to the SAME single End node, or loop back to an earlier step"
+        )
+    elif len(sinks) == 0:
+        issues.append("every node has an outgoing edge - there is no valid End (a bounded procedure needs one)")
+    return issues
+
+
 class DiagramService:
     def __init__(
         self,
@@ -566,6 +610,46 @@ class DiagramService:
             except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
                 log.warning("Diagram kind-correction retry failed for %s: %s", block.id, exc)
 
+        # A bounded procedure needs exactly one Start and one shared End -
+        # a real, confirmed case: a spec with three separate terminal nodes
+        # (Close, Escalate, Keep Task) none of which pointed at a single
+        # shared End left one path with nothing to connect to. One retry,
+        # feeding back exactly which nodes are disconnected, before
+        # rendering ever sees it - render_diagram_svg's own connectivity
+        # repairs (connect_real / the final sweep) still guarantee no REAL
+        # edge is ever silently dropped even if this retry doesn't fully
+        # fix the spec, so a persistent issue is logged and rendered
+        # anyway rather than discarded for the unreliable raster fallback.
+        connectivity_issues = _flow_chart_connectivity_issues(spec)
+        if connectivity_issues:
+            log.info(
+                "Diagram for %s has connectivity problems (%s) - retrying with targeted feedback",
+                block.id, connectivity_issues,
+            )
+            try:
+                reconnected = await self._request_spec(
+                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
+                    memory=memory_text, kind_hint="flow_chart", pin_kind=True, block_id=block.id,
+                    qa_feedback=(
+                        "The rendered flowchart had structural problems: " + "; ".join(connectivity_issues) + ". "
+                        "Every node except the single Start must have at least one real incoming edge; every "
+                        "node except the single End must have at least one real outgoing edge (or loop back to "
+                        "an earlier step). Route every terminal outcome (closing, escalating, keeping, etc.) "
+                        "to the SAME single End node rather than leaving it as its own separate dead end."
+                    ),
+                )
+                reconnected = self._normalise(reconnected)
+                if reconnected.normalised_kind() == "flow_chart" and not _flow_chart_connectivity_issues(reconnected):
+                    spec = reconnected
+                else:
+                    log.warning(
+                        "Diagram for %s still has connectivity problems after retry (%s) - rendering anyway; "
+                        "real edges are still guaranteed to reach the page, just not necessarily a single End",
+                        block.id, connectivity_issues,
+                    )
+            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
+                log.warning("Diagram connectivity retry failed for %s: %s", block.id, exc)
+
         if not spec.is_usable():
             log.info(
                 "Diagram spec for %s (kind=%s) is not usable (%s nodes, %s edges) - falling back",
@@ -604,7 +688,7 @@ class DiagramService:
         # assumes. Running it on schematic produced real false positives
         # (confirmed: several passing electric-motor/pulley tests started
         # failing) rather than catching anything real.
-        issues = [] if spec.normalised_kind() == "schematic" else validate_rendered_svg(svg_bytes)
+        issues = [] if spec.normalised_kind() == "schematic" else validate_rendered_svg(svg_bytes, kind=spec.normalised_kind())
         if issues:
             log.info(
                 "Rendered diagram QA failed for %s (%s) - retrying with targeted feedback",
@@ -624,7 +708,7 @@ class DiagramService:
                 retried = self._normalise(retried)
                 if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
                     retried_svg, retried_w, retried_h = render_diagram_svg(retried, template.theme)
-                    retried_issues = validate_rendered_svg(retried_svg)
+                    retried_issues = validate_rendered_svg(retried_svg, kind=retried.normalised_kind())
                     if len(retried_issues) < len(issues):
                         spec, svg_bytes, width, height, issues = retried, retried_svg, retried_w, retried_h, retried_issues
             except Exception as exc:  # noqa: BLE001 - keep the first render, don't fail the block

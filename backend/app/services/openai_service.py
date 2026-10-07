@@ -33,6 +33,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AIServiceError
 from app.core.logging import get_logger
 from app.core.metrics import CallRecord, current_metrics
+from app.services import azure_image_provider
 
 log = get_logger(__name__)
 
@@ -660,6 +661,28 @@ class OpenAIClient(AIClient):
     async def image(
         self, *, prompt: str, size: str | None = None, phase: str = "image"
     ) -> bytes:
+        """Dispatches on `settings.image_provider` - "openai" (default)
+        keeps the exact behaviour this method always had; "azure" routes
+        through app.services.azure_image_provider instead. Never silently
+        falls back from one to the other on an unrecognised value - that
+        could mask a real production misconfiguration, so it fails clearly
+        instead (see the user's own "Do not silently fall back" requirement).
+        Either path still returns the same (prompt, size) -> PNG bytes
+        contract every caller (ImageService) already relies on."""
+        provider = (self.settings.image_provider or "openai").strip().lower()
+        if provider == "azure":
+            return await self._image_azure(prompt=prompt, size=size, phase=phase)
+        if provider != "openai":
+            raise AIServiceError(
+                f"Unsupported image_provider {self.settings.image_provider!r} - expected 'openai' or 'azure'"
+            )
+        return await self._image_openai(prompt=prompt, size=size, phase=phase)
+
+    async def _image_openai(
+        self, *, prompt: str, size: str | None, phase: str
+    ) -> bytes:
+        """The original (and still default) OpenAI gpt-image-1 path -
+        unchanged from before `image()` grew a provider dispatch above it."""
         started = time.perf_counter()
         metrics = current_metrics()
         if metrics:
@@ -696,6 +719,41 @@ class OpenAIClient(AIClient):
                 model=self.settings.image_model,
                 started=started,
                 retries=retries,
+            )
+            if metrics:
+                metrics.call_finished()
+
+    async def _image_azure(
+        self, *, prompt: str, size: str | None, phase: str
+    ) -> bytes:
+        """Microsoft Azure AI Foundry FLUX.2-flex - see
+        app.services.azure_image_provider.generate_image for the actual
+        HTTP call, retry policy and error handling (deliberately NOT a
+        reuse of `_with_retries`/`_is_retryable`, which assume OpenAI SDK
+        exception shapes - see that module's own docstring). This wrapper
+        only adds the same call-metrics recording the OpenAI path gets, so
+        image generation stays observable the same way regardless of which
+        provider answered."""
+        started = time.perf_counter()
+        metrics = current_metrics()
+        if metrics:
+            metrics.call_started()
+        failed = False
+        try:
+            return await azure_image_provider.generate_image(
+                prompt=prompt, size=size or self.settings.image_size, settings=self.settings
+            )
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._record(
+                kind="image",
+                purpose="image",
+                model="FLUX.2-flex",
+                started=started,
+                retries=0,
+                failed=failed,
             )
             if metrics:
                 metrics.call_finished()
