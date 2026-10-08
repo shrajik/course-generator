@@ -12,6 +12,7 @@ from app.api import (
     activity,
     admin,
     auth,
+    code,
     course_samples,
     course_templates,
     courses,
@@ -92,6 +93,7 @@ async def handle_domain_error(request: Request, exc: CourseCreatorError) -> JSON
 
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(code.router)
 app.include_router(admin.router)
 app.include_router(activity.router)
 app.include_router(courses.router)

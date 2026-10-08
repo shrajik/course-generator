@@ -47,6 +47,58 @@ services:
     profiles:
       - test
 
+  # Runs untrusted, AI-generated and user-edited code. Everything here is about
+  # containing that:
+  #  * its own image - no application code, no database driver;
+  #  * NO env_file and NO secrets: nothing from .env is passed in;
+  #  * attached only to the internal `sandbox` network, so it has no route to
+  #    the internet (and, via app/firewall.py, executed code cannot even reach
+  #    the backend that shares the network);
+  #  * no published ports - only the backend can call it;
+  #  * every capability dropped except the few the service needs to demote
+  #    each run to an unprivileged uid and to install the firewall rule;
+  #  * read-only root filesystem, with a size-bounded tmpfs for scratch space.
+  code-executor:
+    build:
+      context: ./code-executor
+      dockerfile: Dockerfile
+    container_name: course_creator_code_executor
+    # A tiny init as PID 1 that reaps orphaned processes. Without it, every
+    # program that forks and gets killed leaves a zombie, zombies count
+    # against the runner uid's process limit, and after enough of them every
+    # later execution fails to start.
+    init: true
+    networks:
+      - sandbox
+    read_only: true
+    tmpfs:
+      # exec is required: compiled languages (C++) run the binary they just
+      # built. nosuid/nodev keep that from becoming a privilege path.
+      - /work:size=256m,mode=0755,exec,nosuid,nodev
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN   # install the iptables rule that silences executed code
+      - SETUID      # drop each execution to the runner uid
+      - SETGID
+      - CHOWN       # hand the per-run workspace to that uid
+      - DAC_OVERRIDE  # root must clean up files the runner uid created
+      - FOWNER
+      - KILL        # kill a runaway process group owned by another uid
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=4).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -71,6 +123,9 @@ services:
       postgres:
         condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - default
+      - sandbox
 
   frontend:
     build:
@@ -88,6 +143,12 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+networks:
+  # internal: true means containers on it have no route out of the Docker
+  # host. The backend is the only service that shares it with the executor.
+  sandbox:
+    internal: true
 
 volumes:
   postgres_data:

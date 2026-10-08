@@ -45,6 +45,58 @@
   .muted { color: {{ theme.muted_color }}; }
   .caption { font-size: 12.5px; color: {{ theme.muted_color }}; margin-top: 6px; }
 
+  /* Code cell - a Colab-style pair of boxes: light code box, white output box.
+     Every size here is a number in app/course/document/code_cell.py; the
+     layout engine reserves exactly this much, so change them together. */
+  .cell-head {
+    height: 30px; display: flex; align-items: center;
+    font-size: 11px; font-weight: 700; letter-spacing: 0.09em;
+    text-transform: uppercase; color: #5f6368;
+  }
+  .cell-code {
+    border: 1px solid #dadce0; border-radius: 6px; background: #f8f9fa;
+    padding: 8px 0;
+  }
+  .cell-head-static { justify-content: space-between; }
+  .cell-head-static .cell-tag { font-weight: 500; letter-spacing: 0; text-transform: none; color: #9aa0a6; }
+  .cell-code-static { border-color: #E5E7EB; }
+  .cell-row {
+    display: flex; min-height: 18px;
+    font-family: {{ theme.mono_font_family }}; font-size: 12.5px; line-height: 18px;
+    color: #202124;
+  }
+  .cell-ln {
+    flex: 0 0 40px; width: 40px; padding-right: 10px; text-align: right;
+    color: #9aa0a6; user-select: none;
+  }
+  .cell-tx {
+    flex: 1 1 auto; min-width: 0; padding-right: 12px;
+    white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4;
+  }
+  .cell-out {
+    margin-top: 8px; border: 1px solid #e0e0e0; border-radius: 6px;
+    background: #ffffff; padding: 8px 12px;
+  }
+  .cell-out-first { margin-top: 0; }
+  .cell-out-head {
+    height: 20px; line-height: 20px; white-space: nowrap; overflow: hidden;
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; color: #5f6368;
+  }
+  .cell-out-note { font-weight: 400; letter-spacing: 0; color: #80868b; }
+  .cell-out-success .cell-out-head { color: #137333; }
+  .cell-out-error .cell-out-head { color: #b3261e; }
+  .cell-out-error { background: #fdf6f5; border-color: #f1d4d1; }
+  .cell-out-timeout .cell-out-head, .cell-out-stale .cell-out-head { color: #b06000; }
+  .cell-out-timeout, .cell-out-stale { background: #fffaf0; border-color: #f3e1b8; }
+  .cell-out-body { margin-top: 6px; }
+  .cell-out-body pre {
+    margin: 0; font-family: {{ theme.mono_font_family }}; font-size: 12.5px;
+    line-height: 18px; color: #202124; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .cell-out-body pre + pre { margin-top: 4px; }
+  .cell-out-body .cell-stderr { color: #b3261e; }
+  .cell-out-body .cell-none { color: #80868b; font-style: italic; }
+
   pre {
     margin: 0; white-space: pre-wrap; word-break: break-word;
     font-family: {{ theme.mono_font_family }};
@@ -87,10 +139,10 @@
     display: block; border-radius: inherit;
   }
   .img-missing {
-    width: 100%; min-height: 220px; display: flex; align-items: center;
+    box-sizing: border-box; width: 100%; display: flex; align-items: center;
     justify-content: center; text-align: center; font-size: 12.5px;
     color: {{ theme.muted_color }}; background: {{ theme.surface_color }};
-    border: 1px dashed {{ theme.border_color }}; border-radius: 8px; padding: 16px;
+    border: 1px dashed {{ theme.border_color }}; border-radius: 8px; padding: 0 12px;
   }
   /* A section_intro image + its paired paragraph (see html_renderer.py's
      "section_intro_pair" block) are the one place this document uses real
@@ -131,12 +183,9 @@
            diagnostic information for course authors, not educational
            content a student should ever see. See c.error for the real
            message, surfaced only in the editor/admin views, never here. -#}
-        <div class="img-missing" style="min-height:{{ b.image_box }}px">
-          Visual unavailable
-          {% if c.get('purpose') or c.get('caption') %}<br>{{ c.get('purpose', '') or c.get('caption', '') }}{% endif %}
-        </div>
+        <div class="img-missing" style="height:{{ b.image_box }}px">Visual unavailable</div>
       {% endif %}
-      {% if c.get('caption') %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+      {% if c.get('caption') and c.get('illustration_style') != 'section_intro' %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
 
     {%- elif b.type == 'section_intro_pair' -%}
       <div class="section-intro-figure">
@@ -158,8 +207,37 @@
       {% for para in b.paragraphs %}<p>{{ para }}</p>{% endfor %}
 
     {%- elif b.type == 'code' -%}
-      <div class="code-panel" style="{{ b.panel_css }}"><pre><code>{{ c.get('code', '') }}</code></pre></div>
+      {#- Static code: the cell's head + code box, with no Run, status or output.
+          Height is reserved by layout.estimate_height via static_code_height. -#}
+      <div class="cell-head cell-head-static"><span>{{ b.code.label }}{% if b.code.continued %} (continued){% endif %}</span><span class="cell-tag">Code</span></div>
+      <div class="cell-code cell-code-static">
+        {% for row in b.code.rows %}<div class="cell-row"><span class="cell-ln">{{ row.n }}</span><span class="cell-tx">{{ row.text }}</span></div>{% endfor %}
+      </div>
       {% if c.get('caption') %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+
+    {%- elif b.type == 'code_cell' -%}
+      {#- Two independent boxes in normal flow: the code box and the output box.
+          Heights are reserved by layout._code_cell_height from code_cell.py. -#}
+      <div class="cell-head">{{ b.cell.label }} Code{% if b.cell.continued %} (continued){% endif %}</div>
+      {% if b.cell.show_code %}
+      <div class="cell-code">
+        {% for row in b.cell.rows %}<div class="cell-row"><span class="cell-ln">{{ row.n }}</span><span class="cell-tx">{{ row.text }}</span></div>{% endfor %}
+      </div>
+      {% if c.get('caption') and not b.cell.continued %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+      {% endif %}
+      {% if b.cell.show_output %}
+      <div class="cell-out cell-out-{{ b.cell.out.state }}{% if not b.cell.show_code %} cell-out-first{% endif %}">
+        <div class="cell-out-head">{{ b.cell.out.label }}{% if b.cell.out.message %} <span class="cell-out-note">&mdash; {{ b.cell.out.message }}</span>{% endif %}</div>
+        {% if b.cell.out.has_body %}
+        <div class="cell-out-body">
+          {% if b.cell.out.stdout %}<pre class="cell-stdout">{{ b.cell.out.stdout }}</pre>{% endif %}
+          {% if b.cell.out.stderr %}<pre class="cell-stderr">{{ b.cell.out.stderr }}</pre>{% endif %}
+          {% if b.cell.out.is_empty %}<pre class="cell-none">(no output)</pre>{% endif %}
+          {% if b.cell.out.truncated %}<pre class="cell-none">Output was cut short.</pre>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
 
     {%- elif b.type == 'table' -%}
       <table>

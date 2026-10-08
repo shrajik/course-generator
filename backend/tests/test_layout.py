@@ -352,18 +352,54 @@ def test_an_ordinary_illustration_followed_by_a_paragraph_is_not_paired():
     assert pages == [[image, paragraph]]
 
 
-def test_a_section_intro_image_with_no_following_paragraph_renders_standalone():
-    """No paragraph immediately after it (e.g. it's followed by another
-    heading, or it's the last block) - falls back to an ordinary full-width
-    standalone image rather than silently dropping it or crashing."""
+def test_a_section_intro_image_with_no_following_paragraph_stays_small():
+    """No paragraph immediately after it (it is followed by a heading, a list,
+    a callout...) - it is still laid out as the small thumbnail it was
+    generated as, never silently dropped, and never blown up to full width."""
     from app.course.document.layout import SECTION_INTRO_IMAGE_WIDTH
 
     image = _section_intro_image()
     heading = _heading_block("Next section")
     flow_blocks([image, heading])
-    assert image.layout.width == CONTENT_WIDTH
-    assert image.layout.width != SECTION_INTRO_IMAGE_WIDTH
+    assert image.layout.width == SECTION_INTRO_IMAGE_WIDTH
+    assert heading.layout.width == CONTENT_WIDTH
 
 
 def _heading_block(text: str) -> Block:
     return Block(type=BlockType.HEADING, content={"text": text, "level": 2})
+
+
+# --- failed images and section_intro layout -----------------------------------
+
+
+def _image(**content) -> Block:
+    return Block(type=BlockType.IMAGE, content={"kind": "illustration", **content})
+
+
+def test_a_failed_image_reserves_only_a_strip():
+    failed = estimate_height(_image(error="Azure 429", generated=False))
+    pending = estimate_height(_image())
+    done = estimate_height(_image(path="a.png", width=1024, height=1024))
+    assert failed < 80 < pending < done
+
+
+def test_a_failed_image_does_not_leave_a_blank_box_between_blocks():
+    pages = flow_blocks([_paragraph(10), _image(error="x"), _paragraph(10)])
+    blocks = pages[0]
+    assert blocks[2].layout.y - (blocks[1].layout.y + blocks[1].layout.height) < 30
+
+
+def test_a_section_intro_picture_with_no_paragraph_beside_it_stays_small():
+    intro = _image(path="a.png", width=400, height=300, illustration_style="section_intro")
+    callout = Block(type=BlockType.TIP, content={"text": "A tip."})
+    placed = flow_blocks([intro, callout])[0]
+    assert placed[0].layout.width == 210.0
+    assert placed[0].layout.height < 200
+    assert placed[1].layout.width == CONTENT_WIDTH
+
+
+def test_a_section_intro_picture_beside_a_paragraph_is_still_paired():
+    intro = _image(path="a.png", width=400, height=300, illustration_style="section_intro")
+    placed = flow_blocks([intro, _paragraph(40)])[0]
+    assert placed[0].layout.width == 210.0
+    assert placed[0].layout.y == placed[1].layout.y

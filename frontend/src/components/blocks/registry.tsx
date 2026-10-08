@@ -12,6 +12,7 @@ import type { BlockViewProps } from "./types";
 import { CalloutBlock } from "./CalloutBlock";
 import { CaseStudyBlock } from "./CaseStudyBlock";
 import { CodeBlock } from "./CodeBlock";
+import { CodeCellBlock } from "./CodeCellBlock";
 import { DividerBlock } from "./DividerBlock";
 import { ExerciseBlock } from "./ExerciseBlock";
 import { HeadingBlock } from "./HeadingBlock";
@@ -31,6 +32,7 @@ export const BLOCK_REGISTRY: Record<BlockType, ComponentType<BlockViewProps>> = 
   quote: QuoteBlock,
   callout: CalloutBlock,
   code: CodeBlock,
+  code_cell: CodeCellBlock,
   table: TableBlock,
   quiz: QuizBlock,
   exercise: ExerciseBlock,

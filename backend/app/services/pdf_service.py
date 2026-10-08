@@ -12,6 +12,7 @@ from pathlib import Path
 from app.core.config import Settings, get_settings
 from app.core.errors import RenderError
 from app.core.logging import get_logger
+from app.course.document.print import paginate_for_print
 from app.course.templates.registry import is_uploaded_template_id, load_template
 from app.render.html_renderer import render_document_html
 from app.schemas.document import PAGE_HEIGHT, PAGE_WIDTH, CourseDocument
@@ -45,6 +46,10 @@ class PdfService:
 
     def render_html(self, document: CourseDocument) -> str:
         template = load_template(document.template_id)
+        # A sheet has a fixed size, but a stored page can be taller (an editor
+        # run pushed content down; a cell too big for any page). Fit every page
+        # to its sheet first - on a copy, so the stored document is untouched.
+        document = paginate_for_print(document, template)
         log.info(
             "TEMPLATE_SENT_TO_RENDERER template_id=%s source=%s font=%s page=%sx%s",
             template.template_id,

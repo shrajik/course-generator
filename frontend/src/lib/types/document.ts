@@ -7,6 +7,7 @@ export const BLOCK_TYPES = [
   "quote",
   "callout",
   "code",
+  "code_cell",
   "table",
   "quiz",
   "exercise",

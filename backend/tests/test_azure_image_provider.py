@@ -365,3 +365,74 @@ async def test_image_provider_defaults_to_openai_when_unset(monkeypatch):
     monkeypatch.setattr(client, "_image_azure", fail_if_called)
 
     assert await client.image(prompt="p") == b"openai-bytes"
+
+
+# ---------------------------------------------------------------------------
+# rate limiting (429): a longer budget and a longer wait than other failures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    recorded: list[float] = []
+
+    async def _record(seconds, *_a, **_k):
+        recorded.append(seconds)
+
+    monkeypatch.setattr(azure_image_provider.asyncio, "sleep", _record)
+    return recorded
+
+
+async def test_429_waits_the_provider_retry_after(waits):
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "41"}, json={"error": "throttled"})
+        return _b64_response()
+
+    await generate_image(prompt="p", size="1024x1024", settings=_settings(), transport=httpx.MockTransport(handler))
+    assert waits == [41.0]
+
+
+async def test_429_without_retry_after_waits_20_to_30_seconds(waits):
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(429, json={"error": "throttled"}) if calls["count"] < 4 else _b64_response()
+
+    await generate_image(prompt="p", size="1024x1024", settings=_settings(), transport=httpx.MockTransport(handler))
+    assert len(waits) == 3 and all(20 <= wait <= 30 for wait in waits)
+
+
+async def test_429_is_attempted_six_times_regardless_of_max_call_retries(waits):
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(429, json={"error": "throttled"})
+
+    with pytest.raises(AIServiceError, match="429"):
+        await generate_image(
+            prompt="p", size="1024x1024", settings=_settings(max_call_retries=2),
+            transport=httpx.MockTransport(handler),
+        )
+    assert calls["count"] == 6
+
+
+async def test_other_errors_keep_the_short_backoff(waits):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    with pytest.raises(AIServiceError):
+        await generate_image(
+            prompt="p", size="1024x1024", settings=_settings(max_call_retries=3),
+            transport=httpx.MockTransport(handler),
+        )
+    assert len(waits) == 2 and all(wait < 20 for wait in waits)
+
+
+def test_image_concurrency_defaults_to_two():
+    assert Settings().concurrency_for("image") == 2

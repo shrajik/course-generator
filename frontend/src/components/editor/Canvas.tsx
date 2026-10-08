@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBlockRenderer } from "@/components/blocks/registry";
+import { wrapAroundFor } from "@/lib/editor/pairing";
 import { SelectionBox, type HandleId } from "./SelectionBox";
 import { blockBoxStyle } from "@/lib/editor/style";
 import { useEditor } from "@/lib/editor/store";
@@ -135,6 +136,10 @@ export function Canvas() {
     );
   }
 
+  // A page can be taller than the default when a code cell's output pushed
+  // its content down (see fitBlock); the PDF draws it at that height too.
+  const pageHeight = Math.max(activePage.size?.height ?? PAGE_HEIGHT, PAGE_HEIGHT);
+
   return (
     <div
       ref={frameRef}
@@ -143,14 +148,14 @@ export function Canvas() {
     >
       <div
         className="mx-auto"
-        style={{ width: PAGE_WIDTH * scale, height: PAGE_HEIGHT * scale }}
+        style={{ width: PAGE_WIDTH * scale, height: pageHeight * scale }}
       >
         <div
           data-canvas-page={activePage.page_number}
           className="relative rounded-[3px] bg-white shadow-canvas"
           style={{
             width: PAGE_WIDTH,
-            height: PAGE_HEIGHT,
+            height: pageHeight,
             transform: `scale(${scale})`,
             transformOrigin: "top left",
             background: activePage.background ?? "#ffffff",
@@ -192,7 +197,10 @@ export function Canvas() {
                   block={block}
                   documentId={doc.document_id}
                   editable={editing}
+                  interactive
+                  wrapAround={wrapAroundFor(activePage.blocks, block)}
                   onEdit={(path, value) => editor.updateContentPath(block.id, path, value)}
+                  onResize={(height) => editor.fitBlock(block.id, height)}
                 />
                 {selected ? (
                   <SelectionBox

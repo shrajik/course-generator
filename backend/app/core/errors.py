@@ -48,3 +48,14 @@ class AIServiceError(CourseCreatorError):
 class RenderError(CourseCreatorError):
     status_code = 500
     code = "render_error"
+
+
+class CodeExecutionUnavailableError(CourseCreatorError):
+    """The sandboxed executor cannot be reached or declined to run the code.
+
+    Distinct from a failing *program*: a program that crashes still gets a
+    normal result with status "error". This means no verdict was obtained.
+    """
+
+    status_code = 503
+    code = "code_execution_unavailable"

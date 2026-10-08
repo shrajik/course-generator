@@ -54,7 +54,7 @@ export function blockBoxStyle(block: Block): CSSProperties {
     zIndex: layout.z_index || undefined,
   };
 
-  if (type === "code") return css; // chrome lives on the inner panel
+  if (type === "code" || type === "code_cell") return css; // chrome lives on the inner panel
 
   Object.assign(css, typography(style));
 
@@ -97,7 +97,21 @@ export function accentColor(block: Block, fallback = "#C15F3C"): string {
 export const MAX_IMAGE_HEIGHT = 430;
 export const DEFAULT_IMAGE_ASPECT = 0.5625;
 
+/** Mirrors MISSING_IMAGE_BOX_HEIGHT: a failed picture is a one-line strip. */
+export const MISSING_IMAGE_HEIGHT = 36;
+
+/** Mirrors image_generation_failed: no file, and an error recorded. */
+export function imageGenerationFailed(block: Block): boolean {
+  return (
+    block.type === "image" &&
+    block.content.kind !== "toc" &&
+    !block.content.path &&
+    Boolean(block.content.error)
+  );
+}
+
 export function imageBoxHeight(block: Block): number {
+  if (imageGenerationFailed(block)) return MISSING_IMAGE_HEIGHT;
   const padding = block.style.padding ?? 0;
   const width = (block.layout.width || 666) - 2 * padding;
   const intrinsicWidth = Number(block.content.width) || 0;

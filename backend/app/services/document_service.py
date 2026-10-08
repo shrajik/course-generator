@@ -214,15 +214,15 @@ class DocumentService:
         regenerated = await self.images.generate_missing(
             document=document, template=template, only_block_ids=target_ids, force=True
         )
-        if regenerated:
-            reflow_document(document, template)
-            await self._save_document(document)
-
         failed = [
             block.id
             for _, block in document.iter_blocks()
             if block.id in target_ids and block.content.get("error")
         ]
+        if regenerated or failed:
+            reflow_document(document, template)
+            await self._save_document(document)
+
         return RegenerateVisualsResponse(
             document_id=document.document_id,
             version=document.version,

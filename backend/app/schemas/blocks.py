@@ -11,7 +11,7 @@ entry + one renderer branch. Nothing else in the pipeline needs to change.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +24,7 @@ class BlockType(str, Enum):
     QUOTE = "quote"
     CALLOUT = "callout"
     CODE = "code"
+    CODE_CELL = "code_cell"
     TABLE = "table"
     QUIZ = "quiz"
     EXERCISE = "exercise"
@@ -56,7 +57,7 @@ TEXTUAL_BLOCK_TYPES = {
 # (chapter-level pacing, see app.agents.reviewer) and the layout engine
 # (page-level pagination, see app.course.document.layout) so both mean
 # exactly the same thing by "visual".
-VISUAL_BLOCK_TYPES = {BlockType.IMAGE, BlockType.TABLE, BlockType.CODE}
+VISUAL_BLOCK_TYPES = {BlockType.IMAGE, BlockType.TABLE, BlockType.CODE, BlockType.CODE_CELL}
 
 
 class _Content(BaseModel):
@@ -149,6 +150,65 @@ class CodeContent(_Content):
     caption: str = ""
 
 
+class CodeExecution(BaseModel):
+    """The recorded result of running a code cell.
+
+    Mirrors the executor's normalised result (see code-executor/app/models.py)
+    plus `source`, a snapshot of the code that produced it. A cell is only
+    allowed to show its output while `source` still equals its current code -
+    see `execution_is_current` - so output can never be presented as if it
+    belonged to code it did not come from.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    status: Literal["success", "error", "timeout"]
+    language: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    execution_time: float = 0.0
+    phase: Literal["compile", "run"] | None = None
+    exit_code: int | None = None
+    truncated: bool = False
+    # The exact code that was run.
+    source: str = ""
+
+
+class CodeCellContent(_Content):
+    """An executable code cell.
+
+    Distinct from `code`, which stays a static, non-runnable sample. The
+    writer chooses which fits; the user chooses when a cell runs. `execution`
+    is only ever set by the Run action - the AI never writes it, so output is
+    never fabricated.
+    """
+
+    language: str = "python"
+    code: str = ""
+    caption: str = ""
+    execution: CodeExecution | None = None
+
+
+def execution_is_current(content: dict[str, Any]) -> bool:
+    """True when the cell's stored output belongs to its current code.
+
+    Compared against the stored code snapshot rather than a hash: it is exact,
+    needs no shared hashing scheme between the editor and the renderer, and
+    code cells are small enough that keeping the snapshot is cheap.
+    """
+    execution = content.get("execution")
+    if not isinstance(execution, dict):
+        return False
+    # A fragment of a cell split across pages for printing holds only a slice
+    # of the code, so it is compared against the whole cell's code instead
+    # (`cell_code`). Stored cells never carry it - see layout.split_code_cell.
+    code = content.get("cell_code", content.get("code"))
+    return (
+        execution.get("source") == code
+        and (execution.get("language") or content.get("language")) == content.get("language")
+    )
+
+
 class TableRow(BaseModel):
     model_config = ConfigDict(extra="allow")
     cells: list[str] = Field(default_factory=list)
@@ -233,6 +293,7 @@ CONTENT_MODELS: dict[BlockType, type[_Content]] = {
     BlockType.QUOTE: QuoteContent,
     BlockType.CALLOUT: CalloutContent,
     BlockType.CODE: CodeContent,
+    BlockType.CODE_CELL: CodeCellContent,
     BlockType.TABLE: TableContent,
     BlockType.QUIZ: QuizContent,
     BlockType.EXERCISE: ExerciseContent,

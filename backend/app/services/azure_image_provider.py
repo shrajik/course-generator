@@ -38,6 +38,13 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 _ERROR_BODY_PREVIEW_CHARS = 300
 
+# 429s: up to this many attempts, waiting the provider's `Retry-After` when it
+# sends one, otherwise somewhere in this window (jittered so parallel requests
+# do not all come back at the same instant).
+_RATE_LIMIT_ATTEMPTS = 6
+_RATE_LIMIT_WAIT_MIN = 20.0
+_RATE_LIMIT_WAIT_MAX = 30.0
+
 
 def parse_image_size(size: str) -> tuple[int, int]:
     """"1024x1024" -> (1024, 1024). Azure's FLUX.2-flex request body wants
@@ -68,6 +75,12 @@ def _backoff_seconds(attempt: int, *, retry_after: float | None = None) -> float
     if retry_after is not None and retry_after > 0:
         return retry_after
     return min(2**attempt + random.random(), 30)
+
+
+def _rate_limit_wait(retry_after: float | None) -> float:
+    if retry_after is not None and retry_after > 0:
+        return retry_after
+    return random.uniform(_RATE_LIMIT_WAIT_MIN, _RATE_LIMIT_WAIT_MAX)
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -111,8 +124,8 @@ async def generate_image(
     *, prompt: str, size: str, settings: Settings, transport: httpx.BaseTransport | None = None
 ) -> bytes:
     """POSTs to `settings.azure_flux_endpoint` with the FLUX.2-flex request
-    shape (model/width/height/n), retries a throttled or transiently-failed
-    request up to `settings.max_call_retries` times (the same retry BUDGET
+    shape (model/width/height/n), retries a throttled (429) request up to 6 times with a
+    long wait, and a transiently-failed one up to `settings.max_call_retries` times (the same retry BUDGET
     the OpenAI path uses, for consistency - see this module's own docstring
     for why the retry-worthiness check itself isn't shared code), and
     returns the decoded PNG bytes. The API key is read once from `settings`
@@ -138,34 +151,48 @@ async def generate_image(
         "Authorization": f"Bearer {settings.azure_flux_api_key}",
     }
     attempts = max(settings.max_call_retries, 1)
+    # Rate limiting is a quota window, not a glitch: a short retry lands in the
+    # same window and fails again, so it gets its own, longer budget and wait.
+    # Everything else keeps the ordinary (small) budget.
+    failures = 0
+    throttled = 0
     last_status: int | None = None
 
     async with httpx.AsyncClient(timeout=settings.request_timeout, transport=transport) as client:
-        for attempt in range(1, attempts + 1):
+        while True:
             try:
                 response = await client.post(settings.azure_flux_endpoint, headers=headers, json=body)
             except httpx.TimeoutException as exc:
-                if attempt == attempts:
+                failures += 1
+                if failures >= attempts:
                     raise AIServiceError(f"Azure FLUX.2-flex request timed out after {attempts} attempt(s)") from exc
-                await asyncio.sleep(_backoff_seconds(attempt))
+                await asyncio.sleep(_backoff_seconds(failures))
                 continue
             except httpx.HTTPError as exc:
                 # A connection-level failure (DNS, refused, reset, ...) -
                 # the exception's own message is from httpx/the OS, never
                 # anything this function constructed from the request
                 # itself, so it can't echo the Authorization header back.
-                if attempt == attempts:
+                failures += 1
+                if failures >= attempts:
                     raise AIServiceError(f"Azure FLUX.2-flex request failed: {type(exc).__name__}") from exc
-                await asyncio.sleep(_backoff_seconds(attempt))
+                await asyncio.sleep(_backoff_seconds(failures))
                 continue
 
             if response.status_code // 100 == 2:
                 return _decode_image_bytes(response)
 
             last_status = response.status_code
-            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < attempts:
-                await asyncio.sleep(_backoff_seconds(attempt, retry_after=_retry_after_seconds(response)))
-                continue
+            if response.status_code == 429:
+                throttled += 1
+                if throttled < _RATE_LIMIT_ATTEMPTS:
+                    await asyncio.sleep(_rate_limit_wait(_retry_after_seconds(response)))
+                    continue
+            elif response.status_code in _RETRYABLE_STATUS_CODES:
+                failures += 1
+                if failures < attempts:
+                    await asyncio.sleep(_backoff_seconds(failures))
+                    continue
             raise AIServiceError(
                 f"Azure FLUX.2-flex request failed with status {response.status_code}: "
                 f"{_truncate(response.text)}"

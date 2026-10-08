@@ -78,6 +78,24 @@ class Settings(BaseSettings):
     #  whole chapter.
     surgical_revision: bool = True
     max_review_revisions: int = Field(default=1, ge=0, le=3)
+
+    # --- code execution --------------------------------------------------
+    # The sandboxed executor is a separate service on an internal-only network
+    # (see docker-compose.yml). The backend picks the limits for a run; the
+    # browser never does, and network access is not a setting a request can
+    # change.
+    code_executor_url: str = "http://code-executor:9000"
+    code_execution_timeout_seconds: int = Field(default=10, ge=1, le=30)
+    code_execution_memory_mb: int = Field(default=256, ge=32, le=512)
+    code_execution_max_bytes: int = Field(default=100_000, ge=1_000, le=200_000)
+    # Extra time over the run budget for compiling and for the HTTP hop, so a
+    # slow-but-legitimate compile is not mistaken for an unreachable executor.
+    code_executor_http_timeout_seconds: int = Field(default=60, ge=5, le=120)
+    # Languages the writer is allowed to emit as runnable cells. A hint for
+    # generation only - what the editor offers always comes from the live
+    # executor, so this can lag a deployment without ever showing a language
+    # that cannot run.
+    code_cell_languages: list[str] = ["python", "javascript", "cpp", "java"]
     #  Trim the context handed to the writer / reviewer: input size is latency.
     research_context_chars: int = Field(default=6000, ge=1000, le=40000)
     reviewer_context_chars: int = Field(default=20000, ge=2000, le=120000)
@@ -142,7 +160,7 @@ class Settings(BaseSettings):
     max_concurrency: int = Field(default=6, ge=1, le=32)
     research_concurrency: int = Field(default=0, ge=0, le=32)
     writer_concurrency: int = Field(default=0, ge=0, le=32)
-    image_concurrency: int = Field(default=0, ge=0, le=32)
+    image_concurrency: int = Field(default=2, ge=0, le=32)
     request_timeout: float = 900.0
     max_call_retries: int = Field(default=4, ge=1, le=8)
 

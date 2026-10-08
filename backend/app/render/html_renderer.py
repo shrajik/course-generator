@@ -14,6 +14,12 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from app.course.document.layout import image_box_height
 from app.schemas.blocks import BlockType
+from app.course.document.code_cell import (
+    cell_parts,
+    code_lines,
+    language_label,
+    output_view,
+)
 from app.course.templates.docx_parser.placeholders import resolve
 from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
@@ -85,8 +91,12 @@ def _css(block: Block, theme: dict[str, Any]) -> str:
     ]
     if layout.z_index:
         rules.append(f"z-index:{layout.z_index}")
-    if block.type is BlockType.CODE:
-        # Everything visual is applied to the inner code panel instead.
+    if block.type in (BlockType.CODE, BlockType.CODE_CELL):
+        # Everything visual is applied to the inner code panel instead. A code
+        # cell must be in this branch too: without it the template's dark
+        # code style (background, light text, padding) is painted on the WHOLE
+        # block - head, code and output alike - and the output, drawn on its
+        # own light box, inherits near-white text and becomes unreadable.
         return ";".join(rules) + ";"
     if style.font_family:
         rules.append(f"font-family:{style.font_family}")
@@ -154,6 +164,53 @@ def strip_jargon(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: strip_jargon(item) for key, item in value.items()}
     return value
+
+
+def _code_context(block: Block) -> dict[str, Any]:
+    """A static code block is drawn as the cell's code box - without a Run
+    button, status or output."""
+    offset = int(block.content.get("code_line_offset") or 0)
+    return {
+        "label": language_label(str(block.content.get("language") or "")),
+        "continued": bool(block.meta.continued),
+        "rows": [
+            {"n": offset + index + 1, "text": strip_jargon(line)}
+            for index, line in enumerate(code_lines(str(block.content.get("code") or "")))
+        ],
+    }
+
+
+def _cell_context(block: Block) -> dict[str, Any]:
+    """Everything the PDF template needs to draw a code cell.
+
+    Only the recorded result is ever drawn - nothing is executed or invented at
+    render time - and it is drawn only while it still belongs to the cell's
+    code (see code_cell.output_view). Language, status, stdout, stderr and the
+    time are all taken from the normalised result; nothing here knows or cares
+    which language ran or how.
+    """
+    parts = cell_parts(block.content)
+    view = output_view(block.content)
+    return {
+        "label": language_label(str(block.content.get("language") or "")),
+        "continued": parts.continued,
+        "show_code": parts.show_code,
+        "show_output": parts.show_output,
+        "rows": [
+            {"n": parts.first_line_number + index, "text": strip_jargon(line)}
+            for index, line in enumerate(parts.lines)
+        ],
+        "out": {
+            "state": view.state,
+            "label": view.label,
+            "message": view.message,
+            "has_body": view.has_body,
+            "is_empty": view.is_empty,
+            "stdout": strip_jargon(view.stdout),
+            "stderr": strip_jargon(view.stderr),
+            "truncated": view.truncated,
+        },
+    }
 
 
 def _paragraphs(block: Block) -> list[str]:
@@ -272,9 +329,8 @@ def render_document_html(
                     "image_src": _image_src(block, asset_prefix),
                     "inline_html": inline_html,
                     "image_box": round(image_box_height(block), 2),
-                    "panel_css": _code_panel_css(block)
-                    if block.type is BlockType.CODE
-                    else "",
+                    "code": _code_context(block) if block.type is BlockType.CODE else None,
+                    "cell": _cell_context(block) if block.type is BlockType.CODE_CELL else None,
                     "accent": block.style.accent_color or theme.get("accent_color"),
                     "accent_soft": theme.get("surface_color"),
                     "divider_color": block.style.border_color or theme.get("border_color"),

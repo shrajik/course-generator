@@ -107,6 +107,44 @@ def _appended(section: str) -> str:
     return f"\n{section}\n" if section else ""
 
 
+def code_cell_guidance(template: CourseTemplate) -> str:
+    """When to emit a runnable `code_cell` instead of a static `code` block.
+
+    Empty unless the template allows code cells, so prompts for templates that
+    do not (the non-technical one, any uploaded template that restricts block
+    types) are byte-identical to what they were before the feature existed.
+    """
+    from app.core.config import get_settings
+    from app.schemas.blocks import BlockType
+
+    if BlockType.CODE_CELL not in template.allowed_block_types:
+        return ""
+
+    languages = ", ".join(get_settings().code_cell_languages)
+    return f"""EXECUTABLE CODE CELLS:
+- Two block types carry code. `code` is a static sample the learner reads: use
+  it for fragments, signatures, snippets that need surrounding context, and
+  anything that cannot run on its own. `code_cell` is a runnable cell the
+  learner executes in the editor with a Run button.
+- Use a `code_cell` only when seeing the program's output teaches something. It
+  must be a short, complete, self-contained program that runs as written with
+  no input, no files, no network and no installed packages (standard library
+  only), finishes within a couple of seconds, and prints its result to
+  standard output.
+- NEVER write the output yourself and never describe it as a block of its own
+  inside the cell: leave it out entirely. The learner's own run produces it,
+  and an output you invent could be wrong.
+- Set `language` to the language this COURSE teaches - never convert an example
+  to Python to make it runnable. Runnable languages: {languages}. For any other
+  language use a static `code` block instead.
+- C++ needs a complete `int main()`. Java needs one public class containing
+  `public static void main`, ideally named `Main`. Print with the language's
+  normal output call so there is something to show.
+- Follow every `code_cell` with an explanation of what it does and what the
+  learner should observe when they run it.
+"""
+
+
 def _course_context(course_input: CourseInput, template: CourseTemplate) -> str:
     toc_lines = []
     for index, item in enumerate(course_input.toc, start=1):
@@ -551,7 +589,7 @@ ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE WRITING GUIDANCE: {template.writer_guidance}
 IMAGE STYLE GUIDANCE: {template.image_guidance}
-{_appended(pedagogy_rules_brief(course_input.learner_profile))}"""
+{_appended(code_cell_guidance(template))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}"""
 
 
 def writer_user(

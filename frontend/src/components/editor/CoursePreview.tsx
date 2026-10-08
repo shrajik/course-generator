@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Loader2 } from "lucide-react";
 import { BlockRenderer } from "@/components/blocks/BlockRenderer";
+import { wrapAroundFor } from "@/lib/editor/pairing";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
 import { getDocument } from "@/lib/api/documents";
@@ -78,6 +79,7 @@ export function CoursePreview({ documentId }: { documentId: string }) {
                   block={block}
                   documentId={doc.document_id}
                   editable={false}
+                  wrapAround={wrapAroundFor(page.blocks, block)}
                 />
               ))}
             </div>

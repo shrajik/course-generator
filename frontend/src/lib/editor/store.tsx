@@ -29,6 +29,7 @@ import type {
 } from "@/lib/types/document";
 import { applyPatch, type PatchResult } from "./patch";
 import { createBlock, locateBlock, setByPath } from "./blocks";
+import { FIT_TOLERANCE, resizeBlock, sheetHeight } from "./fit";
 
 const HISTORY_LIMIT = 60;
 
@@ -215,6 +216,10 @@ export interface EditorApi extends EditorState {
   updateContent: (blockId: string, patch: Record<string, unknown>) => void;
   updateStyle: (blockId: string, patch: BlockStyle) => void;
   updateLayout: (blockId: string, patch: Partial<BlockLayout>, transient?: boolean) => void;
+  /** Make a block exactly `height` tall, moving the blocks below it by the
+   * difference (and the page taller if it no longer fits). Both directions:
+   * a cell that lost its output gives the room back. */
+  fitBlock: (blockId: string, height: number) => void;
   deleteBlock: (blockId: string) => void;
   insertBlock: (type: BlockType, afterBlockId?: string | null) => void;
   addPage: () => void;
@@ -287,6 +292,28 @@ export function useEditor(): EditorApi {
       );
     },
     [mutate],
+  );
+
+  const fitBlock = useCallback(
+    (blockId: string, height: number) => {
+      if (!document) return;
+      const found = locateBlock(document, blockId);
+      if (!found) return;
+      const current = document.pages[found.pageIndex].blocks[found.blockIndex];
+      // Ignore sub-pixel noise so a measurement that merely jitters never
+      // produces an edit.
+      if (Math.abs(Math.round(height - current.layout.height)) < FIT_TOLERANCE) return;
+
+      // Transient: this is a consequence of the edit that caused it (a run
+      // finishing, a line being added), not an edit of its own, so it must not
+      // add an undo step.
+      mutate(
+        (draft) =>
+          resizeBlock(draft.pages[found.pageIndex], found.blockIndex, height, sheetHeight(draft)),
+        { transient: true },
+      );
+    },
+    [document, mutate],
   );
 
   const deleteBlock = useCallback(
@@ -391,6 +418,7 @@ export function useEditor(): EditorApi {
     updateContent,
     updateStyle,
     updateLayout,
+    fitBlock,
     deleteBlock,
     insertBlock,
     addPage,

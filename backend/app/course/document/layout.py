@@ -15,6 +15,18 @@ import math
 import re
 from typing import Any
 
+from app.course.document.code_cell import (
+    CAPTION_GAP as CELL_CAPTION_GAP,
+    HEAD_H as CELL_HEAD_H,
+    MIN_CODE_LINES_PER_FRAGMENT,
+    ROW_H as CELL_ROW_H,
+    cell_body_height,
+    code_box_height,
+    code_lines,
+    output_box_height,
+    output_view,
+    static_code_height,
+)
 from app.schemas.blocks import VISUAL_BLOCK_TYPES, BlockType
 from app.schemas.template import PageGeometry
 from app.schemas.document import (
@@ -61,6 +73,7 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _DEFAULT_FONT_SIZE: dict[BlockType, float] = {
     BlockType.HEADING: 26.0,
     BlockType.CODE: 12.5,
+    BlockType.CODE_CELL: 12.5,
     BlockType.TABLE: 13.5,
     BlockType.QUOTE: 16.0,
 }
@@ -175,6 +188,23 @@ def caption_height(block: Block) -> float:
 _UNCAPPED_IMAGE_KINDS = {"concept_experience", "toc"}
 
 
+# A picture whose generation failed shows a one-line "Visual unavailable"
+# strip, not an empty frame the size of the picture it should have been.
+MISSING_IMAGE_BOX_HEIGHT = 36.0
+
+
+def image_generation_failed(block: Block) -> bool:
+    """An image with no file because generating it failed. (An image that has
+    simply not been generated yet has no `error`, and keeps its full slot.)"""
+    content = block.content
+    return (
+        block.type is BlockType.IMAGE
+        and content.get("kind") != "toc"
+        and not content.get("path")
+        and bool(content.get("error"))
+    )
+
+
 def image_box_height(block: Block) -> float:
     """Height reserved for the picture itself (excluding caption and padding).
 
@@ -189,6 +219,8 @@ def image_box_height(block: Block) -> float:
     ratio at all; they manage their own one-page ceiling internally, so any
     cap here would only double (and wrongly shrink) what they already do.
     """
+    if image_generation_failed(block):
+        return MISSING_IMAGE_BOX_HEIGHT
     pad = _padding(block)
     width = float(block.layout.width or CONTENT_WIDTH) - 2 * pad
     intrinsic_w = block.content.get("width")
@@ -214,6 +246,10 @@ def image_box_height(block: Block) -> float:
 SECTION_INTRO_IMAGE_WIDTH = 210.0
 SECTION_INTRO_IMAGE_ASPECT = 0.75  # 4:3
 SECTION_INTRO_FLOAT_GAP = 16.0  # matches the PDF template's own float margin-right
+
+
+def _is_section_intro(block: Block) -> bool:
+    return block.type is BlockType.IMAGE and (block.content.get("illustration_style") or "") == "section_intro"
 
 
 def _section_intro_pair_height(image: Block, paragraph: Block, image_h: float) -> float:
@@ -253,6 +289,24 @@ def _section_intro_pair_height(image: Block, paragraph: Block, image_h: float) -
     return max(image_h, text_h)
 
 
+def _code_cell_height(block: Block, th: Any) -> float:
+    """Height of a code cell: head row + code box + output box (+ caption).
+
+    The geometry comes from code_cell.py, which also owns the CSS numbers the
+    PDF and the editor draw with - so what is reserved here is what is
+    painted there. The output box is always accounted for in the state it
+    will actually be drawn in: real output, or a one-line "not executed" /
+    "stale" strip. (Reserving it only when output existed is what let the
+    editor's own banners grow past their slot.)
+    """
+    content = block.content
+    height = cell_body_height(content, float(block.layout.width or CONTENT_WIDTH))
+    caption = content.get("caption")
+    if caption and not content.get("cell_continued"):
+        height += th(caption, size=12.5) + CELL_CAPTION_GAP
+    return height
+
+
 def estimate_height(block: Block) -> float:
     """Height in CSS px for one block at the document content width."""
     content = block.content
@@ -283,7 +337,9 @@ def estimate_height(block: Block) -> float:
         return th(content.get("text"))
 
     if t is BlockType.IMAGE:
-        return image_box_height(block) + caption_height(block) + 2 * pad + 8
+        # A section_intro picture is small and drawn without a caption.
+        caption = 0.0 if _is_section_intro(block) else caption_height(block)
+        return image_box_height(block) + caption + 2 * pad + 8
 
     if t is BlockType.QUOTE:
         return th(content.get("text")) + (th(content.get("attribution"), size=13) or 0) + 2 * pad
@@ -293,9 +349,14 @@ def estimate_height(block: Block) -> float:
         return title + th(content.get("text")) + 2 * pad
 
     if t is BlockType.CODE:
+        # Same box as a code cell (head row + numbered rows), so the height is
+        # exactly the rendered line count - no fixed size, no padding guesses.
         caption = content.get("caption")
-        body = th(content.get("code"), mono=True)
-        return body + (th(caption, size=12.5) + 6 if caption else 0) + 2 * pad + 8
+        height = static_code_height(content, float(block.layout.width or CONTENT_WIDTH))
+        return height + (th(caption, size=12.5) + CELL_CAPTION_GAP if caption else 0)
+
+    if t is BlockType.CODE_CELL:
+        return _code_cell_height(block, th)
 
     if t is BlockType.TABLE:
         rows = content.get("rows") or []
@@ -460,7 +521,11 @@ def _split_lines(
     for cut in range(len(lines) - 1, 0, -1):
         head = _clone(block, {**block.content, key: "\n".join(lines[:cut])}, continued=False)
         if _fits(head, available):
+            head.meta = head.meta.model_copy(update={"continued": block.meta.continued})
             tail_content = {**block.content, key: "\n".join(lines[cut:]), "caption": ""}
+            if block.type is BlockType.CODE:
+                # Keep the line numbers continuous across the page break.
+                tail_content["code_line_offset"] = int(block.content.get("code_line_offset") or 0) + cut
             return head, _clone(block, tail_content, continued=True)
     return None
 
@@ -477,6 +542,79 @@ def _split_list(block: Block, key: str, available: float) -> tuple[Block, Block]
                 tail_content["next_steps"] = block.content.get("next_steps") or []
                 head.content["next_steps"] = []
             return head, _clone(block, tail_content, continued=True)
+    return None
+
+
+def split_code_cell(
+    block: Block, available: float, capacity: float
+) -> tuple[Block, Block] | None:
+    """Split a code cell that is too tall for ANY page, for printing only.
+
+    A cell is one logical block, so the rule is the opposite of paragraphs and
+    plain code: it is never split just because it does not fit the space left
+    on this page. Returning None sends the whole cell to the top of a fresh
+    page, which is almost always what is wanted. Only a cell taller than a full
+    page (`capacity`) - which no amount of moving can fix - is split.
+
+    Two safe cuts, in order of preference:
+
+    * if all the code fits here but the output does not: code on this page,
+      output alone on the next. The output is atomic and capped
+      (MAX_OUTPUT_LINES), so it always fits a page on its own.
+    * otherwise cut the code between two lines. The last fragment carries the
+      output, and a fragment never leaves a one- or two-line stub behind.
+
+    Fragments exist only in the copy made for printing (see
+    app.course.document.print); a stored document always holds whole cells.
+    """
+    if estimate_height(block) <= capacity:
+        return None
+
+    content = block.content
+    width = float(block.layout.width or CONTENT_WIDTH)
+    lines = code_lines(str(content.get("code") or ""))
+    offset = int(content.get("cell_line_offset") or 0)
+    shows_output = not content.get("cell_hide_output")
+    # Staleness is judged against the whole cell's code, not a fragment's.
+    whole = content.get("cell_code", content.get("code"))
+    base = {**content, "cell_code": whole}
+
+    def fragment(start: int, stop: int, *, output: bool, continued: bool) -> Block:
+        piece = {
+            **base,
+            "code": "\n".join(lines[start:stop]),
+            "cell_line_offset": offset + start,
+            "cell_hide_output": not output,
+            "cell_continued": continued or bool(content.get("cell_continued")),
+        }
+        if continued or content.get("cell_continued"):
+            piece["caption"] = ""
+        return _clone(block, piece, continued=continued)
+
+    # Cut 1: the whole code fits here, only the output does not.
+    if shows_output:
+        code_only = fragment(0, len(lines), output=False, continued=False)
+        if estimate_height(code_only) <= available:
+            tail_content = {
+                **base,
+                "code": "",
+                "cell_hide_code": True,
+                "cell_hide_output": False,
+                "cell_continued": True,
+                "caption": "",
+            }
+            return code_only, _clone(block, tail_content, continued=True)
+
+    # Cut 2: between two lines of code.
+    floor = MIN_CODE_LINES_PER_FRAGMENT
+    if len(lines) < 2 * floor:
+        return None
+    for cut in range(len(lines) - 1, floor - 1, -1):
+        if len(lines) - cut < 2 and not shows_output:
+            continue  # would strand a single line on its own page
+        head = fragment(0, cut, output=False, continued=False)
+        if estimate_height(head) <= available:
+            return head, fragment(cut, len(lines), output=shows_output, continued=True)
     return None
 
 
@@ -503,7 +641,10 @@ def _pending_visual_run(current_block: Block, queue: list[Block]) -> list[Block]
 
 
 def flow_blocks(
-    blocks: list[Block], *, geometry: PageGeometry | None = None
+    blocks: list[Block],
+    *,
+    geometry: PageGeometry | None = None,
+    split_oversized_cells: bool = False,
 ) -> list[list[Block]]:
     """Position blocks and group them into pages. Mutates layout coordinates.
 
@@ -511,6 +652,11 @@ def flow_blocks(
     its own (see app.course.templates.docx_parser.style). Omitting it uses the
     built-in box, so every existing caller and both built-in templates
     paginate exactly as they always have.
+
+    `split_oversized_cells` is for printing only. A stored document keeps every
+    code cell whole (an editor edits one cell, not fragments of it); when the
+    PDF is made, a cell taller than a page is split so nothing is drawn past
+    the sheet - see split_code_cell and app.course.document.print.
     """
     box = geometry or PageGeometry()
     margin_top = box.margin_top
@@ -581,7 +727,11 @@ def flow_blocks(
             # on the next iteration.
 
         block.layout.x = margin_x
-        block.layout.width = content_width
+        # A section_intro picture with no paragraph to sit beside (its section
+        # opens with a list, a callout, a quiz...) keeps its small size. It
+        # used to fall through to full width, which blew a 4:3 thumbnail up to
+        # a page-wide 665x465 picture.
+        block.layout.width = SECTION_INTRO_IMAGE_WIDTH if _is_section_intro(block) else content_width
         height = estimate_height(block)
 
         gap = 0.0
@@ -634,7 +784,14 @@ def flow_blocks(
 
         # Doesn't fit: try to split it across the page boundary.
         available = bottom - (y + gap)
-        pieces = split_block(block, available)
+        if block.type is BlockType.CODE_CELL:
+            pieces = (
+                split_code_cell(block, available, box.content_height)
+                if split_oversized_cells
+                else None
+            )
+        else:
+            pieces = split_block(block, available)
         if pieces is not None:
             head, tail = pieces
             head.layout.x = margin_x

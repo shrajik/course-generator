@@ -2,6 +2,7 @@
 
 import { Plus } from "lucide-react";
 import { BlockRenderer } from "@/components/blocks/BlockRenderer";
+import { wrapAroundFor } from "@/lib/editor/pairing";
 import { useEditor } from "@/lib/editor/store";
 import { PAGE_HEIGHT, PAGE_WIDTH, type CourseDocument, type Page } from "@/lib/types/document";
 import { cn } from "@/lib/utils/cn";
@@ -31,6 +32,7 @@ function Thumbnail({ page, document }: { page: Page; document: CourseDocument })
             block={block}
             documentId={document.document_id}
             editable={false}
+            wrapAround={wrapAroundFor(page.blocks, block)}
           />
         ))}
       </div>

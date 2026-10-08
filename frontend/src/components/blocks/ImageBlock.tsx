@@ -3,6 +3,7 @@
 import { ImageOff } from "lucide-react";
 import { Caption, readText } from "./parts";
 import { assetUrl } from "@/lib/api/documents";
+import { isSectionIntroImage } from "@/lib/editor/pairing";
 import { imageBoxHeight } from "@/lib/editor/style";
 import { isHtmlPath, isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
 import type { BlockViewProps } from "./types";
@@ -74,23 +75,29 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
         </div>
       ) : (
         <div
-          className="flex flex-col items-center justify-center gap-2 rounded-[8px] border border-dashed border-line bg-canvas px-4 text-center"
-          style={{ minHeight: Math.max(boxHeight, 160) }}
+          className="flex items-center justify-center gap-2 overflow-hidden rounded-[8px] border border-dashed border-line bg-canvas px-3 text-center"
+          // Exactly the reserved height. A failed picture reserves only a
+          // one-line strip (see imageGenerationFailed); one not generated yet
+          // keeps its full slot until it is.
+          style={{ height: boxHeight }}
+          title={error ? `Image failed: ${error}` : undefined}
         >
-          <ImageOff size={18} className="text-ink-300" aria-hidden />
-          <p className="text-[12.5px] text-ink-500">
-            {error ? `Image failed: ${error}` : "Image not generated yet"}
-          </p>
-          <p className="max-w-[420px] text-[11.5px] text-ink-400">
-            {readText(block.content, "purpose") || readText(block.content, "prompt")}
+          <ImageOff size={16} className="shrink-0 text-ink-300" aria-hidden />
+          <p className="truncate text-[12.5px] text-ink-500">
+            {error ? "Visual unavailable" : "Image not generated yet"}
           </p>
         </div>
       )}
-      <Caption
-        text={readText(block.content, "caption")}
-        editable={editable}
-        onCommit={(value) => onEdit("caption", value)}
-      />
+      {/* A section-intro illustration floats beside its paragraph in the PDF,
+          which draws no caption for it; drawing one here would also overflow
+          the slot reserved for it. */}
+      {isSectionIntroImage(block) ? null : (
+        <Caption
+          text={readText(block.content, "caption")}
+          editable={editable}
+          onCommit={(value) => onEdit("caption", value)}
+        />
+      )}
     </div>
   );
 }

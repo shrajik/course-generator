@@ -6,6 +6,7 @@ from typing import Any
 
 from app.core.ids import block_id as new_block_id
 from app.core.logging import get_logger
+from app.course.document.code_cell import canonical_language
 from app.schemas.blocks import BlockType, validate_content
 from app.schemas.document import Block, BlockLayout, BlockMeta, BlockStyle
 from app.schemas.draft import DraftBlock
@@ -57,6 +58,16 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
     if t is BlockType.CODE:
         return {
             "language": draft.language or "text",
+            "code": _first(draft.code, draft.text),
+            "caption": _first(draft.caption, draft.title),
+        }
+
+    if t is BlockType.CODE_CELL:
+        # No `execution`, ever: a freshly written cell has not been run, and
+        # output only comes from the Run action. The writer cannot fabricate
+        # results because there is no field for it to put them in.
+        return {
+            "language": canonical_language(draft.language) or "python",
             "code": _first(draft.code, draft.text),
             "caption": _first(draft.caption, draft.title),
         }
