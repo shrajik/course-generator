@@ -220,6 +220,9 @@ export interface EditorApi extends EditorState {
    * difference (and the page taller if it no longer fits). Both directions:
    * a cell that lost its output gives the room back. */
   fitBlock: (blockId: string, height: number) => void;
+  /** Fit several blocks of one page to their measured heights in one step
+   * (top to bottom, so each move builds on the last). */
+  fitBlocks: (pageIndex: number, heights: Record<string, number>) => void;
   deleteBlock: (blockId: string) => void;
   insertBlock: (type: BlockType, afterBlockId?: string | null) => void;
   addPage: () => void;
@@ -310,6 +313,29 @@ export function useEditor(): EditorApi {
       mutate(
         (draft) =>
           resizeBlock(draft.pages[found.pageIndex], found.blockIndex, height, sheetHeight(draft)),
+        { transient: true },
+      );
+    },
+    [document, mutate],
+  );
+
+  const fitBlocks = useCallback(
+    (pageIndex: number, heights: Record<string, number>) => {
+      if (!document) return;
+      mutate(
+        (draft) => {
+          const page = draft.pages[pageIndex];
+          if (!page) return false;
+          const order = page.blocks
+            .map((block, index) => ({ id: block.id, index, y: block.layout.y }))
+            .filter((entry) => entry.id in heights)
+            .sort((a, b) => a.y - b.y);
+          let changed = false;
+          for (const entry of order) {
+            changed = resizeBlock(page, entry.index, heights[entry.id], sheetHeight(draft)) || changed;
+          }
+          return changed;
+        },
         { transient: true },
       );
     },
@@ -419,6 +445,7 @@ export function useEditor(): EditorApi {
     updateStyle,
     updateLayout,
     fitBlock,
+    fitBlocks,
     deleteBlock,
     insertBlock,
     addPage,

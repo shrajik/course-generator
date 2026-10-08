@@ -640,6 +640,24 @@ def _pending_visual_run(current_block: Block, queue: list[Block]) -> list[Block]
     return None
 
 
+def _make_ids_unique(pages: list[list[Block]]) -> None:
+    """Give every block on every page its own id.
+
+    Splitting names a tail `{id}_c1`. Re-flowing a document whose blocks were
+    already split splits a fragment again and mints an id an existing fragment
+    already has, so two blocks shared one id. The editor keys its blocks by id:
+    with duplicates React left a ghost copy of a code fragment drawn over the
+    following pages. The first holder keeps its id; later ones are chained with
+    another `_c1` - the form the layout validator already recognises.
+    """
+    seen: set[str] = set()
+    for page in pages:
+        for block in page:
+            while block.id in seen:
+                block.id = f"{block.id}_c1"
+            seen.add(block.id)
+
+
 def flow_blocks(
     blocks: list[Block],
     *,
@@ -818,6 +836,7 @@ def flow_blocks(
 
     if current:
         pages.append(current)
+    _make_ids_unique(pages)
     return pages
 
 

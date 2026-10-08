@@ -95,6 +95,10 @@ export function accentColor(block: Block, fallback = "#C15F3C"): string {
 
 /** Reserved height for the picture itself, matching the backend estimator. */
 export const MAX_IMAGE_HEIGHT = 430;
+/** Mirrors MAX_DIAGRAM_IMAGE_HEIGHT: a page's content height less 100px. */
+export const MAX_DIAGRAM_IMAGE_HEIGHT = 863;
+/** Kinds that manage their own height (see backend _UNCAPPED_IMAGE_KINDS). */
+const UNCAPPED_IMAGE_KINDS = new Set(["concept_experience", "toc"]);
 export const DEFAULT_IMAGE_ASPECT = 0.5625;
 
 /** Mirrors MISSING_IMAGE_BOX_HEIGHT: a failed picture is a one-line strip. */
@@ -120,5 +124,12 @@ export function imageBoxHeight(block: Block): number {
     intrinsicWidth > 0 && intrinsicHeight > 0
       ? intrinsicHeight / intrinsicWidth
       : DEFAULT_IMAGE_ASPECT;
-  return Math.min(width * aspect, MAX_IMAGE_HEIGHT);
+  const height = width * aspect;
+  const kind = String(block.content.kind ?? "");
+  if (UNCAPPED_IMAGE_KINDS.has(kind)) return height;
+  // A diagram is structured content at a readable size, not a decorative
+  // thumbnail: capping it like one drew it tiny inside a box the layout had
+  // reserved far taller, leaving hundreds of pixels of blank page.
+  if (kind === "diagram") return Math.min(height, MAX_DIAGRAM_IMAGE_HEIGHT);
+  return Math.min(height, MAX_IMAGE_HEIGHT);
 }

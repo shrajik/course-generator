@@ -12,6 +12,32 @@ import { cn } from "@/lib/utils/cn";
 const MIN_WIDTH = 80;
 const MIN_HEIGHT = 24;
 
+/** Blocks that size themselves (code, cells) are left to their own components. */
+const SELF_SIZED = new Set(["code", "code_cell", "divider"]);
+const FLEXIBLE_KINDS = new Set(["concept_experience", "toc"]);
+/** Reserved room beyond this much over the content is dead space worth taking back. */
+const SLACK = 6;
+
+/**
+ * The height a block's content really needs: the bottom of its lowest in-flow
+ * child, plus its own padding and border. Measured from the DOM, so it is what
+ * is actually drawn - text as wrapped, images as boxed - not an estimate.
+ */
+function naturalHeight(box: HTMLElement): number {
+  const style = getComputedStyle(box);
+  let bottom = 0;
+  for (const child of Array.from(box.children) as HTMLElement[]) {
+    const position = getComputedStyle(child).position;
+    if (position === "absolute" || position === "fixed") continue; // selection handles
+    bottom = Math.max(bottom, child.offsetTop + child.offsetHeight);
+  }
+  const edges =
+    (parseFloat(style.paddingBottom) || 0) +
+    (parseFloat(style.borderTopWidth) || 0) +
+    (parseFloat(style.borderBottomWidth) || 0);
+  return Math.ceil(bottom + edges);
+}
+
 interface DragSession {
   mode: "move" | "resize";
   handle?: HandleId;
@@ -123,6 +149,62 @@ export function Canvas() {
     },
     [editor, scale],
   );
+
+  // The layout stored with a course reserves room from an estimate of how tall
+  // each block will be, and the estimate errs high; every block then sits that
+  // far apart from the next. Once per page, measure what is really drawn and
+  // close the difference up (the same move the code cell makes with its own
+  // height). A page is only fitted once per session so that sizes a person sets
+  // by hand afterwards are not undone.
+  const fitted = useRef(new Set<string>());
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
+  // A picture that is replaced or regenerated arrives with a new size (or none,
+  // if it failed), so the page is fitted again when any picture on it changes.
+  // Only pictures count: re-fitting on every text edit would undo heights a
+  // person has set by hand.
+  const fitKey =
+    doc && activePage
+      ? `${doc.document_id}:${activePage.id}:` +
+        activePage.blocks
+          .map((block) =>
+            block.type === "image"
+              ? [block.id, block.content.path, block.content.width, block.content.height, block.content.error].join("|")
+              : block.id,
+          )
+          .join(",")
+      : null;
+  const pageIndex = editor.activePageIndex;
+
+  useEffect(() => {
+    if (!fitKey || fitted.current.has(fitKey)) return;
+    let cancelled = false;
+    const run = () => {
+      const page = frameRef.current?.querySelector<HTMLElement>("[data-canvas-page]");
+      const current = editorRef.current.activePage;
+      if (cancelled || !page || !current || fitted.current.has(fitKey)) return;
+      const heights: Record<string, number> = {};
+      for (const block of current.blocks) {
+        if (SELF_SIZED.has(block.type)) continue;
+        // These size themselves from markup that loads after the first paint.
+        if (block.type === "image" && FLEXIBLE_KINDS.has(String(block.content.kind ?? ""))) continue;
+        const box = page.querySelector<HTMLElement>(`[data-block-id="${block.id}"]`);
+        if (!box) continue;
+        const natural = naturalHeight(box);
+        const reserved = block.layout.height;
+        if (reserved - natural > SLACK || natural - reserved > 2) heights[block.id] = natural;
+      }
+      fitted.current.add(fitKey);
+      if (Object.keys(heights).length > 0) editorRef.current.fitBlocks(pageIndex, heights);
+    };
+    // After fonts load, so text is measured at its final wrapping.
+    const ready = (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts?.ready;
+    const frame = requestAnimationFrame(() => (ready ? void ready.then(run) : run()));
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+    };
+  }, [fitKey, pageIndex]);
 
   const endSession = useCallback(() => {
     session.current = null;
