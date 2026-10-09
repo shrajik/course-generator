@@ -74,20 +74,20 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   `level: 1`. Every edge must carry a short, precise relationship `label`
   naming what happens between the two nodes - a direction, a force, a cause,
   a flow (e.g. "moving toward", "induces", "opposes", "flows into").
-- The brief describes something with a real, recognisable physical shape and
-  arrangement - not just abstract relationships between ideas - where seeing
-  that arrangement is what actually teaches the concept -> schematic. This
-  applies just as much to a chemistry reaction (two reactants combining into
-  a product), a biology structure (a cell and its organelles, an organ), an
-  astronomy scene (a planet and its orbit) or a mechanical device as it does
-  to an electrical apparatus - use whichever domain the brief is actually
-  about, never default to an electrical/physics scene just because that's a
-  common example. Often pairs with a "before/after", "at rest/in motion" or
-  "reactant/product" comparison. Use the small illustrated-shape vocabulary
-  below instead of nodes/edges - this is the right choice whenever the brief
-  describes a drawing with real parts and positions, not just a relationship
-  between labelled ideas; never substitute concept_map for a brief that
-  clearly wants an illustration, regardless of subject.
+- `schematic` is PERMANENTLY RETIRED - never produce it, regardless of what
+  the brief describes. A real, recognisable physical shape/arrangement (a
+  chemistry reaction, a biology structure, an astronomy scene, a mechanical
+  device or an electrical apparatus) is never diagrammed here at all - that
+  whole category belongs to `image_kind: illustration` with
+  `illustration_style: "textbook"` instead (a different pipeline, decided by
+  the writer before this call), a real depiction rather than a labelled-box
+  drawing. If a brief like this still reaches you, the caller already
+  rejects a `schematic` answer unconditionally and falls back to that
+  illustration path anyway - so treat this prompt's remaining kinds
+  (concept_map, hierarchy, comparison, flow_chart/process/cycle,
+  data_flow_diagram, er_diagram, swimlane, smart_art) as the complete list;
+  none of them is "physical shape and arrangement," and that's fine - this
+  call was reached in error for that brief.
 - The brief describes a strict parent/child breakdown (an org chart, a
   taxonomy, a category tree) -> hierarchy. Set every node's `level` (0 =
   root, 1 = its children, ...) and add one edge per parent -> child link.
@@ -169,121 +169,6 @@ data_flow_diagram/er_diagram/swimlane:
 - Base every label and detail only on the brief below. Do not invent facts,
   numbers or names that were not given to you. No markdown, no quotes.
 
-Rules for `schematic` - fill `shapes` (or `states` for a before/after
-comparison) instead of `nodes`/`edges`. This is a small, generic drawing kit,
-not physics-specific - it is exactly as appropriate for a chemistry reaction,
-a biology structure or a mechanical device as it is for an electrical one:
-- Each shape has a `type`:
-  * "block" - a labelled rectangle: a magnet, a battery, a beaker/flask, a
-    reactant/product, a machine part - any rectangular object. Set both
-    `label` and `sublabel` for a two-part object (a magnet's N/S poles, a
-    battery's +/- terminals, a reactant turning into a product).
-  * "circle" - a labelled round object: a cell, an atom, a seed, a planet,
-    a droplet - any round object. Set `sublabel` to draw a smaller labelled
-    circle inside it (a cell's nucleus, an atom's core, an embryo).
-  * "coil" - a wound coil, spring, or coiled tube (an induction coil, an
-    intestine, a spring).
-  * "gauge" - a dial/meter reading (`rotation` degrees = needle angle, 0 =
-    resting/vertical; `sublabel` = its caption, e.g. "Ammeter", "pH meter").
-  * "arrow" - a straight motion/direction/reaction-progress arrow
-    (`rotation` degrees = the direction it points, 0 = east, 90 = south,
-    180 = west, 270 = north, only used if `target_id` is unset).
-  * "label" - a standalone text annotation for anything the other shapes
-    don't cover.
-  Pick whichever combination fits the actual subject - e.g. two "block"
-  reactants connected by an "arrow" for a chemical reaction; a "circle" cell
-  with a "circle" nucleus inside plus "label" shapes for other organelles for
-  a biology diagram; "block"/"coil"/"gauge" for an electrical or mechanical
-  apparatus. There is deliberately no shape for field lines, current flow,
-  airflow or any other multi-line "fan" of movement radiating from a point -
-  that geometry has no single correct position for its own label once
-  anything else sits nearby, so it reads as accurate for exactly one layout
-  and overlapping/garbled for every other. A field/flux/current-direction/
-  wave visualization belongs to `image_kind: illustration` with
-  `illustration_style: textbook` instead (an actual picture, not a labelled
-  shape) - describe the exact field/flow pattern in `image_prompt`.
-- Do NOT set `x`/`y`/`width`/`height` yourself - a layout engine positions
-  every shape automatically from the semantic fields below, the same way you
-  never compute pixel coordinates for any other diagram kind. Describe the
-  diagram's *structure*, not its geometry:
-  * `role`: exactly one shape per state is `"primary"` - the single focal
-    object the whole diagram is about (the rotor, the cell, the main
-    reactant). Every other shape is `"secondary"`.
-  * `anchor`: where a shape sits *relative to another shape*, using its
-    `id`. One of `"orbit:<id>"` (arranged around that shape - the default
-    for anything without a stronger spatial reason), `"above:<id>"`,
-    `"below:<id>"`, `"left_of:<id>"`, `"right_of:<id>"` (a clear directional
-    relationship - current flowing left-to-right, a label sitting above what
-    it names), or `"inside:<id>"` (nested content - a nucleus inside a cell,
-    a core inside an atom; use `sublabel` on the parent shape instead
-    whenever that's simpler). Leave `anchor` blank to mean "orbit the
-    primary shape" - the default for most secondary objects.
-  * `priority`: `"critical"` (must always be visible - the primary object
-    always counts as critical), `"important"` (show if the diagram has
-    room), or `"optional"` (the first thing to drop if there are too many
-    annotations). Be honest about this - not every labelled detail is
-    equally important to the learning objective.
-  * `size`: `"small"`, `"medium"` (default), or `"large"` - relative to
-    other shapes, not a measurement. The primary object is usually
-    `"large"` or `"medium"`; a minor annotation is usually `"small"`.
-  * `target_id`: for an "arrow" shape, the `id` of the shape it points
-    at - this both draws the connection and tells the layout engine these
-    two shapes are related, so keep using it exactly as before.
-- One learning objective per diagram. Set `learning_objective` to the single
-  sentence a student should take away. If the brief genuinely contains
-  several independent things to learn with no shared primary object, cover
-  only the most important one here well (the writer can request a second,
-  separate diagram for the rest) rather than cramming every idea into one
-  overloaded panel.
-- Set `max_annotations` (default 5) to how many secondary shapes this
-  diagram can clearly show at once - lower it (e.g. 3-4) for a simple
-  concept, raise it only when the subject genuinely has that many
-  co-equally important parts. Shapes beyond the budget are dropped by
-  priority automatically, so mark the ones that must survive as `critical`.
-- Produce 2 to 8 shapes per state (or in `shapes` for a single static
-  illustration). Every shape needs a `label` naming exactly what it is - no
-  unlabelled decoration.
-- Use `states` (2 or more) only when the brief genuinely describes a
-  before/after, at-rest/in-motion or cause/effect comparison - each state is
-  one snapshot with its own `caption` (e.g. "No current" / "Current flows")
-  and its own `shapes` (repeat the shapes that don't change, move/adjust the
-  ones that do - keep the same `id`s and `role`/`anchor` across states so
-  the layout stays consistent). Leave `states` empty and use the top-level
-  `shapes` for a single static illustration.
-- If the subject is a well-known textbook visual (an electric motor,
-  electromagnetic induction, a fixed pulley, the human heart, an animal or
-  plant cell, a nephron, a convex/concave lens ray diagram, a transformer, a
-  simple electric circuit, or similar), set `visual_type` to its canonical
-  snake_case name (e.g. "electric_motor", "animal_cell"). This lets a
-  canonical blueprint fill in any component you omit and validates your
-  structure against it - prefer matching the real textbook structure for
-  that visual over inventing your own arrangement. Leave `visual_type` blank
-  for anything else; the diagram still renders normally.
-- Use the *minimum* set of components a textbook diagram of this subject
-  actually needs to teach the learning objective - do not add extra shapes
-  just to fill space or make the diagram look busier. Never invent a
-  decorative component (a random gear, an unrelated label, a made-up part)
-  that isn't a real part of the thing being depicted.
-- Set `color_role` on a shape to one of the semantic color roles ("primary",
-  "secondary", "accent", "structure", "current", "magnetic_field",
-  "positive", "negative", "fluid", "highlight", "annotation", "neutral") to
-  give it deliberate, consistent educational color instead of the plain
-  default - e.g. current-carrying parts get "current", a magnet/field gets
-  "magnetic_field", the single focal/primary object usually gets "primary"
-  or "accent". Leave it blank when no particular color meaning applies. This
-  is always a semantic role name, never a hex code. Reuse the same role for
-  every shape that shares the same meaning so the color language stays
-  consistent across the diagram - don't scatter many different roles just to
-  look colorful.
-- Optionally set `relationships` (each with `source`, `type`, `target` shape
-  ids) to state real structural facts using exactly one of: inside,
-  contains, connected_to, attached_to, above, below, left_of, right_of,
-  passes_through, surrounds, contacts, points_to, flows_into, rotates_around,
-  between. This documents *what is true* for validation - it does not affect
-  layout (that's still `anchor`'s job), so a relationship and its matching
-  anchor are independent and both may be set.
-- Base every label, relationship and state only on the brief below. Do not
-  invent facts, numbers or components that were not implied by it.
 """
 
 _KIND_PIN_INSTRUCTION = """
@@ -336,7 +221,13 @@ def _kind_conflicts(hint: str, actual: str) -> bool:
     if hint in SEQUENTIAL_KINDS:
         return actual not in SEQUENTIAL_KINDS
     if hint in RELATIONSHIP_KINDS:
-        return actual in SEQUENTIAL_KINDS
+        # smart_art's own renderer deliberately never draws edges ("numbered
+        # list, no connecting arrows" - see diagram_renderer.py) - it can
+        # never satisfy a relationship brief by construction, exactly like a
+        # sequential answer can't, confirmed via a real generated course
+        # sample where a "concept_map" hint came back as "smart_art" and
+        # this check let it through silently.
+        return actual in SEQUENTIAL_KINDS or actual == "smart_art"
     if hint in ("comparison", "smart_art"):
         return actual in SEQUENTIAL_KINDS or (hint == "comparison" and actual != "comparison")
     return False

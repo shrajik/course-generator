@@ -14,8 +14,10 @@ from app.course.document.layout_validator import (
     content_integrity_report,
     original_id,
     overlapping_pairs,
+    page_content_density,
     page_overflow,
     validate_document,
+    validate_page,
 )
 from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
@@ -353,3 +355,36 @@ def test_an_unrelated_genuine_overlap_is_still_flagged():
     a.layout.height = 60.0
     b.layout.y = 100.0  # genuinely overlaps a, no section_intro involved
     assert overlapping_pairs([a, b]) == [(a.id, b.id)]
+
+
+# ---------------------------------------------------------------------------
+# page content density: a visual stranded with no accompanying content
+# ---------------------------------------------------------------------------
+
+
+def test_page_content_density_flags_a_stranded_visual():
+    """A heading + small section_intro icon alone on a page clears
+    MIN_PAGE_CONTENT_HEIGHT's bare-fragment floor but still leaves most of
+    the page empty - a real, confirmed bug chain (see
+    app.course.document.layout._is_visual_pair's own docstring)."""
+    heading = _heading("Visual Explanation")
+    icon = _section_intro_image()
+    pages = flow_blocks([heading, icon])
+    assert len(pages) == 1
+    page = Page(id="page_1", page_number=1, kind="content", blocks=pages[0])
+
+    assert page_content_density(page) < 0.35
+    findings = validate_page(page)
+    assert any("available page height" in f for f in findings)
+
+
+def test_page_content_density_does_not_flag_a_normal_short_text_only_page():
+    """Regression guard: a plain short page of pure text (e.g. a document's
+    own trailing paragraph, naturally shorter than a full page since the
+    content just ran out) is completely normal and must never be flagged -
+    a confirmed false positive while adding this check, caught against a
+    real multi-page reflow scenario."""
+    pages = flow_blocks([_paragraph(40)])
+    page = Page(id="page_1", page_number=1, kind="content", blocks=pages[0])
+    findings = validate_page(page)
+    assert not any("available page height" in f for f in findings)

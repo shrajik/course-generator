@@ -294,7 +294,7 @@ def test_flow_chart_never_draws_more_arrows_than_real_edges_exist():
     spec = _delegation_workflow_spec()
     svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
     text = svg_bytes.decode("utf-8")
-    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow\)"', text))
+    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow[^)]*\)"', text))
     assert arrow_count <= len(spec.edges)
     assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
 
@@ -383,7 +383,7 @@ def test_flow_chart_every_real_edge_gets_exactly_one_arrow():
     spec = _real_delegation_spec()
     svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
     text = svg_bytes.decode("utf-8")
-    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow\)"', text))
+    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow[^)]*\)"', text))
     assert arrow_count == len(spec.edges)
     assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
 
@@ -421,7 +421,7 @@ def test_flow_chart_select_assignee_connects_to_define_scope():
     scope_top_x, scope_top_y = dx + dw / 2, dy
 
     lines = re.findall(
-        r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*marker-end="url\(#diagram-arrow\)"', text
+        r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*marker-end="url\(#diagram-arrow[^)]*\)"', text
     )
     matching = [
         (x1, y1, x2, y2)
@@ -1158,6 +1158,119 @@ def test_edge_label_wraps_long_text_instead_of_overflowing_its_pill():
     assert long_height > short_height
 
 
+def test_edge_label_pill_width_uses_the_same_calibrated_ratio_as_node_boxes():
+    """The old ad hoc 6.5px/char estimate rendered pills meaningfully
+    narrower than this module's own already-calibrated ratio (the same one
+    `_wrap` and every node box use, confirmed against real browser
+    rendering - see `_wrap`'s own docstring) - a real, confirmed case:
+    "Charge <-> Queue item" overflowed its pill and was visually clipped by
+    a node box painted on top of it afterward."""
+    from app.render.diagram_renderer import (
+        EDGE_LABEL_FONT_SIZE,
+        EDGE_LABEL_MAX_WIDTH,
+        _SANS_RATIO,
+        _edge_label,
+        _wrap,
+    )
+
+    label = "Charge <-> Queue item"
+    svg = _edge_label(100.0, 100.0, label, TemplateTheme())
+    width = float(re.search(r'width="([\d.]+)"', svg).group(1))
+
+    # Mirror _edge_label's own wrapping step - the width formula operates on
+    # the longest WRAPPED line, not the raw unwrapped label.
+    lines = _wrap(label, font_size=EDGE_LABEL_FONT_SIZE, width=EDGE_LABEL_MAX_WIDTH - 16.0, max_lines=2)
+    longest = max(len(line) for line in lines)
+
+    old_ad_hoc_width = min(max(longest * 6.5 + 14, 40.0), EDGE_LABEL_MAX_WIDTH)
+    calibrated_width = min(max(longest * EDGE_LABEL_FONT_SIZE * _SANS_RATIO + 14, 40.0), EDGE_LABEL_MAX_WIDTH)
+
+    assert abs(width - calibrated_width) < 0.2
+    assert width > old_ad_hoc_width
+
+
+def test_concept_map_edge_labels_always_paint_after_every_node_box():
+    """Paint-order regression: a label painted before a node box can be
+    visually clipped by that box if its (necessarily estimated) width ever
+    runs long - a real, confirmed case: a label's leading character
+    vanished under a node box painted on top of it. Labels must always be
+    the LAST elements in the SVG, regardless of geometry."""
+    nodes = [
+        DiagramNode(id="focal", label="Hub", level=0),
+        DiagramNode(id="a", label="A", level=1),
+        DiagramNode(id="b", label="B", level=1),
+        DiagramNode(id="c", label="C", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="focal", target="a", label="connects to"),
+        DiagramEdge(source="b", target="c", label="relates to"),
+    ]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+
+    last_box_index = text.rindex('class="diagram-box"')
+    first_label_index = text.index('class="diagram-edge-label"')
+    assert first_label_index > last_box_index
+
+
+def test_concept_map_focal_node_is_chosen_by_real_connectivity_not_declared_level():
+    """Reproduces the reported bug exactly: the declared level==0 node had
+    only 1 real edge while a DIFFERENT node was actually the best-connected
+    one - the old level-only rule always picked the former, forcing every
+    other edge to bow messily around a ring centred on a near-isolated
+    node. The best-connected node must become focal instead."""
+    from app.render.diagram_renderer import _focal_node
+
+    weak_level0 = DiagramNode(id="hub", label="Software <-> EM analogy", level=0)
+    well_connected = DiagramNode(id="queue", label="Queue item", level=1)
+    charge = DiagramNode(id="charge", label="Charge", level=1)
+    limits = DiagramNode(id="limits", label="Analogy limits", level=1)
+    nodes = [weak_level0, well_connected, charge, limits]
+    edges = [
+        DiagramEdge(source="hub", target="limits", label="Limits"),
+        DiagramEdge(source="charge", target="queue", label="Charge <-> Queue item"),
+        DiagramEdge(source="queue", target="limits", label="also related"),
+    ]
+    # hub: degree 1 (limits). queue: degree 2 (charge, limits) - the real centre.
+    assert _focal_node(nodes, edges).id == "queue"
+
+
+def test_concept_map_focal_node_keeps_a_genuine_hub_focal():
+    """Regression guard: a well-formed single-hub spec (the common,
+    already-correct case) must render exactly as before - the level==0 node
+    IS the best-connected one here, so it stays focal."""
+    from app.render.diagram_renderer import _focal_node
+
+    hub = DiagramNode(id="hub", label="Hub", level=0)
+    a = DiagramNode(id="a", label="A", level=1)
+    b = DiagramNode(id="b", label="B", level=1)
+    nodes = [hub, a, b]
+    edges = [
+        DiagramEdge(source="hub", target="a", label="x"),
+        DiagramEdge(source="hub", target="b", label="y"),
+    ]
+    assert _focal_node(nodes, edges).id == "hub"
+
+
+def test_concept_map_focal_node_tie_breaks_toward_declared_level_zero():
+    """A genuine 3-way degree tie must still resolve to the declared
+    level==0 node, even when a tied node is listed first - only a STRICTLY
+    better-connected node should ever override the level-based default."""
+    from app.render.diagram_renderer import _focal_node
+
+    hub = DiagramNode(id="hub", label="Hub", level=0)
+    tied = DiagramNode(id="tied", label="Tied", level=1)
+    other = DiagramNode(id="other", label="Other", level=1)
+    nodes = [tied, hub, other]  # the tied, non-hub node listed first
+    edges = [
+        DiagramEdge(source="hub", target="tied", label="a"),
+        DiagramEdge(source="hub", target="other", label="b"),
+        DiagramEdge(source="tied", target="other", label="c"),
+    ]
+    assert _focal_node(nodes, edges).id == "hub"
+
+
 def test_concept_map_without_relationships_is_not_usable():
     """A handful of boxes with no labelled relationship between them is not a
     concept map - it's an unlabelled list, and should be rejected so the
@@ -1195,6 +1308,22 @@ def test_kind_conflicts_flags_sequential_vs_relationship_mismatch():
     assert _kind_conflicts("concept_map", "hierarchy") is False
     assert _kind_conflicts("concept_map", "concept_map") is False
     assert _kind_conflicts("", "flow_chart") is False  # no hint, no opinion
+
+
+def test_kind_conflicts_flags_smart_art_answering_a_relationship_hint():
+    """A real, confirmed gap: smart_art's own renderer deliberately never
+    draws edges ("numbered list, no connecting arrows") - it can never
+    satisfy a relationship brief by construction, exactly like answering
+    with a sequential kind can't (already caught above), but this specific
+    case previously slipped through un-flagged."""
+    from app.services.diagram_service import _kind_conflicts
+
+    assert _kind_conflicts("concept_map", "smart_art") is True
+    assert _kind_conflicts("hierarchy", "smart_art") is True
+    assert _kind_conflicts("er_diagram", "smart_art") is True
+    # Still no opinion when smart_art itself was requested, or no hint given.
+    assert _kind_conflicts("smart_art", "smart_art") is False
+    assert _kind_conflicts("", "smart_art") is False
 
 
 async def test_diagram_service_retries_once_when_hint_is_ignored(service):
@@ -1379,41 +1508,44 @@ def _em_induction_states() -> list[SchematicState]:
     ]
 
 
-def test_schematic_spec_needs_at_least_two_recognised_shapes():
+def test_schematic_is_permanently_unusable_regardless_of_content():
+    """`schematic` is permanently retired (see DiagramSpec.is_usable's own
+    docstring) - never usable, no matter how well-formed the spec is. This
+    makes the EXISTING "unusable spec -> fall back to a raster illustration"
+    path in DiagramService.generate_for_block catch every schematic request
+    unconditionally, regardless of what any future prompt or model happens
+    to produce."""
     assert not DiagramSpec(kind="schematic", shapes=[]).is_usable()
     assert not DiagramSpec(
         kind="schematic", shapes=[SchematicShape(type="block", label="Only one")]
     ).is_usable()
-    assert DiagramSpec(
+    # A genuinely well-formed, 2-shape spec - the kind of input that used to
+    # pass this check - must still be rejected now.
+    assert not DiagramSpec(
         kind="schematic",
         shapes=[SchematicShape(type="block", label="A"), SchematicShape(type="coil", label="B")],
     ).is_usable()
+    # Multi-state ("before/after") specs are rejected the same way.
+    assert not DiagramSpec(kind="schematic", states=_em_induction_states()).is_usable()
 
 
-def test_schematic_spec_requires_shapes_in_every_state():
-    usable_states = _em_induction_states()
-    assert DiagramSpec(kind="schematic", states=usable_states).is_usable()
-
-    empty_second_state = [usable_states[0], SchematicState(caption="Empty", shapes=[])]
-    assert not DiagramSpec(kind="schematic", states=empty_second_state).is_usable()
-
-    assert not DiagramSpec(kind="schematic", states=[usable_states[0]]).is_usable()  # only one state
-
-
-def test_render_schematic_svg_reproduces_the_em_induction_reference_layout():
-    """The exact scenario from the reported bug: a magnet moving toward a
-    coil, an ammeter, and a before/after state change - the kind of
-    labelled physical illustration a concept_map cannot draw."""
+def test_render_schematic_svg_renders_only_the_first_state_never_a_multi_panel_comparison():
+    """Multi-state ("before/after") rendering is permanently retired (see
+    _layout_schematic's own docstring) - two stacked panels repeating the
+    same shapes, with real anchor-layout overlap bugs on top, read as a
+    genuinely unwanted visual format, not something to keep rendering. A
+    spec with 2+ states (legacy data, or a model that set it anyway despite
+    no prompt encouragement) must render ONLY the first state as a normal
+    single-panel illustration - the second state's own content must never
+    appear."""
     spec = DiagramSpec(kind="schematic", title="Electromagnetic Induction", states=_em_induction_states())
     svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
 
     ET.fromstring(svg_bytes)  # valid XML
     text = svg_bytes.decode("utf-8")
     assert "No current" in text
-    assert "Current flows through the circuit" in text
-    assert text.count("<ellipse") >= 8  # coil loops drawn in both panels
+    assert "Current flows through the circuit" not in text
     assert "diagram-node" in text  # every shape is still hoverable/interactive
-    assert text.count("<title>") >= 6
     assert width > 0 and height > 0
 
 
@@ -1505,11 +1637,13 @@ def test_chemistry_reaction_schematic_renders_without_overlap():
     assert width > 0 and height > 0
 
 
-async def test_electromagnetic_induction_gets_a_schematic_not_a_concept_map(service):
-    """The exact reference scenario, end to end through DiagramService: a
-    physical-apparatus brief hinted as `schematic` must render as an
-    illustrated before/after diagram, not fall back to a flowchart or a
-    generic labelled-box concept map."""
+async def test_electromagnetic_induction_schematic_hint_is_permanently_rejected(service):
+    """`schematic` is permanently retired (see DiagramSpec.is_usable's own
+    docstring) - a physical-apparatus brief hinted as `schematic` (the exact
+    reference scenario that used to render as an illustrated before/after
+    diagram) must now be rejected unconditionally, so the caller falls back
+    to a raster illustration instead. Confirmed end to end through
+    DiagramService, not just the is_usable() unit check."""
     template = load_template("technical")
     block = _diagram_block(
         diagram_kind="schematic",
@@ -1527,27 +1661,18 @@ async def test_electromagnetic_induction_gets_a_schematic_not_a_concept_map(serv
         course_id="course_em_schematic", block=block, template=template, course_title="Electromagnetic Induction"
     )
 
-    assert ok is True
-    assert block.content["kind"] == "diagram"
-    assert block.content["diagram_kind"] == "schematic"
-    assert block.content["path"].endswith(".svg")
-    # Prove it actually rendered as an illustrated schematic (a "before/after"
-    # panel pair), not a labelled-box graph - the offline mock always returns
-    # a two-state schematic for a "schematic" hint (see mock_ai._diagram_spec),
-    # regardless of the specific EM-induction content in the brief above,
-    # which is exactly the genericity this fix requires.
-    svg_text = service.storage.asset_abs_path("course_em_schematic", block.content["path"]).read_text(
-        encoding="utf-8"
-    )
-    assert "<rect" in svg_text  # panel frame(s) present
-    assert svg_text.count("<title>") >= 4  # each illustrated shape stays hoverable
+    assert ok is False
+    assert not block.content.get("path")
 
 
-async def test_schematic_and_flow_chart_coexist_for_electromagnetic_induction(
+async def test_a_retired_schematic_hint_falls_back_to_illustration_while_flow_chart_still_renders(
     service, technical_input, monkeypatch
 ):
     """Full pipeline: a chapter with both a problem-solving flowchart and a
-    physical schematic ends up with both, correctly distinguished."""
+    (now-retired) physical-schematic request ends up with the flowchart
+    rendered normally and the schematic request silently falling back to a
+    raster illustration instead - never crashing the chapter, never
+    producing a schematic SVG."""
     original = WriterAgent.write_chapter
 
     async def with_em_visuals(self, **kwargs):
@@ -1572,13 +1697,19 @@ async def test_schematic_and_flow_chart_coexist_for_electromagnetic_induction(
     await service.generate(record.course_id, GenerateRequest(mode="sync"))
 
     document = service.storage.load_document(record.course_id)
-    diagrams = [b for b in document.blocks_of_type(BlockType.IMAGE) if b.content.get("kind") == "diagram"]
-    by_hint = {b.content.get("diagram_kind"): b for b in diagrams}
+    images = [b for b in document.blocks_of_type(BlockType.IMAGE) if b.content.get("diagram_kind") in ("flow_chart", "schematic")]
+    by_hint = {b.content.get("diagram_kind"): b for b in images}
 
     assert "flow_chart" in by_hint and "schematic" in by_hint
-    for block in (by_hint["flow_chart"], by_hint["schematic"]):
-        assert block.content["path"].endswith(".svg")
-        assert service.storage.asset_abs_path(record.course_id, block.content["path"]).exists()
+    flow_chart_block = by_hint["flow_chart"]
+    assert flow_chart_block.content["path"].endswith(".svg")
+    assert service.storage.asset_abs_path(record.course_id, flow_chart_block.content["path"]).exists()
+
+    schematic_block = by_hint["schematic"]
+    # Still gets SOME real image (never left ungenerated) - just never an SVG,
+    # since schematic itself is never rendered any more.
+    assert schematic_block.content.get("path")
+    assert not schematic_block.content["path"].endswith(".svg")
 
 
 # ---------------------------------------------------------------------------
@@ -1771,20 +1902,17 @@ class TestSchematicQA:
         assert "generate the diagram again" not in feedback.lower()
 
 
-async def test_schematic_qa_failure_triggers_exactly_one_targeted_retry(service, monkeypatch):
-    """QA failing on the first attempt must cause exactly one retry, and the
-    retry's prompt must carry the actual failure reason - never a bare
-    "generate again"."""
+async def test_schematic_request_is_rejected_before_any_qa_retry_is_attempted(service, monkeypatch):
+    """`schematic` is permanently retired (see DiagramSpec.is_usable's own
+    docstring) - `is_usable()` rejects it before `generate_for_block` ever
+    reaches the schematic-specific QA/retry step
+    (`_resolve_and_check_schematic`, now unreachable for this kind), so a
+    schematic request must fail on the FIRST attempt with no retry at all -
+    never spend a second generation call on a permanently-retired kind,
+    however well-formed the first attempt's spec was."""
     template = load_template("technical")
     block = _diagram_block(diagram_kind="schematic", prompt="Two interacting components")
 
-    bad_spec = DiagramSpec(
-        kind="schematic",
-        shapes=[
-            SchematicShape(type="block", id="a", label="A", x=0.5, y=0.5, width=0.4, height=0.4, role="primary"),
-            SchematicShape(type="block", id="b", label="B", x=0.55, y=0.5, width=0.4, height=0.4),
-        ],
-    )
     good_spec = DiagramSpec(
         kind="schematic",
         shapes=[
@@ -1796,7 +1924,7 @@ async def test_schematic_qa_failure_triggers_exactly_one_targeted_retry(service,
 
     async def fake_request_spec(self, **kwargs):
         received_feedback.append(kwargs.get("qa_feedback", ""))
-        return (bad_spec if len(received_feedback) == 1 else good_spec).model_copy(deep=True)
+        return good_spec.model_copy(deep=True)
 
     monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
 
@@ -1804,18 +1932,8 @@ async def test_schematic_qa_failure_triggers_exactly_one_targeted_retry(service,
         course_id="course_schematic_qa_retry", block=block, template=template, course_title="Two Parts"
     )
 
-    assert ok is True
-    assert len(received_feedback) == 2, "expected exactly one retry"
-    assert received_feedback[0] == ""
-    assert received_feedback[1] and "generate the diagram again" not in received_feedback[1].lower()
-    assert "overlap" in received_feedback[1].lower()
-
-    svg_text = service.storage.asset_abs_path(
-        "course_schematic_qa_retry", block.content["path"]
-    ).read_text(encoding="utf-8")
-    result = evaluate_schematic(good_spec.model_copy(update={"shapes": resolve_schematic_layout(good_spec).shapes}))
-    assert result.passed
-    assert "<rect" in svg_text
+    assert ok is False
+    assert len(received_feedback) == 1, "schematic must never trigger a retry - rejected on the first attempt"
 
 
 # ---------------------------------------------------------------------------
@@ -2168,7 +2286,7 @@ class TestNestedColorAndConnectors:
         resolved = resolve_schematic_layout(DiagramSpec(kind="schematic", shapes=shapes))
         svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
         text = svg_bytes.decode("utf-8")
-        lines = re.findall(r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*url\(#diagram-arrow\)', text)
+        lines = re.findall(r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*url\(#diagram-arrow[^)]*\)', text)
         assert lines, "expected an arrow line with the arrowhead marker"
         x1, y1, x2, y2 = (float(v) for v in lines[0])
         # Its end point must actually land at/on the edge of a real drawn
@@ -2228,8 +2346,12 @@ class TestNestedColorAndConnectors:
         svg_bytes, _, _ = render_diagram_svg(resolved, TemplateTheme())
         text = svg_bytes.decode("utf-8")
         # The marker *definition* may still be present (harmless, unused SVG
-        # defs) - what must be absent is anything actually *using* it.
-        assert "url(#schematic-relationship-arrow)" not in text
+        # defs) - what must be absent is anything actually *using* it. Marker
+        # ids get a per-render-call unique suffix (see render_diagram_svg -
+        # SVG ids must be unique within a document once multiple diagrams are
+        # inlined on one page), so this checks the "url(#...-arrow" prefix,
+        # not an exact closed `url(#...)` string.
+        assert not re.search(r'url\(#schematic-relationship-arrow[^)]*\)', text)
         assert "stroke-dasharray" not in text
 
     def test_relationship_referencing_a_merged_sublabel_shape_is_skipped_safely(self):
@@ -2331,7 +2453,11 @@ class TestLearningObjectiveAndAnnotationBudget:
 # ---------------------------------------------------------------------------
 
 
-async def test_full_blueprint_pipeline_renders_a_colorful_valid_electric_motor(service):
+async def test_schematic_blueprint_requests_are_rejected_not_rendered(service):
+    """`schematic` is permanently retired - even a blueprint-registered
+    canonical visual_type (e.g. "electric_motor", which used to fill in
+    missing components and render a colorful valid diagram) must still be
+    rejected unconditionally, with no blueprint pipeline work attempted."""
     template = load_template("technical")
     block = _diagram_block(
         diagram_kind="schematic",
@@ -2344,23 +2470,16 @@ async def test_full_blueprint_pipeline_renders_a_colorful_valid_electric_motor(s
         course_id="course_motor_pipeline", block=block, template=template, course_title="Motors"
     )
 
-    assert ok is True
-    assert block.content["diagram_kind"] == "schematic"
-    svg_text = service.storage.asset_abs_path("course_motor_pipeline", block.content["path"]).read_text(
-        encoding="utf-8"
-    )
-    ET.fromstring(svg_text)
-    assert "Coil" in svg_text
-    # the blueprint's semantic color roles actually reached the rendered SVG
-    assert TEXTBOOK_PALETTE["accent"].stroke in svg_text or TEXTBOOK_PALETTE["magnetic_field"].stroke in svg_text
+    assert ok is False
+    assert not block.content.get("path")
 
 
-async def test_invalid_first_attempt_produces_targeted_combined_feedback_and_a_successful_retry(
-    service, monkeypatch
-):
-    """An LLM's first attempt that's missing a required blueprint component
-    must produce specific retry feedback naming the missing component, and
-    the corrected second attempt must be the one that actually renders."""
+async def test_schematic_blueprint_retry_pipeline_is_unreachable(service, monkeypatch):
+    """The blueprint-validation retry loop (missing-component feedback,
+    corrected second attempt) is now permanently unreachable for
+    `schematic` - `is_usable()` rejects the very first attempt before any
+    blueprint check or retry is even considered, regardless of what that
+    first attempt was missing."""
     template = load_template("technical")
     block = _diagram_block(
         diagram_kind="schematic",
@@ -2373,29 +2492,16 @@ async def test_invalid_first_attempt_produces_targeted_combined_feedback_and_a_s
         kind="schematic",
         visual_type="fixed_pulley",
         title="Fixed Pulley",
-        # 2 shapes (satisfies is_usable()'s minimum) but still missing the
-        # blueprint's required "load" component - this is what should
-        # trigger a targeted blueprint-validation retry, not the generic
-        # too-few-shapes fallback.
         shapes=[
             SchematicShape(type="circle", id="pulley", label="Pulley", role="primary"),
             SchematicShape(type="arrow", id="applied_force", label="Applied Force", anchor="right_of:pulley"),
-        ],
-    )
-    complete_spec = DiagramSpec(
-        kind="schematic",
-        visual_type="fixed_pulley",
-        title="Fixed Pulley",
-        shapes=[
-            SchematicShape(type="circle", id="pulley", label="Pulley", role="primary"),
-            SchematicShape(type="block", id="load", label="Load", anchor="below:pulley", priority="critical"),
         ],
     )
     received_feedback: list[str] = []
 
     async def fake_request_spec(self, **kwargs):
         received_feedback.append(kwargs.get("qa_feedback", ""))
-        return (incomplete_spec if len(received_feedback) == 1 else complete_spec).model_copy(deep=True)
+        return incomplete_spec.model_copy(deep=True)
 
     monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
 
@@ -2403,15 +2509,8 @@ async def test_invalid_first_attempt_produces_targeted_combined_feedback_and_a_s
         course_id="course_pulley_retry", block=block, template=template, course_title="Simple Machines"
     )
 
-    assert ok is True
-    assert len(received_feedback) == 2, "expected exactly one retry"
-    assert received_feedback[0] == ""
-    assert received_feedback[1] and "load" in received_feedback[1].lower()
-
-    svg_text = service.storage.asset_abs_path("course_pulley_retry", block.content["path"]).read_text(
-        encoding="utf-8"
-    )
-    assert "Load" in svg_text
+    assert ok is False
+    assert len(received_feedback) == 1, "no retry should ever be attempted for a retired kind"
 
 
 # ---------------------------------------------------------------------------

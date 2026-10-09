@@ -126,7 +126,13 @@ _META_PROPERTY_KEYS = {"style", "styling", "css", "format", "formatting"}
 # content-free "BULLET1:" label.
 _PLACEHOLDER_PROPERTY_KEY_RE = re.compile(r"^(bullet|point|item|line|prop(?:erty)?|note|fact)\s*\d*$", re.IGNORECASE)
 
-
+# A sentence/formula-shaped property value is caught and retried at the
+# source - app.services.concept_qa's structural QA (same length caps) - not
+# truncated here: this renderer has an existing, deliberate guarantee that a
+# long UNBROKEN token (a function signature, an identifier with no spaces)
+# still renders in full and wraps via CSS (`overflow-wrap:anywhere` on
+# `.cev-root *`) rather than being cut short, which a blanket length-based
+# truncation here would silently break.
 def _render_prop(key: str, value: str) -> str:
     if _PLACEHOLDER_PROPERTY_KEY_RE.match(key.strip()):
         return f'<span class="cev-prop">{_esc(value)}</span>' if value.strip() else ""
@@ -172,6 +178,31 @@ def _entity_card_html(entity: VisualEntity, *, extra_class: str = "", index: int
 # both renderers treat this vocabulary consistently.
 _SPATIAL_ONLY_RELATIONSHIP_TYPES = {"above", "below", "left_of", "right_of", "between"}
 
+# A structural relationship type that states the obvious once two entities are
+# already drawn connected by a real line - "connected to", repeated on every
+# spoke of a hub, tells a reader nothing they couldn't already see (a real,
+# confirmed case: six distinct facts about ONE concept, each drawn as its own
+# satellite entity "connected_to" the concept, every single connector
+# captioned the identical word "connected to" - pure visual noise, not a
+# relationship worth naming). Reused by `_tree_links_html` below for the same
+# reason. A model that actually has something specific to say (a SQL join's
+# own type, "manages", "feeds into") still gets to say it - only the bare,
+# generic placeholder words are hidden.
+_GENERIC_STRUCTURAL_EDGE_TYPES = {"inside", "contains", "connected_to", "attached_to", "surrounds", "passes_through"}
+_REDUNDANT_CONNECTOR_LABEL_TYPES = _SPATIAL_ONLY_RELATIONSHIP_TYPES | _GENERIC_STRUCTURAL_EDGE_TYPES
+
+
+def _connector_label(rel_type: str) -> str:
+    """The visible text for a relationship connector/spoke - blank for the
+    spatial-anchoring and generic-structural vocabulary that states the
+    obvious once two entities are already drawn connected (see
+    _REDUNDANT_CONNECTOR_LABEL_TYPES). Shared by `_connector_html` (the
+    flat-row connector) and `_render_concept_map_html` (the circular
+    hub/ring layout) so both ever apply exactly the same suppression
+    rule."""
+    normalized = rel_type.strip().lower()
+    return "" if normalized in _REDUNDANT_CONNECTOR_LABEL_TYPES else rel_type.replace("_", " ").strip()
+
 
 def _connector_html(rel_type: str) -> str:
     """A real visual connector - an animated flowing line with an arrowhead
@@ -182,8 +213,7 @@ def _connector_html(rel_type: str) -> str:
     cards it sits between, which is what a `relationship`/`hierarchy`
     concept (a SQL join, a microservice calling another) needs to read as
     connected rather than two unrelated cards."""
-    normalized = rel_type.strip().lower()
-    label = "" if normalized in _SPATIAL_ONLY_RELATIONSHIP_TYPES else rel_type.replace("_", " ").strip()
+    label = _connector_label(rel_type)
     label_html = f'<span class="cev-connector-label">{_esc(label)}</span>' if label else ""
     return f'<div class="cev-connector"><span class="cev-connector-line"></span>{label_html}<span class="cev-connector-arrow">&rarr;</span></div>'
 
@@ -279,23 +309,621 @@ def _is_linear_chain(entities: list[VisualEntity], relationships) -> list[str] |
 
 
 def _chain_row_html(entities_in_order: list[VisualEntity]) -> str:
-    """A genuine chain, rendered as one flowing left-to-right series - a
-    plain arrow between each consecutive card, never the per-relationship
-    "connected to" connector `_entities_row_html` draws (that phrasing and
-    the animated dashed line both make sense for an independent spoke off a
+    """A genuine chain, rendered as one flowing series - a plain arrow
+    between each consecutive card, never the per-relationship "connected
+    to" connector `_entities_row_html` draws (that phrasing and the
+    animated dashed line both make sense for an independent spoke off a
     hub; repeated down an actual straight sequence, it reads as five
-    separate little relationships rather than one continuous flow). Reuses
-    `_entity_card_html` itself unchanged (still gets its icon/props/
-    actions) - only the connector between cards and the class the caller
-    wraps this in (`cev-style-flow`, see `_render_object`) differ, so a
-    chain gets the same flatter, whiteboard-flowchart treatment
-    `_render_process` already uses for an explicit step sequence."""
+    separate little relationships rather than one continuous flow).
+
+    Wrap-aware: a short chain fits one row and just needs an arrow between
+    cards, but a longer one (5+ entities - a real, confirmed case: a
+    7-layer OSI-style hierarchy rendered this way) wraps onto several rows,
+    and a plain flex-wrap row has no way to show that row 2 continues from
+    row 1 - it reads as a disconnected grid of cards, not one flow. Reuses
+    the exact two-column-grid-plus-curved-connector technique
+    `_zigzag_steps_html` already proved out for `_render_process`'s own
+    step sequence (`_ZIG_LINK_HTML` between a row's pair, `_zig_curve_svg`
+    carrying the line from one row's end into the next row's start) -
+    the caller wraps this in `.cev-zig-grid`, not `.cev-steps` (see
+    `_render_object`/`_render_tree`/`_render_concept_flow_html`)."""
     parts: list[str] = []
-    for index, entity in enumerate(entities_in_order):
-        if index > 0:
-            parts.append('<div class="cev-step-arrow">&rarr;</div>')
-        parts.append(_entity_card_html(entity, extra_class="cev-instance cev-step", index=index))
+    n = len(entities_in_order)
+    last_stroke = "#94a3b8"
+    index = 0
+    while index < n:
+        pair = entities_in_order[index : index + 2]
+        if len(pair) == 2:
+            parts.append(_entity_card_html(pair[0], extra_class="cev-instance cev-step", index=index))
+            parts.append(_ZIG_LINK_HTML)
+            parts.append(_entity_card_html(pair[1], extra_class="cev-instance cev-step", index=index + 1))
+            last_stroke = _resolve_color_role(pair[1].color_role).stroke
+        else:
+            parts.append(
+                _entity_card_html(pair[0], extra_class="cev-instance cev-step cev-zig-card-solo", index=index)
+            )
+            last_stroke = _resolve_color_role(pair[0].color_role).stroke
+        index += 2
+        if index < n:
+            parts.append(_zig_curve_svg(last_stroke))
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# concept map: entities connected by `relationships` that are NOT a clean
+# linear chain (_is_linear_chain already owns that shape - see
+# `_render_object`) - laid out on a circle instead of the old flat
+# flex-wrap card row with a connector threaded between every card
+# (`_entities_row_html`'s own relationship branch, which `_render_data_structure`
+# still uses unchanged for its own tree/graph-shaped case - see that
+# function's docstring for why). A real, confirmed case this replaces: one
+# concept explained by six of its own defining facts, rendered as a hub
+# with every spoke captioned the same generic word, wrapped into a
+# multi-row grid that no longer read as a hub at all - just a grid with
+# lines in it. A genuine star (one source, 2+ distinct targets, never
+# itself a target - see `_concept_map_hub`) now gets a real centre-hub with
+# satellites orbiting it; anything else connected (a cycle, a small web, a
+# merge) gets every entity evenly spaced on the ring with a straight chord
+# per relationship - still a real circular shape, never a guess at a "hub"
+# the data doesn't actually have. Used by `_render_object` (for
+# `relationship`/`spatial`, and `object` on the rare occasion it's given
+# relationships) and by `_render_tree`'s own "not a clean tree" fallback
+# (for `hierarchy`/`decision_tree`).
+# ---------------------------------------------------------------------------
+
+
+def _concept_map_hub(entities: list[VisualEntity], relationships) -> VisualEntity | None:
+    """A clean star: ONE entity that is the source of 2+ relationships, is
+    never itself a target, and no other entity has any outgoing edge of its
+    own - the exact shape the old flat row rendered as "one hub + N
+    independent spokes", now given a real centre instead. `None` for
+    anything else (a cycle, a merge, a multi-hub web, a lone pair) - the
+    caller then arranges every entity on the ring instead, rather than
+    guessing which one deserves the centre."""
+    if not relationships:
+        return None
+    by_id = {e.id: e for e in entities}
+    out_ids: set[str] = set()
+    in_ids: set[str] = set()
+    out_count: dict[str, int] = {}
+    for rel in relationships:
+        if rel.source not in by_id or rel.target not in by_id:
+            return None
+        out_ids.add(rel.source)
+        in_ids.add(rel.target)
+        out_count[rel.source] = out_count.get(rel.source, 0) + 1
+    if len(out_ids) != 1:
+        return None  # more than one entity has an outgoing edge - not a pure star
+    hub_id = next(iter(out_ids))
+    if hub_id in in_ids or out_count[hub_id] < 2:
+        return None  # the "hub" is also a target somewhere, or has <2 spokes - not a star
+    return by_id[hub_id]
+
+
+def _concept_map_satellite_angles(count: int) -> list[float]:
+    """The real discrete angles (radians) `count` satellites land at,
+    starting at the top (12 o'clock) and going clockwise - the one source
+    of truth both `_concept_map_ring_positions` (where a satellite is
+    actually drawn) and every geometry calculation below (how much room
+    that satellite actually needs) read from, so the two can never
+    disagree about what angle a given satellite is at."""
+    if count <= 0:
+        return []
+    if count == 1:
+        return [math.radians(-90.0)]
+    return [math.radians(-90 + i * (360.0 / count)) for i in range(count)]
+
+
+def _concept_map_ring_positions(count: int, radius: float) -> list[tuple[float, float]]:
+    """`count` points evenly spaced on a circle of `radius` - plain Python
+    trigonometry, baked into fixed pixel offsets, not CSS trig functions
+    the renderer would have to trust the browser to evaluate consistently."""
+    if count == 1:
+        return [(0.0, -radius)]
+    return [(radius * math.cos(a), radius * math.sin(a)) for a in _concept_map_satellite_angles(count)]
+
+
+def _concept_map_hub_circle_html(hub: VisualEntity, *, diameter: float) -> str:
+    """The hub's own markup for the circular concept-map (hub mode only) -
+    a solid-filled CIRCLE (icon + title, an optional short subtitle from
+    the hub's own properties) rather than the rounded-rectangle card every
+    other entity/renderer in this module uses, matching a real circular
+    concept-map's own visual convention (the centre idea reads as the
+    "hub" of a wheel, not just another card)."""
+    role = _resolve_color_role(hub.color_role)
+    css_vars = f"--cev-fill:{role.fill};--cev-stroke:{role.stroke};--cev-text:{role.text};"
+    icon_html = f'<div class="cev-icon-badge"><span class="cev-icon">{_esc(_entity_icon_char(hub))}</span></div>'
+    label_html = f'<div class="cev-label">{_esc(hub.label.strip() or hub.id)}</div>'
+    sub_items = "".join(
+        _render_prop(k, v)
+        for k, v in hub.properties.items()
+        if k.strip() and k.strip().lower() not in _META_PROPERTY_KEYS
+    )
+    sub_html = f'<div class="cev-cmap-hub-sub">{sub_items}</div>' if sub_items else ""
+    return (
+        f'<div class="cev-cmap-hub-circle" style="{css_vars}width:{diameter:.0f}px;height:{diameter:.0f}px;">'
+        f"{icon_html}{label_html}{sub_html}</div>"
+    )
+
+
+def _concept_map_node_html(
+    entity: VisualEntity, *, dx: float, dy: float, is_hub: bool = False, hub_diameter: float = 0.0
+) -> str:
+    """The outer wrapper's own `class` is always exactly `"cev-cmap-node"`
+    (never a hub-specific variant) - existing callers/tests key off
+    `data-cmap-node-id` plus the `data-cmap-is-hub` marker attribute below
+    to tell the hub apart, not the class list, so this stays a stable,
+    single exact string regardless of which inner markup (a card, or the
+    hub's own circle - see _concept_map_hub_circle_html) a given node
+    wraps."""
+    inner = (
+        _concept_map_hub_circle_html(entity, diameter=hub_diameter)
+        if is_hub
+        else _entity_card_html(entity, extra_class="cev-instance")
+    )
+    hub_attr = ' data-cmap-is-hub="true"' if is_hub else ""
+    return (
+        f'<div class="cev-cmap-node" style="transform:translate(-50%,-50%) translate({dx:.1f}px,{dy:.1f}px);" '
+        f'data-cmap-node-id="{_esc(entity.id)}"{hub_attr}>{inner}</div>'
+    )
+
+
+def _concept_map_curved_spoke_path(
+    *, x1: float, y1: float, x2: float, y2: float
+) -> tuple[str, float, float]:
+    """A gentle quadratic-bezier curve from (x1,y1) to (x2,y2), bowed
+    perpendicular to the straight line between them (a fixed, consistent
+    "always bows the same way" curvature, not a randomised wobble) -
+    matching a real hand-drawn concept-map's curved connectors instead of
+    a plain straight chord. Returns (path `d`, label_x,
+    label_y) - the label point is the curve's OWN midpoint (the quadratic
+    bezier at t=0.5), not the straight line's midpoint, so a label sits
+    visually ON the curve rather than floating off to one side of it."""
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy) or 1.0
+    px, py = -dy / length, dx / length  # unit vector perpendicular to the spoke
+    bow = min(length * 0.16, 36.0)
+    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    ctrl_x, ctrl_y = mx + px * bow, my + py * bow
+    path_d = f"M{x1:.1f},{y1:.1f} Q{ctrl_x:.1f},{ctrl_y:.1f} {x2:.1f},{y2:.1f}"
+    label_x = 0.25 * x1 + 0.5 * ctrl_x + 0.25 * x2
+    label_y = 0.25 * y1 + 0.5 * ctrl_y + 0.25 * y2
+    return path_d, label_x, label_y
+
+
+_CONCEPT_MAP_ARROW_MARKER_ID = "cevCmapArrow"
+
+
+def _concept_map_curved_spokes_svg(
+    spokes: list[tuple[float, float, float, float, str]], *, container_w: float, container_h: float
+) -> str:
+    """One shared SVG overlay for every hub-mode spoke (hub centre to each
+    satellite) - a single `<defs><marker>` arrowhead reused by every path,
+    rather than one per spoke. `spokes` is a list of (x1, y1, x2, y2,
+    label) in the map's own centre-origin coordinate space; stroke/fill
+    colours come from the `.cev-cmap-curve-*` CSS classes in `_style_html`
+    (the same "colour lives in the <style> block, markup stays
+    presentation-agnostic" pattern `.cev-cmap-spoke-line` already uses),
+    except the arrowhead's own `fill`, which SVG `<marker>` content can't
+    reliably inherit from an external stylesheet - its value is baked in
+    directly from the one color this module's style block already commits
+    to for this element at the CSS level (`_CEV_PALETTE["neutral"].stroke`
+    at `#475569`, exactly what `.cev-cmap-curve-path`'s own stroke resolves
+    to), so the two can never visually mismatch."""
+    paths: list[str] = []
+    labels: list[str] = []
+    for x1, y1, x2, y2, label in spokes:
+        path_d, lx, ly = _concept_map_curved_spoke_path(x1=x1, y1=y1, x2=x2, y2=y2)
+        paths.append(
+            f'<path class="cev-cmap-curve-path" d="{path_d}" fill="none" '
+            f'marker-end="url(#{_CONCEPT_MAP_ARROW_MARKER_ID})"/>'
+        )
+        if label:
+            labels.append(f'<text class="cev-cmap-curve-label" x="{lx:.1f}" y="{ly:.1f}">{_esc(label)}</text>')
+    marker = (
+        f'<marker id="{_CONCEPT_MAP_ARROW_MARKER_ID}" markerWidth="9" markerHeight="9" '
+        f'refX="6.5" refY="3.5" orient="auto-start-reverse">'
+        f'<path d="M0,0 L7,3.5 L0,7 Z" fill="#475569"/></marker>'
+    )
+    view_box = f"{-container_w / 2:.1f} {-container_h / 2:.1f} {container_w:.1f} {container_h:.1f}"
+    return (
+        f'<svg class="cev-cmap-curves" viewBox="{view_box}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+        f"<defs>{marker}</defs>{''.join(paths)}{''.join(labels)}</svg>"
+    )
+
+
+def _concept_map_card_height(entity: VisualEntity) -> float:
+    """The same icon-badge+label+properties card-height estimate
+    `_render_before_after` already uses (`_entity_chars`/`_slot_width`,
+    reused here, not reinvented) - independent of width tier, since a
+    card's height tracks how much TEXT it holds, not which max-width cap
+    it's rendered at."""
+    return float(_slot_width(_entity_chars(entity), compact=170, wide=260))
+
+
+def _concept_map_required_radius(
+    hub_w: float, hub_h: float, sat_w: float, sat_h: float, angles: list[float]
+) -> float:
+    """Approach C (exact axis-aligned-rectangle separation), not a bounding
+    circle: two axis-aligned rectangles don't overlap iff they're separated
+    on x OR y, so the minimum radius at which a satellite at angle `theta`
+    first clears the hub is `min(A/|cos(theta)|, B/|sin(theta)|)` where
+    `A`/`B` are the summed half-widths/half-heights plus clearance - never
+    the full diagonal, which earlier measurement proved is needlessly
+    conservative at axis-aligned angles (confirmed: a satellite sitting
+    directly beside the hub only ever needs horizontal clearance, not its
+    full corner-to-corner reach). The same separating-axis logic, applied
+    to each pair of ring-adjacent satellites, gives the minimum radius
+    satellites need to clear EACH OTHER. Division by a near-zero cos/sin
+    (a satellite sitting exactly on that axis) is skipped rather than
+    risking a float blow-up - that axis simply contributes nothing to the
+    "required" side for that satellite/pair, which is correct: a
+    satellite with zero horizontal projection needs zero horizontal
+    clearance from the hub."""
+    count = len(angles)
+    if count == 0:
+        return _CONCEPT_MAP_BASE_RADIUS
+
+    hub_sat_a = hub_w / 2.0 + sat_w / 2.0 + _CONCEPT_MAP_CLEARANCE
+    hub_sat_b = hub_h / 2.0 + sat_h / 2.0 + _CONCEPT_MAP_CLEARANCE
+    hub_sat_needed = 0.0
+    for theta in angles:
+        terms = []
+        c, s = math.cos(theta), math.sin(theta)
+        if abs(c) > _CONCEPT_MAP_ANGLE_EPSILON:
+            terms.append(hub_sat_a / abs(c))
+        if abs(s) > _CONCEPT_MAP_ANGLE_EPSILON:
+            terms.append(hub_sat_b / abs(s))
+        if terms:
+            hub_sat_needed = max(hub_sat_needed, min(terms))
+
+    sat_sat_needed = 0.0
+    if count >= 2:
+        sat_sat_c = sat_w + _CONCEPT_MAP_CLEARANCE
+        sat_sat_d = sat_h + _CONCEPT_MAP_CLEARANCE
+        for i in range(count):
+            theta_i, theta_j = angles[i], angles[(i + 1) % count]
+            kx = math.cos(theta_i) - math.cos(theta_j)
+            ky = math.sin(theta_i) - math.sin(theta_j)
+            terms = []
+            if abs(kx) > _CONCEPT_MAP_ANGLE_EPSILON:
+                terms.append(sat_sat_c / abs(kx))
+            if abs(ky) > _CONCEPT_MAP_ANGLE_EPSILON:
+                terms.append(sat_sat_d / abs(ky))
+            if terms:
+                sat_sat_needed = max(sat_sat_needed, min(terms))
+
+    return max(_CONCEPT_MAP_BASE_RADIUS, hub_sat_needed, sat_sat_needed)
+
+
+def _concept_map_max_radius_for_width(sat_w: float, angles: list[float]) -> float:
+    """The largest radius whose rendered shape - every satellite's own
+    rectangle at its real angle - still fits inside the page's available
+    width (`_INNER_WIDTH`), derived directly from the actual horizontal
+    extent of the outermost satellite rectangles, never a flat placeholder
+    margin (the earlier `(_INNER_WIDTH-220)/2` constant was never actually
+    tied to a card's real width - this replaces it). A satellite sitting
+    exactly on the vertical axis (zero horizontal projection - e.g. a
+    2-satellite map's top/bottom pair) never constrains width at all, so
+    width is correctly left unbounded (`math.inf`) when that's the only
+    kind of satellite present; the hub's own half-width is never the
+    binding term in practice since it's always smaller than
+    `_INNER_WIDTH`, so it isn't included as a separate branch."""
+    cos_max = max((abs(math.cos(theta)) for theta in angles), default=0.0)
+    if cos_max <= _CONCEPT_MAP_ANGLE_EPSILON:
+        return math.inf
+    return (_INNER_WIDTH / 2.0 - sat_w / 2.0) / cos_max
+
+
+def _concept_map_container_size(
+    hub_w: float, hub_h: float, sat_w: float, sat_h: float, radius: float, angles: list[float]
+) -> tuple[float, float]:
+    """The real bounding box of everything hub mode actually draws - the
+    hub at the centre plus every satellite's own rectangle at its real
+    angle and the chosen radius - computed from the same inputs as the
+    radius itself, never a flat `+220`-style margin applied the same way
+    regardless of the actual shape."""
+    max_x = hub_w / 2.0
+    max_y = hub_h / 2.0
+    for theta in angles:
+        max_x = max(max_x, radius * abs(math.cos(theta)) + sat_w / 2.0)
+        max_y = max(max_y, radius * abs(math.sin(theta)) + sat_h / 2.0)
+    return max_x * 2.0, max_y * 2.0
+
+
+def _concept_map_hub_layout(
+    hub: VisualEntity, satellites: list[VisualEntity]
+) -> tuple[float, bool, float, float]:
+    """Hub-mode geometry, computed once here and shared by both the
+    renderer (which needs the real container box to size `.cev-cmap`) and
+    `_raw_pixel_size` (which needs to reserve the same height the renderer
+    will actually produce), so the two can never drift apart. Tries the
+    normal card-width tier first; only drops to the narrower "compact"
+    tier when the normal tier's REQUIRED radius (Approach C, above)
+    genuinely exceeds the page-width-AVAILABLE radius for that tier - never
+    unconditionally, and never by shrinking clearance or inflating the
+    page-width cap to force a fit. If even the compact tier's required
+    radius exceeds what's available, the radius is clamped to what's
+    actually available at that tier (the same "never silently fail, never
+    an open-ended shrink loop" final safety net as before) - a real,
+    flagged residual limitation for an extreme case, not a hidden one.
+    Returns (radius, used_compact_tier, container_width, container_height).
+    """
+    angles = _concept_map_satellite_angles(len(satellites))
+    tiers = (
+        (_CONCEPT_MAP_HUB_WIDTH, _CONCEPT_MAP_SAT_WIDTH, False),
+        (_CONCEPT_MAP_HUB_WIDTH_COMPACT, _CONCEPT_MAP_SAT_WIDTH_COMPACT, True),
+    )
+    radius = _CONCEPT_MAP_BASE_RADIUS
+    hub_w, sat_w = _CONCEPT_MAP_HUB_WIDTH, _CONCEPT_MAP_SAT_WIDTH
+    hub_h = _concept_map_card_height(hub)
+    sat_h = max((_concept_map_card_height(e) for e in satellites), default=170.0)
+    compact = False
+    for hub_width, sat_width, compact in tiers:
+        hub_w, sat_w = hub_width, sat_width
+        needed = _concept_map_required_radius(hub_w, hub_h, sat_w, sat_h, angles)
+        available = _concept_map_max_radius_for_width(sat_w, angles)
+        radius = needed if available == math.inf else min(needed, available)
+        if needed <= available:
+            break  # this tier satisfies the real geometry AND fits the page - done
+    container_w, container_h = _concept_map_container_size(hub_w, hub_h, sat_w, sat_h, radius, angles)
+    return radius, compact, container_w, container_h
+
+
+def _render_concept_map_html(entities: list[VisualEntity], relationships) -> str:
+    """See the module section comment above. Falls back to the plain flat
+    row for the genuinely degenerate case of 0-1 entities - nothing to
+    arrange on a circle."""
+    if len(entities) < 2:
+        cards = "".join(_entity_card_html(e, extra_class="cev-instance", index=i) for i, e in enumerate(entities))
+        return f'<div class="cev-instances">{cards}</div>'
+
+    hub = _concept_map_hub(entities, relationships)
+
+    if hub is not None:
+        nodes_html: list[str] = []
+        lines_html: list[str] = []
+        container_class = "cev-cmap"
+        satellites = [e for e in entities if e.id != hub.id]
+        radius, compact, container_w, container_h = _concept_map_hub_layout(hub, satellites)
+        if compact:
+            container_class += " cev-cmap-compact"
+        hub_diameter = (_CONCEPT_MAP_HUB_WIDTH_COMPACT if compact else _CONCEPT_MAP_HUB_WIDTH) * 0.85
+        angles = _concept_map_satellite_angles(len(satellites))
+        ring = _concept_map_ring_positions(len(satellites), radius)
+        positions = {satellite.id: pos for satellite, pos in zip(satellites, ring)}
+        angle_by_id = {satellite.id: a for satellite, a in zip(satellites, angles)}
+        label_by_target: dict[str, str] = {}
+        for rel in relationships:
+            label_by_target.setdefault(rel.target, _connector_label(rel.type))
+        nodes_html.append(_concept_map_node_html(hub, dx=0.0, dy=0.0, is_hub=True, hub_diameter=hub_diameter))
+        spokes: list[tuple[float, float, float, float, str]] = []
+        for entity in satellites:
+            dx, dy = positions[entity.id]
+            nodes_html.append(_concept_map_node_html(entity, dx=dx, dy=dy))
+            a = angle_by_id[entity.id]
+            start_x, start_y = (hub_diameter / 2.0) * math.cos(a), (hub_diameter / 2.0) * math.sin(a)
+            end_x, end_y = dx - _CONCEPT_MAP_SPOKE_PULLBACK * math.cos(a), dy - _CONCEPT_MAP_SPOKE_PULLBACK * math.sin(a)
+            spokes.append((start_x, start_y, end_x, end_y, label_by_target.get(entity.id, "")))
+        lines_html.append(
+            _concept_map_curved_spokes_svg(spokes, container_w=container_w, container_h=container_h)
+        )
+        return (
+            f'<div class="cev-cmap-wrap"><div class="{container_class}" '
+            f'style="width:{container_w:.0f}px;height:{container_h:.0f}px;">'
+            f'{"".join(lines_html)}{"".join(nodes_html)}</div></div>'
+        )
+
+    # No single dominant hub - a real top-to-bottom flowchart (see
+    # _render_concept_flow_html) instead of a circular "ring" of chords
+    # (the ring layout this replaced was confirmed, in practice, to read
+    # as a tangle of crossing lines rather than a clear flow - a real,
+    # confirmed complaint on exactly this shape, e.g. a microservice call
+    # graph).
+    return _render_concept_flow_html(entities, relationships)
+
+
+def _build_flow_levels(
+    entities: list[VisualEntity], relationships
+) -> tuple[list[list[VisualEntity]], dict[str, int]]:
+    """BFS levels from the root(s) (an entity never targeted by a
+    relationship) - the same top-down shape `_build_tree_levels` builds,
+    but never gives up: a genuine web (branches AND merges), a cycle, or a
+    disconnected entity all still get a definite level, never `None`. A
+    node is placed at the level of its FIRST arrival (BFS, so the
+    shortest/most direct path wins); if literally every entity has an
+    incoming edge (a pure cycle with no obvious start), the first entity
+    in list order becomes the lone root - a real start is always picked,
+    never a hard failure. Any entity relationships don't connect to a root
+    at all is appended as its own trailing level rather than silently
+    dropped."""
+    if not entities:
+        return [], {}
+    by_id = {e.id: e for e in entities}
+    out_edges: dict[str, list] = {}
+    has_incoming: set[str] = set()
+    for rel in relationships:
+        if rel.source not in by_id or rel.target not in by_id:
+            continue
+        out_edges.setdefault(rel.source, []).append(rel)
+        has_incoming.add(rel.target)
+
+    roots = [e.id for e in entities if e.id not in has_incoming] or [entities[0].id]
+    level_of: dict[str, int] = {}
+    order: list[str] = []
+    current: list[str] = []
+    for rid in roots:
+        if rid not in level_of:
+            level_of[rid] = 0
+            order.append(rid)
+            current.append(rid)
+    while current:
+        next_ids: list[str] = []
+        for nid in current:
+            for rel in out_edges.get(nid, []):
+                if rel.target not in level_of:
+                    level_of[rel.target] = level_of[nid] + 1
+                    order.append(rel.target)
+                    next_ids.append(rel.target)
+        current = next_ids
+    trailing = max(level_of.values(), default=-1) + 1
+    for entity in entities:
+        if entity.id not in level_of:
+            level_of[entity.id] = trailing
+            order.append(entity.id)
+
+    levels: list[list[VisualEntity]] = [[] for _ in range(max(level_of.values()) + 1)]
+    for eid in order:
+        levels[level_of[eid]].append(by_id[eid])
+    return levels, level_of
+
+
+def _concept_flow_height_estimate(entities: list[VisualEntity], relationships) -> float:
+    """The flow-chart's own reserved-height estimate, used by
+    `_raw_pixel_size` so the page layout always matches what
+    `_render_concept_flow_html` actually renders - one row per level plus
+    one short arrowed-stem row between each pair (the same accounting
+    `_render_tree`'s own successful-tree branch already uses for an
+    identical level-row shape), plus a little extra for any level that
+    shows a back-edge badge underneath it."""
+    levels, level_of = _build_flow_levels(entities, relationships)
+    if not levels:
+        return 0.0
+    by_id = {e.id: e for e in entities}
+    valid_rels = [r for r in relationships if r.source in by_id and r.target in by_id]
+    forward_edges = [r for r in valid_rels if level_of.get(r.target) == level_of.get(r.source, -2) + 1]
+    back_edges = [r for r in valid_rels if r not in forward_edges]
+    back_edge_sources = {r.source for r in back_edges}
+    busiest = max((_entity_chars(e) for e in entities), default=0)
+
+    if len(levels) > 1 and all(len(lvl) == 1 for lvl in levels):
+        # A pure chain - renders via _chain_row_html's own two-column
+        # zig-grid technique (see _render_concept_flow_html's matching
+        # branch and _chain_row_html's own docstring for why), so this
+        # needs the exact same accounting _render_process already uses for
+        # that identical grid shape - two entities per row, one curved
+        # connector row between each pair of rows - never the level-count
+        # math below (that's for genuinely vertical level stacking).
+        per_row_height = _slot_width(busiest, compact=88, wide=160)
+        rows = math.ceil(len(levels) / 2)
+        height = rows * per_row_height
+        height += max(rows - 1, 0) * 54.0  # curved connector between rows
+        if back_edge_sources:
+            height += 36.0
+        return height
+
+    level_h = _slot_width(busiest, compact=120, wide=190)
+    height = len(levels) * level_h
+    height += max(len(levels) - 1, 0) * 52.0  # stem+arrowhead row between levels
+    for level_entities in levels:
+        if any(e.id in back_edge_sources for e in level_entities):
+            height += 36.0  # the back-edge badge row under this level
+    return height
+
+
+def _flow_links_html(
+    child_entities: list[VisualEntity], labels: dict[str, str]
+) -> str:
+    """The arrowed connector row between one flow level and the next - the
+    same proven flex-sizing trick `_tree_links_html` uses (`.cev-flow-level`/
+    `.cev-flow-links` share identical per-card flex-basis, so a stem always
+    lines up under its own child with no pixel math needed), but with a
+    real arrowhead (this is a flowchart - the direction of flow is the
+    whole point, which a tree's plain stem never needed to show)."""
+    cells: list[str] = []
+    for child in child_entities:
+        raw_label = labels.get(child.id, "").strip()
+        show_label = bool(raw_label) and raw_label.lower() not in _GENERIC_STRUCTURAL_EDGE_TYPES
+        label_html = (
+            f'<span class="cev-tree-link-label">{_esc(raw_label.replace("_", " "))}</span>' if show_label else ""
+        )
+        cells.append(f'<div class="cev-flow-link-cell">{label_html}</div>')
+    return f'<div class="cev-flow-links">{"".join(cells)}</div>'
+
+
+def _flow_backedges_html(
+    source_entities: list[VisualEntity], back_edges: list, by_id: dict[str, VisualEntity]
+) -> str:
+    """A small annotation badge per back/cross edge whose SOURCE is in this
+    level - a cycle (B loops back to an earlier step) or a skip/lateral
+    link shown as a labelled note rather than a long line crossing back up
+    through the whole chart, which would turn a clean top-to-bottom read
+    into a tangle - exactly the shape this flowchart replaced the old
+    circular "ring" layout to get away from. Mirrors `_render_cycle`'s own
+    "then back to ..." badge, generalised to name both ends since a flow
+    can have several distinct back-edges, not just one implicit loop."""
+    source_ids = {e.id for e in source_entities}
+    relevant = [rel for rel in back_edges if rel.source in source_ids]
+    if not relevant:
+        return ""
+    items: list[str] = []
+    for rel in relevant:
+        source = by_id.get(rel.source)
+        target = by_id.get(rel.target)
+        if source is None or target is None:
+            continue
+        label = _connector_label(rel.type)
+        label_html = f' <span class="cev-flow-backedge-note">({_esc(label)})</span>' if label else ""
+        items.append(
+            '<div class="cev-flow-backedge">'
+            '<span class="cev-flow-backedge-icon" aria-hidden="true">&#8635;</span>'
+            f'<span>back to &ldquo;{_esc(target.label.strip() or target.id)}&rdquo;</span>{label_html}'
+            "</div>"
+        )
+    return "".join(items)
+
+
+def _render_concept_flow_html(entities: list[VisualEntity], relationships) -> str:
+    """Entities connected by `relationships` with no single dominant hub
+    (see `_concept_map_hub`) - a real top-to-bottom FLOWCHART: BFS levels
+    from the root(s) (`_build_flow_levels`, tolerant of branches, merges,
+    cycles and disconnected nodes - never fails), each level its own row,
+    connected to the next by arrowed stems (`_flow_links_html` - the exact
+    `_tree_links_html` technique, plus a real arrowhead since direction is
+    the point of a flowchart). A back/cross edge (a cycle, or a link that
+    doesn't advance exactly one level) is never drawn as a long line
+    crossing back up through the chart - it's a small labelled badge right
+    after the row it starts from (`_flow_backedges_html`), keeping the
+    top-to-bottom read clean. Replaces the old circular "ring" layout for
+    this exact shape (a web/cycle with no single hub) - confirmed, in
+    practice, to read as crossing chords rather than a clear flow."""
+    levels, level_of = _build_flow_levels(entities, relationships)
+    by_id = {e.id: e for e in entities}
+    valid_rels = [r for r in relationships if r.source in by_id and r.target in by_id]
+    forward_edges = [r for r in valid_rels if level_of.get(r.target) == level_of.get(r.source, -2) + 1]
+    back_edges = [r for r in valid_rels if r not in forward_edges]
+
+    if len(levels) > 1 and all(len(lvl) == 1 for lvl in levels):
+        # A pure linear chain - every level has exactly one entity, no
+        # branching or merging at all (see _render_tree's own matching
+        # branch for why this gets the flowing-horizontal-row treatment
+        # instead of a tall vertical stack of single-card "levels"). Any
+        # back-edge still shows as its own badge underneath, same as the
+        # level-based layout below.
+        chain_html = _chain_row_html([lvl[0] for lvl in levels])
+        backedges_html = _flow_backedges_html(entities, back_edges, by_id)
+        backedges_block = f'<div class="cev-flow-backedges">{backedges_html}</div>' if backedges_html else ""
+        return f'<div class="cev-zig-grid">{chain_html}</div>{backedges_block}'
+
+    parts: list[str] = []
+    index = 0
+    for level_index, level_entities in enumerate(levels):
+        cards = "".join(_tree_card_html(e, index + i) for i, e in enumerate(level_entities))
+        parts.append(f'<div class="cev-flow-level">{cards}</div>')
+        index += len(level_entities)
+        backedges_html = _flow_backedges_html(level_entities, back_edges, by_id)
+        if backedges_html:
+            parts.append(f'<div class="cev-flow-backedges">{backedges_html}</div>')
+        if level_index + 1 < len(levels):
+            next_level = levels[level_index + 1]
+            label_by_child: dict[str, str] = {}
+            for rel in forward_edges:
+                if rel.target in {e.id for e in next_level}:
+                    label_by_child.setdefault(rel.target, rel.type)
+            parts.append(_flow_links_html(next_level, label_by_child))
+    flow_html = "".join(parts)
+
+    return f'<div class="cev-flow-chart">{flow_html}</div>'
 
 
 def _style_html(theme: TemplateTheme) -> str:
@@ -345,11 +973,11 @@ def _style_html(theme: TemplateTheme) -> str:
 .cev-flow-cue{{text-align:center;color:{theme.muted_color};font-size:12.5px;margin:2px 0 12px;line-height:1.5;animation:cevFadeUp .4s ease .15s both;}}
 .cev-instances{{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:stretch;}}
 .cev-card{{
-  border-radius:20px;border:3px solid var(--cev-stroke,{theme.border_color});
-  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 45%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 68%, #fff));
+  border-radius:20px;border:2px solid var(--cev-stroke,{theme.border_color});
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 60%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 80%, #fff));
   color:var(--cev-text,{theme.text_color});
   padding:14px 18px;min-width:104px;text-align:center;
-  box-shadow:0 3px 0 color-mix(in srgb, var(--cev-stroke,{theme.border_color}) 55%, transparent), 0 6px 14px rgba(0,0,0,.08);
+  box-shadow:0 2px 8px rgba(0,0,0,.07);
   animation:cevFadeUp .4s ease both;
 }}
 /* Cards in an entity row (object instances, or a relationship-shaped
@@ -365,7 +993,7 @@ def _style_html(theme: TemplateTheme) -> str:
 .cev-icon-badge{{
   width:50px;height:50px;border-radius:50%;margin:0 auto 8px;display:flex;align-items:center;justify-content:center;
   background:var(--cev-stroke,{theme.accent_color});
-  box-shadow:inset 0 -3px 0 rgba(0,0,0,.15), 0 2px 4px rgba(0,0,0,.12);
+  box-shadow:0 1px 3px rgba(0,0,0,.1);
 }}
 .cev-icon{{font-size:26px;line-height:1;font-weight:700;color:#fff;}}
 .cev-label{{font-size:15px;font-weight:800;margin-top:2px;}}
@@ -411,7 +1039,7 @@ def _style_html(theme: TemplateTheme) -> str:
 .cev-step-number{{
   width:24px;height:24px;border-radius:50%;background:var(--cev-stroke,{theme.accent_color});color:#fff;
   font-size:11.5px;font-weight:800;display:flex;align-items:center;justify-content:center;margin:0 auto 5px;
-  box-shadow:0 2px 3px rgba(0,0,0,.15);
+  box-shadow:0 1px 3px rgba(0,0,0,.12);
 }}
 .cev-step-desc{{font-size:11px;color:{theme.muted_color};margin-top:5px;}}
 .cev-step-arrow{{color:{theme.accent_color};font-size:22px;font-weight:700;padding:0 2px;}}
@@ -421,8 +1049,8 @@ def _style_html(theme: TemplateTheme) -> str:
 .cev-cmp-corner{{background:transparent;width:26%;}}
 .cev-cmp-col{{
   padding:12px 10px;border-radius:16px 16px 0 0;text-align:center;color:var(--cev-text,{theme.text_color});
-  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 45%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 68%, #fff));
-  border:3px solid var(--cev-stroke,{theme.border_color});border-bottom:none;
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 60%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 80%, #fff));
+  border:2px solid var(--cev-stroke,{theme.border_color});border-bottom:none;
 }}
 .cev-cmp-col .cev-icon-badge{{width:38px;height:38px;margin-bottom:6px;}}
 .cev-cmp-col .cev-icon{{font-size:18px;}}
@@ -450,10 +1078,10 @@ def _style_html(theme: TemplateTheme) -> str:
 .cev-before-after{{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;align-items:center;}}
 .cev-ba-panel{{flex:1 1 200px;max-width:250px;display:flex;}}
 .cev-ba-card{{
-  flex:1;border-radius:20px;border:3px solid var(--cev-stroke,{theme.border_color});
-  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 45%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 68%, #fff));
+  flex:1;border-radius:20px;border:2px solid var(--cev-stroke,{theme.border_color});
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 60%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 80%, #fff));
   color:var(--cev-text,{theme.text_color});padding:18px;text-align:center;
-  box-shadow:0 3px 0 color-mix(in srgb, var(--cev-stroke,{theme.border_color}) 55%, transparent), 0 6px 14px rgba(0,0,0,.08);
+  box-shadow:0 2px 8px rgba(0,0,0,.07);
   animation:cevFadeUp .4s ease both;
 }}
 .cev-ba-tag{{
@@ -522,17 +1150,17 @@ def _style_html(theme: TemplateTheme) -> str:
    row down into the left card of the next. */
 .cev-zig-grid{{display:grid;grid-template-columns:1fr 36px 1fr;align-items:center;row-gap:4px;column-gap:6px;margin-top:6px;}}
 .cev-zig-card{{
-  position:relative;border-radius:20px;border:3px solid var(--cev-stroke,{theme.border_color});
-  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 26%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 46%, #fff));
+  position:relative;border-radius:20px;border:2px solid var(--cev-stroke,{theme.border_color});
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 42%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 60%, #fff));
   color:var(--cev-text,{theme.text_color});padding:14px 16px 14px 30px;display:flex;align-items:center;gap:10px;
-  box-shadow:0 3px 0 color-mix(in srgb, var(--cev-stroke,{theme.border_color}) 55%, transparent), 0 6px 14px rgba(0,0,0,.08);
+  box-shadow:0 2px 8px rgba(0,0,0,.07);
   animation:cevFadeUp .4s ease both;min-width:0;
 }}
 .cev-zig-card-solo{{grid-column:1/-1;width:74%;margin:0 auto;}}
 .cev-zig-badge{{
   position:absolute;top:-13px;left:-13px;width:36px;height:36px;background:var(--cev-stroke,{theme.accent_color});
   color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;
-  box-shadow:0 3px 6px rgba(0,0,0,.22);z-index:1;
+  box-shadow:0 1px 4px rgba(0,0,0,.15);z-index:1;
 }}
 .cev-zig-badge-circle{{border-radius:50%;}}
 .cev-zig-badge-diamond{{transform:rotate(45deg);border-radius:20%;}}
@@ -564,17 +1192,117 @@ def _style_html(theme: TemplateTheme) -> str:
 .cev-tree-links{{display:flex;gap:14px;justify-content:center;height:34px;}}
 .cev-tree-links .cev-tree-link-cell{{flex:1 1 140px;max-width:220px;position:relative;}}
 .cev-tree-link-cell::after{{
-  content:"";position:absolute;left:50%;top:0;bottom:0;width:3px;
-  background:{theme.border_color};transform:translateX(-50%);
+  content:"";position:absolute;left:50%;top:0;bottom:0;width:4px;border-radius:2px;
+  background:{theme.accent_color};transform:translateX(-50%);
 }}
-.cev-tree-links-fanned{{border-top:3px solid {theme.border_color};}}
+.cev-tree-links-fanned{{border-top:4px solid {theme.accent_color};}}
 .cev-tree-link-label{{
-  position:absolute;top:2px;left:50%;transform:translateX(-50%);
+  position:absolute;top:2px;left:50%;transform:translateX(-50%);z-index:1;
   font-size:10px;font-weight:700;color:{theme.muted_color};
   background:{theme.page_background};padding:0 5px;white-space:nowrap;
 }}
+/* concept flow-chart (no single dominant hub - see
+   _render_concept_flow_html): the exact same level-row/stem technique
+   `.cev-tree*` above uses (`.cev-flow-level`/`.cev-flow-links` share
+   identical per-card flex-sizing with their own level row, so a stem
+   always lines up under its own child), plus a real arrowhead - a
+   flowchart's whole point is the direction of flow, which a tree's plain
+   stem never needed to show. */
+.cev-flow-chart{{display:flex;flex-direction:column;align-items:stretch;}}
+.cev-flow-level{{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;}}
+.cev-flow-level .cev-card{{flex:1 1 140px;max-width:220px;}}
+.cev-flow-links{{display:flex;gap:14px;justify-content:center;height:46px;}}
+.cev-flow-links .cev-flow-link-cell{{flex:1 1 140px;max-width:220px;position:relative;}}
+.cev-flow-link-cell::after{{
+  content:"";position:absolute;left:50%;top:16px;bottom:11px;width:4px;border-radius:2px;
+  background:{theme.accent_color};transform:translateX(-50%);
+}}
+.cev-flow-link-cell::before{{
+  content:"";position:absolute;left:50%;bottom:0;width:0;height:0;
+  transform:translateX(-50%);
+  border-left:8px solid transparent;border-right:8px solid transparent;
+  border-top:11px solid {theme.accent_color};
+}}
+.cev-flow-backedges{{
+  display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:4px 0 10px;
+}}
+.cev-flow-backedge{{
+  display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;color:{theme.muted_color};
+  background:color-mix(in srgb, {theme.accent_color} 10%, #fff);
+  border:2px dashed color-mix(in srgb, {theme.accent_color} 45%, {theme.border_color});
+  border-radius:999px;padding:5px 14px;
+}}
+.cev-flow-backedge-icon{{font-size:14px;line-height:1;color:{theme.accent_color};}}
+.cev-flow-backedge-note{{font-weight:500;text-transform:none;}}
+/* concept map (relationship/spatial hub-or-network, and hierarchy/
+   decision_tree's own not-a-clean-tree fallback - see
+   _render_concept_map_html): entities on a circle - every position is a
+   fixed pixel transform computed once in Python (see that function),
+   never CSS trigonometry. Hub mode connects them with curved SVG spokes
+   (.cev-cmap-curves below, a real hand-drawn-concept-map look); ring mode
+   (no single dominant hub) keeps its own plain straight chords
+   (.cev-cmap-spoke, further below) - deliberately left alone, see
+   _render_concept_map_html's own ring-mode comment for why. */
+.cev-cmap-wrap{{display:flex;justify-content:center;}}
+.cev-cmap{{position:relative;margin:6px 0;}}
+.cev-cmap-node{{position:absolute;top:50%;left:50%;}}
+.cev-cmap-node .cev-card{{min-width:0;max-width:176px;position:relative;padding-top:30px;}}
+/* The icon badge floats above the card's own top edge (centred), rather
+   than sitting inside the card's own padding like every other `.cev-card`
+   user in this module - a real concept-map's own visual signature. The
+   extra top padding above makes room for it without the label/props
+   underneath ever sitting beneath the badge. */
+.cev-cmap-node:not([data-cmap-is-hub]) .cev-icon-badge{{
+  position:absolute;top:-22px;left:50%;transform:translateX(-50%);margin:0;
+}}
+.cev-cmap-node .cev-props{{text-align:left;}}
+/* A "hanging bullet" via absolute position, not flex - `.cev-prop`'s real
+   content is `<b>key</b>: value` as one continuous inline run (see
+   _render_prop); making THIS element `display:flex` was tried first and
+   reverted - mixing an element (`<b>`) with bare text nodes as flex
+   children splits them into separate flex items that each shrink/wrap
+   independently (a confirmed real bug: "summary" wrapped one letter per
+   line), rather than reading as one wrapped paragraph. Plain block flow
+   plus an absolutely-positioned bullet avoids that entirely. */
+.cev-cmap-node .cev-prop{{display:block;position:relative;padding-left:13px;}}
+.cev-cmap-node .cev-prop::before{{
+  content:"\\2022";position:absolute;left:0;top:0;font-weight:800;color:var(--cev-stroke,{theme.accent_color});
+}}
+.cev-cmap-node[data-cmap-is-hub]{{z-index:1;}}
+/* The hub's own circular markup (_concept_map_hub_circle_html) - solid
+   fill, icon + title centred, an optional short subtitle beneath. Sized
+   via its own inline width/height (see that function), not this tier CSS
+   (the hub is never a `.cev-card`, so the tier rules below never touch it). */
+.cev-cmap-hub-circle{{
+  border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:4px;padding:14px;text-align:center;box-sizing:border-box;
+  background:linear-gradient(155deg, color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 65%, #fff), color-mix(in srgb, var(--cev-fill,{theme.surface_color}) 85%, #fff));
+  border:2px solid var(--cev-stroke,{theme.border_color});color:var(--cev-text,{theme.text_color});
+  box-shadow:0 4px 14px rgba(0,0,0,.1);
+  animation:cevFadeUp .4s ease both;
+}}
+.cev-cmap-hub-circle .cev-icon-badge{{margin:0 0 2px;}}
+.cev-cmap-hub-circle .cev-label{{font-size:15.5px;line-height:1.2;}}
+.cev-cmap-hub-sub{{font-size:10px;color:var(--cev-text,{theme.text_color});opacity:.85;line-height:1.3;}}
+/* Narrower satellite-card tier (see _concept_map_hub_layout) - used when
+   the page-width-safe orbit radius at the normal tier still wouldn't give
+   the hub and its satellites enough clearance to avoid overlapping. The
+   hub's own diameter shrinks the same way, but via the inline width/height
+   `_concept_map_hub_circle_html` is called with (computed from the same
+   `compact` flag in Python), not a CSS class - it was never a `.cev-card`. */
+.cev-cmap-compact .cev-cmap-node .cev-card{{max-width:140px;}}
+/* Hub-mode curved spokes (_concept_map_curved_spokes_svg) - one shared SVG
+   overlay, positioned/sized to exactly cover `.cev-cmap` and using the
+   same centre-origin coordinate space every node's own transform already
+   uses (see that function's own viewBox). */
+.cev-cmap-curves{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;}}
+.cev-cmap-curve-path{{stroke:#475569;stroke-width:2.5;stroke-linecap:round;}}
+.cev-cmap-curve-label{{
+  font-size:10.5px;font-weight:700;fill:{theme.muted_color};text-anchor:middle;dominant-baseline:middle;
+  paint-order:stroke;stroke:{theme.page_background};stroke-width:4px;stroke-linejoin:round;
+}}
 @media (prefers-reduced-motion: reduce) {{
-  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line,.cev-timeline-entry,.cev-ba-card,.cev-zig-card {{
+  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line,.cev-timeline-entry,.cev-ba-card,.cev-zig-card,.cev-cmap-hub-circle {{
     animation:none !important;
   }}
 }}
@@ -584,7 +1312,7 @@ def _style_html(theme: TemplateTheme) -> str:
   finish - without this, a printed page could freeze mid fade-in (a still-
   faded card, a half-drawn connector). Printing always shows the fully
   settled final state instead, with no added export latency. */
-  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line,.cev-timeline-entry,.cev-ba-card,.cev-zig-card {{
+  .cev-card,.cev-connector,.cev-flow-cue,.cev-metaphor,.cev-connector-line,.cev-timeline-entry,.cev-ba-card,.cev-zig-card,.cev-cmap-hub-circle {{
     animation:none !important;
   }}
 }}
@@ -602,15 +1330,18 @@ def _render_object(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
     """A template/blueprint entity plus its real instances, with an explicit
     flow cue between them (labels, never prose) - or, when `relationships`
     is set (the `relationship`/`spatial` case, and `hierarchy`/`decision_tree`'s
-    own fallback when their data isn't a clean tree - see `_render_tree`), a
-    row of entities connected by real visual connectors instead - a flat,
-    flowing left-to-right SERIES (see `_chain_row_html`) when those relationships form one
-    unambiguous straight path through every instance (`_is_linear_chain`),
-    the existing hub-style card row (each spoke independently connected,
-    still the right shape for e.g. one thing connected to several unrelated
-    requirements) otherwise. A static picture - every instance is
-    pre-populated in the markup, so the one rendered state is already a
-    complete picture with nothing left to reveal."""
+    own fallback when their data isn't a clean tree - see `_render_tree`),
+    entities connected by real visual connectors instead of an unconnected
+    row: a flat, flowing left-to-right SERIES (see `_chain_row_html`) when
+    those relationships form one unambiguous straight path through every
+    instance (`_is_linear_chain`), the circular concept-map layout (see
+    `_render_concept_map_html`) for anything else connected (a hub, a
+    cycle, a small web) - never the old flat flex-wrap card row with a
+    connector threaded between every card, which reads as a grid with
+    lines in it rather than the hub/network shape it's actually showing. A
+    static picture - every instance is pre-populated in the markup, so the
+    one rendered state is already a complete picture with nothing left to
+    reveal."""
     template_entities = [e for e in spec.entities if e.role == "template"]
     instance_entities = [e for e in spec.entities if e.role != "template"]
 
@@ -618,8 +1349,23 @@ def _render_object(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
     if chain_order:
         by_id = {e.id: e for e in instance_entities}
         instances_html = _chain_row_html([by_id[eid] for eid in chain_order])
-        instances_class = "cev-steps"
+        instances_class = "cev-zig-grid"
         root_class = "cev-root cev-style-flow"
+    elif spec.relationships and not template_entities:
+        # A hub or small network, not a clean chain - see this function's
+        # own docstring and the module-level concept-map section comment.
+        instances_html = _render_concept_map_html(instance_entities, spec.relationships)
+        instances_class = ""
+        # A genuine single-dominant-hub keeps the circular concept-map's
+        # own vivid per-entity look (a deliberate design choice elsewhere
+        # in this module); the flowchart fallback (no dominant hub - see
+        # _render_concept_map_html/_render_concept_flow_html) is visually
+        # the exact same shape as process/cycle's own flowchart, so it
+        # earns that same toned-down "textbook" treatment instead of the
+        # default saturated icon-card palette - a real, confirmed
+        # complaint about exactly this shape ("too colourful").
+        is_hub = _concept_map_hub(instance_entities, spec.relationships) is not None
+        root_class = "cev-root" if is_hub else "cev-root cev-style-flow"
     else:
         instances_html = _entities_row_html(instance_entities, spec.relationships, extra_class="cev-instance")
         instances_class = "cev-instances"
@@ -653,15 +1399,6 @@ def _render_object(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
 #    connected-node diagram - three different shapes from the same
 #    entities+relationships input).
 # ---------------------------------------------------------------------------
-
-# A structural relationship type whose label is redundant once two entities
-# are already drawn as parent/child in a tree (position alone says "this
-# contains/connects to that") - hidden here the same way
-# _SPATIAL_ONLY_RELATIONSHIP_TYPES is hidden on the flat connector, so a
-# tree's branch label is reserved for when it actually says something a
-# reader couldn't already see (a decision's "yes"/"no", a real condition).
-_GENERIC_STRUCTURAL_EDGE_TYPES = {"inside", "contains", "connected_to", "attached_to", "surrounds", "passes_through"}
-
 
 def _build_tree_levels(
     entities: list[VisualEntity], relationships
@@ -762,22 +1499,55 @@ def _render_tree(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
     """hierarchy/decision_tree: entities laid out top-down in BFS levels from
     the root(s) declared by `relationships` (see _build_tree_levels), each
     level its own row, connected by a simple rail+stem - a genuine
-    branching/tree shape, distinct from "relationship"'s flat connected row
-    even though both read the same entities+relationships input. Falls back
-    to that same flat row (no relationships at all, or a shape too tangled
-    to call a clean tree) rather than guessing - never a hard failure."""
+    branching/tree shape, distinct from "relationship"'s circular
+    concept-map layout even though both read the same entities+relationships
+    input. Falls back to the plain flat row when there are no relationships
+    at all, or to that same circular concept-map layout (see
+    `_render_concept_map_html`) when the data has relationships but isn't a
+    clean tree (a cycle, a re-merge, a disconnected node) - never a hard
+    failure."""
     built = _build_tree_levels(spec.entities, spec.relationships)
     if built is None:
-        instances_html = _entities_row_html(spec.entities, spec.relationships, extra_class="cev-instance")
+        if spec.relationships:
+            content_html = _render_concept_map_html(spec.entities, spec.relationships)
+            wrapper_open, wrapper_close = "", ""
+        else:
+            content_html = _entities_row_html(spec.entities, spec.relationships, extra_class="cev-instance")
+            wrapper_open, wrapper_close = '<div class="cev-instances">', "</div>"
         body = f"""\
 <div class="cev-root">
 {_style_html(theme)}
 {_header_html(spec, theme)}
-<div class="cev-instances">{instances_html}</div>
+{wrapper_open}{content_html}{wrapper_close}
 </div>"""
         return body.encode("utf-8")
 
     levels, level_labels = built
+
+    if len(levels) > 1 and all(len(lvl) == 1 for lvl in levels):
+        # A pure linear chain dressed up as a hierarchy - every level has
+        # exactly one entity, no branching at all (a real, confirmed case:
+        # the OSI model's 7 layers, each strictly nested inside the last,
+        # with no sibling layers anywhere). Stacking that vertically as
+        # "levels" wastes the page's own width (the whole diagram is only
+        # ever as wide as one card) and, for a chain long enough, forces
+        # the page-fit safety net (`_fit_scale`) to shrink the entire
+        # fragment - and its connector lines with it - down to a fraction
+        # of its natural size. A flowing horizontal chain (the exact
+        # `_chain_row_html` technique a genuine relationship chain already
+        # uses) reads exactly as correctly - still top-to-bottom in
+        # meaning, left-to-right on the page - while actually using the
+        # page's width and wrapping onto more rows instead of shrinking.
+        chain_entities = [lvl[0] for lvl in levels]
+        tree_html = _chain_row_html(chain_entities)
+        body = f"""\
+<div class="cev-root">
+{_style_html(theme)}
+{_header_html(spec, theme)}
+<div class="cev-zig-grid">{tree_html}</div>
+</div>"""
+        return body.encode("utf-8")
+
     parts: list[str] = []
     index = 0
     for level_index, level_entities in enumerate(levels):
@@ -1216,11 +1986,20 @@ _REPRESENTATION_RENDERERS = {
 # Representations that get the flatter "flow" card treatment (see
 # .cev-style-flow in _style_html) instead of the default colourful icon-card
 # look. Keyed by representation, not by renderer function, because
-# "decision_tree" shares _render_object with "hierarchy"/"relationship"/
-# "object" (which must keep the icon-card look) - a renderer-identity check
-# couldn't tell those apart.
+# "decision_tree" and "hierarchy" share _render_tree with each other but
+# must look the same regardless (both are the identical top-down branching/
+# flowchart shape, just with or without branch labels), while "object" (via
+# _render_object, a DIFFERENT function) must keep the icon-card look for its
+# own template+instances/flat-row case - a renderer-identity check couldn't
+# tell those apart, but representation can. "relationship"/"spatial" are
+# deliberately NOT listed here even though they also share _render_object:
+# unlike hierarchy/decision_tree, _render_object already decides per-branch
+# whether toned-down styling applies (a genuine single-dominant-hub keeps
+# its own vivid concept-map look; its flowchart fallback gets toned down -
+# see that function's own logic), so a blanket entry here would double up
+# with (and fight) that finer-grained, structure-aware decision.
 _FLOW_STYLE_REPRESENTATIONS = {
-    "process", "sequence", "pipeline", "state_machine", "cycle", "decision_tree",
+    "process", "sequence", "pipeline", "state_machine", "cycle", "decision_tree", "hierarchy",
 }
 
 
@@ -1314,6 +2093,32 @@ _MAX_HEIGHT = CONTENT_HEIGHT - 100.0
 # of underestimating height for any card long enough to sit near its
 # `.cev-card`/`.cev-step` max-width (see that rule in _style_html).
 _INNER_WIDTH = _REFERENCE_WIDTH - 56
+
+# Concept-map hub-mode sizing (see _render_concept_map_html/
+# _concept_map_hub_layout) - a floor so even a 1-2-satellite hub doesn't
+# look cramped.
+_CONCEPT_MAP_BASE_RADIUS = 130.0
+
+# Hub-mode geometry (see _concept_map_hub_layout/_concept_map_required_radius/
+# _concept_map_max_radius_for_width) - the real CSS max-width caps for each
+# card-width tier (.cev-cmap-node's own rules, and their
+# `.cev-cmap-compact` narrower overrides below), the clear gap a spoke line
+# needs between a card's edge and its neighbour's, and the float tolerance
+# a satellite angle's cos/sin is treated as exactly zero at (avoids a
+# division blow-up for a satellite sitting exactly on that axis).
+_CONCEPT_MAP_HUB_WIDTH = 200.0
+_CONCEPT_MAP_SAT_WIDTH = 176.0
+_CONCEPT_MAP_HUB_WIDTH_COMPACT = 160.0
+_CONCEPT_MAP_SAT_WIDTH_COMPACT = 140.0
+_CONCEPT_MAP_CLEARANCE = 28.0
+_CONCEPT_MAP_ANGLE_EPSILON = 1e-6
+
+# How far a curved spoke (_concept_map_curved_spoke_path) pulls its satellite
+# end back from the satellite's own centre, toward the hub, so the curve
+# visually stops near the card's edge instead of running into its middle -
+# an approximation (this module has never claimed pixel-exact connectors),
+# not a measurement of any specific card's real edge.
+_CONCEPT_MAP_SPOKE_PULLBACK = 26.0
 
 # A card only stretches out toward its CSS max-width when it actually has
 # enough text to need it (a description, several properties, a long label) -
@@ -1436,23 +2241,49 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
         # pair of levels (see _tree_links_html) - never one row per entity,
         # since siblings on the same level share a row.
         built = _build_tree_levels(spec.entities, spec.relationships)
-        if built is None:
-            # No relationships, or not a clean tree - falls back to the
-            # exact same flat connected-row estimate as the `else` branch
-            # below (that's what it actually renders as - see _render_tree).
+        if built is None and spec.relationships and len(spec.entities) >= 2:
+            # Not a clean tree, but has relationships - falls back to the
+            # concept-map's own real footprint (see _render_tree and the
+            # matching `_render_object` branch above for why) - hub mode's
+            # exact-geometry container height (_concept_map_hub_layout)
+            # when there's a genuine hub, the flow-chart's own level-count
+            # estimate (_concept_flow_height_estimate) otherwise, so this
+            # estimate always matches what actually renders.
+            hub = _concept_map_hub(spec.entities, spec.relationships)
+            if hub is not None:
+                satellites = [e for e in spec.entities if e.id != hub.id]
+                _radius, _compact, _container_w, container_h = _concept_map_hub_layout(hub, satellites)
+                height += container_h
+            else:
+                height += _concept_flow_height_estimate(spec.entities, spec.relationships)
+        elif built is None:
+            # No relationships at all - falls back to the plain flat row
+            # (that's what it actually renders as - see _render_tree).
             busiest = max((_entity_chars(e) for e in spec.entities), default=0)
-            slot = _slot_width(busiest, compact=180, wide=340) if spec.relationships else _slot_width(
-                busiest, compact=120, wide=212
-            )
+            slot = _slot_width(busiest, compact=120, wide=212)
             per_row = max(1, _INNER_WIDTH // slot)
             if spec.entities:
                 height += math.ceil(len(spec.entities) / per_row) * 168.0
         else:
             levels, _labels = built
-            busiest = max((_entity_chars(e) for e in spec.entities), default=0)
-            level_h = _slot_width(busiest, compact=120, wide=190)
-            height += len(levels) * level_h
-            height += max(len(levels) - 1, 0) * 40.0  # stem+rail row between levels
+            if len(levels) > 1 and all(len(lvl) == 1 for lvl in levels):
+                # A pure linear chain (see _render_tree's own matching
+                # branch) - renders via _chain_row_html's own two-column
+                # zig-grid technique, not vertical levels, so this needs
+                # the exact same accounting _render_process already uses
+                # for that identical grid shape (never the level-count
+                # math a few lines down, which is for genuinely vertical
+                # level stacking).
+                busiest = max((_entity_chars(e) for e in spec.entities), default=0)
+                per_row_height = _slot_width(busiest, compact=88, wide=160)
+                rows = math.ceil(len(levels) / 2)
+                height += rows * per_row_height
+                height += max(rows - 1, 0) * 54.0  # curved connector between rows
+            else:
+                busiest = max((_entity_chars(e) for e in spec.entities), default=0)
+                level_h = _slot_width(busiest, compact=120, wide=190)
+                height += len(levels) * level_h
+                height += max(len(levels) - 1, 0) * 40.0  # stem+rail row between levels
     else:  # _render_object and every representation that falls back to it
         template_count = sum(1 for e in spec.entities if e.role == "template")
         instance_count = len(spec.entities) - template_count
@@ -1461,14 +2292,45 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
         if template_count and instance_count:
             height += 48.0  # flow cue between template and instances
         instances = [e for e in spec.entities if e.role != "template"]
-        busiest = max((_entity_chars(e) for e in instances), default=0)
-        if spec.relationships:
-            slot = _slot_width(busiest, compact=180, wide=340)  # connector + card, one unit
+        chain_order = _is_linear_chain(instances, spec.relationships) if not template_count else None
+        if chain_order is None and spec.relationships and not template_count and len(instances) >= 2:
+            # A hub/network concept map (see _render_concept_map_html) - not
+            # a per-character row-wrap estimate (that math, below, is for
+            # the flat card row this shape no longer renders as). Hub
+            # mode's real exact-geometry container height
+            # (_concept_map_hub_layout) when there's a genuine hub, the
+            # flow-chart's own level-count estimate
+            # (_concept_flow_height_estimate) otherwise - see the matching
+            # `_render_tree` branch above.
+            hub = _concept_map_hub(instances, spec.relationships)
+            if hub is not None:
+                satellites = [e for e in instances if e.id != hub.id]
+                _radius, _compact, _container_w, container_h = _concept_map_hub_layout(hub, satellites)
+                height += container_h
+            else:
+                height += _concept_flow_height_estimate(instances, spec.relationships)
+        elif chain_order is not None:
+            # Renders via _chain_row_html's own two-column zig-grid
+            # technique (see _render_tree's matching branch and
+            # _chain_row_html's own docstring for why) - the exact
+            # _render_process accounting for that identical grid shape,
+            # never the flat per-character row-wrap math below (that's for
+            # the unconnected/template+instances cases, which still render
+            # as a plain flex-wrap row via _entities_row_html, unchanged).
+            busiest = max((_entity_chars(e) for e in instances), default=0)
+            per_row_height = _slot_width(busiest, compact=88, wide=160)
+            rows = math.ceil(instance_count / 2)
+            height += rows * per_row_height
+            height += max(rows - 1, 0) * 54.0  # curved connector between rows
         else:
-            slot = _slot_width(busiest, compact=120, wide=212)
-        per_row = max(1, _INNER_WIDTH // slot)
-        if instance_count:
-            height += math.ceil(instance_count / per_row) * 168.0
+            busiest = max((_entity_chars(e) for e in instances), default=0)
+            if spec.relationships:
+                slot = _slot_width(busiest, compact=180, wide=340)  # connector + card, one unit
+            else:
+                slot = _slot_width(busiest, compact=120, wide=212)
+            per_row = max(1, _INNER_WIDTH // slot)
+            if instance_count:
+                height += math.ceil(instance_count / per_row) * 168.0
 
     return width, height * _ESTIMATE_SAFETY
 

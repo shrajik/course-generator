@@ -52,6 +52,22 @@ class Settings(BaseSettings):
     #  silently falls back from one to the other, since that could mask a
     #  real production misconfiguration rather than surface it.
     image_provider: str = "openai"
+    #  A real, confirmed trade-off from a direct side-by-side comparison (3
+    #  topics, both providers, identical prompts): Azure's FLUX.2-flex
+    #  renders a cleaner, more consistent background/composition, but is
+    #  meaningfully less reliable at precise text - one real run produced a
+    #  genuinely garbled label ("Irrlstior" instead of "Indicator") and
+    #  missed requested labels outright on 2 of 3 topics (text_verified=
+    #  False), while gpt-image-1 rendered every requested label correctly,
+    #  spelled right, on all 3. A `textbook`-style illustration's whole job
+    #  is accurately depicting and labelling a real apparatus/structure (see
+    #  ImageContent.illustration_style / TEXTBOOK_ILLUSTRATION_GUIDANCE) -
+    #  text/label correctness matters far more there than for a purely
+    #  decorative illustration, so it overrides `image_provider` with this
+    #  setting instead (see ImageService._generate_illustration) rather than
+    #  switching every illustration over and paying gpt-image-1's higher
+    #  cost for pictures that never carry text in the first place.
+    textbook_image_provider: str = "openai"
     #  Azure AI Foundry FLUX.2-flex. Both are required only when
     #  image_provider == "azure" - validated at call time (in
     #  azure_image_provider.generate_image), not here, so constructing

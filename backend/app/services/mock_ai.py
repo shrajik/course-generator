@@ -152,7 +152,7 @@ class MockAIClient(AIClient):
         )
 
     async def image(
-        self, *, prompt: str, size: str | None = None, phase: str = "image"
+        self, *, prompt: str, size: str | None = None, phase: str = "image", provider: str | None = None
     ) -> bytes:
         self.calls.append({"kind": "image"})
         await self._simulate("image", "image")

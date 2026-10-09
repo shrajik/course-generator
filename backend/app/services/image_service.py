@@ -35,6 +35,73 @@ log = get_logger(__name__)
 
 MAX_PROMPT_CHARS = 4500
 
+_CONTEXT_FIELD_CHAR_CAP = 120  # a title is always short; this only guards against a pathological outlier
+
+
+_KEY_CONCEPT_CHAR_CAP = 200
+
+
+def chapter_section_context(document: CourseDocument) -> dict[str, tuple[str, str, str]]:
+    """Maps every block id to (chapter_title, section_title, key_concept).
+
+    `chapter_title`/`section_title` are the nearest preceding level-1/other
+    heading's text, walking the document in its own natural page/block
+    order (see `CourseDocument.iter_blocks`) - exactly what the writer
+    already put in the document's own heading blocks (every chapter's
+    first block is a level-1 heading with the chapter title - see
+    WRITER_SYSTEM), so this generalises to any subject with zero per-topic
+    logic.
+
+    `key_concept` is a further, smaller fix for a real gap the chapter
+    title alone leaves open: "Newton's Laws of Motion" tells an image model
+    WHICH chapter, never WHAT TO ACTUALLY DEPICT - a generic "physics"
+    visual satisfies the chapter noun without teaching the law itself. The
+    writer already produces exactly that missing detail, as real sentences,
+    in the chapter's own `learning_objectives` block (confirmed in real
+    generated course data, e.g. "Select and configure a reproducible
+    environment (venv, Poetry, pipx, or Docker)" - concrete and mechanism-
+    level, never just the chapter name) - falling back to the chapter's own
+    `summary.key_takeaways` when no objectives block exists. This is a
+    SECOND pass over the same walk (not a per-block lookup) because that
+    block can sit anywhere in the chapter, often AFTER the very
+    section_intro image that would most benefit from it - a real, confirmed
+    case: in generated course data, the "Learning Objectives" section's own
+    opening image is the block immediately BEFORE the objectives list, not
+    after it. Still zero new AI calls, zero per-subject rules - purely
+    reusing content the writer already wrote for this exact chapter."""
+    chapter_title = ""
+    section_title = ""
+    titles: dict[str, tuple[str, str]] = {}
+    chapter_key_concept: dict[str, str] = {}
+    chapter_fallback_concept: dict[str, str] = {}
+    for _, block in document.iter_blocks():
+        if block.type is BlockType.HEADING:
+            text = str(block.content.get("text") or "").strip()
+            level = block.content.get("level") or 2
+            if text:
+                if level <= 1:
+                    chapter_title = text
+                    section_title = ""  # a new chapter starts with no section yet
+                else:
+                    section_title = text
+        titles[block.id] = (chapter_title, section_title)
+        if not chapter_title:
+            continue
+        if block.type is BlockType.LEARNING_OBJECTIVES and chapter_title not in chapter_key_concept:
+            items = [str(item).strip() for item in (block.content.get("items") or []) if str(item).strip()]
+            if items:
+                chapter_key_concept[chapter_title] = items[0][:_KEY_CONCEPT_CHAR_CAP]
+        elif block.type is BlockType.SUMMARY and chapter_title not in chapter_fallback_concept:
+            takeaways = [
+                str(item).strip() for item in (block.content.get("key_takeaways") or []) if str(item).strip()
+            ]
+            if takeaways:
+                chapter_fallback_concept[chapter_title] = takeaways[0][:_KEY_CONCEPT_CHAR_CAP]
+    return {
+        block_id: (ch, se, chapter_key_concept.get(ch) or chapter_fallback_concept.get(ch, ""))
+        for block_id, (ch, se) in titles.items()
+    }
+
 # PIL's own `Image.format` value (always uppercase, e.g. "JPEG" - never
 # "JPG") -> the file extension that format should be saved/served under -
 # see ImageService._detect_extension. Anything not listed here (an unknown
@@ -115,37 +182,94 @@ FINAL CHECK, all must pass: (1) premium textbook diagram, not generic AI art? (2
 # structured diagram/concept_experience visual that already explains its
 # structure, so it needs its own, different style contract.
 TEXTBOOK_ILLUSTRATION_GUIDANCE = (
-    "Professional educational textbook illustration. Clean, technically or "
-    "scientifically accurate, structured composition suitable for a modern "
-    "textbook or educational platform - not generic AI art, not a stock "
-    "photo. Depict the real subject clearly (the apparatus, organism, "
-    "structure or mechanism itself), not a diagram of boxes and arrows. "
-    "Avoid unnecessary or excessive text - include a label only when it is "
-    "essential for understanding, never paragraphs or captions baked into "
-    "the image. Do not render any title, heading or course/subject name as "
-    "text anywhere in the image - a caption is shown separately outside the "
-    "picture. Consistent, polished, uncluttered style."
+    "STYLE, exactly: a flat 2D vector illustration / modern educational "
+    "infographic, the kind printed in a well-produced digital textbook or "
+    "e-learning platform - crisp clean line art, solid or simply-shaded flat "
+    "colors, no photorealistic shading, no 3D render, no soft ambient "
+    "studio lighting, no moody/atmospheric glow. This is a firm style "
+    "requirement, not a suggestion - a semi-realistic or 3D-rendered picture "
+    "fails the brief even if otherwise accurate. Depict the real subject "
+    "clearly (the apparatus, organism, structure or mechanism itself), not "
+    "an abstract diagram of boxes and arrows standing in for it.\n"
+    "BACKGROUND: pure white or one single soft pastel tint, completely flat "
+    "and solid - never a dark background, never a vignette, never a glow or "
+    "gradient behind the subject. If the composition uses multiple panels "
+    "(see below), each panel may use its own distinct pale pastel tint "
+    "(e.g. pale blue, pale lavender, pale mint) to tell them apart, still "
+    "flat and solid, never a gradient within a single panel.\n"
+    "LABELS: default to small rounded callout-box labels (short pill-shaped "
+    "boxes with a thin leader line connecting each one to the exact part/"
+    "vector/direction it names) rather than text floating loosely on the "
+    "picture - the real subject stays the focal illustration, the callouts "
+    "are a light annotation layer on top of it. Label each distinct part "
+    "ONCE, at its clearest instance - never repeat the same label on every "
+    "occurrence of a repeated element.\n"
+    "MULTI-PANEL COMPOSITIONS: when the brief covers 2-3 closely related "
+    "sub-concepts that build on each other (e.g. a field around a source, "
+    "then the effect that field produces, then the governing law), compose "
+    "them as separate bordered panels arranged in a clean grid within the "
+    "one image, each panel with its own short, bold section title in a "
+    "colored header strip at its top (e.g. \"Magnetic Field\", \"Induced "
+    "Current\") and its own pastel background tint - this in-panel section "
+    "title is a structural label for that panel's own sub-topic, not the "
+    "image's overall course/chapter caption, so it's expected and welcome "
+    "here even though the rule below still applies to the course/chapter "
+    "name itself.\n"
+    "FORMULA BLOCK: if the concept has one key governing equation, you may "
+    "include it once, in its own clearly bordered box (distinct from the "
+    "illustration panels), set in large clean mathematical notation, with "
+    "each symbol it uses defined immediately below in short \"symbol = "
+    "meaning\" lines (exactly like a textbook's own equation callout) - "
+    "spell every defined term correctly and completely, nothing truncated "
+    "or cut off.\n"
+    "Avoid unnecessary or excessive text beyond callouts/panel titles/the "
+    "formula block - never paragraphs baked into the image. Do not render "
+    "the overall course/chapter/subject name anywhere in the image - the "
+    "page's own caption is shown separately outside the picture; this is "
+    "different from a multi-panel composition's own short per-panel "
+    "section titles, which belong inside the image as described above.\n"
+    "CRITICAL FRAMING RULE: every element (panels, icons, shapes, callout "
+    "boxes, text, the formula block) must sit with clear, generous margin "
+    "on all four sides of the canvas and fit completely inside the frame; "
+    "nothing may touch, crowd or extend past any edge. A real, confirmed "
+    "failure mode: a prompt asking for several side-by-side items (e.g. 3-4 "
+    "icon+label groups in a row) rendered wider than the canvas could hold, "
+    "so the first and last items were sliced off at the left/right edges "
+    "mid-way through their own labels. If the subject naturally has several "
+    "distinct parts to show side by side, either keep the count small "
+    "enough (2-3 at most) to comfortably fit with margin to spare, or "
+    "arrange them in a grid/stack (or as the separate panels described "
+    "above) instead of a single wide row - never let the composition's own "
+    "content decide the canvas is too small after the fact."
 )
 
 
 # Fixed (not per-template) guidance for a "section_intro" illustration - see
 # ImageContent.illustration_style. The writer's own `image_prompt` for this
 # style already follows the exact wording contract (<=40 words, one clear
-# subject, ends with "no text, no letters, no labels" - see WRITER_SYSTEM) -
-# this constant exists to REINFORCE that same palette/style consistently
-# rather than let DEFAULT_ILLUSTRATION_GUIDANCE's own "bright... flat vector"
-# style direction dilute or contradict it (every section_intro image across
-# a whole course should read as the same consistent picture language, not
-# whatever DEFAULT's broader per-topic guidance happens to suggest).
+# subject, ends with "no text, no letters, no labels" - see WRITER_SYSTEM).
+# This constant used to also pin every section_intro image to one fixed
+# dark-blue/teal palette "for consistency" - dropped because, across a real
+# course, that made every section's icon look like the same reused neon
+# asset regardless of subject (a confirmed, reported problem), which is a
+# worse outcome than a style that varies by topic the way DEFAULT_
+# ILLUSTRATION_GUIDANCE's illustrations already do. Only the genuinely
+# cross-topic rules (no text, one clear centred subject) remain fixed here.
 SECTION_INTRO_ILLUSTRATION_GUIDANCE = (
     "STRICT NO-TEXT RULE: the image must contain zero text of any kind - no "
     "words, letters, numbers, labels, captions, titles, watermarks or logos, "
     "and no writing rendered on any object, screen, sign or surface within "
     "the scene either.\n"
-    "STYLE: clean modern digital illustration, dark-blue/teal tones with "
-    "soft glow accents - the exact same palette for every image. One single "
-    "clear subject, centred, with no clutter and no unnecessary background "
-    "detail."
+    "STYLE: clean modern digital illustration, with colors and tone that "
+    "genuinely fit this specific subject - never the same fixed palette "
+    "reused across unrelated topics. One single clear subject, centred, "
+    "with no clutter and no unnecessary background detail.\n"
+    "If the subject above is a symbolic/abstract mechanism with no "
+    "physical form (code, data structures, algorithms, math), it has "
+    "already been translated into one concrete object or scene that "
+    "behaves the same way - draw exactly THAT object/scene, specific and "
+    "recognisable, never a generic glowing shape, bar, orb or abstract "
+    "icon standing in for it."
 )
 
 
@@ -166,24 +290,105 @@ class ImageService:
 
     # --- prompt -----------------------------------------------------------
     @staticmethod
-    def build_prompt(block: Block, template: CourseTemplate, course_title: str) -> str:
+    def build_prompt(
+        block: Block,
+        template: CourseTemplate,
+        course_title: str,
+        *,
+        chapter_title: str = "",
+        section_title: str = "",
+        key_concept: str = "",
+    ) -> str:
+        """`chapter_title`/`section_title`/`key_concept` (see
+        `chapter_section_context`) are the deterministic fix for a real,
+        confirmed failure mode: the writer LLM sees full chapter/course
+        context when it invents `image_prompt`/`purpose`, but that's free
+        text it may or may not actually use - if it writes something vague
+        (or leaves the field blank, in which case `draft_to_content` falls
+        back to the block's own generic title like "Learning Objectives"),
+        the image model previously received NO chapter/subject signal at
+        all and produced a plausible-but-generic result. This line
+        guarantees every request structurally carries that context
+        regardless of what the writer's own free text happened to say -
+        never a hardcoded per-subject mapping, since it's built from
+        exactly the chapter/section titles (and, for `key_concept`, the
+        chapter's own learning objective) already written into this
+        document, for whatever subject that is.
+
+        `key_concept` specifically closes a narrower, still-real gap: a
+        chapter TITLE alone ("Newton's Laws of Motion") tells the model
+        WHICH chapter, never WHAT TO ACTUALLY DEPICT - a generic "physics"
+        visual technically satisfies the chapter noun. One concrete,
+        already-written objective sentence ("explain how force relates to
+        acceleration") gives the model an actual mechanism to draw, not
+        just a subject label."""
         content = block.content
         style = (content.get("illustration_style") or "").strip().lower()
-        # The generic "for the course 'X'" framing line is dropped for every
-        # style - a real illustration model tends to read a quoted course/
-        # subject name as a title to render literally into the picture
-        # (confirmed: without this, a "textbook" heart illustration came
-        # back with a "HUMAN BIOLOGY" banner baked across the top), exactly
-        # the text every style's own guidance below already forbids on its
-        # own terms.
         if style == "textbook":
             style_guidance = TEXTBOOK_ILLUSTRATION_GUIDANCE
         elif style == "section_intro":
             style_guidance = SECTION_INTRO_ILLUSTRATION_GUIDANCE
         else:
             style_guidance = DEFAULT_ILLUSTRATION_GUIDANCE
+        context_bits = []
+        if course_title.strip():
+            context_bits.append(f"Course: {course_title.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+        if chapter_title.strip():
+            context_bits.append(f"Chapter: {chapter_title.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+        if section_title.strip():
+            context_bits.append(f"Section: {section_title.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+        if key_concept.strip():
+            context_bits.append(f"This chapter teaches: {key_concept.strip()[:_KEY_CONCEPT_CHAR_CAP]}")
+        # Never a bare "for the course 'X'" framing line - a real
+        # illustration model tends to read a quoted subject name as a title
+        # to render literally into the picture (confirmed: without a
+        # qualifier like this, a "textbook" heart illustration once came
+        # back with a "HUMAN BIOLOGY" banner baked across the top). The
+        # explicit "do not render" instruction travels WITH the context
+        # itself, never relying only on the general no-text rule below.
+        context_line = (
+            "Educational context, for your understanding only - never render any of this "
+            "as visible text, a title or a banner in the image - " + " | ".join(context_bits)
+            if context_bits
+            else ""
+        )
+        # `expected_labels` was previously used ONLY to verify the finished
+        # image after the fact (see _verify_generated_text) - never actually
+        # told the image model to draw them in the first place. The writer's
+        # own free-text `image_prompt` might describe the scene without
+        # explicitly asking for every specific label, so a well-populated
+        # `expected_labels` list could still ship unlabelled (a real,
+        # confirmed case: a magnetic-flux apparatus illustration rendered
+        # with unlabelled arrows). Stating the exact expected words directly
+        # in the generation prompt closes that gap - the verify/retry loop
+        # below still catches a misspelling or omission either way. Scoped
+        # to style == "textbook" specifically - the only style this field is
+        # actually wired up for (see `_generate_illustration`'s `is_textbook
+        # and expected_labels` branch); `section_intro` and the default style
+        # both carry their own STRICT NO-TEXT RULE, so injecting a "must
+        # include these labels" line there would directly contradict it if
+        # `expected_labels` were ever populated by mistake.
+        expected_labels = (
+            [str(label).strip() for label in (content.get("expected_labels") or []) if str(label).strip()]
+            if style == "textbook"
+            else []
+        )
+        labels_line = (
+            "This image must include these exact labels, spelled correctly and clearly "
+            "legible, placed next to the part/vector/direction each one names: "
+            + ", ".join(expected_labels)
+            + ". Label each one ONCE, at its clearest instance - never repeat the same label "
+            "on every occurrence of a repeated element (e.g. one field line out of a drawn "
+            "group, not every line in it). These are the only labels to add - the picture "
+            "must still read as clean and uncluttered, exactly as the style below describes, "
+            "not covered in repeated text."
+            if expected_labels
+            else ""
+        )
         parts = [
+            context_line,
             content.get("prompt") or content.get("purpose") or content.get("caption") or "",
+            labels_line,
             style_guidance,
             "Do not include watermarks, signatures or lorem ipsum text.",
         ]
@@ -323,6 +528,92 @@ class ImageService:
         detected = {normalize(text) for text in result.detected_text}
         return [label for label in expected_labels if normalize(label) not in detected]
 
+    async def _verify_image_has_no_text(self, image: bytes) -> list[str]:
+        """For a force-text-free image (see `_generate_text_free_illustration`)
+        - the same vision-model transcription technique `_verify_generated_text`
+        uses, inverted: there's no specific label to check against here, the
+        ask is simply "did ANY text survive onto an image that was explicitly
+        requested text-free". The original request behind a text-free
+        fallback is always a labelled diagram/flowchart a raster model
+        couldn't reliably spell (see `generate_for_block`'s own docstring on
+        `structured_fallback`) - so any text that does show up is
+        presumptively more of that same garbled, unreliable lettering, not a
+        message worth keeping. Returns whatever text was actually detected
+        (empty list = genuinely text-free); never raises (a vision-check
+        failure isn't treated as "it has text" - that would needlessly burn
+        through the caller's own bounded retry budget on a QA-step problem,
+        not an image problem)."""
+        try:
+            result = await self.ai.structured(
+                schema=ImageTextCheck,
+                system=(
+                    "You inspect an image to check whether it contains ANY readable "
+                    "text at all - words, labels, letters, numbers, captions, "
+                    "anything resembling writing, however small or faint. List every "
+                    "distinct piece of text you can see, even a single short word or "
+                    "a garbled/partial one. If the image is genuinely free of any "
+                    "text, report an empty list."
+                ),
+                user="List every piece of text visible in the attached image, or an empty list if there is none.",
+                model=self.settings.diagram_model,
+                purpose="image_no_text_check",
+                phase="image",
+                image=image,
+            )
+        except Exception as exc:  # noqa: BLE001 - never block on a QA-step failure
+            log.warning("Image no-text check failed: %s", exc)
+            return []
+        return [text for text in result.detected_text if text.strip()]
+
+    async def _generate_text_free_illustration(
+        self, prompt: str, *, block_id: str, provider: str | None = None, size: str | None = None
+    ) -> tuple[bytes, bool]:
+        """Every illustration style that isn't `textbook` - `section_intro`
+        and the default/blank style alike - carries its own STRICT NO-TEXT
+        RULE (see SECTION_INTRO_ILLUSTRATION_GUIDANCE/
+        DEFAULT_ILLUSTRATION_GUIDANCE), and so does the force-text-free
+        diagram/concept_experience fallback (see `_generate_illustration`/
+        `generate_for_block`) - but a raster image model does not reliably
+        comply with "no text" 100% of the time (the same confirmed failure
+        mode `_generate_with_text_check` already documents for the labelled
+        path: an "Oxygen" label survived as "Oxgeen" on what was meant to be
+        a text-free attempt). Trusting an unverified "text-free" image on
+        faith risks shipping exactly the garbled lettering this rule exists
+        to avoid - two real, confirmed cases: a flowchart-shaped fallback
+        image with "coan oicts"/"medership" baked in, and - because
+        `section_intro` previously had NO verification at all, unlike the
+        force-text-free fallback - a set of small section-intro icons that
+        shipped with "sourrces", "Fraith magntised field", "toleente",
+        "Teretore", "Mechanician" baked in. Verified, with one bounded
+        retry using a more emphatic prompt - never unlimited - and the
+        honest `text_verified` result returned either way, the same
+        contract `_generate_with_text_check` already keeps for the labelled
+        path."""
+        size = size or self.settings.image_size
+        data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=size, provider=provider)
+        found = await self._verify_image_has_no_text(data)
+        if not found:
+            return data, True
+
+        log.info(
+            "Text-free image for %s still rendered text (%s) - one final, more emphatic attempt",
+            block_id, found,
+        )
+        final_prompt = (
+            f"{prompt}\n\nABSOLUTELY CRITICAL: this image must contain ZERO text of any kind - "
+            "no letters, no words, no numbers, no labels, no captions, nothing resembling "
+            "writing anywhere in the image, not even small or decorative text. A previous "
+            "attempt still rendered some text - this time, render no text at all, full stop."
+        )
+        data = await self.ai.image(prompt=final_prompt, size=size, provider=provider)
+        found = await self._verify_image_has_no_text(data)
+        if found:
+            log.warning(
+                "Text-free image for %s still has text after every bounded attempt (%s) - "
+                "flagged, not silently accepted as correct", block_id, found,
+            )
+        return data, not found
+
     # --- generation -------------------------------------------------------
     async def generate_for_block(
         self,
@@ -331,6 +622,9 @@ class ImageService:
         block: Block,
         template: CourseTemplate,
         course_title: str,
+        chapter_title: str = "",
+        section_title: str = "",
+        key_concept: str = "",
     ) -> bool:
         """Diagram/concept_experience blocks try their structured path first
         and fall back to the raster illustration path on any failure - a
@@ -348,7 +642,17 @@ class ImageService:
             # block's `path` from silently replacing the colorful contents
             # grid with an unrelated raster image.
             return True
-        structured_fallback = False
+        # Starts True for ANY diagram/concept_experience-kind block, not just
+        # ones where generation was actually attempted-and-failed - a real,
+        # confirmed gap: when `enable_diagram_generation`/
+        # `enable_concept_experience_visuals` is off, the block never even
+        # reaches the structured path below, so this must already assume
+        # "this was never really an illustration request" before that check
+        # runs, or a labelled-diagram-shaped prompt reaches the raster model
+        # WITHOUT the text-free guard - the exact mechanism behind a real
+        # observed garbled-text diagram. Only set back to False below, and
+        # only for a genuine `kind == "illustration"` block from the start.
+        structured_fallback = kind in ("diagram", "concept_experience")
         if kind == "diagram" and self.settings.enable_diagram_generation:
             ok = await self.diagrams.generate_for_block(
                 course_id=course_id, block=block, template=template, course_title=course_title
@@ -356,7 +660,6 @@ class ImageService:
             if ok:
                 return True
             log.info("Falling back to a raster illustration for %s", block.id)
-            structured_fallback = True
         elif kind == "concept_experience" and self.settings.enable_concept_experience_visuals:
             ok = await self.concept_visuals.generate_for_block(
                 course_id=course_id, block=block, template=template, course_title=course_title
@@ -364,17 +667,25 @@ class ImageService:
             if ok:
                 return True
             log.info("Falling back to a raster illustration for %s", block.id)
-            structured_fallback = True
         return await self._generate_illustration(
             course_id=course_id,
             block=block,
             template=template,
             course_title=course_title,
+            chapter_title=chapter_title,
+            section_title=section_title,
+            key_concept=key_concept,
             force_text_free=structured_fallback,
         )
 
     async def _generate_with_text_check(
-        self, prompt: str, expected_labels: list[str], *, block_id: str
+        self,
+        prompt: str,
+        expected_labels: list[str],
+        *,
+        block_id: str,
+        provider: str | None = None,
+        size: str | None = None,
     ) -> tuple[bytes, bool]:
         """Generate a textbook illustration, verify its text is actually
         correct (see _verify_generated_text), and - if it isn't - retry ONCE
@@ -391,8 +702,8 @@ class ImageService:
         never mistake "we stopped retrying" for "this was confirmed
         correct" (see `_generate_illustration`'s `text_verified` field).
         Returns (image bytes, text_verified)."""
-        size = self.settings.image_size
-        data = await self.ai.image(prompt=prompt, size=size)
+        size = size or self.settings.image_size
+        data = await self.ai.image(prompt=prompt, size=size, provider=provider)
         missing = await self._verify_generated_text(data, expected_labels)
         if not missing:
             return data, True
@@ -405,7 +716,7 @@ class ImageService:
             f"{', '.join(expected_labels)}. Double-check every letter before finalizing - "
             "a near-miss spelling (an extra, missing, or swapped letter) is still wrong."
         )
-        data = await self.ai.image(prompt=retry_prompt, size=size)
+        data = await self.ai.image(prompt=retry_prompt, size=size, provider=provider)
         missing = await self._verify_generated_text(data, expected_labels)
         if not missing:
             return data, True
@@ -413,7 +724,7 @@ class ImageService:
         log.info(
             "Image text check failed again for %s (%s) - attempting a text-free image", block_id, missing
         )
-        data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=size)
+        data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=size, provider=provider)
         # Trust nothing on faith: a "text-free" request can still come back
         # with partial, wrong text (the confirmed "Oxgeen" case) - checked
         # against the exact same expected labels, since any of them
@@ -433,7 +744,7 @@ class ImageService:
             "attempt at a text-free version still rendered some incorrect text - this time, "
             "render no text at all, full stop."
         )
-        data = await self.ai.image(prompt=final_prompt, size=size)
+        data = await self.ai.image(prompt=final_prompt, size=size, provider=provider)
         missing = await self._verify_generated_text(data, expected_labels)
         # Whatever this final, bounded attempt produced is what ships - but
         # the caller is told the honest truth about whether it's clean.
@@ -446,6 +757,9 @@ class ImageService:
         block: Block,
         template: CourseTemplate,
         course_title: str,
+        chapter_title: str = "",
+        section_title: str = "",
+        key_concept: str = "",
         force_text_free: bool = False,
     ) -> bool:
         """`force_text_free` is set when this is a FALLBACK from a failed
@@ -455,33 +769,99 @@ class ImageService:
         the confirmed cause of real, observed garbled-text diagrams: e.g.
         "Balid prompt", "eparates prompt text", "Fallute" instead of
         "Failure" - a diffusion model attempting to bake a dozen technical
-        labels into pixels). Rather than gamble on an unverified, text-heavy
-        raster image for a request that was never really an "illustration"
-        to begin with, this asks for a text-free picture instead - still a
-        real, relevant visual, just never a source of misspelled labels."""
-        prompt = self.build_prompt(block, template, course_title)
+        labels into pixels). This asks for a text-free picture instead -
+        still a real, relevant visual, just never meant to carry labels -
+        and, unlike an earlier version of this path, that "text-free"
+        request is itself verified with a bounded retry
+        (`_generate_text_free_illustration`), not trusted on faith: a real
+        image model does not reliably comply with "no text" either, and an
+        unverified attempt was exactly how a flowchart-shaped request for
+        "list vs generator" ended up as a real image with "coan oicts" and
+        "medership" baked into it."""
+        prompt = self.build_prompt(
+            block, template, course_title,
+            chapter_title=chapter_title, section_title=section_title, key_concept=key_concept,
+        )
         if not prompt.strip():
             log.warning("Image block %s has no prompt - skipped", block.id)
             return False
+        # Made explicit (never silent) so nobody evaluates visual quality
+        # against a deterministic offline placeholder without realising it -
+        # `MockAIClient.image()` ignores prompt content entirely. `is_mock`
+        # already exists on AIClient for exactly this purpose (course_service
+        # already uses it to record which model actually produced a block).
         is_textbook = (block.content.get("illustration_style") or "").strip().lower() == "textbook"
+        # A `textbook` illustration's whole job is accurately depicting and
+        # LABELLING a real apparatus/structure - text/label correctness
+        # matters far more there than for a purely decorative illustration.
+        # A real, confirmed side-by-side comparison (see Settings.
+        # textbook_image_provider's own docstring) showed the configured
+        # default provider missing requested labels or outright garbling one
+        # ("Irrlstior" instead of "Indicator") on 2 of 3 real topics, while
+        # this override's provider got every label right on all 3 - so this
+        # style overrides the configured default rather than inheriting it.
+        provider = self.settings.textbook_image_provider if is_textbook else None
+        log.info(
+            "%s image generation for %s (provider=%s)",
+            "MOCK" if self.ai.is_mock else "REAL",
+            block.id,
+            "mock" if self.ai.is_mock else (provider or self.settings.image_provider),
+        )
         expected_labels = [
             str(label).strip() for label in (block.content.get("expected_labels") or []) if str(label).strip()
         ]
-        # None means "nothing was promised to verify" (no expected labels,
-        # or a forced text-free fallback) - genuinely different from False
-        # ("checked, and it's still wrong after every bounded attempt"), so
-        # a caller can tell "nothing to confirm" from "confirmed wrong"
-        # rather than a bare boolean collapsing both into one meaning.
+        # A content-rich textbook illustration (several distinct labelled
+        # parts) is routinely a naturally WIDE composition (several icons or
+        # components side by side) - forcing it into a square canvas and
+        # hoping the model rearranges into a grid on its own is exactly what
+        # produced a real, confirmed bug: a 4-label composition drawn wider
+        # than the square canvas could hold, slicing the first and last
+        # items off at the edges mid-label. Giving it real extra width up
+        # front, rather than relying on the framing instruction alone to
+        # compensate after the fact, is the more reliable fix - the two
+        # layer together (this for genuine breathing room, the framing rule
+        # in TEXTBOOK_ILLUSTRATION_GUIDANCE as the safety net for whatever
+        # composition the model still chooses).
+        image_size = (
+            "1536x1024" if is_textbook and len(expected_labels) >= 4 else None
+        )
+        # None means "nothing was promised to verify" (no expected labels at
+        # all) - genuinely different from False ("checked, and it's still
+        # wrong after every bounded attempt"), so a caller can tell "nothing
+        # to confirm" from "confirmed wrong" rather than a bare boolean
+        # collapsing both into one meaning. A forced text-free fallback DOES
+        # get checked now (see _generate_text_free_illustration) - "nothing
+        # was promised" never applied to it in the first place, since the
+        # whole point of forcing text-free is a real promise ("no text")
+        # that's just as checkable as a labelled one.
         text_verified: bool | None = None
         try:
-            if force_text_free:
-                data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=self.settings.image_size)
-            elif is_textbook and expected_labels:
+            if force_text_free or not is_textbook:
+                # Every style that isn't "textbook" (the default/blank style,
+                # and "section_intro") carries its own STRICT NO-TEXT RULE
+                # (see DEFAULT_ILLUSTRATION_GUIDANCE/
+                # SECTION_INTRO_ILLUSTRATION_GUIDANCE) - previously trusted
+                # on faith, with zero verification, unlike the force-text-
+                # free diagram-fallback case right above it. A real,
+                # confirmed case: a set of small section-intro icons shipped
+                # with "sourrces", "Fraith magntised field", "toleente",
+                # "Teretore", "Mechanician" baked in - this is exactly as
+                # checkable (and exactly as capable of silently garbling) as
+                # the force-text-free case, so it now gets the identical
+                # bounded verify-and-retry treatment, not a free pass just
+                # because its trigger is a style name instead of a failed
+                # structured-diagram attempt.
+                data, text_verified = await self._generate_text_free_illustration(
+                    prompt, block_id=block.id, provider=provider, size=image_size
+                )
+            elif expected_labels:
                 data, text_verified = await self._generate_with_text_check(
-                    prompt, expected_labels, block_id=block.id
+                    prompt, expected_labels, block_id=block.id, provider=provider, size=image_size
                 )
             else:
-                data = await self.ai.image(prompt=prompt, size=self.settings.image_size)
+                data = await self.ai.image(
+                    prompt=prompt, size=image_size or self.settings.image_size, provider=provider
+                )
         except Exception as exc:  # noqa: BLE001 - a failed image must not fail the course
             log.warning("Image generation failed for %s: %s", block.id, exc)
             block.content = merge_content(
@@ -509,6 +889,7 @@ class ImageService:
                 "width": width,
                 "height": height,
                 "text_verified": text_verified,
+                "generation_mode": "mock" if self.ai.is_mock else "real",
             },
         )
         log.info("Generated %s for block %s", relative, block.id)
@@ -537,15 +918,23 @@ class ImageService:
         if not targets:
             return 0
 
+        # Computed once over the whole document (see chapter_section_context's
+        # own docstring) rather than per-block, so a big course doesn't repeat
+        # the same linear walk once per image block.
+        context_map = chapter_section_context(document)
         limiter = get_limiter("image", self.settings.concurrency_for("image"))
 
         async def worker(block: Block) -> bool:
+            chapter_title, section_title, key_concept = context_map.get(block.id, ("", "", ""))
             async with limiter.slot():
                 return await self.generate_for_block(
                     course_id=document.course_id,
                     block=block,
                     template=template,
                     course_title=document.course_title,
+                    chapter_title=chapter_title,
+                    section_title=section_title,
+                    key_concept=key_concept,
                 )
 
         with metrics_phase("images"):

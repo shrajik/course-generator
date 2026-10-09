@@ -541,19 +541,26 @@ class DiagramSpec(BaseModel):
     def is_usable(self) -> bool:
         """A diagram needs at least two labelled things to relate to each
         other, and a relationship-shaped diagram needs at least one labelled
-        relationship - a bare list of boxes isn't a concept map. A schematic
-        needs at least two recognised shapes, and every state (if any) needs
-        its own shapes - an empty "before" panel isn't a comparison."""
+        relationship - a bare list of boxes isn't a concept map.
+
+        `schematic` is permanently retired - never usable, regardless of
+        content. Real, confirmed failure modes: the anchor-based shape
+        layout produced genuinely overlapping, unreadable results (a label
+        shape landing directly on top of its own parent box's text), and a
+        multi-state "before/after" comparison doubled that risk across two
+        stacked panels. Rather than trust prompt guidance alone to stop the
+        model from ever picking this kind, `is_usable() == False` here makes
+        the EXISTING "unusable spec -> fall back to a raster illustration"
+        path (see DiagramService.generate_for_block) catch it unconditionally
+        - every apparatus/structure topic that used to go through schematic
+        (physics, chemistry, mechanical AND biology/life-science alike) now
+        reliably lands on `kind: "illustration"` with `illustration_style:
+        "textbook"` instead, a real photographic-style depiction rather than
+        a labelled-box schematic, regardless of what any future prompt or
+        model happens to request."""
         kind = self.normalised_kind()
         if kind == "schematic":
-            if self.states:
-                if len(self.states) < 2:
-                    return False
-                return all(len(state.shapes) >= 1 for state in self.states) and (
-                    sum(len(state.shapes) for state in self.states) >= 3
-                )
-            valid = [s for s in self.shapes if s.type in SHAPE_TYPES]
-            return len(valid) >= 2
+            return False
 
         if kind == "concept_experience":
             # Not every representation needs entities (a pure step sequence

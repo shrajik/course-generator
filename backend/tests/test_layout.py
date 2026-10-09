@@ -255,6 +255,35 @@ def test_keep_together_rule_never_fires_when_the_visual_already_fits():
     assert len(pages) == 1
 
 
+def _heading(text: str, *, level: int = 2) -> Block:
+    return Block(type=BlockType.HEADING, content={"text": text, "level": level})
+
+
+def test_two_visuals_placed_back_to_back_move_together_not_split_across_pages():
+    """Reproduces the reported bug exactly: a diagram-only template slot
+    (technical_v1.json's visual_explanation section) pairs a small
+    section_intro icon with the section's real diagram image, back-to-back,
+    with no paragraph between them. Images aren't splittable, so if the
+    second one alone didn't fit the remaining page space, it used to get
+    bumped to a fresh page by itself, stranding the first - often just a
+    heading + a tiny icon - behind on an otherwise near-empty page. The two
+    images must always land on the same page as each other.
+
+    Sized (confirmed empirically) so heading+icon+diagram genuinely don't
+    all fit one page - without the fix, this exact scenario put the heading
+    and icon on page 1 and the diagram alone on page 2."""
+    heading = _heading("Visual Explanation")
+    small_icon = _section_intro_image()
+    large_diagram = _image_block("diagram", width=666, height=750)
+
+    pages = flow_blocks([heading, small_icon, large_diagram])
+    assert len(pages) > 1, "scenario didn't actually force a page split - test isn't exercising anything"
+
+    icon_page = next(page for page in pages if small_icon in page)
+    diagram_page = next(page for page in pages if large_diagram in page)
+    assert icon_page is diagram_page, "the two back-to-back images were split across pages"
+
+
 def test_page_visual_fraction_of_an_all_text_page_is_zero():
     pages = flow_blocks([_paragraph(30), _paragraph(30)])
     assert page_visual_fraction(pages[0]) == 0.0
@@ -367,6 +396,56 @@ def test_a_section_intro_image_with_no_following_paragraph_stays_small():
 
 def _heading_block(text: str) -> Block:
     return Block(type=BlockType.HEADING, content={"text": text, "level": 2})
+
+
+def test_estimate_height_of_an_unplaced_section_intro_image_uses_its_narrow_width():
+    """A real, confirmed bug: `estimate_height` on a section_intro image
+    whose `layout.width` hasn't been narrowed yet by `flow_blocks` (i.e. a
+    lookahead peek at an upcoming block, before it's actually placed) used
+    to fall back to the full CONTENT_WIDTH - nearly 3x wider than the
+    SECTION_INTRO_IMAGE_WIDTH it actually renders at - wildly overestimating
+    its height. `_pending_visual_run`/`_is_visual_pair` (flow_blocks) rely on
+    exactly this lookahead to decide whether an upcoming heading+icon pair
+    fits the current page; the inflated estimate made them wrongly conclude
+    it wouldn't, forcing an unnecessary early page break that stranded the
+    heading alone on an otherwise near-empty fresh page. A freshly
+    constructed Block's `layout.width` already defaults to CONTENT_WIDTH
+    (see BlockLayout), so this is the exact unplaced state a lookahead
+    actually sees."""
+    from app.course.document.layout import SECTION_INTRO_IMAGE_WIDTH
+
+    intro = _section_intro_image()
+    assert intro.layout.width == CONTENT_WIDTH  # still unplaced/default
+
+    unplaced_estimate = estimate_height(intro)
+
+    placed = _section_intro_image()
+    placed.layout.width = SECTION_INTRO_IMAGE_WIDTH
+    placed_estimate = estimate_height(placed)
+
+    assert unplaced_estimate == pytest.approx(placed_estimate)
+
+
+def test_a_heading_and_its_icon_stay_with_preceding_content_when_they_genuinely_fit():
+    """Reproduces the real bug end-to-end, tuned (empirically, against this
+    page geometry) so the preceding paragraph leaves just enough remaining
+    room for the true, narrow-width heading+icon height but NOT enough for
+    the old inflated full-width estimate - confirmed by running this exact
+    scenario against the pre-fix code, which splits it across 2 pages
+    (heading+icon stranded alone on the second, near-empty one); this is
+    the same shape of bug a real generated course hit (a "Common mistakes"
+    heading+icon landing alone on a 20%-full page, see
+    page_content_density's own docstring). With the fix, all three
+    genuinely fit together in the space available and must land on one
+    page."""
+    filler = _paragraph(180)
+    heading = _heading_block("Common mistakes - and the early signs")
+    icon = _section_intro_image()
+
+    pages = flow_blocks([filler, heading, icon])
+
+    assert len(pages) == 1, "the heading+icon pair was unnecessarily bumped to a fresh page"
+    assert pages[0] == [filler, heading, icon]
 
 
 # --- failed images and section_intro layout -----------------------------------

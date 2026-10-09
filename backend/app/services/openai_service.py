@@ -123,9 +123,12 @@ class AIClient(abc.ABC):
 
     @abc.abstractmethod
     async def image(
-        self, *, prompt: str, size: str | None = None, phase: str = "image"
+        self, *, prompt: str, size: str | None = None, phase: str = "image", provider: str | None = None
     ) -> bytes:
-        """Return PNG bytes."""
+        """Return PNG bytes. `provider` overrides `settings.image_provider`
+        for this one call only (e.g. ImageService forcing a textbook-style
+        illustration through a specific provider) - never mutates settings,
+        so every other call keeps using the configured default."""
 
     @abc.abstractmethod
     async def embed(
@@ -659,23 +662,22 @@ class OpenAIClient(AIClient):
 
     # --- images ------------------------------------------------------------
     async def image(
-        self, *, prompt: str, size: str | None = None, phase: str = "image"
+        self, *, prompt: str, size: str | None = None, phase: str = "image", provider: str | None = None
     ) -> bytes:
-        """Dispatches on `settings.image_provider` - "openai" (default)
-        keeps the exact behaviour this method always had; "azure" routes
-        through app.services.azure_image_provider instead. Never silently
-        falls back from one to the other on an unrecognised value - that
-        could mask a real production misconfiguration, so it fails clearly
-        instead (see the user's own "Do not silently fall back" requirement).
-        Either path still returns the same (prompt, size) -> PNG bytes
-        contract every caller (ImageService) already relies on."""
-        provider = (self.settings.image_provider or "openai").strip().lower()
-        if provider == "azure":
+        """Dispatches on `provider` if given, else `settings.image_provider`
+        - "openai" (default) keeps the exact behaviour this method always
+        had; "azure" routes through app.services.azure_image_provider
+        instead. Never silently falls back from one to the other on an
+        unrecognised value - that could mask a real production
+        misconfiguration, so it fails clearly instead (see the user's own
+        "Do not silently fall back" requirement). Either path still returns
+        the same (prompt, size) -> PNG bytes contract every caller
+        (ImageService) already relies on."""
+        resolved = (provider or self.settings.image_provider or "openai").strip().lower()
+        if resolved == "azure":
             return await self._image_azure(prompt=prompt, size=size, phase=phase)
-        if provider != "openai":
-            raise AIServiceError(
-                f"Unsupported image_provider {self.settings.image_provider!r} - expected 'openai' or 'azure'"
-            )
+        if resolved != "openai":
+            raise AIServiceError(f"Unsupported image_provider {resolved!r} - expected 'openai' or 'azure'")
         return await self._image_openai(prompt=prompt, size=size, phase=phase)
 
     async def _image_openai(

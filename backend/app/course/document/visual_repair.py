@@ -27,7 +27,7 @@ from app.core.ids import block_id as new_block_id
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, BlockType
 from app.schemas.document import Block, BlockLayout, BlockMeta, BlockStyle, CourseDocument
 from app.schemas.template import CourseTemplate
-from app.services.image_service import ImageService
+from app.services.image_service import ImageService, chapter_section_context
 from app.services.openai_service import AIClient
 
 log = get_logger(__name__)
@@ -249,6 +249,15 @@ async def audit_and_repair_visuals(
         if not deficient:
             break
 
+        # Computed once per pass (not once per page) over the document's
+        # CURRENT structure - reflow_document at the end of the previous
+        # pass can move blocks between pages/chapters, so this must be
+        # recomputed every pass, never cached across the whole repair run.
+        # Reuses the exact same production mechanism generate_missing()
+        # already uses (see image_service.py) - never a second,
+        # independent context-resolution implementation.
+        context_map = chapter_section_context(document)
+
         any_inserted = False
         for page in deficient:
             fraction_before = page_visual_fraction(page.blocks)
@@ -279,11 +288,20 @@ async def audit_and_repair_visuals(
 
             reference = page.blocks[-1]
             new_block = _build_repair_block(plan, template, reference)
+            # `new_block` isn't in `document` yet (inserted further below,
+            # only once generation succeeds), so it has no entry of its own
+            # in `context_map` - the reference block it's about to be
+            # inserted next to already does, and is exactly the chapter/
+            # section this repair visual belongs to.
+            chapter_title, section_title, key_concept = context_map.get(reference.id, ("", "", ""))
             ok = await images.generate_for_block(
                 course_id=document.course_id,
                 block=new_block,
                 template=template,
                 course_title=document.course_title,
+                chapter_title=chapter_title,
+                section_title=section_title,
+                key_concept=key_concept,
             )
             if not ok:
                 report.failed.append({

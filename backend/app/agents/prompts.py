@@ -412,21 +412,39 @@ How to produce blocks:
   motion/force/current/flow, and what causes what. Prose describing a
   mechanism is not enough on its own; a reader needs to see the components
   and how they relate. Choose which shape fits:
-  * `diagram_kind: schematic` ONLY for a biology/life-science structure - a
-    cell and its organelles, a plant's parts, an organ - where a labelled
-    parts-diagram is genuinely what's needed. NEVER `schematic` for physics,
-    chemistry or math: a magnet and a coil, a titration setup, a molecule
-    forming from its atoms, an orbit, a mechanical assembly, any experimental
-    apparatus - all of these go through `image_kind: illustration` with
-    `illustration_style: textbook` instead (describe the exact setup/
-    components in `image_prompt`), never the labelled-shape schematic
-    renderer, full stop - this is a firm preference from real generated
-    courses, not just a style suggestion. This split is by SUBJECT, not by
-    whether something happens to have a physical shape: a cell (biology)
-    still gets `schematic`; a magnet, a beaker/flask, an orbit or a pulley
-    (physics/chemistry) always gets `illustration` instead, even for a
-    simple static object that would render fine as a schematic - use
-    illustration anyway.
+  * `diagram_kind: schematic` is PERMANENTLY RETIRED - never set it, for any
+    subject. A labelled-box schematic (a cell and its organelles, a magnet
+    and a coil, a titration setup, an orbit, a mechanical assembly, any
+    experimental apparatus) now ALWAYS goes through `image_kind:
+    illustration` with `illustration_style: textbook` instead (describe the
+    exact setup/components in `image_prompt`) - this applies to every
+    subject alike, biology/life-science included; there is no longer a
+    subject split here, `schematic` is simply never the right choice for
+    anything. The renderer itself now rejects any `schematic` spec
+    unconditionally regardless of what gets requested, so setting it only
+    wastes a generation attempt before falling back to illustration anyway -
+    go straight there. Routing it to `illustration` does NOT make its
+    labels optional - the rule above (every mechanism needs a labelled
+    diagram showing every relevant component and the direction of motion/
+    force/current/flow) still applies in full; `schematic` just isn't the
+    renderer that satisfies it here. A real, confirmed failure mode: an
+    illustration for "magnetic flux through a surface" shipped with
+    unlabelled arrows and no indication of which one was B, which was the
+    surface normal, or which direction was positive - technically a clean
+    picture, but useless for actually teaching the mechanism, since nothing
+    in the image itself says what anything is. Identify the 2-6 real labels
+    this specific apparatus needs (component names, vector/quantity symbols
+    like "B", "n̂", "+"/"-", direction arrows) and set them in
+    `image_expected_labels` (see below) - do not leave this picture
+    unlabelled just because it's going through `illustration` instead of
+    `schematic`. If the picture includes a formula block (one key governing
+    equation with its symbols defined below it, e.g. "ε = induced emf"),
+    list EVERY one of those definition phrases in `image_expected_labels`
+    too, not just the component labels - a real, confirmed case shipped a
+    formula block with "electromotive force" garbled into "electromotivie
+    oforce" because only the diagram's own component labels were listed,
+    leaving the formula's own text completely unverified even though it's
+    exactly as checkable.
   * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
     the relationships is enough (an abstract system, an organisation, a
     reaction pathway) and there's no real physical arrangement to draw.
@@ -452,30 +470,30 @@ How to produce blocks:
     every subject, not just technical ones: history, business, science -
     anywhere a "what happened, in order" needs showing.
 - A chapter with BOTH a process to walk through AND a phenomenon/structure to
-  show needs BOTH visuals (a flow_chart plus a schematic/concept_map/
-  illustration, per the subject rule above) - one does not replace the
-  other, and this is normal and expected, not redundant. This applies to
-  every subject: a chemistry chapter gets both a reaction-mechanism
-  flow_chart and an illustration of the molecules involved; a biology
-  chapter gets both a process flow_chart and a schematic of the organism/
-  structure; a physics chapter gets both a problem-solving flow_chart and an
-  illustration of the apparatus - do not stop at just the flowchart because
-  it feels like "enough".
+  show needs BOTH visuals (a flow_chart plus a concept_map/illustration, per
+  the subject rule above) - one does not replace the other, and this is
+  normal and expected, not redundant. This applies to every subject: a
+  chemistry chapter gets both a reaction-mechanism flow_chart and an
+  illustration of the molecules involved; a biology chapter gets both a
+  process flow_chart and an illustration of the organism/structure; a
+  physics chapter gets both a problem-solving flow_chart and an illustration
+  of the apparatus - do not stop at just the flowchart because it feels like
+  "enough".
 - Beyond the structured diagram/concept_experience visual above (which
   explains structure/steps/relationships through labelled shapes), some
   concepts ALSO genuinely benefit from a second, complementary illustrative
   picture alongside it - what the real thing actually looks like, not a
-  labelled-box abstraction of it (this is on top of the physics/chemistry/
-  math rule above, which already routes those subjects' own apparatus/
-  molecule/setup pictures through illustration as their ONLY diagram, not an
-  addition to one). Use this rarely and only when it adds further value: a
-  recognisable anatomical structure (a heart, a cell, an organ) alongside its
-  biology schematic, a well-known technical architecture illustration (a
-  neural network, a transformer, a RAG pipeline) alongside its
-  concept_experience diagram, a geographic or geological scene (a region's
-  terrain, a volcano's cross-section, a landform), or a historical scene
-  (what a place, event or artefact actually looked like) - where seeing it
-  helps as much as seeing its labelled parts does. When this applies, add a
+  labelled-box abstraction of it (this is on top of the apparatus rule
+  above, which already routes EVERY subject's own apparatus/structure/
+  molecule/setup pictures - physics, chemistry, math, biology/life-science
+  alike - through illustration as their ONLY diagram, not an addition to
+  one). Use this rarely and only when it adds further value: a well-known
+  technical architecture illustration (a neural network, a transformer, a
+  RAG pipeline) alongside its concept_experience diagram, a geographic or
+  geological scene (a region's terrain, a volcano's cross-section, a
+  landform), or a historical scene (what a place, event or artefact
+  actually looked like) - where seeing it helps as much as seeing its
+  labelled parts does. When this applies, add a
   SEPARATE
   `image` block right after the diagram/concept_experience block for that
   same concept, with `image_kind: illustration` and `illustration_style:
@@ -484,22 +502,30 @@ How to produce blocks:
   process, a comparison, or anything that has no real visual form to
   depict. Keep `image_prompt` precise about the actual subject (the accurate
   structure/components/setting) and note that only essential labels should
-  appear in the image itself - never a wall of text or captions baked in.
-  Image models frequently misspell or garble text they draw - if the
-  picture needs ANY specific words/labels rendered in it, list each one,
-  exactly as it must be spelled, in `image_expected_labels` - a real
-  automated check compares the finished image against this list before
-  it's accepted, so a labelled image without this list can't be verified
-  and might ship with garbled text. Leave it empty for a picture that
-  needs no text at all (often the better choice anyway - a label the
-  reader needs can just as well live in the caption or the paragraph
-  beside it).
+  appear in the image itself - a handful of short part/vector/quantity
+  names and directions, never a wall of text, paragraphs or captions baked
+  in. Default to labelling it: a technical/scientific illustration whose
+  whole job is showing a mechanism (per the labelled-diagram rule above)
+  almost always needs its key components and directions named directly on
+  the image, or a reader has no way to tell which arrow/part is which -
+  only skip labels for a genuinely non-technical, purely scene-setting
+  picture (a historical/geographic scene, a decorative mood image) where
+  nothing in the picture needs to be individually identified. Image models
+  frequently misspell or garble text they draw - if the picture needs ANY
+  specific words/labels rendered in it, list each one, exactly as it must
+  be spelled, in `image_expected_labels` - a real automated check compares
+  the finished image against this list before it's accepted, so a
+  labelled image without this list can't be verified and might ship with
+  garbled text, or silently ship with NO labels at all even though the
+  diagram needed them (a real, confirmed case: a magnetic-flux apparatus
+  illustration rendered with unlabelled arrows, leaving a reader unable to
+  tell which one was B, the surface normal, or the sign convention).
 - Set `diagram_kind` whenever you can tell which shape fits (flow_chart,
-  process, cycle, schematic, concept_map, hierarchy, comparison, smart_art,
-  data_flow_diagram, er_diagram, swimlane) - this is what the renderer
-  actually builds, so getting it right here is
-  what makes the diagram useful. Leave it blank only when you genuinely
-  cannot tell.
+  process, cycle, concept_map, hierarchy, comparison, smart_art,
+  data_flow_diagram, er_diagram, swimlane - never `schematic`, permanently
+  retired, see above) - this is what the renderer actually builds, so
+  getting it right here is what makes the diagram useful. Leave it blank
+  only when you genuinely cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a
   precise `image_prompt` (every component/label/direction the diagram needs,
   not just a style description) and a `caption`. Set `image_kind: diagram`
@@ -519,15 +545,26 @@ How to produce blocks:
   block that follows it must be that section's first paragraph - the
   ordering of the blocks list is itself what pairs the picture with the
   text it will appear beside in the finished page; never add any marker or
-  placeholder text inside a paragraph for this. This is separate from, and
+  placeholder text inside a paragraph for this.
+  EXCEPTION: a template section whose own `block_types` has no general
+  narrative block type (e.g. a diagram-only slot like "Visual Explanation")
+  is a sub-slot of its PARENT section, not a new top-level section in its
+  own right - skip the section_intro image there entirely. That slot's own
+  guidance already requires a short paragraph beside each diagram it adds;
+  piling a decorative opener icon in front of that too is redundant, and a
+  real, confirmed failure mode: with no paragraph allowed in that slot, the
+  icon ended up paired with nothing, stranded alone on an otherwise blank
+  page. This is separate from, and
   can sit alongside, any `diagram`/`concept_experience` visual or textbook
   companion picture the section also needs - they serve different purposes.
   For THIS block's `image_prompt`: at most 40 words, one single clear
   subject with no clutter or background detail, always in the style "clean
-  modern digital illustration, dark-blue/teal tones with soft glow accents"
-  (the exact same palette phrase every time, for every section_intro image
-  in this chapter), and the prompt text must end with the exact words "no
-  text, no letters, no labels". The SUBJECT must be genuinely tied to what
+  modern digital illustration" - but choose colors that fit what THIS
+  subject actually is (e.g. warm earth tones for a desert ecosystem, green
+  for plant biology, the sodium-glow orange of a streetlamp circuit) rather
+  than one fixed palette repeated for every section_intro image in the
+  course, and the prompt text must end with the exact words "no text, no
+  letters, no labels". The SUBJECT must be genuinely tied to what
   this specific section actually teaches, never the section's own NAME -
   "Learning Objectives"/"Summary"/"Concept"/"Overview" are headings, not
   visual subjects, and must never be illustrated literally (a trophy for
@@ -536,18 +573,35 @@ How to produce blocks:
   own content actually says (its real objectives/takeaways/steps, not the
   heading), (2) the 2-4 most concrete entities, components, stages or
   relationships that content actually names, and (3) which of those -
-  never a stand-in metaphor - to put in the picture. This applies to every
-  subject the chapter could be about, not just technical ones: a Python
-  setup section's objectives are about a terminal/interpreter, an isolated
-  project folder, installed dependency blocks and a smoke-test check, not
-  a target; a photosynthesis section is about sunlight reaching a
-  chloroplast with CO2/H2O becoming glucose/O2, not a leaf icon; an
-  economics section on supply and demand is about the two curves and
-  their equilibrium point, not coins; a history section's overview is the
-  actual sequence of events/figures involved, not a generic scroll. A
-  purely structural/meta section still needs one of ITS OWN chapter's real
-  anchors from step (2) above, never a universal stand-in for what the
-  heading is called in the abstract. Before finalizing, apply both checks:
+  never a stand-in metaphor for what KIND of section this is (a trophy for
+  any "objectives" section, a ribbon for any "summary") - to put in the
+  picture. This applies to every subject the chapter could be about, not
+  just technical ones: a Python setup section's objectives are about a
+  terminal/interpreter, an isolated project folder, installed dependency
+  blocks and a smoke-test check, not a target; a photosynthesis section is
+  about sunlight reaching a chloroplast with CO2/H2O becoming glucose/O2,
+  not a leaf icon; an economics section on supply and demand is about the
+  two curves and their equilibrium point, not coins; a history section's
+  overview is the actual sequence of events/figures involved, not a
+  generic scroll. A purely structural/meta section still needs one of ITS
+  OWN chapter's real anchors from step (2) above, never a universal
+  stand-in for what the heading is called in the abstract.
+  When step (2)'s real entities are themselves symbolic/abstract with no
+  physical form (a function, a data structure, an algorithm's behaviour, a
+  mathematical relationship - e.g. a decorator wrapping a function, a
+  generator yielding values lazily, a closure capturing a variable), a
+  raster image model cannot draw the entity itself, so translate its
+  EXACT mechanism - never the section heading - into ONE concrete,
+  physically renderable object or scene that behaves the same way: a
+  decorator wrapping a function becomes a package being wrapped in an
+  outer layer of paper that everything passing in or out must go through;
+  a generator yielding lazily becomes one item being drawn out of a
+  dispenser at a time while the rest sit inside, not yet formed; a closure
+  capturing a variable becomes a sealed container carrying one labelled
+  item away with it after the room around it is gone. This is still THIS
+  mechanism, made drawable - not a generic icon and not interchangeable
+  with any other chapter's abstract concept.
+  Before finalizing, apply both checks:
   would this image still look at home pasted in front of a completely
   different chapter (if yes, it's too generic - pick a more specific
   anchor), and could a student, shown only the picture with no caption or
@@ -955,12 +1009,12 @@ Rules:
   "concept_experience" and leave `diagram_kind` blank - this is the right
   choice for that content, not a fallback. Otherwise set `kind` to
   "diagram" for a flow chart, process, hierarchy, comparison, concept
-  map/labelled relationship diagram, physical schematic or SmartArt-style
-  list (rendered from labelled shapes, so labels stay exact); also set
-  `diagram_kind` to the specific shape (flow_chart/process/cycle for a sequence,
-  schematic ONLY for a biology/life-science structure (a cell, a plant, an
-  organ) - NEVER for physics, chemistry or math (a magnet, an apparatus, a
-  molecule, an orbit, a mechanical assembly): those always get `kind:
+  map/labelled relationship diagram or SmartArt-style list (rendered from
+  labelled shapes, so labels stay exact); also set `diagram_kind` to the
+  specific shape (flow_chart/process/cycle for a sequence - never
+  `schematic`, permanently retired for every subject including biology/
+  life-science: a cell, a plant, an organ, a magnet, an apparatus, a
+  molecule, an orbit, a mechanical assembly all always get `kind:
   "illustration"` with `illustration_style: "textbook"` instead, even for a
   simple static object - this is a firm preference from real generated
   courses, not a style suggestion,
@@ -993,12 +1047,12 @@ Rules:
   even if the user didn't mention "kind" at all. A block sitting on `kind:
   "diagram"` whose topic clearly qualifies for `concept_experience`, whose
   topic is actually a coordinate-axis graph wrongly rendered as boxes-and-
-  lines, or whose `diagram_kind` is "schematic" for a physics/chemistry/math
-  topic, is a bug to fix while you're there, not a choice to preserve - set
-  `kind` to "concept_experience" (diagram_kind clears itself), or to
-  "illustration" (with `illustration_style: "textbook"` for the schematic
-  case) instead of only swapping the prompt and reproducing the same wrong
-  output.
+  lines, or whose `diagram_kind` is "schematic" (permanently retired, for
+  any subject), is a bug to fix while you're there, not a choice to
+  preserve - set `kind` to "concept_experience" (diagram_kind clears
+  itself), or to "illustration" (with `illustration_style: "textbook"` for
+  the former-schematic case) instead of only swapping the prompt and
+  reproducing the same wrong output.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.

@@ -123,7 +123,18 @@ relationship, or a state machine:
   technically be given a throwaway relationship like "connected_to"; a
   relationship line implies a REAL link the reader should learn, so
   inventing one between things that merely sit next to each other on the
-  page is worse than no relationship at all.
+  page is worse than no relationship at all. Be equally wary of ONE concept
+  being explained by ITS OWN defining traits/facts (a definition-style
+  brief: what it is, its key characteristics, an example, a non-example, an
+  analogy) - splitting each trait into its own satellite entity just to
+  give it a "connected_to" spoke back to the main concept produces a hub
+  where every single connector is captioned the identical generic word,
+  which teaches nothing a reader couldn't already see from the layout
+  alone. When every "relationship" you can name is this same generic word
+  repeated, that is itself a sign this content has no real relationships to
+  diagram - prefer naming only the few genuinely distinct links (if any)
+  and leaving the rest as plain, unconnected entities instead of inventing
+  a connection for every one of them.
 - "hierarchy": parent/child structure (the OSI/TCP-IP layers, class
   inheritance, a file system, an org chart, a Kubernetes cluster's nesting).
 - "comparison": 2+ things compared side by side on the SAME criteria (stack

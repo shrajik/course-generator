@@ -9,6 +9,7 @@ diagram always renders crisp labels and never drifts from the brand.
 from __future__ import annotations
 
 import math
+import uuid
 from xml.sax.saxutils import escape
 
 from app.render.textbook_palette import resolve_color_role, stroke_width_for
@@ -304,7 +305,14 @@ def _edge_label(x: float, y: float, text: str, theme: TemplateTheme, *, max_widt
     if not lines:
         return ""
     longest = max(len(line) for line in lines)
-    width = min(max(longest * 6.5 + 14, 40.0), max_width)
+    # Same calibration _wrap already uses for every node box (confirmed
+    # against real browser rendering - see _wrap's own docstring), not an
+    # independent estimate: a mismatched ratio here left label pills ~27%
+    # narrower than their real text, so the text overflowed the pill and
+    # got clipped by whichever node box painted over it afterward (a real,
+    # confirmed case: "Charge <-> Queue item" rendered as "harge <-> Queue
+    # item" in an exported PDF).
+    width = min(max(longest * EDGE_LABEL_FONT_SIZE * _SANS_RATIO + 14, 40.0), max_width)
     height = 18.0 if len(lines) == 1 else 18.0 + EDGE_LABEL_LINE_GAP
     rect = (
         f'<rect class="diagram-edge-label" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
@@ -1512,6 +1520,28 @@ CONCEPT_MAP_LABEL_MAX_WIDTH = 150.0  # narrower than the default pill - leaves r
 CONCEPT_MAP_LABEL_GAP = CONCEPT_MAP_LABEL_MAX_WIDTH + 40.0
 
 
+def _focal_node(nodes: list[DiagramNode], edges: list[DiagramEdge]) -> DiagramNode:
+    """The node the diagram should actually centre on - chosen by real
+    connectivity (how many edges touch it), never by declared `level` or
+    list position alone. A low-degree node forced into the focal role is a
+    visually poor centre: every edge among the OTHER, better-connected
+    nodes still has to bow around the ring to reach its real neighbours
+    instead of radiating cleanly from the centre - a real, confirmed case:
+    a 7-satellite concept map where the `level == 0` node had only 1 real
+    connection while 6 of its satellites were actually wired to each other
+    in 3 unrelated pairs, producing messy, crossing bulged chords. Falls
+    back to the old level/position rule only when it's at least as
+    connected as the degree-based pick (e.g. no edges at all, or a genuine
+    tie), so a well-formed single-hub spec renders exactly as before."""
+    degree: dict[str, int] = {}
+    for edge in edges:
+        degree[edge.source] = degree.get(edge.source, 0) + 1
+        degree[edge.target] = degree.get(edge.target, 0) + 1
+    default = next((n for n in nodes if n.level == 0), nodes[0])
+    best = max(nodes, key=lambda n: degree.get(n.id, 0))
+    return best if degree.get(best.id, 0) > degree.get(default.id, 0) else default
+
+
 def _layout_concept_map(
     nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
 ) -> tuple[list[str], float, float]:
@@ -1523,7 +1553,7 @@ def _layout_concept_map(
     if not nodes:
         return [], CANVAS_WIDTH, 0.0
 
-    focal = next((n for n in nodes if n.level == 0), nodes[0])
+    focal = _focal_node(nodes, edges)
     satellites = [n for n in nodes if n is not focal] or [focal]
     is_self_referential = satellites == [focal]
     if is_self_referential:
@@ -1577,7 +1607,14 @@ def _layout_concept_map(
         positions[sat_ids[index]] = (sx, sy, sat_w, sat_heights[index])
         sat_angles[sat_ids[index]] = angle
 
-    # Relationship lines first, so node boxes sit cleanly on top of them.
+    # Relationship lines first, so node boxes sit cleanly on top of their
+    # stub ends - but edge LABELS are collected separately and painted last
+    # (see below), never interleaved with the lines: a label sitting near a
+    # box edge must stay fully legible even when its pill's estimated
+    # position runs close to that box, which painting it before the boxes
+    # could clip (a real, confirmed case: a label's leading character
+    # vanished under a node box painted on top of it).
+    edge_labels: list[str] = []
     for edge in edges:
         p1 = positions.get(edge.source)
         p2 = positions.get(edge.target)
@@ -1617,7 +1654,7 @@ def _layout_concept_map(
                 0.25 * start[0] + 0.5 * ctrl[0] + 0.25 * end[0],
                 0.25 * start[1] + 0.5 * ctrl[1] + 0.25 * end[1],
             )
-        elements.append(_edge_label(mid[0], mid[1], edge.label, theme, max_width=CONCEPT_MAP_LABEL_MAX_WIDTH))
+        edge_labels.append(_edge_label(mid[0], mid[1], edge.label, theme, max_width=CONCEPT_MAP_LABEL_MAX_WIDTH))
 
     focal_svg, _ = _node_block(
         focal, x=cx - focal_w / 2, y=cy - focal_h / 2, width=focal_w, theme=theme, emphasis=True
@@ -1627,6 +1664,7 @@ def _layout_concept_map(
         sx, sy, w, h = positions[sat_ids[index]]
         svg, _ = _node_block(sat, x=sx - w / 2, y=sy - h / 2, width=w, theme=theme, badge=str(index + 1))
         elements.append(svg)
+    elements.extend(edge_labels)
 
     height_total = cy + radius + max_sat_h / 2 + 20 - top
     return elements, canvas_w, height_total
@@ -2169,7 +2207,18 @@ def _draw_relationship_connectors(
 
 
 def _layout_schematic(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
-    states = spec.states if spec.states else [SchematicState(caption="", shapes=spec.shapes)]
+    # Multi-state ("before/after") rendering is permanently retired - see
+    # app.agents.prompts' schematic guidance, which no longer tells the
+    # writer to populate `states` at all. A real, confirmed case: two
+    # stacked panels repeating the same cramped shape set, with real
+    # overlap bugs in the anchor layout on top of it, read as a genuinely
+    # unwanted visual format, not just a bug to patch. Only the FIRST state
+    # (or `spec.shapes` directly, the normal single-panel case) is ever
+    # rendered now - any stray `states` entry beyond the first (legacy data,
+    # or a model that set it anyway despite no prompt encouragement) is
+    # silently ignored rather than drawn, so this format can never render
+    # again regardless of what a spec happens to contain.
+    states = [spec.states[0]] if spec.states else [SchematicState(caption="", shapes=spec.shapes)]
     panel_w = CANVAS_WIDTH - 2 * MARGIN
     elements = [_arrow_marker("diagram-arrow", theme.muted_color)]
     if spec.relationships:
@@ -2304,6 +2353,27 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
     doc_title = f"<title>{escape(spec.title.strip() or 'Diagram')}</title>"
 
     body = "".join(elements)
+    # Every layout function in this module emits a fixed, literal marker id
+    # ("diagram-arrow", "schematic-relationship-arrow") - harmless for one
+    # SVG in isolation, but SVG/HTML ids must be unique within a DOCUMENT,
+    # and the frontend inlines potentially many diagram SVGs into the SAME
+    # page DOM (see app/render... consumed by frontend/src/components/blocks/
+    # ImageBlock.tsx's `dangerouslySetInnerHTML`, one per diagram block on a
+    # page). A real, confirmed bug: two diagrams on one page both define
+    # id="diagram-arrow", so every marker-end="url(#diagram-arrow)"
+    # reference becomes ambiguous once inlined together - a duplicate id is
+    # undefined behaviour per spec, and a real browser can silently fail to
+    # resolve it, rendering a line with no arrowhead at all, which reads as
+    # "not connected to its target" even though the line's own endpoints are
+    # mathematically correct. Suffixing every marker id (both the
+    # `<marker id="...">` definition and every reference to it) with a
+    # random, per-render-call-unique tag closes this for every layout
+    # function at once, at the one chokepoint every one of them already
+    # funnels through, without threading an id parameter through ~20 call
+    # sites individually.
+    unique = uuid.uuid4().hex[:8]
+    body = body.replace("diagram-arrow", f"diagram-arrow-{unique}")
+    body = body.replace("schematic-relationship-arrow", f"schematic-relationship-arrow-{unique}")
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {canvas_w:.0f} {canvas_h:.0f}" '
         f'width="{canvas_w:.0f}" height="{canvas_h:.0f}" role="img">'

@@ -15,6 +15,7 @@ test_diagrams.py's structure so the two suites read as siblings.
 
 from __future__ import annotations
 
+import math
 import re
 
 import pytest
@@ -47,6 +48,7 @@ from app.services import mock_ai as mock_ai_module
 from app.services.concept_qa import (
     CONCEPT_NOT_CLEAR,
     DANGLING_TRANSITION,
+    DISCONNECTED_CONCEPTS,
     GENERIC_VISUAL,
     MISSING_ENTITY,
     MISSING_LEARNING_OBJECTIVES,
@@ -58,6 +60,7 @@ from app.services.concept_qa import (
 from app.services.concept_visual_service import ConceptVisualService
 from app.services.mock_ai import MockAIClient
 from app.services.visual_planner import VisualPlanner
+from tests.test_pdf import needs_browser
 
 # ---------------------------------------------------------------------------
 # schema: concept_experience is additive, legacy specs are unaffected
@@ -405,10 +408,16 @@ class TestRelationshipChainLayout:
         # appear - a genuine chain no longer routes through it at all.
         assert 'class="cev-rel-link"' not in body
         assert 'class="cev-connector"' not in body
-        # Every consecutive pair is joined by a plain arrow, and the whole
-        # thing gets the flatter, whiteboard-flowchart "flow" treatment
-        # `_render_process` already uses for an explicit step sequence.
-        assert body.count('class="cev-step-arrow"') == 7  # 8 nodes -> 7 arrows
+        # Wrap-aware zig-grid technique (see _chain_row_html's own
+        # docstring for why a plain flex-wrap row isn't enough once a
+        # chain is long enough to wrap onto more than one row): pairs of
+        # cards joined by a plain arrow, consecutive rows joined by a
+        # curved connector, the whole thing getting the flatter,
+        # whiteboard-flowchart "flow" treatment `_render_process` already
+        # uses for an explicit step sequence.
+        assert 'class="cev-zig-grid"' in body
+        assert body.count('class="cev-zig-link"') == 4  # 8 nodes, 2 per row -> 4 pairs
+        assert body.count('class="cev-zig-curve-row"') == 3  # 4 rows -> 3 connectors between them
         assert body.count('data-entity-id="e') == 8  # every node still rendered, once each
         assert 'class="cev-root cev-style-flow"' in html
         # Order is preserved start-to-end, not just "all present somewhere".
@@ -426,10 +435,15 @@ class TestRelationshipChainLayout:
         html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
         assert html.count('data-entity-id="hub"') == 1
 
-    def test_a_hub_still_gets_the_existing_card_row_not_the_chain_layout(self):
+    def test_a_hub_renders_via_the_circular_concept_map_not_the_old_card_row(self):
         """The same hub shape as above, checked from the chain-layout side:
         a hub must NOT be mistaken for a chain (`_is_linear_chain` returns
-        None for it) - it keeps the per-relationship connector rendering."""
+        None for it). It no longer gets the old flat flex-wrap card row
+        with a connector threaded between every card either (that's the
+        exact shape a real, confirmed bug report traced to - a hub reading
+        as "a grid with lines in it" instead of a hub) - it gets a real
+        centre-hub + orbiting-satellites layout instead (see
+        _render_concept_map_html/_concept_map_hub)."""
         entities = [VisualEntity(id="hub", label="Hub"), VisualEntity(id="a", label="A"), VisualEntity(id="b", label="B")]
         relationships = [
             SchematicRelationship(source="hub", target="a", type="connected_to"),
@@ -438,7 +452,20 @@ class TestRelationshipChainLayout:
         spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=entities, relationships=relationships)
         html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
         body = html.split("</style>", 1)[1]
-        assert 'class="cev-rel-link"' in body
+        assert 'class="cev-rel-link"' not in body
+        assert 'class="cev-instances"' not in body
+        assert 'class="cev-cmap-wrap"' in body
+        assert body.count('class="cev-cmap-node"') == 3  # hub + 2 satellites, each rendered once
+        assert 'data-cmap-is-hub="true"' in body
+        assert body.count('data-cmap-is-hub="true"') == 1  # exactly one hub
+        # Hub mode draws curved SVG spokes (_concept_map_curved_spokes_svg),
+        # not ring mode's straight cev-cmap-spoke divs.
+        assert 'class="cev-cmap-spoke"' not in body
+        assert body.count('class="cev-cmap-curves"') == 1  # one shared SVG overlay
+        assert body.count('class="cev-cmap-curve-path"') == 2  # one curve per satellite
+        # "connected_to" is a generic structural label, suppressed on a spoke
+        # exactly as it already is on a flat-row connector (_connector_label).
+        assert 'class="cev-cmap-curve-label"' not in body
         assert 'class="cev-root cev-style-flow"' not in html  # the root div never gets this class for a hub
 
     def test_is_linear_chain_helper_directly(self):
@@ -464,6 +491,664 @@ class TestRelationshipChainLayout:
         assert _is_linear_chain(cycle, [rel("a", "b"), rel("b", "c"), rel("c", "a")]) is None
 
         assert _is_linear_chain(chain, []) is None  # no relationships at all
+
+
+class TestConceptMapRenderer:
+    """The circular layout `_render_object`/`_render_tree` fall through to
+    for a hub or small network that isn't a clean chain/tree - see
+    _render_concept_map_html. Covers: hub-detection on its own, the
+    rendered hub layout, the rendered general-ring layout, real (non-
+    generic) labels surviving onto a spoke, and that `_render_object`'s own
+    template+instances (no relationships) case is completely untouched."""
+
+    def test_concept_map_hub_helper_directly(self):
+        from app.render.concept_experience_renderer import _concept_map_hub
+
+        e = lambda *ids: [VisualEntity(id=i, label=i) for i in ids]  # noqa: E731
+        rel = lambda s, t: SchematicRelationship(source=s, target=t, type="connected_to")  # noqa: E731
+
+        star = e("hub", "a", "b", "c")
+        found = _concept_map_hub(star, [rel("hub", "a"), rel("hub", "b"), rel("hub", "c")])
+        assert found is not None and found.id == "hub"
+
+        # Only one spoke - not a star (see _render_concept_map_html's own
+        # 0-1-entity/single-edge handling; a lone pair reads fine as a plain
+        # two-point ring instead of inventing a "hub" for it).
+        pair = e("a", "b")
+        assert _concept_map_hub(pair, [rel("a", "b")]) is None
+
+        cycle = e("a", "b", "c")
+        assert _concept_map_hub(cycle, [rel("a", "b"), rel("b", "c"), rel("c", "a")]) is None
+
+        two_sources = e("a", "b", "c", "d")
+        assert _concept_map_hub(two_sources, [rel("a", "c"), rel("b", "d")]) is None
+
+        # The "hub" is also someone's target - not a pure star.
+        not_pure = e("a", "b", "c")
+        assert _concept_map_hub(not_pure, [rel("a", "b"), rel("a", "c"), rel("b", "a")]) is None
+
+        assert _concept_map_hub(star, []) is None
+
+    def test_hub_spoke_count_matches_satellite_count_and_hub_renders_once(self):
+        entities = [VisualEntity(id="core", label="Core")] + [
+            VisualEntity(id=f"fact{i}", label=f"Fact {i}") for i in range(6)
+        ]
+        relationships = [SchematicRelationship(source="core", target=f"fact{i}", type="connected_to") for i in range(6)]
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert body.count('data-cmap-node-id="core"') == 1
+        assert body.count('class="cev-cmap-node"') == 7
+        assert body.count('class="cev-cmap-curve-path"') == 6
+
+    def test_a_real_relationship_label_survives_onto_a_spoke(self):
+        """Unlike the generic "connected_to" vocabulary (suppressed - see
+        the hub test above), a real, specific relationship type still
+        shows as visible text on its spoke, exactly as it already does on
+        a flat-row connector (_connector_label is shared by both)."""
+        entities = [VisualEntity(id="svc", label="Order Service"), VisualEntity(id="db", label="Orders DB"),
+                    VisualEntity(id="cache", label="Redis Cache")]
+        relationships = [
+            SchematicRelationship(source="svc", target="db", type="writes_to"),
+            SchematicRelationship(source="svc", target="cache", type="reads_from"),
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "writes to" in html
+        assert "reads from" in html
+
+    def test_a_small_web_with_no_single_hub_renders_as_a_flow_chart_not_a_crash(self):
+        """Two independent sources (a->c, b->d) - not a star (see the hub
+        helper test), not a chain, not a tree. A real top-to-bottom
+        flowchart instead (every entity its own level row, an arrowed stem
+        per edge - see _render_concept_flow_html), never a hard failure."""
+        entities = [VisualEntity(id=i, label=i) for i in ("a", "b", "c", "d")]
+        relationships = [
+            SchematicRelationship(source="a", target="c", type="calls"),
+            SchematicRelationship(source="b", target="d", type="calls"),
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="spatial", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert "cev-cmap-hub" not in body
+        assert 'class="cev-flow-chart"' in body
+        assert body.count('class="cev-flow-level"') == 2  # {a,b} then {c,d}
+        assert body.count('class="cev-card cev-tree-card"') == 4  # every entity rendered once
+        assert body.count('class="cev-flow-link-cell"') == 2  # one arrowed stem per edge
+        assert "cev-flow-backedge" not in body  # both edges advance a level - no cycle here
+        # A real, confirmed complaint about exactly this shape ("too
+        # colourful") - the flowchart fallback (no dominant hub) must get
+        # the same toned-down "textbook" treatment process/cycle already
+        # use, not the default saturated icon-card palette a genuine hub
+        # keeps (see test_a_hub_renders_via_the_circular_concept_map_...).
+        assert 'class="cev-root cev-style-flow"' in html
+
+    def test_object_representation_with_no_relationships_is_completely_unaffected(self):
+        """A plain template+instances "object" spec (the common case - a
+        Java class and its objects) never has relationships at all, so it
+        must keep rendering as the existing flat instances row, not the new
+        concept map - a pure regression guard."""
+        html = render_concept_experience_html(_java_class_and_object_spec(), TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-instances"' in body
+        assert 'class="cev-cmap-wrap"' not in body
+
+    def test_data_structure_with_relationships_is_completely_unaffected(self):
+        """_render_data_structure keeps its own established connector-row
+        treatment for a tree/graph-shaped structure (a BST) unchanged -
+        this renderer change is scoped to relationship/spatial/hierarchy/
+        decision_tree's own fallback only, never data_structure."""
+        spec = DiagramSpec(
+            kind="concept_experience", representation="data_structure", title="Binary Search Tree",
+            entities=[VisualEntity(id="n8", label="8"), VisualEntity(id="n3", label="3"), VisualEntity(id="n10", label="10")],
+            relationships=[
+                SchematicRelationship(source="n8", type="connected_to", target="n3"),
+                SchematicRelationship(source="n8", type="connected_to", target="n10"),
+            ],
+        )
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-rel-link"' in body
+        assert 'class="cev-cmap-wrap"' not in body
+
+    def test_pixel_height_estimate_grows_with_satellite_count(self):
+        """The concept map's reserved height should track its own real
+        container footprint (_concept_map_hub_layout), not the old
+        per-character row-wrap formula - a regression guard on the
+        _raw_pixel_size branch added alongside the renderer itself."""
+        def hub_spec(n: int) -> DiagramSpec:
+            entities = [VisualEntity(id="hub", label="Hub")] + [VisualEntity(id=f"s{i}", label=f"Sat {i}") for i in range(n)]
+            relationships = [SchematicRelationship(source="hub", target=f"s{i}", type="connected_to") for i in range(n)]
+            return DiagramSpec(kind="concept_experience", representation="relationship", entities=entities, relationships=relationships)
+
+        _, small_height = estimate_pixel_size(hub_spec(2))
+        _, large_height = estimate_pixel_size(hub_spec(10))
+        assert large_height > small_height
+
+
+class TestConceptMapHubGeometry:
+    """Deterministic geometry tests for the exact rectangle model
+    (_concept_map_required_radius/_concept_map_max_radius_for_width/
+    _concept_map_hub_layout) - replaces an earlier bounding-circle model
+    proven (by direct computation during investigation) to be too
+    conservative at axis-aligned angles: it made even a 2-satellite map
+    need more radius than the page allows, and produced an IDENTICAL
+    clamped radius for n=2 and n=10 alike. These tests verify the
+    replacement model's invariants directly from raw rectangle edges, not
+    by re-deriving the same formula and comparing it to itself."""
+
+    @staticmethod
+    def _rect_edges(cx: float, cy: float, w: float, h: float) -> tuple[float, float, float, float]:
+        return cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
+
+    @classmethod
+    def _no_overlap(cls, c1: tuple[float, float, float, float], c2: tuple[float, float, float, float]) -> bool:
+        """Independent AABB overlap check - re-derives whether two
+        rectangles (cx, cy, w, h) actually overlap from their raw edges,
+        not from any function under test."""
+        l1, r1, t1, b1 = cls._rect_edges(*c1)
+        l2, r2, t2, b2 = cls._rect_edges(*c2)
+        return r1 <= l2 or r2 <= l1 or b1 <= t2 or b2 <= t1
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 5, 6, 8, 10])
+    def test_hub_and_every_satellite_rectangle_genuinely_do_not_overlap(self, n):
+        """Whenever the chosen tier's own required radius fits within what
+        the page allows (`needed <= available` - the formula's own
+        promise, never broken), the ESTIMATED worst-case rectangles must
+        not overlap. At very high satellite counts with properties-heavy
+        content, even the compact tier can genuinely exceed the page width
+        - by design, `_concept_map_hub_layout` then clamps to the largest
+        radius the page allows rather than overlapping arbitrarily or
+        silently failing; that residual, documented case is verified here
+        too, just against the TRUE invariant it actually keeps (the
+        clamped radius equals exactly the page-width-available radius, not
+        something smaller), not a blanket overlap claim this test can't
+        truthfully make for it. See TestConceptMapRealBrowserGeometry for
+        whether that worst-case estimate is ever actually reached by real
+        rendering (it generally isn't - see that class's own docstring)."""
+        from app.render.concept_experience_renderer import (
+            _CONCEPT_MAP_HUB_WIDTH,
+            _CONCEPT_MAP_HUB_WIDTH_COMPACT,
+            _CONCEPT_MAP_SAT_WIDTH,
+            _CONCEPT_MAP_SAT_WIDTH_COMPACT,
+            _concept_map_card_height,
+            _concept_map_hub_layout,
+            _concept_map_max_radius_for_width,
+            _concept_map_required_radius,
+            _concept_map_satellite_angles,
+        )
+
+        hub = VisualEntity(id="hub", label="Hub")
+        sats = [
+            VisualEntity(id=f"s{i}", label=f"Satellite number {i}", properties={"k": "a modestly long property value"})
+            for i in range(n)
+        ]
+        radius, compact, _container_w, _container_h = _concept_map_hub_layout(hub, sats)
+        hub_w = _CONCEPT_MAP_HUB_WIDTH_COMPACT if compact else _CONCEPT_MAP_HUB_WIDTH
+        sat_w = _CONCEPT_MAP_SAT_WIDTH_COMPACT if compact else _CONCEPT_MAP_SAT_WIDTH
+        hub_h = _concept_map_card_height(hub)
+        sat_h = max(_concept_map_card_height(s) for s in sats)
+        angles = _concept_map_satellite_angles(n)
+        needed = _concept_map_required_radius(hub_w, hub_h, sat_w, sat_h, angles)
+        available = _concept_map_max_radius_for_width(sat_w, angles)
+
+        if needed <= available:
+            hub_rect = (0.0, 0.0, hub_w, hub_h)
+            for s, a in zip(sats, angles):
+                sat_rect = (radius * math.cos(a), radius * math.sin(a), sat_w, _concept_map_card_height(s))
+                assert self._no_overlap(hub_rect, sat_rect), f"n={n}: a satellite overlaps the hub"
+        else:
+            assert radius == pytest.approx(available), (
+                f"n={n}: the formula's own promise doesn't hold here (page too narrow for this much "
+                "content at this tier) - the clamp must still pick the largest page-safe radius, not "
+                "something smaller"
+            )
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 5, 6, 8, 10])
+    def test_adjacent_satellite_rectangles_genuinely_do_not_overlap(self, n):
+        """See test_hub_and_every_satellite_rectangle_genuinely_do_not_overlap's
+        own docstring for why this is conditional on the clamp not having
+        engaged."""
+        from app.render.concept_experience_renderer import (
+            _CONCEPT_MAP_SAT_WIDTH,
+            _CONCEPT_MAP_SAT_WIDTH_COMPACT,
+            _CONCEPT_MAP_HUB_WIDTH,
+            _CONCEPT_MAP_HUB_WIDTH_COMPACT,
+            _concept_map_card_height,
+            _concept_map_hub_layout,
+            _concept_map_max_radius_for_width,
+            _concept_map_required_radius,
+            _concept_map_satellite_angles,
+        )
+
+        hub = VisualEntity(id="hub", label="Hub")
+        sats = [VisualEntity(id=f"s{i}", label=f"Satellite {i}") for i in range(n)]
+        radius, compact, _w, _h = _concept_map_hub_layout(hub, sats)
+        hub_w = _CONCEPT_MAP_HUB_WIDTH_COMPACT if compact else _CONCEPT_MAP_HUB_WIDTH
+        sat_w = _CONCEPT_MAP_SAT_WIDTH_COMPACT if compact else _CONCEPT_MAP_SAT_WIDTH
+        angles = _concept_map_satellite_angles(n)
+        hub_h = _concept_map_card_height(hub)
+        sat_h = max(_concept_map_card_height(s) for s in sats)
+        needed = _concept_map_required_radius(hub_w, hub_h, sat_w, sat_h, angles)
+        available = _concept_map_max_radius_for_width(sat_w, angles)
+
+        if needed <= available:
+            positions = [(radius * math.cos(a), radius * math.sin(a)) for a in angles]
+            heights = [_concept_map_card_height(s) for s in sats]
+            for i in range(n):
+                j = (i + 1) % n
+                c1 = (positions[i][0], positions[i][1], sat_w, heights[i])
+                c2 = (positions[j][0], positions[j][1], sat_w, heights[j])
+                assert self._no_overlap(c1, c2), f"n={n}: adjacent satellites {i} and {j} overlap"
+        else:
+            assert radius == pytest.approx(available), (
+                f"n={n}: the formula's own promise doesn't hold here - the clamp must still pick the "
+                "largest page-safe radius, not something smaller"
+            )
+
+    @pytest.mark.parametrize("n", [2, 3, 4, 5, 6, 8, 10])
+    def test_every_rectangle_stays_inside_the_computed_container(self, n):
+        from app.render.concept_experience_renderer import (
+            _CONCEPT_MAP_HUB_WIDTH,
+            _CONCEPT_MAP_HUB_WIDTH_COMPACT,
+            _CONCEPT_MAP_SAT_WIDTH,
+            _CONCEPT_MAP_SAT_WIDTH_COMPACT,
+            _concept_map_card_height,
+            _concept_map_hub_layout,
+            _concept_map_satellite_angles,
+        )
+
+        hub = VisualEntity(id="hub", label="Hub")
+        sats = [VisualEntity(id=f"s{i}", label=f"Satellite {i}") for i in range(n)]
+        radius, compact, container_w, container_h = _concept_map_hub_layout(hub, sats)
+        hub_w = _CONCEPT_MAP_HUB_WIDTH_COMPACT if compact else _CONCEPT_MAP_HUB_WIDTH
+        sat_w = _CONCEPT_MAP_SAT_WIDTH_COMPACT if compact else _CONCEPT_MAP_SAT_WIDTH
+        angles = _concept_map_satellite_angles(n)
+        half_w, half_h = container_w / 2, container_h / 2
+        assert _concept_map_card_height(hub) / 2 <= half_h + 0.5
+        assert hub_w / 2 <= half_w + 0.5
+        for s, a in zip(sats, angles):
+            x, y = radius * math.cos(a), radius * math.sin(a)
+            sat_h = _concept_map_card_height(s)
+            assert abs(x) + sat_w / 2 <= half_w + 0.5, f"n={n}: a satellite exceeds the container width"
+            assert abs(y) + sat_h / 2 <= half_h + 0.5, f"n={n}: a satellite exceeds the container height"
+
+    def test_container_width_never_exceeds_the_page(self):
+        """The one hard constraint that must never be violated regardless
+        of tier or satellite count - clipping by `.cev-root`'s
+        `overflow:hidden` would silently hide content."""
+        from app.render.concept_experience_renderer import _INNER_WIDTH, _concept_map_hub_layout
+
+        hub = VisualEntity(id="hub", label="Hub")
+        for n in (2, 3, 4, 5, 6, 8, 10, 12):
+            sats = [
+                VisualEntity(
+                    id=f"s{i}", label=f"A reasonably long satellite label {i}",
+                    properties={"detail": "some descriptive text about this satellite"},
+                )
+                for i in range(n)
+            ]
+            _radius, _compact, container_w, _h = _concept_map_hub_layout(hub, sats)
+            assert container_w <= _INNER_WIDTH + 1.0, f"n={n}: container width {container_w} exceeds page width {_INNER_WIDTH}"
+
+    def test_normal_tier_is_preferred_for_two_short_satellites(self):
+        """Requirement: normal tier stays active whenever it genuinely
+        fits - the simplest possible hub case (2 bare-label satellites)
+        must not be forced into compact."""
+        from app.render.concept_experience_renderer import _concept_map_hub_layout
+
+        hub = VisualEntity(id="hub", label="Hub")
+        sats = [VisualEntity(id="a", label="A"), VisualEntity(id="b", label="B")]
+        _radius, compact, _w, _h = _concept_map_hub_layout(hub, sats)
+        assert compact is False
+
+    def test_compact_tier_engages_only_when_normal_genuinely_cannot_fit(self):
+        """Cross-checks `_concept_map_hub_layout`'s own tier decision
+        against an independently recomputed normal-tier needed-vs-available
+        comparison - compact must be selected if and only if the normal
+        tier's own required radius exceeds what the page allows it."""
+        from app.render.concept_experience_renderer import (
+            _CONCEPT_MAP_HUB_WIDTH,
+            _CONCEPT_MAP_SAT_WIDTH,
+            _concept_map_card_height,
+            _concept_map_hub_layout,
+            _concept_map_max_radius_for_width,
+            _concept_map_required_radius,
+            _concept_map_satellite_angles,
+        )
+
+        hub = VisualEntity(id="hub", label="Hub")
+        sats = [VisualEntity(id=f"s{i}", label=f"Sat {i}") for i in range(8)]
+        angles = _concept_map_satellite_angles(8)
+        hub_h = _concept_map_card_height(hub)
+        sat_h = max(_concept_map_card_height(s) for s in sats)
+        needed_normal = _concept_map_required_radius(_CONCEPT_MAP_HUB_WIDTH, hub_h, _CONCEPT_MAP_SAT_WIDTH, sat_h, angles)
+        available_normal = _concept_map_max_radius_for_width(_CONCEPT_MAP_SAT_WIDTH, angles)
+        _radius, compact, _w, _h = _concept_map_hub_layout(hub, sats)
+        assert compact == (needed_normal > available_normal)
+
+    def test_long_labels_and_properties_select_the_appropriate_tier(self):
+        """Long text makes cards taller (_entity_chars/_slot_width), which
+        can push a modest satellite count past the normal tier - this is
+        the pure-math half of that check (does the MODEL correctly choose
+        compact here, and does the clamp invariant hold); whether real
+        Chromium rendering of this exact content ("Operating System", the
+        original bug report's own content) has any ACTUAL overlap is
+        verified authoritatively in
+        TestConceptMapRealBrowserGeometry.test_operating_system_case_has_no_overlap
+        instead - a pure-Python estimate can't answer that, see this
+        class's own module-level distinction notes."""
+        from app.render.concept_experience_renderer import (
+            _CONCEPT_MAP_HUB_WIDTH_COMPACT,
+            _CONCEPT_MAP_SAT_WIDTH_COMPACT,
+            _concept_map_card_height,
+            _concept_map_hub_layout,
+            _concept_map_max_radius_for_width,
+            _concept_map_required_radius,
+            _concept_map_satellite_angles,
+        )
+
+        hub = VisualEntity(id="hub", label="Operating System")
+        sats = [
+            VisualEntity(id="def", label="Definition", properties={"summary": "System software that manages hardware and software resources"}),
+            VisualEntity(id="mem", label="Memory Management", properties={"role": "Allocates RAM to running programs"}),
+            VisualEntity(id="sched", label="Process Scheduling", properties={"role": "Decides which process runs next on the CPU"}),
+            VisualEntity(id="example", label="Example", properties={"value": "Windows, Linux, macOS, Android"}),
+            VisualEntity(id="analogy", label="Analogy", properties={"value": "A building manager coordinating every tenant's use of shared utilities"}),
+        ]
+        radius, compact, _container_w, _container_h = _concept_map_hub_layout(hub, sats)
+        assert compact is True  # this much real text genuinely doesn't fit the normal tier
+
+        hub_w, sat_w = _CONCEPT_MAP_HUB_WIDTH_COMPACT, _CONCEPT_MAP_SAT_WIDTH_COMPACT
+        hub_h = _concept_map_card_height(hub)
+        sat_h = max(_concept_map_card_height(s) for s in sats)
+        angles = _concept_map_satellite_angles(len(sats))
+        needed = _concept_map_required_radius(hub_w, hub_h, sat_w, sat_h, angles)
+        available = _concept_map_max_radius_for_width(sat_w, angles)
+
+        if needed <= available:
+            hub_rect = (0.0, 0.0, hub_w, hub_h)
+            for s, a in zip(sats, angles):
+                sat_rect = (radius * math.cos(a), radius * math.sin(a), sat_w, _concept_map_card_height(s))
+                assert self._no_overlap(hub_rect, sat_rect)
+        else:
+            assert radius == pytest.approx(available)
+
+    def test_radius_grows_with_real_geometry_not_a_flat_constant(self):
+        """The old bounding-circle model produced an IDENTICAL clamped
+        radius for n=2 and n=10 (the exact bug this investigation started
+        from) - the replacement must not repeat that: across a spread of
+        satellite counts, the radii must not all collapse to one repeated
+        value."""
+        from app.render.concept_experience_renderer import _concept_map_hub_layout
+
+        hub = VisualEntity(id="hub", label="Hub")
+        radii = set()
+        for n in (2, 3, 4, 6, 8, 10):
+            sats = [VisualEntity(id=f"s{i}", label=f"Sat {i}") for i in range(n)]
+            radius, _compact, _w, _h = _concept_map_hub_layout(hub, sats)
+            radii.add(round(radius, 1))
+        assert len(radii) > 1
+
+
+class TestConceptMapRenderedLayoutRegression:
+    """A fast, browser-free smoke check: parses the real transform values
+    back out of the rendered HTML string - cheap enough to run on every
+    test invocation, but only ever as strong as the ESTIMATED footprint
+    (_concept_map_card_height) it's built from, which real `.cev-card`s
+    (min-width:0, shrink-to-fit) often render smaller than - see
+    TestConceptMapRealBrowserGeometry below for the authoritative, real-
+    Chromium-measured equivalent of an actual overlap claim. This class is
+    kept narrow on purpose: just confirming distinct node positions (the
+    exact failure mode an earlier CSS-animation bug in this same
+    investigation caused - every node silently collapsing onto one point
+    while every markup-level test kept passing), not full geometry."""
+
+    NODE_RE = re.compile(
+        r'<div class="cev-cmap-node" style="transform:translate\(-50%,-50%\) '
+        r'translate\(([-\d.]+)px,([-\d.]+)px\);" data-cmap-node-id="([^"]+)"'
+    )
+
+    @classmethod
+    def _parse_nodes(cls, html: str) -> dict[str, tuple[float, float]]:
+        body = html.split("</style>", 1)[1]
+        return {node_id: (float(dx), float(dy)) for dx, dy, node_id in cls.NODE_RE.findall(body)}
+
+    def test_rendered_two_satellite_case_uses_normal_tier_and_every_node_is_distinct(self):
+        entities = [VisualEntity(id="hub", label="Hub"), VisualEntity(id="a", label="A"), VisualEntity(id="b", label="B")]
+        relationships = [
+            SchematicRelationship(source="hub", target="a", type="connected_to"),
+            SchematicRelationship(source="hub", target="b", type="connected_to"),
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert "cev-cmap-compact" not in body  # requirement: normal tier used when there's clearly room
+
+        positions = self._parse_nodes(html)
+        # The exact failure mode the animation-conflict bug produced: every
+        # node collapsing onto the identical point - a direct, minimal
+        # regression guard against that specific class of bug recurring.
+        assert positions["hub"] != positions["a"]
+        assert positions["hub"] != positions["b"]
+        assert positions["a"] != positions["b"]
+
+
+class TestConceptMapRealBrowserGeometry:
+    """Authoritative geometry validation via a real Chromium page - same
+    Playwright launch pattern as `app.services.pdf_service.PdfService.
+    export_pdf` (`args=["--no-sandbox"]`), and the same availability guard
+    `tests.test_pdf` already defines (`needs_browser`), reused here rather
+    than inventing a second browser setup.
+
+    The division of labour in this module, explicitly:
+    - `TestConceptMapHubGeometry` validates the MATHEMATICAL layout MODEL
+      itself (the exact-rectangle formula's own inequalities, the
+      container-bound derivation, the tier decision) against the same
+      conservative footprint ESTIMATE the renderer uses as a safety
+      ceiling - pure math, no browser, fast, and it stays that way
+      (card dimensions there are a text-length estimate, never a DOM
+      measurement).
+    - THIS class validates what Chromium actually draws from the real
+      CSS. `.cev-card` has `min-width:0` and only grows toward its
+      max-width cap if its content genuinely needs that much room - a
+      short one-line label typically renders far smaller than the
+      estimate's safety ceiling, so real rendered clearance is usually
+      MORE than the model strictly guarantees, never less. This is the
+      only way to answer "does a reader actually see any overlap" -
+      confirmed, during this investigation, to matter: an earlier bug (a
+      CSS animation silently cancelling the positioning transform) passed
+      every markup/estimate-based test while collapsing every node onto
+      one point in the real browser. These tests close that exact gap.
+    """
+
+    @staticmethod
+    def _boxes_overlap(a: dict, b: dict, *, tolerance: float = 0.5) -> bool:
+        return not (
+            a["x"] + a["width"] <= b["x"] + tolerance
+            or b["x"] + b["width"] <= a["x"] + tolerance
+            or a["y"] + a["height"] <= b["y"] + tolerance
+            or b["y"] + b["height"] <= a["y"] + tolerance
+        )
+
+    @staticmethod
+    async def _measure(playwright, entities, relationships, *, title: str = "") -> dict:
+        """Renders a real concept_experience HTML fragment in an actual
+        Chromium page and returns the ACTUAL CSS-rendered geometry -
+        pure-Python geometry tests elsewhere in this module can only ever
+        estimate a card's size (_concept_map_card_height); this is the one
+        place that measures what a browser really draws."""
+        spec = DiagramSpec(
+            kind="concept_experience", representation="relationship", title=title,
+            entities=entities, relationships=relationships,
+        )
+        fragment = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        html = f"<!doctype html><html><body>{fragment}</body></html>"
+
+        browser = await playwright.chromium.launch(args=["--no-sandbox"])
+        try:
+            page = await browser.new_page(viewport={"width": 900, "height": 1600})
+            await page.set_content(html, wait_until="load")
+            root_box = await page.eval_on_selector(".cev-root", "el => el.getBoundingClientRect().toJSON()")
+            container = await page.query_selector(".cev-cmap")
+            container_box = await container.bounding_box()
+            container_class = await container.get_attribute("class") or ""
+            node_handles = await page.query_selector_all(".cev-cmap-node")
+            nodes = {}
+            for handle in node_handles:
+                node_id = await handle.get_attribute("data-cmap-node-id")
+                nodes[node_id] = await handle.bounding_box()
+            return {
+                "root": root_box,
+                "container": container_box,
+                "compact": "cev-cmap-compact" in container_class,
+                "nodes": nodes,
+            }
+        finally:
+            await browser.close()
+
+    @staticmethod
+    def _hub_spec_entities(n: int) -> tuple[list[VisualEntity], list[SchematicRelationship]]:
+        hub = VisualEntity(id="hub", label="Hub Concept")
+        sats = [VisualEntity(id=f"s{i}", label=f"Satellite {i}") for i in range(n)]
+        rels = [SchematicRelationship(source="hub", target=f"s{i}", type="connected_to") for i in range(n)]
+        return [hub] + sats, rels
+
+    async def _assert_clean_layout(
+        self, playwright, entities, relationships, *, expect_compact: bool | None = None, title: str = ""
+    ) -> dict:
+        result = await self._measure(playwright, entities, relationships, title=title)
+        nodes = result["nodes"]
+        assert len(nodes) == len(entities)  # every entity rendered exactly once, none dropped/duplicated
+
+        if expect_compact is not None:
+            assert result["compact"] is expect_compact
+
+        root = result["root"]
+        container = result["container"]
+        ids = list(nodes)
+        for i in range(len(ids)):
+            box_i = nodes[ids[i]]
+            assert box_i is not None, f"{ids[i]} has no visible box"
+            # Inside the concept-map container itself (the box
+            # `_concept_map_container_size` computed) - a tolerance wide
+            # enough for sub-pixel layout rounding, not for a real miss.
+            assert box_i["x"] >= container["x"] - 2.0, f"{ids[i]} sits outside the concept-map container (left)"
+            assert box_i["y"] >= container["y"] - 2.0, f"{ids[i]} sits outside the concept-map container (top)"
+            assert box_i["x"] + box_i["width"] <= container["x"] + container["width"] + 2.0, (
+                f"{ids[i]} sits outside the concept-map container (right)"
+            )
+            assert box_i["y"] + box_i["height"] <= container["y"] + container["height"] + 2.0, (
+                f"{ids[i]} sits outside the concept-map container (bottom)"
+            )
+            # no clipping - every node's box must also sit fully inside
+            # .cev-root's own box (the real `overflow:hidden` ancestor -
+            # see _style_html) - a looser bound than the container check
+            # above, but the one that actually determines visibility.
+            assert box_i["x"] >= root["x"] - 1.0, f"{ids[i]} clipped on the left by .cev-root"
+            assert box_i["y"] >= root["y"] - 1.0, f"{ids[i]} clipped on the top by .cev-root"
+            assert box_i["x"] + box_i["width"] <= root["x"] + root["width"] + 1.0, f"{ids[i]} clipped on the right"
+            assert box_i["y"] + box_i["height"] <= root["y"] + root["height"] + 1.0, f"{ids[i]} clipped on the bottom"
+            for j in range(i + 1, len(ids)):
+                box_j = nodes[ids[j]]
+                assert not self._boxes_overlap(box_i, box_j), f"rendered {ids[i]}/{ids[j]} rectangles overlap"
+
+        # Hub approximately centred in the map.
+        hub_box = nodes["hub"]
+        hub_cx, hub_cy = hub_box["x"] + hub_box["width"] / 2, hub_box["y"] + hub_box["height"] / 2
+        container = result["container"]
+        container_cx = container["x"] + container["width"] / 2
+        container_cy = container["y"] + container["height"] / 2
+        assert abs(hub_cx - container_cx) < 3.0, "hub is not centred horizontally in the concept map"
+        assert abs(hub_cy - container_cy) < 3.0, "hub is not centred vertically in the concept map"
+
+        sat_ids = [i for i in ids if i != "hub"]
+        sat_angles: dict[str, float] = {}
+        for sid in sat_ids:
+            box = nodes[sid]
+            cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+            dist = math.hypot(cx - hub_cx, cy - hub_cy)
+            # No satellite collapses toward the hub - the exact failure
+            # mode an earlier CSS-animation bug in this same investigation
+            # caused (every node landing on the hub's own centre point).
+            assert dist > 20.0, f"{sid} is suspiciously close to the hub centre ({dist:.1f}px) - possible collapse"
+            # Angle normalised relative to the renderer's own starting
+            # angle (-90deg = 12 o'clock, clockwise - see
+            # _concept_map_satellite_angles) so it increases monotonically
+            # with satellite index instead of wrapping at +-180deg.
+            raw_deg = math.degrees(math.atan2(cy - hub_cy, cx - hub_cx))
+            sat_angles[sid] = (raw_deg + 90.0) % 360.0
+
+        # Satellites keep the same clockwise order they were declared in -
+        # a real rendering check that the angular placement
+        # (_concept_map_ring_positions) wasn't scrambled.
+        assert list(sat_angles) == sorted(sat_angles, key=sat_angles.get)
+
+        return result
+
+    @needs_browser
+    @pytest.mark.parametrize("n", [2, 3, 6])
+    async def test_short_label_hub_cases_use_normal_tier_with_no_overlap(self, n):
+        from playwright.async_api import async_playwright
+
+        entities, relationships = self._hub_spec_entities(n)
+        async with async_playwright() as playwright:
+            await self._assert_clean_layout(playwright, entities, relationships, expect_compact=False, title="Hub Concept")
+
+    @needs_browser
+    @pytest.mark.parametrize("n", [5, 8, 10])
+    async def test_dense_short_label_hub_cases_have_no_overlap_even_at_normal_or_compact_tier(self, n):
+        """n=5/8/10 (bare short labels) are exactly where the exact-
+        rectangle model's own count/angle-alignment maths pushes the
+        required radius past the normal tier (n=5 needs compact too, not
+        just the denser n=8/10 - a non-monotonic property of the exact
+        model confirmed during investigation) - and where the pure-math
+        estimate-based tests in TestConceptMapHubGeometry can no longer
+        guarantee non-overlap at their conservative worst-case footprint
+        (see those tests' own docstrings). Real Chromium rendering is the
+        authoritative check for whether that worst case is ever actually
+        reached - it isn't, for short one-word labels: they render far
+        smaller than the estimate's safety ceiling, so real clearance
+        remains even here."""
+        from playwright.async_api import async_playwright
+
+        entities, relationships = self._hub_spec_entities(n)
+        async with async_playwright() as playwright:
+            await self._assert_clean_layout(playwright, entities, relationships, title="Hub Concept")
+
+    @needs_browser
+    async def test_operating_system_case_has_no_overlap(self):
+        """The exact content from the original bug report - the one case
+        this entire investigation traces back to."""
+        from playwright.async_api import async_playwright
+
+        entities = [VisualEntity(id="hub", label="Operating System")] + [
+            VisualEntity(id="def", label="Definition", properties={"summary": "System software that manages hardware and software resources"}),
+            VisualEntity(id="mem", label="Memory Management", properties={"role": "Allocates RAM to running programs"}),
+            VisualEntity(id="sched", label="Process Scheduling", properties={"role": "Decides which process runs next on the CPU"}),
+            VisualEntity(id="example", label="Example", properties={"value": "Windows, Linux, macOS, Android"}),
+            VisualEntity(id="analogy", label="Analogy", properties={"value": "A building manager coordinating every tenant's use of shared utilities"}),
+        ]
+        relationships = [SchematicRelationship(source="hub", target=e.id, type="connected_to") for e in entities[1:]]
+        async with async_playwright() as playwright:
+            await self._assert_clean_layout(playwright, entities, relationships, expect_compact=True, title="Operating System")
+
+    @needs_browser
+    async def test_long_label_case_selects_normal_tier_when_it_fits(self):
+        """Longer labels than the bare-word default, but few enough
+        satellites that normal tier still has real room - confirms normal
+        tier isn't abandoned just because labels grow a little (requirement:
+        compact only when normal genuinely cannot fit)."""
+        from playwright.async_api import async_playwright
+
+        entities = [VisualEntity(id="hub", label="Central Idea")] + [
+            VisualEntity(id="a", label="A Moderately Long Supporting Point"),
+            VisualEntity(id="b", label="Another Related Concept"),
+            VisualEntity(id="c", label="A Third Connected Idea"),
+        ]
+        relationships = [SchematicRelationship(source="hub", target=e.id, type="connected_to") for e in entities[1:]]
+        async with async_playwright() as playwright:
+            await self._assert_clean_layout(playwright, entities, relationships, expect_compact=False, title="Central Idea")
 
 
 class TestTextNeverOverflowsItsBox:
@@ -854,6 +1539,175 @@ class TestConceptQAStructural:
         ])
         result = await evaluate_concept_experience(spec)
         assert TOO_DENSE in {i.reason for i in result.issues}
+
+    async def test_sentence_or_formula_length_property_values_are_flagged_as_too_dense(self):
+        # A real, confirmed failure mode: an entity's property value held a
+        # full theorem statement instead of a short fact, and sailed
+        # straight through to a rendered card as literal "key : value" text.
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="a", role="instance", properties={
+                "equation": "closed loop with oriented boundary and small surface, flux through it",
+            }),
+            VisualEntity(id="b", role="instance", properties={"x": "2"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert TOO_DENSE in {i.reason for i in result.issues}
+
+    async def test_nonsense_property_keys_are_flagged_as_too_dense(self):
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="a", role="instance", properties={
+                "Ghost duplicate: reverse n to flip the sign": "yes",
+            }),
+            VisualEntity(id="b", role="instance", properties={"x": "2"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert TOO_DENSE in {i.reason for i in result.issues}
+
+    async def test_short_properties_do_not_trigger_too_dense(self):
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="a", role="instance", properties={"color": "Red", "mutability": "immutable"}),
+            VisualEntity(id="b", role="instance", properties={"color": "Blue", "mutability": "mutable"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert TOO_DENSE not in {i.reason for i in result.issues}
+
+    async def test_instances_sharing_no_common_property_are_flagged_as_disconnected(self):
+        """Reproduces the reported bug exactly: 4 distinct physics
+        sub-concepts (a unit-normal convention, a B-vs-H curve, Stokes'
+        theorem, Gauss' theorem) modelled as "instances" that share not one
+        property name - each is really its own separate idea, not a real
+        instance of one shared concept, which is exactly what rendered as a
+        row of disconnected, unrelated-looking cards."""
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="normal", role="instance", properties={"label": "n", "color": "green"}),
+            VisualEntity(id="bh_curve", role="instance", properties={"plot": "B vs H curve, flattens at high H"}),
+            VisualEntity(id="stokes", role="instance", properties={"equation": "oint A.dl = int curl A.dA"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert DISCONNECTED_CONCEPTS in {i.reason for i in result.issues}
+
+    async def test_instances_sharing_at_least_one_common_property_are_not_flagged(self):
+        """Regression guard: real instances of one concept (Car objects, in
+        this spec's own default) always share at least one common attribute
+        name, even if they don't share every one - must never be flagged."""
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="a", role="instance", properties={"color": "Red", "speed": "80"}),
+            VisualEntity(id="b", role="instance", properties={"color": "Blue", "fuel": "electric"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert DISCONNECTED_CONCEPTS not in {i.reason for i in result.issues}
+
+    async def test_blank_representation_with_relationships_is_judged_as_relationship_not_object(self):
+        """Reproduces a real bug found via a live (non-mocked) VisualPlanner
+        call: the model's structured response left `representation` blank
+        entirely, on an otherwise good, specific, well-labelled relationship
+        spec (a LangChain components diagram). The renderer's own
+        `_render_object` is relationship-aware and already renders this
+        case correctly as a hub/network concept-map, not a flat grid - QA
+        defaulting blank to "object" instead demanded a template-role
+        entity the spec correctly didn't have, failing good content for
+        the wrong reason."""
+        spec = _good_metaphor_spec(
+            representation="",
+            entities=[
+                VisualEntity(id="agent", role="orchestrator", properties={"responsibility": "plans calls"}),
+                VisualEntity(id="llm", role="llm_wrapper", properties={"interface": "generate()"}),
+                VisualEntity(id="tools", role="tools", properties={"examples": "search, calculator"}),
+            ],
+            relationships=[
+                SchematicRelationship(source="agent", target="llm", type="calls"),
+                SchematicRelationship(source="agent", target="tools", type="invokes"),
+            ],
+        )
+        result = await evaluate_concept_experience(spec)
+        assert MISSING_ENTITY not in {i.reason for i in result.issues}
+
+    async def test_relationship_representation_with_repeated_generic_label_is_flagged(self):
+        """Reproduces a real generated course's own bug: a repeated generic
+        relationship label ("connected to" x4 of 5 edges, in the real case)
+        even when the entities themselves share a real common property -
+        the label-repetition problem is distinct from the disconnected-
+        entities problem and must be caught on its own."""
+        spec = _good_metaphor_spec(
+            representation="relationship",
+            entities=[
+                VisualEntity(id="a", role="instance", properties={"kind": "service"}),
+                VisualEntity(id="b", role="instance", properties={"kind": "service"}),
+                VisualEntity(id="c", role="instance", properties={"kind": "service"}),
+                VisualEntity(id="d", role="instance", properties={"kind": "service"}),
+            ],
+            relationships=[
+                SchematicRelationship(source="a", target="b", type="connected_to"),
+                SchematicRelationship(source="b", target="c", type="connected_to"),
+                SchematicRelationship(source="c", target="d", type="connected_to"),
+            ],
+        )
+        result = await evaluate_concept_experience(spec)
+        assert GENERIC_VISUAL in {i.reason for i in result.issues}
+
+    async def test_relationship_representation_with_specific_varied_labels_is_not_flagged(self):
+        """Regression guard: real, specific, varied relationship labels on
+        entities that share a common property must never be flagged."""
+        spec = _good_metaphor_spec(
+            representation="relationship",
+            entities=[
+                VisualEntity(id="a", role="instance", properties={"kind": "service"}),
+                VisualEntity(id="b", role="instance", properties={"kind": "service"}),
+                VisualEntity(id="c", role="instance", properties={"kind": "service"}),
+            ],
+            relationships=[
+                SchematicRelationship(source="a", target="b", type="authenticates"),
+                SchematicRelationship(source="b", target="c", type="writes_to"),
+            ],
+        )
+        result = await evaluate_concept_experience(spec)
+        reasons = {i.reason for i in result.issues}
+        assert DISCONNECTED_CONCEPTS not in reasons
+        assert GENERIC_VISUAL not in reasons
+
+    async def test_spatial_representation_gets_the_same_generic_label_coverage(self):
+        spec = _good_metaphor_spec(
+            representation="spatial",
+            visual_metaphor="a workbench",
+            entities=[
+                VisualEntity(id="a", role="instance", properties={"formula": "F = ma"}),
+                VisualEntity(id="b", role="instance", properties={"color": "blue"}),
+                VisualEntity(id="c", role="instance", properties={"shape": "disc"}),
+            ],
+            relationships=[
+                SchematicRelationship(source="a", target="b", type="above"),
+                SchematicRelationship(source="b", target="c", type="above"),
+                SchematicRelationship(source="a", target="c", type="above"),
+            ],
+        )
+        result = await evaluate_concept_experience(spec)
+        assert GENERIC_VISUAL in {i.reason for i in result.issues}
+
+    async def test_entities_connected_by_relationship_may_legitimately_share_no_property(self):
+        """Regression guard for a real false positive found while adding
+        this check: a genuinely GOOD "relationship" spec connects DIFFERENT
+        kinds of things (an `orders` table with a `customer_id` property, a
+        `customers` table with an `id` property) - sharing zero property
+        names is entirely correct here, unlike the "object"/instance case
+        where sharing a schema is exactly the point. Must never be flagged
+        just for that, with only one, specific, non-generic relationship."""
+        spec = _good_metaphor_spec(
+            representation="relationship",
+            entities=[
+                VisualEntity(id="orders", role="table", properties={"customer_id": "FK"}),
+                VisualEntity(id="customers", role="table", properties={"id": "PK"}),
+            ],
+            relationships=[SchematicRelationship(source="orders", target="customers", type="references")],
+        )
+        result = await evaluate_concept_experience(spec)
+        reasons = {i.reason for i in result.issues}
+        assert DISCONNECTED_CONCEPTS not in reasons
+        assert GENERIC_VISUAL not in reasons
 
     async def test_state_machine_dangling_transition_is_caught(self):
         spec = DiagramSpec(
@@ -1250,6 +2104,15 @@ class TestHierarchyTreeRenderer:
         assert body.index('data-entity-id="root"') < body.index('data-entity-id="left"')
         assert body.index('data-entity-id="left"') < body.index('data-entity-id="left_child"')
 
+    def test_hierarchy_gets_the_same_toned_down_treatment_as_decision_tree(self):
+        """A real, confirmed inconsistency: "hierarchy" and "decision_tree"
+        share the exact same _render_tree code and the identical top-down
+        branching shape - decision_tree already got the toned-down "flow"
+        treatment, but hierarchy was left out, rendering an otherwise
+        identical diagram in the default saturated icon-card palette."""
+        html = render_concept_experience_html(self._three_level_spec(), TemplateTheme()).decode("utf-8")
+        assert 'class="cev-root cev-style-flow"' in html
+
     def test_a_generic_structural_edge_label_is_not_shown_as_a_branch_label(self):
         """"contains" is redundant once two entities are already drawn as
         parent/child (position alone says that) - unlike decision_tree's
@@ -1269,7 +2132,56 @@ class TestHierarchyTreeRenderer:
         assert 'class="cev-tree"' not in body
         assert 'class="cev-instances"' in body
 
-    def test_a_cycle_falls_back_to_a_flat_row_instead_of_crashing(self):
+    def test_a_pure_single_chain_hierarchy_renders_as_a_flowing_row_not_a_tall_vertical_stack(self):
+        """A real, confirmed case: a 7-layer OSI-model-style hierarchy
+        where every layer strictly nests the next (no sibling layers
+        anywhere) rendered as a tall single-card-per-row vertical stack -
+        wasting the page's own width and, because it's tall enough, forcing
+        the whole fragment to shrink well below natural size to fit one
+        page. A pure chain (every BFS level has exactly one entity) now
+        gets the flowing zig-grid treatment instead (the same wrap-aware
+        `_chain_row_html` technique a genuine relationship chain already
+        uses - see that function's own docstring), using the page's width
+        and never needing that shrink."""
+        entities = [VisualEntity(id=f"layer{i}", label=f"Layer {i}") for i in range(7, 0, -1)]
+        relationships = [
+            SchematicRelationship(source=f"layer{i}", type="contains", target=f"layer{i - 1}")
+            for i in range(7, 1, -1)
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="hierarchy", entities=entities, relationships=relationships)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-tree"' not in body
+        assert 'class="cev-tree-level"' not in body
+        assert 'class="cev-zig-grid"' in body
+        assert body.count('cev-instance cev-step') == 7  # every layer rendered once (6 paired + 1 solo)
+        assert body.count('class="cev-zig-link"') == 3  # 7 nodes, 2 per row -> 3 pairs + 1 solo
+        assert body.count('class="cev-zig-curve-row"') == 3  # 4 rows (3 pairs + solo) -> 3 connectors
+        for i in range(1, 8):
+            assert f'data-entity-id="layer{i}"' in body
+        # order is preserved start-to-end (layer7 first, layer1 last).
+        assert body.index('data-entity-id="layer7"') < body.index('data-entity-id="layer1"')
+
+    def test_a_branching_hierarchy_keeps_the_vertical_level_layout(self):
+        """Regression guard: the pure-chain shortcut must never engage for
+        a genuinely branching hierarchy (more than one entity on some
+        level) - _three_level_spec's root has two children, so this must
+        still render as real vertical tree levels."""
+        html = render_concept_experience_html(self._three_level_spec(), TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-tree-level"' in body
+        assert 'class="cev-steps"' not in body
+
+    def test_a_cycle_renders_as_a_flowing_chain_with_a_back_edge_badge_instead_of_crashing(self):
+        """Not a clean tree (it loops back) - previously fell back to the
+        flat card row. a -> b -> c -> a is a PURE chain (every BFS level
+        has exactly one entity, no branching anywhere), so it gets the
+        flowing-horizontal-row treatment (_chain_row_html, via
+        _render_concept_flow_html's own pure-chain branch) rather than a
+        tall vertical stack of single-card levels - with the c -> a edge
+        that actually forms the cycle shown as a back-edge badge, never a
+        long line crossing back up through the chart. Still never a
+        crash."""
         entities = [VisualEntity(id=eid, label=eid) for eid in ("a", "b", "c")]
         relationships = [
             SchematicRelationship(source="a", type="contains", target="b"),
@@ -1280,7 +2192,13 @@ class TestHierarchyTreeRenderer:
         html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
         body = html.split("</style>", 1)[1]
         assert 'class="cev-tree"' not in body
-        assert 'class="cev-instances"' in body
+        assert 'class="cev-instances"' not in body
+        assert 'class="cev-flow-chart"' not in body  # pure chain - not the level-based layout
+        assert 'class="cev-zig-grid"' in body
+        assert body.count('cev-instance cev-step') == 3  # a, b (paired) + c (solo)
+        assert body.count('class="cev-zig-link"') == 1  # a->b, the one pair
+        assert 'class="cev-flow-backedge"' in body  # c->a is the one edge that doesn't advance a level
+        assert "back to" in body and "a" in body.split("back to", 1)[1][:30]
         for eid in ("a", "b", "c"):
             assert f'data-entity-id="{eid}"' in body
 

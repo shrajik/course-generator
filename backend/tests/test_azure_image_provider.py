@@ -367,6 +367,50 @@ async def test_image_provider_defaults_to_openai_when_unset(monkeypatch):
     assert await client.image(prompt="p") == b"openai-bytes"
 
 
+async def test_image_provider_param_overrides_the_configured_default(monkeypatch):
+    """ImageService forces `provider="openai"` for a textbook-style
+    illustration regardless of the configured default (see Settings.
+    textbook_image_provider) - the per-call override must win, and must
+    never mutate `settings.image_provider` itself (every other call keeps
+    using the configured default)."""
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    called = {"openai": False, "azure": False}
+
+    async def fake_openai(**_kwargs):
+        called["openai"] = True
+        return b"openai-bytes"
+
+    async def fake_azure(**_kwargs):
+        called["azure"] = True
+        return b"azure-bytes"
+
+    monkeypatch.setattr(client, "_image_openai", fake_openai)
+    monkeypatch.setattr(client, "_image_azure", fake_azure)
+
+    result = await client.image(prompt="p", provider="openai")
+    assert result == b"openai-bytes"
+    assert called == {"openai": True, "azure": False}
+    assert settings.image_provider == "azure"  # untouched
+
+
+async def test_image_provider_param_none_falls_back_to_the_configured_default(monkeypatch):
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    async def fake_azure(**_kwargs):
+        return b"azure-bytes"
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("openai path should not be used when provider=None")
+
+    monkeypatch.setattr(client, "_image_openai", fail_if_called)
+    monkeypatch.setattr(client, "_image_azure", fake_azure)
+
+    assert await client.image(prompt="p", provider=None) == b"azure-bytes"
+
+
 # ---------------------------------------------------------------------------
 # rate limiting (429): a longer budget and a longer wait than other failures
 # ---------------------------------------------------------------------------

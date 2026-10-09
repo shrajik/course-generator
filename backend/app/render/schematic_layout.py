@@ -123,7 +123,25 @@ def _merge_inside_anchors(shapes: list[SchematicShape]) -> list[SchematicShape]:
     own label right where the parent's own centred label already sits (the
     parent doesn't know a child rendered on top of it and shorten its own
     text) - reusing the existing mechanism sidesteps that entirely rather
-    than trying to out-position it."""
+    than trying to out-position it.
+
+    A real, confirmed failure mode when the merge can't happen because the
+    target's own `sublabel` slot is already taken (e.g. a two-part block
+    like "Handheld scanner" / "(body)", itself using label+sublabel) AND the
+    shape that wanted to nest is a plain "label" (pure text, no shape/box of
+    its own): it used to stay anchored "inside" anyway and fall through to
+    `_place_ring`'s inner ring, which is deliberately sized to stay WITHIN
+    the reference's own footprint - correct for true nested content with its
+    own visual boundary (a circle/block/gauge "nucleus inside a cell" still
+    reads as nested even when a sibling already claimed the sublabel), but a
+    "label" shape has no boundary of its own to separate it from the
+    parent's existing text, so it lands directly on top of it (a real case:
+    "Scanner sensor window" rendered overlapping "Handheld scanner"/"(body)",
+    unreadable). Retargeting only a "label" shape to "above" moves it onto
+    the OUTER ring instead - still visually associated with its parent, but
+    no longer guaranteed to overlap it. A circle/block/gauge/coil shape that
+    can't merge keeps its original "inside" anchor and nested placement,
+    unchanged."""
     by_id = {s.id: s for s in shapes if s.id}
     merged_ids: set[int] = set()
     for shape in shapes:
@@ -131,7 +149,11 @@ def _merge_inside_anchors(shapes: list[SchematicShape]) -> list[SchematicShape]:
         if keyword != "inside" or not target_ref or shape.type in ("flow", "arrow"):
             continue
         target = by_id.get(target_ref)
-        if target is None or target.type not in ("block", "circle", "gauge") or target.sublabel.strip():
+        if target is None or target.type not in ("block", "circle", "gauge"):
+            continue
+        if target.sublabel.strip():
+            if shape.type == "label":
+                shape.anchor = f"above:{target_ref}"
             continue
         target.sublabel = shape.label
         target.sublabel_color_role = shape.color_role
@@ -295,10 +317,24 @@ def _place_ring(
 
     fixed: dict[int, float] = {}
     free: list[SchematicShape] = []
+    step = 2 * math.pi / max(count, 1)
     for shape in ring:
         keyword, _ = _parse_anchor(shape.anchor)
         if not inward and keyword in _FIXED_ANCHOR_ANGLES:
-            fixed[id(shape)] = math.radians(_FIXED_ANCHOR_ANGLES[keyword])
+            angle = math.radians(_FIXED_ANCHOR_ANGLES[keyword])
+            # Two shapes can legitimately share the same directional keyword
+            # (two things both "above" the same reference) - the exact same
+            # angle would place them at the identical position, a real,
+            # confirmed case ("Mis-read" and "Move strap away" both anchored
+            # "above" the same scanner, rendered exactly on top of each
+            # other). Nudge each repeat claim of an already-used fixed angle
+            # outward, the same step a free shape uses to dodge a claimed
+            # one, so same-keyword siblings fan out instead of stacking.
+            guard = 0
+            while any(abs(((angle - used + math.pi) % (2 * math.pi)) - math.pi) < 1e-6 for used in fixed.values()) and guard < 12:
+                angle += step / 3
+                guard += 1
+            fixed[id(shape)] = angle
         else:
             free.append(shape)
 
@@ -311,7 +347,6 @@ def _place_ring(
         return any(abs(((angle - used + math.pi) % (2 * math.pi)) - math.pi) < min_gap for used in used_angles)
 
     angle = -math.pi / 2
-    step = 2 * math.pi / max(count, 1)
     for shape in free:
         guard = 0
         while _too_close(angle) and guard < 12:

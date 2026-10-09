@@ -32,7 +32,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import Settings, get_settings
-from app.schemas.diagram import DiagramSpec
+from app.schemas.diagram import DiagramSpec, VisualEntity
 from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult
 from app.services.openai_service import AIClient, get_ai_client
 
@@ -45,6 +45,7 @@ MISSING_LEARNING_OBJECTIVES = "missing_learning_objectives"
 TOO_DENSE = "too_dense"
 GENERIC_VISUAL = "generic_visual"
 DANGLING_TRANSITION = "dangling_transition"
+DISCONNECTED_CONCEPTS = "disconnected_concepts"
 
 # --- semantic (layer 2) failure reasons -------------------------------------
 CONCEPT_NOT_CLEAR = "concept_not_clear"
@@ -52,6 +53,17 @@ CORE_MESSAGE_NOT_DELIVERED = "core_message_not_delivered"
 WRONG_RELATIONSHIP = "wrong_relationship"
 
 _LABEL_LENGTH_CAP = 40  # characters - "short, a few words", not a sentence
+# Looser than _LABEL_LENGTH_CAP since a real short fact ("flattens at high
+# H, saturation limits") can reasonably run a little longer than a label,
+# but still bounded - a property exists to name ONE short attribute, never
+# to carry a theorem statement, a formula, or a free-form description. A
+# real, confirmed failure mode this catches: entities whose `properties`
+# held values like "closed loop with oriented boundary and small surface"
+# or keys like "Ghost duplicate: reverse n -> Phi changes sign" - both
+# sailed straight through the old label-only length check and rendered as
+# literal "key : value" text dumped into a plain card.
+_PROPERTY_KEY_LENGTH_CAP = 30
+_PROPERTY_VALUE_LENGTH_CAP = 60
 # Representations where a learner comparing concrete instances is central to
 # the whole point - the only ones instance-count/variation checks apply to.
 _INSTANCE_DRIVEN_REPRESENTATIONS = ("object", "comparison", "data_structure", "before_after")
@@ -68,9 +80,32 @@ _ENTITY_BASED_REPRESENTATIONS = (
 # ---------------------------------------------------------------------------
 
 
+def _effective_representation(spec: DiagramSpec) -> str:
+    """The representation this QA pass judges the spec against - mirrors
+    `concept_experience_renderer.render_concept_experience_html`'s own
+    dispatch fallback, which this file previously diverged from: a real,
+    confirmed case (the model's structured response simply omitted
+    `representation`) showed QA defaulting a blank value straight to
+    "object" while the renderer's `_render_object` is itself relationship-
+    aware and already renders exactly this case as a proper hub/network
+    concept-map (not a flat card grid) whenever `relationships` is
+    populated. Judging it as "object" anyway demanded a template-role
+    entity the spec correctly didn't have, failing good content for the
+    wrong reason and masking whether any of this module's other checks
+    even run. Only the blank-value fallback changes here - a genuinely
+    unrecognised non-blank value still falls through to "object" via the
+    renderer's own last-resort default, unchanged."""
+    representation = spec.representation.strip()
+    if representation:
+        return representation
+    if spec.relationships:
+        return "relationship"
+    return "object"
+
+
 def _structural_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
     issues: list[DiagramQAIssue] = []
-    representation = spec.representation.strip() or "object"
+    representation = _effective_representation(spec)
 
     if not spec.learning_objectives:
         issues.append(DiagramQAIssue(
@@ -110,6 +145,9 @@ def _structural_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
     if representation in _INSTANCE_DRIVEN_REPRESENTATIONS:
         issues.extend(_instance_issues(spec, representation))
 
+    if representation in ("relationship", "spatial"):
+        issues.extend(_relationship_structure_issues(spec))
+
     if representation == "state_machine":
         issues.extend(_state_machine_issues(spec))
 
@@ -126,6 +164,25 @@ def _structural_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
             f"Some labels are too long (over {_LABEL_LENGTH_CAP} characters, e.g. "
             f"'{long_labels[0][:60]}...') - keep every label/property/action short, this is a "
             "visual, not a passage of prose.",
+        ))
+
+    long_property_keys = [
+        key for e in spec.entities for key in e.properties
+        if len(key) > _PROPERTY_KEY_LENGTH_CAP
+    ]
+    long_property_values = [
+        value for e in spec.entities for value in e.properties.values()
+        if len(str(value)) > _PROPERTY_VALUE_LENGTH_CAP
+    ]
+    if long_property_keys or long_property_values:
+        example = (long_property_keys or long_property_values)[0]
+        issues.append(DiagramQAIssue(
+            TOO_DENSE,
+            "Some entity `properties` read like a sentence, formula or theorem statement "
+            f"instead of a short attribute (e.g. '{str(example)[:60]}...') - a property is one "
+            "short fact (\"color: Red\"), never a full description. If this content doesn't "
+            "reduce to short facts, it likely isn't a fit for this representation at all - "
+            "reconsider the entity/property breakdown or the representation choice.",
         ))
 
     return issues
@@ -215,6 +272,89 @@ def _instance_issues(spec: DiagramSpec, representation: str) -> list[DiagramQAIs
                 f"These instance entities have no populated property values yet: "
                 f"{', '.join(empty_props)} - the default state must already be a complete "
                 "picture, not filled in only after an interaction.",
+            ))
+        # A real, confirmed failure mode: a math/physics topic with several
+        # genuinely distinct sub-concepts (Gauss' theorem, Stokes' theorem,
+        # a B-vs-H saturation curve, a unit-normal sign convention) got
+        # modelled as "instances" that share not one single property name -
+        # each one is really its own separate idea with its own ad hoc
+        # schema, not a real instance of a common template/concept, which is
+        # exactly what rendered as a row of disconnected, unrelated-looking
+        # cards. See _entities_share_no_common_property's own docstring for
+        # why an empty intersection is a safe, conservative signal.
+        if _entities_share_no_common_property(instances):
+            issues.append(DiagramQAIssue(
+                DISCONNECTED_CONCEPTS,
+                "These entities share NOT ONE common property between them - they read as several "
+                "unrelated ideas crammed into one visual (e.g. one entity has 'formula'/'equation', "
+                "another has 'plot', another has 'label'/'color'), not real instances of one shared "
+                "concept. Pick ONE clear, specific concept this visual actually teaches and represent "
+                "only that - drop every entity that doesn't genuinely belong to it, even if it was "
+                "part of the same source material.",
+            ))
+    return issues
+
+
+def _entities_share_no_common_property(entities: list[VisualEntity]) -> bool:
+    """True when 2+ of `entities` have properties, and there is not a
+    single property NAME shared by every one of them - the same check used
+    for "instance" entities (see `_instance_issues`) and for "relationship"/
+    "spatial" entities (see `_relationship_structure_issues`), since the
+    underlying question is identical either way: are these really facets of
+    ONE concept, or several unrelated ideas crammed into one visual? Real
+    instances/components of one concept (Car objects, HTTP responses, stack
+    frames, nodes in a genuine mechanism) always share at least one common
+    attribute name - a completely empty intersection is a strong,
+    conservative signal this spec violates "one concept per visual" rather
+    than a borderline call."""
+    key_sets = [set(e.properties.keys()) for e in entities if e.properties]
+    return len(key_sets) >= 2 and not set.intersection(*key_sets)
+
+
+# A relationship `type` repeated across this many (or more) edges, accounting
+# for at least half of all of them, reads as the model reaching for the same
+# generic word rather than naming each connection's real, specific
+# relationship - two real, confirmed cases in generated course data: a
+# "LangChain Core Components" diagram with "connected to" on 4 of 5 edges
+# between heterogeneous entities, and an "Event Loop & Task Interleaving"
+# diagram with "points to" on 3 of its edges. The planner's own prompt
+# (visual_planner.py) already names this exact smell in prose - nothing
+# downstream enforced it until now. Thresholded on BOTH a minimum count and
+# a majority share so a hub that is genuinely, meaningfully all "manages" or
+# "causes" (every edge actually is that same real relationship) isn't
+# false-flagged - only "most connectors say the same uninformative thing".
+_GENERIC_RELATIONSHIP_LABEL_MIN_COUNT = 3
+
+
+def _relationship_structure_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
+    """Deliberately does NOT reuse `_entities_share_no_common_property` here
+    the way `_instance_issues` does - confirmed, via a real false positive
+    while adding this check, that the signal doesn't transfer: an "object"
+    visual's instances are meant to share one schema (Car objects all have
+    color/speed), but a "relationship" visual's entities are meant to be
+    DIFFERENT kinds of things connected by a real relationship (a genuinely
+    good SQL JOIN spec has an `orders` table with a `customer_id` property
+    and a `customers` table with an `id` property - zero shared property
+    names, and entirely correct). The actual, real-data-confirmed smell for
+    this representation is specifically the generic/repeated label below."""
+    issues: list[DiagramQAIssue] = []
+    if spec.relationships:
+        type_counts: dict[str, int] = {}
+        for rel in spec.relationships:
+            rel_type = rel.type.strip().lower()
+            if rel_type:
+                type_counts[rel_type] = type_counts.get(rel_type, 0) + 1
+        total = len(spec.relationships)
+        worst_type, worst_count = max(type_counts.items(), key=lambda kv: kv[1], default=("", 0))
+        if worst_count >= _GENERIC_RELATIONSHIP_LABEL_MIN_COUNT and worst_count >= total * 0.5:
+            issues.append(DiagramQAIssue(
+                GENERIC_VISUAL,
+                f"The relationship type '{worst_type}' is repeated across {worst_count} of {total} "
+                "connections - when most connectors say the same generic thing, that's a sign these "
+                "entities don't have a real, specific relationship to diagram. Either give each "
+                "connection its own specific, meaningful label, or pick a representation this content "
+                "actually needs (process/hierarchy/cycle if there's an order or structure, not a loose "
+                "relationship web).",
             ))
     return issues
 

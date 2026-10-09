@@ -226,3 +226,118 @@ async def test_repair_visual_coverage_reports_a_failed_generation_not_silently(
     assert len(response.failed) >= 1
     assert response.failed[0]["page"] == 1
     assert len(response.still_deficient) == 1  # never silently marked as fixed
+
+
+# ---------------------------------------------------------------------------
+# Context propagation (chapter_title/section_title/key_concept) - a real,
+# confirmed gap: this call site used to pass only course_title, so a repair-
+# inserted visual got course-level context only, unlike every visual
+# generated through the normal generate_missing() path. Fixed by reusing
+# image_service.chapter_section_context - the same production mechanism,
+# never a second implementation.
+# ---------------------------------------------------------------------------
+
+
+async def _seeded_thin_document_with_rich_context(service, documents, technical_input):
+    """Same shape as `_seeded_thin_document`, plus a section-level heading
+    and a `learning_objectives` block - enough structure for
+    chapter_section_context to resolve all three fields to something
+    non-empty, so a propagation test can actually prove something."""
+    record = await service.create_course(technical_input, run_planner=False)
+    blocks = [
+        Block(id="heading", type=BlockType.HEADING, content={"text": "Newton's Laws of Motion", "level": 1}),
+        Block(id="subheading", type=BlockType.HEADING, content={"text": "Newton's Second Law", "level": 2}),
+        Block(
+            id="objectives", type=BlockType.LEARNING_OBJECTIVES,
+            content={"items": ["Explain how force relates to acceleration for a fixed mass"]},
+        ),
+        Block(
+            id="para1", type=BlockType.PARAGRAPH,
+            content={"text": " ".join(["force mass acceleration newton second law"] * 16)},
+            meta=BlockMeta(chapter_id="ch1", chapter_number=1),
+        ),
+    ]
+    document = CourseDocument(
+        document_id=record.document_id,
+        course_id=record.course_id,
+        course_title=technical_input.course_title,
+        template_id="technical_v1",
+        meta=DocumentMeta(),
+        pages=[Page(id="page_1", page_number=1, kind="content", blocks=blocks)],
+    )
+    saved = await documents.save(record.document_id, document)
+    return record, saved
+
+
+async def test_repair_visual_coverage_forwards_chapter_section_and_key_concept(
+    service, documents, technical_input, monkeypatch
+):
+    record, document = await _seeded_thin_document_with_rich_context(service, documents, technical_input)
+
+    captured: dict = {}
+
+    async def fake_generate_for_block(self, **kwargs):
+        captured.update(kwargs)
+        block = kwargs["block"]
+        block.content = merge_content(
+            block.type, block.content, {"path": "assets/fake.png", "width": 800, "height": 300}
+        )
+        return True
+
+    from app.schemas.blocks import merge_content
+    from app.services.image_service import ImageService
+
+    monkeypatch.setattr(ImageService, "generate_for_block", fake_generate_for_block)
+
+    response = await documents.repair_visual_coverage(record.document_id)
+
+    assert len(response.repaired) == 1  # the fix doesn't break the existing repair flow
+    assert captured["chapter_title"] == "Newton's Laws of Motion"
+    assert captured["section_title"] == "Newton's Second Law"
+    assert captured["key_concept"] == "Explain how force relates to acceleration for a fixed mass"
+
+
+async def test_repair_visual_coverage_uses_safe_empty_context_when_unresolvable(
+    service, documents, technical_input, monkeypatch
+):
+    """No heading at all anywhere in the document - chapter_section_context
+    has nothing to resolve. Must degrade to empty strings (the existing,
+    already-safe default on generate_for_block), never raise."""
+    record = await service.create_course(technical_input, run_planner=False)
+    blocks = [
+        Block(
+            id="para1", type=BlockType.PARAGRAPH,
+            content={"text": " ".join(["orphan paragraph with no heading anywhere"] * 16)},
+        ),
+    ]
+    document = CourseDocument(
+        document_id=record.document_id,
+        course_id=record.course_id,
+        course_title=technical_input.course_title,
+        template_id="technical_v1",
+        meta=DocumentMeta(),
+        pages=[Page(id="page_1", page_number=1, kind="content", blocks=blocks)],
+    )
+    await documents.save(record.document_id, document)
+
+    captured: dict = {}
+
+    async def fake_generate_for_block(self, **kwargs):
+        captured.update(kwargs)
+        block = kwargs["block"]
+        block.content = merge_content(
+            block.type, block.content, {"path": "assets/fake.png", "width": 800, "height": 300}
+        )
+        return True
+
+    from app.schemas.blocks import merge_content
+    from app.services.image_service import ImageService
+
+    monkeypatch.setattr(ImageService, "generate_for_block", fake_generate_for_block)
+
+    response = await documents.repair_visual_coverage(record.document_id)
+
+    assert len(response.repaired) == 1  # still succeeds - never crashes on unresolved context
+    assert captured["chapter_title"] == ""
+    assert captured["section_title"] == ""
+    assert captured["key_concept"] == ""

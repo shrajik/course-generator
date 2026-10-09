@@ -205,7 +205,7 @@ def image_generation_failed(block: Block) -> bool:
     )
 
 
-def image_box_height(block: Block) -> float:
+def image_box_height(block: Block, *, width_hint: float | None = None) -> float:
     """Height reserved for the picture itself (excluding caption and padding).
 
     `MAX_IMAGE_HEIGHT` caps a decorative raster picture's box - reasonable
@@ -218,11 +218,20 @@ def image_box_height(block: Block) -> float:
     The kinds in `_UNCAPPED_IMAGE_KINDS` are not pictures at a fixed aspect
     ratio at all; they manage their own one-page ceiling internally, so any
     cap here would only double (and wrongly shrink) what they already do.
+
+    `width_hint`, when given, is used instead of `block.layout.width` - for
+    a block `flow_blocks` hasn't placed yet (a lookahead estimate, e.g.
+    `_pending_visual_run`/`_is_visual_pair` peeking at an upcoming block),
+    `layout.width` is still unset/default and this is the only way to get
+    an accurate number. See `estimate_height`'s own IMAGE branch, the one
+    caller that needs this - every other caller runs at actual placement
+    time, after `layout.width` is already correct, and omits it.
     """
     if image_generation_failed(block):
         return MISSING_IMAGE_BOX_HEIGHT
     pad = _padding(block)
-    width = float(block.layout.width or CONTENT_WIDTH) - 2 * pad
+    raw_width = width_hint if width_hint is not None else float(block.layout.width or CONTENT_WIDTH)
+    width = raw_width - 2 * pad
     intrinsic_w = block.content.get("width")
     intrinsic_h = block.content.get("height")
     if intrinsic_w and intrinsic_h:
@@ -338,8 +347,22 @@ def estimate_height(block: Block) -> float:
 
     if t is BlockType.IMAGE:
         # A section_intro picture is small and drawn without a caption.
-        caption = 0.0 if _is_section_intro(block) else caption_height(block)
-        return image_box_height(block) + caption + 2 * pad + 8
+        # It's also laid out at SECTION_INTRO_IMAGE_WIDTH, not the full
+        # content width this function otherwise assumes - a real, confirmed
+        # bug: `_pending_visual_run`/`_is_visual_pair` (flow_blocks) call
+        # this on an UPCOMING section_intro block before flow_blocks has
+        # set its real `layout.width`, so without this hint the fallback-
+        # to-CONTENT_WIDTH here overestimates its height ~3x (full-width
+        # aspect-ratio box vs the true narrow one), making the lookahead
+        # wrongly conclude a small heading+icon pair "won't fit" the
+        # current page and force an early break that strands them alone on
+        # a near-empty fresh page - confirmed via a real generated course
+        # whose "Common mistakes" heading+icon landed on its own 20%-full
+        # page for exactly this reason.
+        is_intro = _is_section_intro(block)
+        caption = 0.0 if is_intro else caption_height(block)
+        width_hint = SECTION_INTRO_IMAGE_WIDTH if is_intro else None
+        return image_box_height(block, width_hint=width_hint) + caption + 2 * pad + 8
 
     if t is BlockType.QUOTE:
         return th(content.get("text")) + (th(content.get("attribution"), size=13) or 0) + 2 * pad
@@ -623,6 +646,24 @@ def split_code_cell(
 # ---------------------------------------------------------------------------
 
 
+def _is_visual_pair(current_block: Block, queue: list[Block]) -> list[Block] | None:
+    """Two visuals placed directly back-to-back, nothing between them - e.g.
+    a diagram-only template slot (technical_v1.json's `visual_explanation`)
+    where the writer adds a small section_intro icon immediately followed by
+    the section's real diagram image, with no paragraph allowed in between.
+    A real, confirmed bug: when the second image didn't fit the remaining
+    page space, it alone got bumped to a fresh page (images aren't
+    splittable), stranding the first - often just a heading + a small icon -
+    alone on an otherwise near-empty page. Returns `[current_block, next]`
+    only when both are visuals with nothing between them; None otherwise -
+    deliberately narrower than `_pending_visual_run`'s bridging lookahead
+    below, which already handles the (more common) text-then-visual case."""
+    if current_block.type not in VISUAL_BLOCK_TYPES or not queue:
+        return None
+    nxt = queue[0]
+    return [current_block, nxt] if nxt.type in VISUAL_BLOCK_TYPES else None
+
+
 def _pending_visual_run(current_block: Block, queue: list[Block]) -> list[Block] | None:
     """If a visual is coming up within a short, bridgeable run of non-visual
     blocks starting right after `current_block`, return
@@ -764,6 +805,24 @@ def flow_blocks(
         ):
             start_new_page()
             gap = 0.0
+
+        # Never let two visuals placed directly back-to-back get split
+        # across a page boundary (see _is_visual_pair) - deliberately NOT
+        # gated behind _MIN_CONTENT_BEFORE_EARLY_BREAK like the lookahead
+        # below: the bug this fixes is exactly a SMALL amount of preceding
+        # content (a bare heading + a small icon) getting stranded alone,
+        # so requiring "enough content already" first would silence the
+        # protection in precisely the case that needs it.
+        if current:
+            visual_pair = _is_visual_pair(block, queue)
+            if visual_pair is not None:
+                pair_height = sum(estimate_height(b) for b in visual_pair) + BLOCK_GAP
+                space_here = bottom - (y + gap)
+                would_strand_pair = pair_height > space_here
+                pair_fits_a_fresh_page = pair_height <= box.content_height
+                if would_strand_pair and pair_fits_a_fresh_page:
+                    start_new_page()
+                    gap = 0.0
 
         # Never let a visual (image/table/code) get separated from the text
         # immediately before it - the writer places that text right next to

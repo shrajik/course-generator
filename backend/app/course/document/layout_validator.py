@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import re
 
-from app.schemas.blocks import BlockType
-from app.schemas.document import PAGE_MARGIN_BOTTOM, Block, CourseDocument, Page
+from app.course.document.layout import BLOCK_GAP
+from app.schemas.blocks import VISUAL_BLOCK_TYPES, BlockType
+from app.schemas.document import PAGE_MARGIN_BOTTOM, PAGE_MARGIN_TOP, Block, CourseDocument, Page
 
 # `_clone` (layout.py) gives a split block's tail fragment an id of
 # `{original_id}_c1` (chained again as `{original_id}_c1_c1` if that
@@ -57,6 +58,40 @@ _TOLERANCE = 2.0
 # which already tries to prevent this at flow time; this is the after-the-
 # fact check that catches it if it still happens).
 MIN_PAGE_CONTENT_HEIGHT = 40.0
+
+
+# A page can clear MIN_PAGE_CONTENT_HEIGHT's bare-fragment floor yet still
+# be mostly blank relative to its own PHYSICAL size - a real, confirmed
+# case: a heading + one small section_intro icon stranded alone (see
+# app.course.document.layout._is_visual_pair's own docstring for the full
+# bug chain), roughly 220-230px of total block height on a page whose
+# usable content area is ~680px tall, comfortably clearing the 40px floor
+# above while leaving most of the page empty. Neither that check nor
+# `page_visual_fraction` (layout.py) catches this - `page_visual_fraction`'s
+# denominator is the page's own ALREADY-PLACED content, never the physical
+# page, so a page that is 100% visual and 0% text (because there's no text
+# at all) reads as perfectly balanced there, not empty.
+#
+# Scoped to pages that actually hold a VISUAL block - a plain short page of
+# pure text (e.g. the document's own final trailing paragraph, naturally
+# shorter than a full page since the content just ran out) is completely
+# normal and must never be flagged; a confirmed false positive while adding
+# this check. The real, targeted failure mode is specifically a visual with
+# little/no accompanying explanation, not "any page that happens to be thin".
+MIN_CONTENT_DENSITY = 0.35
+
+
+def page_content_density(page: Page) -> float:
+    """`page`'s own rendered content height (every block's height, plus the
+    gaps between them - the same measure `page_visual_fraction` sums) as a
+    fraction of the PHYSICAL usable page area (`page.size.height` minus its
+    top/bottom margins) - not of its own already-placed content, which is
+    what `page_visual_fraction` measures instead. 0.0 for an empty page."""
+    if not page.blocks:
+        return 0.0
+    rendered = sum(b.layout.height for b in page.blocks) + BLOCK_GAP * (len(page.blocks) - 1)
+    usable = page.size.height - PAGE_MARGIN_TOP - PAGE_MARGIN_BOTTOM
+    return rendered / usable if usable > 0 else 0.0
 
 
 def _bottom(block: Block) -> float:
@@ -121,6 +156,14 @@ def validate_page(page: Page) -> list[str]:
         findings.append(
             f"page {page.page_number} holds almost no content ({total_height:.0f}px) - "
             "likely an orphaned fragment left behind by a split"
+        )
+
+    has_visual = any(b.type in VISUAL_BLOCK_TYPES for b in page.blocks)
+    density = page_content_density(page)
+    if has_visual and 0 < density < MIN_CONTENT_DENSITY:
+        findings.append(
+            f"page {page.page_number} uses only {density:.0%} of the available page height - "
+            "likely a visual stranded with no accompanying content"
         )
 
     return findings
