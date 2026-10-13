@@ -172,15 +172,58 @@ class RunInfo(BaseModel):
 ReviewStatus = Literal["draft", "in_review", "changes_requested", "approved"]
 
 
-class ReviewHistoryEntry(BaseModel):
-    """One entry in a course's review audit trail (append-only)."""
+class OverrideEvidence(BaseModel):
+    """Structured audit evidence for one of the four admin-only quality-gate
+    override actions (see ReviewHistoryEntry.action and
+    app.services.course_service's `_approve_with_override`). Only the
+    fields relevant to the specific override action taken are populated;
+    the rest keep their safe (empty) defaults - never fabricated.
+
+    Wording note: `verification_error`/`evaluation_error` describe a check
+    that could not be completed, never a confirmed content defect - see the
+    override policy's explicit wording requirement."""
 
     model_config = ConfigDict(extra="allow")
 
-    action: Literal["submitted", "approved", "changes_requested"]
+    # override_approved_blockers
+    standards_version: str | None = None
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    # override_approved_verification_failed
+    verifier: str | None = None
+    verification_error: str | None = None
+    # override_approved_evaluation_failure
+    evaluation_error: str | None = None
+    # override_approved_incomplete_chapters
+    affected_chapters: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ReviewHistoryEntry(BaseModel):
+    """One entry in a course's review audit trail (append-only).
+
+    The four `override_approved_*` actions (MOM quality-governance
+    follow-up) are admin-only, server-enforced bypasses of one specific
+    quality gate each - see `CourseService._approve_with_override` for the
+    exact policy each one is scoped to, and `OverrideEvidence` for the
+    structured evidence `override_evidence` carries. They are deliberately
+    distinct from plain "approved": never collapse one into another, and
+    never let a different override action's absence be read as "nothing
+    was wrong"."""
+
+    model_config = ConfigDict(extra="allow")
+
+    action: Literal[
+        "submitted",
+        "approved",
+        "changes_requested",
+        "override_approved_blockers",
+        "override_approved_verification_failed",
+        "override_approved_evaluation_failure",
+        "override_approved_incomplete_chapters",
+    ]
     by: str | None = None  # user id of whoever performed the action
     at: str
     comment: str | None = None
+    override_evidence: OverrideEvidence | None = None
 
 
 class QualitySnapshot(BaseModel):
@@ -359,6 +402,19 @@ class ApproveCourseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     comment: str | None = Field(default=None, max_length=4000)
+
+
+class OverrideApprovalRequest(BaseModel):
+    """Body for each of the four admin-only override-approve endpoints.
+    Deliberately has no field selecting WHICH quality gate to bypass - that
+    is fixed by which endpoint/action is called, never a client-supplied
+    parameter (see the four `override_approved_*` actions on
+    ReviewHistoryEntry) - so the ordinary `/approve` endpoint and its
+    `ApproveCourseRequest` stay free of any override parameter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    comment: str = Field(min_length=1, max_length=4000, description="Why this override is justified.")
 
 
 class CourseReviewResponse(BaseModel):

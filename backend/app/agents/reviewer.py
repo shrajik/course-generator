@@ -26,6 +26,7 @@ from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, VISUAL_BLOCK_TYPES, BlockTyp
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
 from app.schemas.document import Block
+from app.schemas.draft import StructuralFinding
 from app.schemas.learner import LearnerProfile
 from app.schemas.review import ChapterReview, ContinuityReport, ReviewIssue
 from app.schemas.template import CourseTemplate
@@ -78,7 +79,7 @@ class ReviewerAgent:
         course_input: CourseInput,
         blocks: list[Block],
         continuity: ContinuityContext,
-    ) -> ChapterReview:
+    ) -> tuple[ChapterReview, list[StructuralFinding]]:
         log.info(
             "TEMPLATE_SENT_TO_REVIEWER template_id=%s chapter=%s required_sections=%s",
             template.template_id,
@@ -110,7 +111,7 @@ class ReviewerAgent:
             phase="reviewer",
         )
         review.reviewed_at = utc_now_iso()
-        self._apply_structural_checks(
+        structural_findings = self._apply_structural_checks(
             review, template, blocks, course_input.learner_profile, course_input
         )
         # Keep the reviewer honest: structural gaps always block approval.
@@ -123,7 +124,7 @@ class ReviewerAgent:
             review.scores.overall(),
             len(review.issues),
         )
-        return review
+        return review, structural_findings
 
     async def review_continuity(
         self,
@@ -153,22 +154,56 @@ class ReviewerAgent:
         blocks: list[Block],
         profile: LearnerProfile | None = None,
         course_input: CourseInput | None = None,
-    ) -> None:
+    ) -> list[StructuralFinding]:
+        """Mutates `review` exactly as before (unchanged contract: every
+        deterministic gap still lands in `review.missing_required_blocks`,
+        which is what drives the existing retry/auto-revision loop in
+        CourseService._generate_chapter - untouched by this change) and
+        additionally RETURNS the subset of those gaps that came from a real
+        deterministic check here, as typed `StructuralFinding`s, so a
+        caller can persist them separately (see GeneratedChapter.
+        structural_findings) without having to guess which of
+        `missing_required_blocks`' plain strings were deterministic versus
+        the reviewer MODEL's own self-reported text (also merged into that
+        same list, exactly as before) - that distinction can't be
+        recovered from the flat list alone once merged."""
         present_types = {block.type for block in blocks}
         present_sections = {block.meta.section_key for block in blocks if block.meta.section_key}
 
+        deterministic: list[StructuralFinding] = []
         missing: list[str] = list(review.missing_required_blocks)
+
         for block_type in template.required_block_types:
             if block_type not in present_types:
-                missing.append(f"block type '{block_type.value}'")
+                text = f"block type '{block_type.value}'"
+                missing.append(text)
+                deterministic.append(
+                    StructuralFinding(check="missing_block_type", description=text, dimension="completeness")
+                )
         for section in template.required_sections():
             allowed = set(section.block_types) or set(BlockType)
             if section.key not in present_sections and not (allowed & present_types):
-                missing.append(f"section '{section.key}'")
-        missing.extend(_visual_balance_issues(blocks))
+                text = f"section '{section.key}'"
+                missing.append(text)
+                deterministic.append(
+                    StructuralFinding(check="missing_section", description=text, dimension="completeness")
+                )
+        for text in _visual_balance_issues(blocks):
+            missing.append(text)
+            deterministic.append(
+                StructuralFinding(check="visual_balance", description=text, dimension="visual")
+            )
         content_level = course_input.content_level if course_input is not None else 2
-        missing.extend(_content_level_3_issues(blocks, content_level))
-        missing.extend(_section_completeness_issues(blocks))
+        for text in _content_level_3_issues(blocks, content_level):
+            missing.append(text)
+            deterministic.append(
+                StructuralFinding(check="content_level_3", description=text, dimension="pedagogy")
+            )
+        for text in _section_completeness_issues(blocks):
+            missing.append(text)
+            deterministic.append(
+                StructuralFinding(check="section_completeness", description=text, dimension="completeness")
+            )
         # Deduplicate while preserving order.
         review.missing_required_blocks = list(dict.fromkeys(missing))
 
@@ -179,6 +214,8 @@ class ReviewerAgent:
             course_input.learner_profile if course_input is not None else None
         )
         review.issues.extend(_pedagogy_issues(blocks, effective_profile))
+
+        return deterministic
 
 
 def _block_word_count(block: Block) -> int:

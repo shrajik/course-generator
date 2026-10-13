@@ -31,7 +31,7 @@ from app.core.logging import get_logger
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.course import CourseRecord
 from app.schemas.document import CourseDocument
-from app.schemas.draft import GeneratedChapter
+from app.schemas.draft import ChapterInventoryIssue, GeneratedChapter
 from app.schemas.research import ChapterResearch
 
 log = get_logger(__name__)
@@ -226,6 +226,33 @@ class StorageService:
             except Exception as exc:  # pragma: no cover
                 log.warning("Skipping unreadable chapter %s: %s", path.name, exc)
         return sorted(chapters, key=lambda c: c.chapter_number)
+
+    def verify_chapter_inventory(
+        self, course_id: str, expected_chapter_ids: list[str]
+    ) -> list[ChapterInventoryIssue]:
+        """Fail-closed counterpart to `load_all_chapters`, which silently
+        skips a chapter it can't parse (the right behaviour for continuity
+        builders/document assembly/the course-detail API, all unchanged by
+        this method). This instead checks each blueprint-EXPECTED chapter
+        id (`CourseRecord.chapters`, the stable, authoritative "what was
+        planned" contract - never `record.status`, which only reflects
+        whether the chapters a given `generate()` call targeted succeeded,
+        not whether every planned chapter was ever attempted) individually,
+        and reports exactly which are missing vs. corrupt - the distinction
+        `has_chapter` (existence only) and a direct `load_chapter` attempt
+        make possible, that `load_all_chapters` collapses into silence."""
+        issues: list[ChapterInventoryIssue] = []
+        for chapter_id in expected_chapter_ids:
+            if not self.has_chapter(course_id, chapter_id):
+                issues.append(ChapterInventoryIssue(chapter_id=chapter_id, status="missing"))
+                continue
+            try:
+                self.load_chapter(course_id, chapter_id)
+            except Exception as exc:
+                issues.append(
+                    ChapterInventoryIssue(chapter_id=chapter_id, status="corrupt", detail=str(exc))
+                )
+        return issues
 
     # --- document ---------------------------------------------------------
     def save_document(self, document: CourseDocument) -> Path:

@@ -32,7 +32,14 @@ from app.agents.reviewer import ReviewerAgent
 from app.agents.writer import WriterAgent, to_generated_chapter
 from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
-from app.core.errors import ConflictError, NotFoundError, ValidationFailedError
+from app.core.errors import (
+    ConflictError,
+    IncompleteChapterInventoryError,
+    NotFoundError,
+    QualityApprovalBlockedError,
+    QualityEvaluationFailedError,
+    ValidationFailedError,
+)
 from app.core.generation_stream import get_stream_hub, make_stream_sink
 from app.core.ids import course_id as new_course_id
 from app.core.ids import document_id_for_course, new_id, utc_now_iso
@@ -52,12 +59,13 @@ from app.schemas.course import (
     GenerateResponse,
     ImproveTocRequest,
     ImproveTocResponse,
+    OverrideEvidence,
     ReviewHistoryEntry,
     RunInfo,
     WorkspaceActivityEntry,
 )
 from app.schemas.document import CourseDocument
-from app.schemas.draft import GeneratedChapter
+from app.schemas.draft import ChapterInventoryIssue, GeneratedChapter, StructuralFinding
 from app.schemas.memory import GenerationRunEntry
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
@@ -70,6 +78,7 @@ from app.services.quality_framework import (
     QualityReport,
     build_course_quality_report,
     quality_gate_evaluation_failed_warning,
+    quality_gate_incomplete_inventory_warning,
     quality_gate_warning,
     quality_snapshot_from_report,
 )
@@ -257,6 +266,21 @@ class CourseService:
             raise ConflictError(
                 f"Course cannot be submitted for review from status '{record.review_status}'"
             )
+        # MOM quality-governance follow-up: `record.status == "ready"` alone
+        # does NOT reliably mean every blueprint-planned chapter exists - it
+        # only reflects whether the chapters a given `generate()` call
+        # targeted succeeded (targeted/partial generation is supported), so
+        # a partially-generated course can read "ready" while chapters are
+        # still entirely unattempted. This independently verifies the real
+        # chapter inventory against `record.chapters` (the stable,
+        # blueprint-derived expected set) rather than trusting `status`.
+        inventory_issues = await self._verify_inventory(record)
+        if inventory_issues:
+            raise IncompleteChapterInventoryError(
+                f"Course '{course_id}' cannot be submitted for review: "
+                f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
+                details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
         now = utc_now_iso()
         record.review_status = "in_review"
         # Clear the previous reviewer's note - it's stale once the author has
@@ -276,10 +300,31 @@ class CourseService:
     async def approve_course(
         self, course_id: str, reviewer_id: str, comment: str | None = None
     ) -> CourseRecord:
+        """Ordinary approval - deliberately free of any override parameter
+        (see OverrideApprovalRequest's own docstring and the four
+        `approve_course_override_*` methods below): every quality gate
+        below is fully enforced, with no bypass available here."""
         record = await self._load_course(course_id)
         if record.review_status != "in_review":
             raise ConflictError(
                 f"Course is not ready for review approval (status '{record.review_status}')"
+            )
+        inventory_issues, report, eval_error = await self._evaluate_quality_for_approval(record)
+        if inventory_issues:
+            raise IncompleteChapterInventoryError(
+                f"Course '{course_id}' cannot be approved: "
+                f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
+                details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
+        if eval_error is not None:
+            raise QualityEvaluationFailedError(
+                f"Quality evaluation could not be completed for '{course_id}': {eval_error}"
+            ) from eval_error
+        blocking = report.approval_blocking_findings if report is not None else []
+        if blocking:
+            raise QualityApprovalBlockedError(
+                f"Course '{course_id}' has {len(blocking)} unresolved quality blocker(s)",
+                details={"findings": [f.model_dump(mode="json") for f in blocking]},
             )
         now = utc_now_iso()
         record.review_status = "approved"
@@ -294,6 +339,182 @@ class CourseService:
         record = await self._save_course(record)
         log.info("Course %s approved by %s", course_id, reviewer_id)
         return record
+
+    async def _verify_inventory(self, record: CourseRecord) -> list[ChapterInventoryIssue]:
+        expected_ids = [c.chapter_id for c in record.chapters]
+        return self.storage.verify_chapter_inventory(record.course_id, expected_ids)
+
+    async def _evaluate_quality_for_approval(
+        self, record: CourseRecord
+    ) -> tuple[list[ChapterInventoryIssue], QualityReport | None, Exception | None]:
+        """Never raises - the caller (plain `approve_course` or one of the
+        four `approve_course_override_*` methods) decides what each
+        category of problem means for it. Always computes all three
+        pieces (inventory issues, report, evaluation error) so an override
+        has the full picture to build its audit evidence from, even when
+        it only ultimately needs one of them."""
+        inventory_issues = await self._verify_inventory(record)
+        report: QualityReport | None = None
+        eval_error: Exception | None = None
+        try:
+            chapters = self.storage.load_all_chapters(record.course_id)
+            document = (
+                await self._load_document(record.course_id)
+                if await self._has_document(record.course_id)
+                else None
+            )
+            report = build_course_quality_report(
+                course_id=record.course_id,
+                document_id=document.document_id if document else "",
+                chapters=chapters,
+                document=document,
+                inventory_issues=inventory_issues,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never swallowed silently
+            eval_error = exc
+        return inventory_issues, report, eval_error
+
+    # --- admin-only quality-gate overrides ----------------------------------
+    # Four distinct, server-enforced bypasses (MOM quality-governance
+    # follow-up) - each lifts exactly ONE gate and no other. All four still
+    # require `review_status == "in_review"` (the same precondition as plain
+    # `approve_course`) and still run every OTHER gate normally: an override
+    # for one category never silently waves through a different, unrelated
+    # problem. See ReviewHistoryEntry.action / OverrideEvidence for the
+    # audit-trail shape this persists.
+    async def _approve_with_override(
+        self,
+        course_id: str,
+        admin_id: str,
+        reason: str,
+        *,
+        action: str,
+    ) -> CourseRecord:
+        if not reason or not reason.strip():
+            raise ValidationFailedError("A reason is required to override the quality gate")
+        record = await self._load_course(course_id)
+        if record.review_status != "in_review":
+            raise ConflictError(
+                f"Course is not ready for review approval (status '{record.review_status}')"
+            )
+        inventory_issues, report, eval_error = await self._evaluate_quality_for_approval(record)
+        evidence = OverrideEvidence()
+
+        if inventory_issues and action != "override_approved_incomplete_chapters":
+            # This override is scoped to a different category - an
+            # incomplete inventory is never silently waved through by it.
+            raise IncompleteChapterInventoryError(
+                f"Course '{course_id}' cannot be approved: "
+                f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
+                details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
+        if inventory_issues:
+            evidence.affected_chapters = [
+                {"chapter_id": i.chapter_id, "status": i.status, "detail": i.detail}
+                for i in inventory_issues
+            ]
+        elif action == "override_approved_incomplete_chapters":
+            raise ValidationFailedError(
+                "This course's chapter inventory is already complete; use normal approval instead"
+            )
+
+        if eval_error is not None:
+            if action != "override_approved_evaluation_failure":
+                raise QualityEvaluationFailedError(
+                    f"Quality evaluation could not be completed for '{course_id}': {eval_error}"
+                ) from eval_error
+            evidence.evaluation_error = str(eval_error)[:500]
+        elif action == "override_approved_evaluation_failure":
+            raise ValidationFailedError(
+                "Quality evaluation succeeded for this course; use normal approval instead"
+            )
+        else:
+            assert report is not None
+            # Inventory issues are handled above, via their own category -
+            # never double-counted here as a "confirmed blocker" too.
+            remaining = [
+                f
+                for f in report.approval_blocking_findings
+                if f.reason != "incomplete_chapter_inventory"
+            ]
+            confirmed = [f for f in remaining if f.verification_status == "independently_verified"]
+            verification_failed = [f for f in remaining if f.verification_status == "verification_failed"]
+
+            if confirmed and action != "override_approved_blockers":
+                raise QualityApprovalBlockedError(
+                    f"Course '{course_id}' has {len(confirmed)} confirmed quality blocker(s)",
+                    details={"category": "confirmed_blockers", "findings": [f.model_dump(mode="json") for f in confirmed]},
+                )
+            if verification_failed and action != "override_approved_verification_failed":
+                raise QualityApprovalBlockedError(
+                    f"Course '{course_id}' has {len(verification_failed)} verification-failed "
+                    "quality blocker(s)",
+                    details={
+                        "category": "verification_failed",
+                        "findings": [f.model_dump(mode="json") for f in verification_failed],
+                    },
+                )
+            if action == "override_approved_blockers":
+                if not confirmed:
+                    raise ValidationFailedError(
+                        "No confirmed blocking findings to override; use normal approval instead"
+                    )
+                evidence.standards_version = report.standards_version
+                evidence.findings = [f.model_dump(mode="json") for f in confirmed]
+            if action == "override_approved_verification_failed":
+                if not verification_failed:
+                    raise ValidationFailedError(
+                        "No verification-failed findings to override; use normal approval instead"
+                    )
+                evidence.findings = [f.model_dump(mode="json") for f in verification_failed]
+                verifiers = sorted({f.verifier for f in verification_failed if f.verifier})
+                evidence.verifier = ", ".join(verifiers) if verifiers else None
+                errors = [f.verification_error for f in verification_failed if f.verification_error]
+                evidence.verification_error = "; ".join(errors)[:1000] if errors else None
+
+        now = utc_now_iso()
+        record.review_status = "approved"
+        record.review_comment = reason
+        record.reviewer_id = admin_id
+        record.reviewed_at = now
+        record.review_history = [
+            *record.review_history,
+            ReviewHistoryEntry(
+                action=action, by=admin_id, at=now, comment=reason, override_evidence=evidence
+            ),
+        ]
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Course %s approved via %s by %s", course_id, action, admin_id)
+        return record
+
+    async def approve_course_override_blockers(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_blockers"
+        )
+
+    async def approve_course_override_verification_failed(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_verification_failed"
+        )
+
+    async def approve_course_override_evaluation_failure(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_evaluation_failure"
+        )
+
+    async def approve_course_override_incomplete_chapters(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_incomplete_chapters"
+        )
 
     async def request_changes(
         self, course_id: str, reviewer_id: str, comment: str
@@ -387,14 +608,21 @@ class CourseService:
         already-persisted chapters/document, so it reflects the course's
         CURRENT state, including any hand-edits made since generation."""
         await self.get_course_record(course_id)  # raises NotFoundError if unknown
-        chapters = self.storage.load_all_chapters(course_id)
-        document = await self._load_document(course_id) if await self._has_document(course_id) else None
-        return build_course_quality_report(
-            course_id=course_id,
-            document_id=document.document_id if document else "",
-            chapters=chapters,
-            document=document,
-        )
+        try:
+            chapters = self.storage.load_all_chapters(course_id)
+            document = (
+                await self._load_document(course_id) if await self._has_document(course_id) else None
+            )
+            return build_course_quality_report(
+                course_id=course_id,
+                document_id=document.document_id if document else "",
+                chapters=chapters,
+                document=document,
+            )
+        except Exception as exc:  # noqa: BLE001 - a crashed computation is its own distinct category
+            raise QualityEvaluationFailedError(
+                f"Quality evaluation could not be completed for '{course_id}': {exc}"
+            ) from exc
 
     # --- phase 1: plan -----------------------------------------------------
     async def plan_course(self, record: CourseRecord) -> CourseBlueprint:
@@ -784,6 +1012,7 @@ class CourseService:
             )
 
             review: ChapterReview | None = None
+            structural_findings: list[StructuralFinding] = []
             revisions = 0
             try:
                 # ChapterReview is a critique object (scores/issues), not prose,
@@ -791,7 +1020,7 @@ class CourseService:
                 # just mark the phase so the UI can say "Reviewing" for real,
                 # exactly when the reviewer call actually starts.
                 hub.start(record.course_id, chapter.id, "reviewing")
-                review = await self.reviewer.review_chapter(
+                review, structural_findings = await self.reviewer.review_chapter(
                     blueprint=blueprint,
                     chapter=chapter,
                     template=template,
@@ -815,7 +1044,7 @@ class CourseService:
                         on_delta=make_stream_sink(record.course_id, chapter.id, "reviewing"),
                     )
                     hub.start(record.course_id, chapter.id, "reviewing")
-                    review = await self.reviewer.review_chapter(
+                    review, structural_findings = await self.reviewer.review_chapter(
                         blueprint=blueprint,
                         chapter=chapter,
                         template=template,
@@ -833,6 +1062,7 @@ class CourseService:
                 review=review,
                 revisions=revisions,
                 model="mock" if self.ai.is_mock else self.settings.writer_model,
+                structural_findings=structural_findings,
             )
             self.storage.save_chapter(record.course_id, artifact)
             await self._mark_progress(
@@ -953,15 +1183,25 @@ class CourseService:
             quality_report: QualityReport | None = None
             try:
                 quality_chapters = self.storage.load_all_chapters(record.course_id)
+                # MOM quality-governance follow-up: this gate is advisory
+                # (never fatal to generation, exactly as before), so an
+                # incomplete inventory is surfaced as a visible, distinct
+                # warning here - never as a raised IncompleteChapterInventoryError,
+                # which is reserved for the hard submission/approval gates.
+                inventory_issues = await self._verify_inventory(record)
                 quality_report = build_course_quality_report(
                     course_id=record.course_id,
                     document_id=document.document_id,
                     chapters=quality_chapters,
                     document=document,
+                    inventory_issues=inventory_issues,
                 )
                 gate_warning = quality_gate_warning(quality_report)
                 if gate_warning:
                     warnings.append(gate_warning)
+                inventory_warning = quality_gate_incomplete_inventory_warning(inventory_issues)
+                if inventory_warning:
+                    warnings.append(inventory_warning)
             except Exception as exc:  # noqa: BLE001 - the gate is advisory, never fatal to generation
                 # An evaluation that could not run must never be silently
                 # indistinguishable from "evaluated and clean" - this used to

@@ -10,7 +10,12 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.course_authorization import get_course_for_author_action, get_owned_course
-from app.api.dependencies import get_current_user, get_current_user_if_db_enabled, require_roles
+from app.api.dependencies import (
+    get_current_admin,
+    get_current_user,
+    get_current_user_if_db_enabled,
+    require_roles,
+)
 from app.core.errors import NotFoundError, ValidationFailedError
 from app.core.logging import get_logger
 from app.core.generation_stream import get_stream_hub
@@ -34,6 +39,7 @@ from app.schemas.course import (
     GenerateResponse,
     ImproveTocRequest,
     ImproveTocResponse,
+    OverrideApprovalRequest,
     RequestChangesRequest,
 )
 from app.schemas.document import CourseDocument
@@ -428,6 +434,114 @@ async def approve_course(
     record = await service.approve_course(course_id, str(current_user.id), comment)
     await service.record_activity(
         course_id, str(current_user.id), current_user.email, "approved", comment
+    )
+    return _to_review_response(record)
+
+
+def _override_activity_message(action: str, comment: str) -> str:
+    return f"[{action}] {comment}"
+
+
+@router.post("/{course_id}/approve/override/blockers", response_model=CourseReviewResponse)
+async def override_approve_blockers(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve past CONFIRMED (independently-verified) blocking
+    quality findings. Lifts only that one gate - the course must still be
+    `in_review` and have a complete, readable chapter inventory, and any
+    verification-failed or whole-report-evaluation-failure blocker still
+    stops this path (use the matching override for those instead)."""
+    record = await service.approve_course_override_blockers(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_blockers", request.comment),
+    )
+    return _to_review_response(record)
+
+
+@router.post(
+    "/{course_id}/approve/override/verification-failed", response_model=CourseReviewResponse
+)
+async def override_approve_verification_failed(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve past a blocker whose own verifier failed to run
+    (uncertainty, never a confirmed defect - see QualityFinding.verification_error).
+    Every other gate (inventory, confirmed blockers, evaluation failure)
+    still applies normally."""
+    record = await service.approve_course_override_verification_failed(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_verification_failed", request.comment),
+    )
+    return _to_review_response(record)
+
+
+@router.post(
+    "/{course_id}/approve/override/evaluation-failure", response_model=CourseReviewResponse
+)
+async def override_approve_evaluation_failure(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve a course whose quality-report COMPUTATION itself
+    crashed (distinct from a complete report with a real finding - see
+    QualityEvaluationFailedError). Every other gate still applies."""
+    record = await service.approve_course_override_evaluation_failure(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_evaluation_failure", request.comment),
+    )
+    return _to_review_response(record)
+
+
+@router.post(
+    "/{course_id}/approve/override/incomplete-chapters", response_model=CourseReviewResponse
+)
+async def override_approve_incomplete_chapters(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve a course with a missing/unreadable expected
+    chapter (see StorageService.verify_chapter_inventory). Does NOT
+    implicitly authorize approving a course whose generation lifecycle is
+    otherwise incomplete - every other gate (confirmed blockers,
+    verification failure, evaluation failure) still applies to whatever
+    content IS readable."""
+    record = await service.approve_course_override_incomplete_chapters(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_incomplete_chapters", request.comment),
     )
     return _to_review_response(record)
 

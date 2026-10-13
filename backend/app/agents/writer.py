@@ -22,7 +22,13 @@ from app.schemas.blocks import BlockType
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
 from app.schemas.document import Block
-from app.schemas.draft import BlockRevision, ChapterDraft, DraftBlock, GeneratedChapter
+from app.schemas.draft import (
+    BlockRevision,
+    ChapterDraft,
+    DraftBlock,
+    GeneratedChapter,
+    StructuralFinding,
+)
 from app.schemas.research import ChapterResearch
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
@@ -260,6 +266,7 @@ def to_generated_chapter(
     review: ChapterReview | None,
     revisions: int,
     model: str,
+    structural_findings: list[StructuralFinding] | None = None,
 ) -> GeneratedChapter:
     return GeneratedChapter(
         chapter_id=chapter.id,
@@ -268,6 +275,7 @@ def to_generated_chapter(
         summary=summary,
         blocks=[block.model_dump(mode="json") for block in blocks],
         review=review.model_dump(mode="json") if review else None,
+        structural_findings=structural_findings or [],
         revisions=revisions,
         model=model,
         generated_at=utc_now_iso(),

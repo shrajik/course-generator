@@ -169,7 +169,7 @@ async def test_reviewer_receives_reviewer_stage_memory(service, technical_input)
         Block(type=BlockType.HEADING, content={"text": "Chapter One", "level": 1}),
         Block(type=BlockType.PARAGRAPH, content={"text": "Some content about the chapter."}),
     ]
-    review = await agent.review_chapter(
+    review, structural_findings = await agent.review_chapter(
         blueprint=bp,
         chapter=bp.chapters[0],
         template=template,
@@ -178,4 +178,5 @@ async def test_reviewer_receives_reviewer_stage_memory(service, technical_input)
         continuity=ContinuityContext(),
     )
     assert review is not None
+    assert isinstance(structural_findings, list)
     assert fake.calls == ["reviewer"]

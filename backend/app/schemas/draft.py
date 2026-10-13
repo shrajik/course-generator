@@ -8,6 +8,8 @@ Course Document block.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.blocks import BlockType
@@ -131,6 +133,28 @@ class ChapterDraft(BaseModel):
     words_estimate: int = 0
 
 
+class StructuralFinding(BaseModel):
+    """One deterministic claim established by a structural check at
+    generation time (app.agents.reviewer._apply_structural_checks) - never
+    an AI-facing schema (unlike `ChapterReview.missing_required_blocks`,
+    which the reviewer model can also populate itself), so a finding built
+    from this list is the one place app.services.quality_framework can
+    safely mark something `independently_verified` without the model being
+    able to claim that status for itself.
+
+    `check` is a stable code naming exactly which deterministic check
+    produced this (e.g. "missing_block_type", "visual_balance",
+    "content_level_3", "section_completeness") - narrowly scoped to what
+    that check actually proves (see each check function's own docstring/
+    comment), never a broader claim about chapter quality."""
+
+    model_config = ConfigDict(extra="allow")
+
+    check: str
+    description: str
+    dimension: str = "completeness"
+
+
 class GeneratedChapter(BaseModel):
     """Persisted chapter artifact: data/courses/{id}/chapters/chapter_XX.json"""
 
@@ -142,6 +166,28 @@ class GeneratedChapter(BaseModel):
     summary: str = ""
     blocks: list[dict] = Field(default_factory=list)  # normalised Block payloads
     review: dict | None = None
+    # Additive (MOM quality-governance follow-up) - the deterministic subset
+    # of `review["missing_required_blocks"]`, returned by
+    # `ReviewerAgent._apply_structural_checks` and persisted separately so
+    # app.services.quality_framework can tell a real structural check apart
+    # from the reviewer model's own self-reported text. `[]` for every
+    # chapter generated before this field existed - never backfilled or
+    # inferred after the fact.
+    structural_findings: list[StructuralFinding] = Field(default_factory=list)
     revisions: int = 0
     model: str = ""
     generated_at: str = ""
+
+
+class ChapterInventoryIssue(BaseModel):
+    """One blueprint-expected chapter that is not present and loadable on
+    disk (see StorageService.verify_chapter_inventory) - the fail-closed
+    chapter-inventory check. `detail` carries the real parse-failure
+    message when `status == "corrupt"`; always "" for "missing" (nothing
+    to parse, so nothing is invented)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str
+    status: Literal["missing", "corrupt"]
+    detail: str = ""

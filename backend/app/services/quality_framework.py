@@ -48,14 +48,30 @@ read as having done that on its own authority.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.ids import utc_now_iso
+from app.core.logging import get_logger
 from app.course.document.layout_validator import validate_document
 from app.schemas.blocks import BlockType
 from app.schemas.course import QualitySnapshot
 from app.schemas.document import CourseDocument
-from app.schemas.draft import GeneratedChapter
+from app.schemas.draft import ChapterInventoryIssue, GeneratedChapter
+
+log = get_logger(__name__)
+
+# The three-state verification contract (MOM quality-governance follow-up):
+# a finding is never treated as "proven true" merely because a model wrote
+# it. Only code that ACTUALLY performed an independent, deterministic check
+# may set "independently_verified"; a verifier that itself errored sets
+# "verification_failed" (fail-closed: still blocks a "blocker"-severity
+# finding, but never implies the underlying claim is true); everything
+# else - in particular every reviewer-LLM finding, with NO exception for
+# category/dimension/text content - defaults to, and stays, "unverified".
+# Never inferred from `source`, `dimension`, severity, or finding text.
+VerificationStatus = Literal["unverified", "independently_verified", "verification_failed"]
 
 QUALITY_STANDARDS_VERSION = "2026.1"
 # "proposed" | "approved" - see module docstring. Keep this honest: nothing
@@ -154,6 +170,15 @@ class QualityFinding(BaseModel):
     description: str
     remediation: str = ""
     source: str = ""  # which subsystem produced this: "reviewer" | "layout_validator" | "image"
+    # Additive (MOM quality-governance follow-up) - see VerificationStatus
+    # above for the contract. Every finding constructor in this module sets
+    # this EXPLICITLY (never left to infer from the other fields).
+    verification_status: VerificationStatus = "unverified"
+    verifier: str | None = None  # which deterministic check/mechanism set verification_status
+    verified_at: str | None = None  # when verification_status was last determined
+    # Populated ONLY for "verification_failed" - the real error from the
+    # verifier itself, never a claim about the underlying finding.
+    verification_error: str | None = None
 
 
 def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
@@ -163,7 +188,45 @@ def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
     than a typed `ChapterReview`, because it is written once by the pipeline
     and read generically thereafter - this re-validates it defensively
     (`.get` everywhere) so a chapter from before a given review field existed
-    still produces a (shorter, honest) finding list instead of raising."""
+    still produces a (shorter, honest) finding list instead of raising.
+
+    Verification policy (MOM quality-governance follow-up, Option B applied
+    UNIFORMLY): every finding sourced from the reviewer MODEL's own output -
+    `issues`, `donts_violations`, `dos_violations`, the `not_approved`
+    fallback, and whatever part of `missing_required_blocks` the model
+    contributed itself - is "unverified": a real, visible finding, but
+    never independently proven. The ONLY findings this function marks
+    "independently_verified" are the ones in `chapter.structural_findings`
+    (app.agents.reviewer._apply_structural_checks's deterministic output,
+    never an AI-facing schema target - see StructuralFinding's own
+    docstring) - each scoped to exactly the narrow claim its own check
+    establishes, nothing broader. A chapter from before `structural_findings`
+    existed simply has an empty list here, same backward-compatibility
+    contract as every other additive field."""
+    try:
+        return _chapter_findings(chapter)
+    except Exception as exc:  # noqa: BLE001 - a broken re-derivation must not crash the whole report
+        log.warning("Chapter finding derivation failed for %s: %s", chapter.chapter_id, exc)
+        return [
+            QualityFinding(
+                artifact=f"chapter:{chapter.chapter_id}",
+                dimension="completeness",
+                severity="blocker",
+                reason="chapter_findings_verification_failed",
+                description=(
+                    f"This chapter's stored review/structural data could not be read to "
+                    f"determine its quality findings: {exc}"
+                ),
+                remediation="Investigate the persisted chapter artifact; it may be malformed.",
+                source="reviewer",
+                verification_status="verification_failed",
+                verifier="chapter_findings",
+                verification_error=str(exc)[:500],
+            )
+        ]
+
+
+def _chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
     review = chapter.review or {}
     findings: list[QualityFinding] = []
     label = f"chapter:{chapter.chapter_id}"
@@ -184,11 +247,36 @@ def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
                 description=str(issue.get("description") or ""),
                 remediation=str(issue.get("suggestion") or ""),
                 source="reviewer",
+                verification_status="unverified",
+            )
+        )
+
+    # The deterministic subset, re-surfaced from its own typed, non-AI-facing
+    # field (see StructuralFinding's docstring for exactly why this is safe
+    # to mark verified while the model's own self-reported text, below,
+    # never is).
+    structural_texts = {f.description for f in chapter.structural_findings}
+    for finding in chapter.structural_findings:
+        findings.append(
+            QualityFinding(
+                artifact=label,
+                dimension=finding.dimension,
+                severity="blocker",
+                reason="missing_required_block",
+                description=finding.description,
+                remediation="Add the missing block/section, or (for content level 3 / section "
+                "completeness) the specific content named above, then re-review.",
+                source="reviewer",
+                verification_status="independently_verified",
+                verifier=f"structural_check:{finding.check}",
+                verified_at=chapter.generated_at or None,
             )
         )
 
     for missing in review.get("missing_required_blocks", []) or []:
         text = str(missing)
+        if text in structural_texts:
+            continue  # already emitted above as independently_verified - never double-counted
         findings.append(
             QualityFinding(
                 artifact=label,
@@ -199,6 +287,7 @@ def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
                 remediation="Add the missing block/section, or (for content level 3 / section "
                 "completeness) the specific content named above, then re-review.",
                 source="reviewer",
+                verification_status="unverified",
             )
         )
 
@@ -212,6 +301,7 @@ def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
                 description=str(violation),
                 remediation="Revise the chapter so it no longer violates this Don't.",
                 source="reviewer",
+                verification_status="unverified",
             )
         )
 
@@ -228,6 +318,7 @@ def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
                 description=str(violation),
                 remediation="Revise the chapter to honour this Do.",
                 source="reviewer",
+                verification_status="unverified",
             )
         )
 
@@ -243,6 +334,7 @@ def chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
                 reason="not_approved",
                 description=str(review.get("summary") or "Reviewer did not approve this chapter."),
                 source="reviewer",
+                verification_status="unverified",
             )
         )
 
@@ -283,61 +375,99 @@ def visual_findings(document: CourseDocument) -> list[QualityFinding]:
     for _page, block in document.iter_blocks():
         if block.type is not BlockType.IMAGE:
             continue
-        content = block.content
         artifact = f"image:{block.id}"
-        error = content.get("error")
-        if error:
+        try:
+            findings.extend(_visual_findings_for_block(artifact, block.content))
+        except Exception as exc:  # noqa: BLE001 - one block's malformed data must not sink the report
+            log.warning("Visual finding derivation failed for %s: %s", artifact, exc)
             findings.append(
                 QualityFinding(
                     artifact=artifact,
                     dimension="visual",
                     severity="blocker",
-                    reason="image_generation_failed",
-                    description=f"Image generation failed with no usable fallback: {error}",
-                    remediation="Regenerate this image, or replace it with a different visual.",
+                    reason="visual_verification_failed",
+                    description=f"This image's stored QA/verification data could not be read: {exc}",
+                    remediation="Investigate the persisted image block; its content may be malformed.",
                     source="image",
+                    verification_status="verification_failed",
+                    verifier="visual_findings",
+                    verification_error=str(exc)[:500],
                 )
             )
-        if content.get("text_verified") is False:
-            essential = _is_educationally_essential(content)
-            findings.append(
-                QualityFinding(
-                    artifact=artifact,
-                    dimension="visual",
-                    severity="blocker" if essential else "minor",
-                    reason="image_text_unverified",
-                    description=(
-                        ("This image carries required educational content whose baked-in text "
-                         if essential else "This image's baked-in text ")
-                        + "could not be verified as matching its expected labels "
-                        f"({', '.join(content.get('expected_labels', []))})."
-                    ),
-                    remediation="Regenerate with a text-free illustration style, or verify the "
-                    "rendered text manually.",
-                    source="image",
-                )
+    return findings
+
+
+def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFinding]:
+    findings: list[QualityFinding] = []
+    error = content.get("error")
+    if error:
+        # Deterministic, operational fact: every repair/fallback this
+        # pipeline has already ran by the time this is read (see
+        # ImageService) - an `error` still set here means no asset exists,
+        # which is directly checkable, not a judgment call.
+        findings.append(
+            QualityFinding(
+                artifact=artifact,
+                dimension="visual",
+                severity="blocker",
+                reason="image_generation_failed",
+                description=f"Image generation failed with no usable fallback: {error}",
+                remediation="Regenerate this image, or replace it with a different visual.",
+                source="image",
+                verification_status="independently_verified",
+                verifier="image_service:generation_failed",
             )
-        for entry in content.get("visual_qa_findings") or []:
-            if not isinstance(entry, dict):
-                continue
-            resolution = str(entry.get("resolution") or "")
-            # "Fell back to illustration" means a SAFE replacement already
-            # shipped (see diagram_service.py) - informational, not a
-            # current defect. "Rendered with unresolved issues" means the
-            # flawed structure shipped anyway (concept_visual_service.py has
-            # no fallback) - a real, visible quality problem.
-            severity = "major" if resolution == "rendered_with_unresolved_issues" else "minor"
-            findings.append(
-                QualityFinding(
-                    artifact=artifact,
-                    dimension="visual",
-                    severity=severity,
-                    reason=f"visual_qa_{entry.get('type', 'unknown')}",
-                    description=str(entry.get("detail") or ""),
-                    remediation="Review this visual's structure and content for the issue noted.",
-                    source="diagram_qa" if resolution == "fell_back_to_illustration" else "concept_qa",
-                )
+        )
+    if content.get("text_verified") is False:
+        essential = _is_educationally_essential(content)
+        findings.append(
+            QualityFinding(
+                artifact=artifact,
+                dimension="visual",
+                severity="blocker" if essential else "minor",
+                reason="image_text_unverified",
+                description=(
+                    ("This image carries required educational content whose baked-in text "
+                     if essential else "This image's baked-in text ")
+                    + "could not be verified as matching its expected labels "
+                    f"({', '.join(content.get('expected_labels', []))})."
+                ),
+                remediation="Regenerate with a text-free illustration style, or verify the "
+                "rendered text manually.",
+                source="image",
+                # A vision-model judgment call, not a deterministic check -
+                # must never be marked verified, regardless of severity.
+                verification_status="unverified",
             )
+        )
+    for entry in content.get("visual_qa_findings") or []:
+        if not isinstance(entry, dict):
+            continue
+        resolution = str(entry.get("resolution") or "")
+        # "Fell back to illustration" means a SAFE replacement already
+        # shipped (see diagram_service.py) - informational, not a
+        # current defect. "Rendered with unresolved issues" means the
+        # flawed structure shipped anyway (concept_visual_service.py has
+        # no fallback) - a real, visible quality problem.
+        severity = "major" if resolution == "rendered_with_unresolved_issues" else "minor"
+        source = "diagram_qa" if resolution == "fell_back_to_illustration" else "concept_qa"
+        findings.append(
+            QualityFinding(
+                artifact=artifact,
+                dimension="visual",
+                severity=severity,
+                reason=f"visual_qa_{entry.get('type', 'unknown')}",
+                description=str(entry.get("detail") or ""),
+                remediation="Review this visual's structure and content for the issue noted.",
+                source=source,
+                # The underlying diagram/concept-visual QA checks are real
+                # structural/geometric Python logic (edge crossings,
+                # property-key overlap, etc.), never an LLM judgment call -
+                # see app.services.diagram_render_qa / concept_qa.
+                verification_status="independently_verified",
+                verifier=f"{source}:{entry.get('type', 'unknown')}",
+            )
+        )
     return findings
 
 
@@ -347,12 +477,41 @@ def document_findings(document: CourseDocument) -> list[QualityFinding]:
     shape as every other dimension's findings. All layout findings are
     "major": they indicate a rendering defect (clipped/overlapping content,
     an orphaned page) a learner would actually see, but never block the
-    course from existing the way a missing required block does."""
-    problems = validate_document(document)
+    course from existing the way a missing required block does.
+
+    `validate_document` is a live call (recomputed on every report - see
+    `get_quality_report`'s own docstring) - a genuine verifier that can
+    itself fail transiently (e.g. a document mid-rebuild). A crash here is
+    reported as ONE "verification_failed" finding (fail-closed: severity
+    "blocker", so it still blocks approval until a fresh recomputation
+    succeeds or an admin override) rather than propagating and aborting the
+    whole report - a transient layout-check failure is a different, more
+    localized category of problem than the entire report computation
+    crashing (see QualityEvaluationFailedError)."""
+    try:
+        problems = validate_document(document)
+    except Exception as exc:  # noqa: BLE001 - localize to the document dimension
+        log.warning("Document layout verification failed for %s: %s", document.document_id, exc)
+        return [
+            QualityFinding(
+                artifact="document",
+                dimension="document",
+                severity="blocker",
+                reason="layout_verification_failed",
+                description=f"Document layout could not be verified: {exc}",
+                remediation="Re-run pagination/layout, or retry once the document finishes "
+                "rebuilding, then re-evaluate.",
+                source="layout_validator",
+                verification_status="verification_failed",
+                verifier="layout_validator",
+                verification_error=str(exc)[:500],
+            )
+        ]
+
+    from app.course.document.layout_validator import DOCUMENT_LEVEL
+
     findings: list[QualityFinding] = []
     for page_number, texts in problems.items():
-        from app.course.document.layout_validator import DOCUMENT_LEVEL
-
         artifact = "document" if page_number == DOCUMENT_LEVEL else f"document:page_{page_number}"
         for text in texts:
             findings.append(
@@ -365,6 +524,11 @@ def document_findings(document: CourseDocument) -> list[QualityFinding]:
                     remediation="Re-run pagination/layout for this document, or adjust the "
                     "offending block's content so it fits its page.",
                     source="layout_validator",
+                    # Pure geometry/structure checks (re.py + schema types
+                    # only, no AI dependency) - see layout_validator's own
+                    # module docstring.
+                    verification_status="independently_verified",
+                    verifier="layout_validator",
                 )
             )
     return findings
@@ -396,6 +560,24 @@ class QualityReport(BaseModel):
         decision, which also checks things this report cannot see (e.g.
         whether generation itself completed for every chapter)."""
         return not self.hard_failures
+
+    @property
+    def approval_blocking_findings(self) -> list[QualityFinding]:
+        """The admin-approval gate's own predicate (MOM quality-governance
+        follow-up) - deliberately NARROWER than `hard_failures`/`passed`
+        above, which keep their existing, unchanged meaning (the
+        generation-time advisory warning and the persisted
+        `quality_snapshot`, both already-tested behaviour this must not
+        regress): `severity == "blocker" AND verification_status !=
+        "unverified"`. A merely-unverified reviewer-model opinion - however
+        severe it claims to be - never blocks approval on its own; a
+        confirmed (`independently_verified`) or uncertain
+        (`verification_failed`, fail-closed) blocker always does."""
+        return [
+            f
+            for f in self.findings
+            if f.severity == "blocker" and f.verification_status != "unverified"
+        ]
 
     def by_dimension(self) -> dict[str, list[QualityFinding]]:
         grouped: dict[str, list[QualityFinding]] = {d: [] for d in QUALITY_DIMENSIONS}
@@ -454,20 +636,78 @@ def quality_gate_evaluation_failed_warning(error: BaseException) -> str:
     return f"quality gate: evaluation failed and could not be completed - {error}"
 
 
+def quality_gate_incomplete_inventory_warning(issues: list[ChapterInventoryIssue]) -> str | None:
+    """The generation-time advisory counterpart to `IncompleteChapterInventoryError`
+    (which blocks submission/approval outright - see CourseService). `_finalise`
+    must never raise over this (generation itself stays fail-soft), so this is
+    a third, distinct warning shape alongside `quality_gate_warning` and
+    `quality_gate_evaluation_failed_warning` - a missing/corrupt chapter must
+    stay visibly distinguishable from an ordinary hard failure or an
+    evaluation crash, per the quality-governance failure taxonomy."""
+    if not issues:
+        return None
+    detail = ", ".join(f"{i.chapter_id} ({i.status})" for i in issues)
+    return f"quality gate: chapter inventory incomplete - {len(issues)} chapter(s) - {detail}"
+
+
+def inventory_findings(issues: list[ChapterInventoryIssue]) -> list[QualityFinding]:
+    """One blocker finding per chapter-inventory issue (see
+    StorageService.verify_chapter_inventory) - deterministic (file
+    existence/parse, not a judgment call), so always
+    "independently_verified". Wording deliberately says "could not be
+    evaluated"/"unreadable", never "confirmed defect" - a missing or
+    corrupt chapter is unevaluated content, not a proven content problem."""
+    findings: list[QualityFinding] = []
+    for issue in issues:
+        if issue.status == "missing":
+            description = (
+                f"Expected chapter '{issue.chapter_id}' is missing from storage and could not "
+                "be evaluated."
+            )
+        else:
+            description = (
+                f"Expected chapter '{issue.chapter_id}' exists but could not be read and could "
+                f"not be evaluated: {issue.detail}"
+            )
+        findings.append(
+            QualityFinding(
+                artifact=f"chapter:{issue.chapter_id}",
+                dimension="completeness",
+                severity="blocker",
+                reason="incomplete_chapter_inventory",
+                description=description,
+                remediation="Regenerate this chapter, or verify it was written and saved "
+                "correctly, then re-evaluate.",
+                source="inventory",
+                verification_status="independently_verified",
+                verifier="chapter_inventory_check",
+                verified_at=utc_now_iso(),
+            )
+        )
+    return findings
+
+
 def build_course_quality_report(
     *,
     course_id: str,
     document_id: str = "",
     chapters: list[GeneratedChapter],
     document: CourseDocument | None = None,
+    inventory_issues: list[ChapterInventoryIssue] | None = None,
 ) -> QualityReport:
     """The one place that assembles a whole course's quality findings from
     already-persisted artifacts - no AI calls, no re-generation, safe to run
-    as often as a caller (an admin page, the finalisation gate) wants."""
+    as often as a caller (an admin page, the finalisation gate) wants.
+
+    `inventory_issues` (MOM quality-governance follow-up) is optional and
+    additive: existing callers that never pass it get exactly the same
+    findings as before this parameter existed."""
     findings: list[QualityFinding] = []
     for chapter in chapters:
         findings.extend(chapter_findings(chapter))
     if document is not None:
         findings.extend(visual_findings(document))
         findings.extend(document_findings(document))
+    if inventory_issues:
+        findings.extend(inventory_findings(inventory_issues))
     return QualityReport(course_id=course_id, document_id=document_id, findings=findings)
