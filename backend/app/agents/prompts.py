@@ -271,6 +271,57 @@ def learning_approaches_brief(approaches: list[str]) -> str:
     return "\n".join(lines)
 
 
+def approach_review_brief(course_input: CourseInput) -> str:
+    """Quality-governance follow-up (Phase 3.10a) - gives the REVIEWER the
+    same facts the writer already received about which content level and
+    learning approach(es) were requested, so it can judge adherence instead
+    of being blind to the request entirely (previously `reviewer_user` never
+    passed this through at all, even though `course_input` was already a
+    parameter - confirmed by inspection, not assumed).
+
+    Deliberately reuses `content_level_brief`/`learning_approaches_brief`
+    verbatim rather than maintaining a second, review-framed copy of the
+    same guidance that could drift out of sync - this function only adds a
+    short header (reframing "what to write" as "what to check for") and one
+    instruction line, never new facts about what each approach requires.
+
+    "" when both underlying briefs are themselves "" (content_level == 2,
+    no approaches selected - the pre-existing default) - same contract as
+    every other `_brief` function in this module, so a course that never
+    opted into either feature gets a byte-identical reviewer prompt to
+    before this function existed.
+
+    This does NOT change how the resulting judgement is classified: like
+    every other reviewer opinion, whatever the model reports lands in
+    `review.issues` and app.services.quality_framework marks it
+    `verification_status="unverified"` unconditionally, regardless of the
+    severity text used - this prompt only gives the model something to
+    form an (still unverified) opinion about. Severity is explicitly
+    capped at major/minor below, mirroring `chapter_contract_brief`'s own
+    existing instruction, so this introduces no new severity-policy
+    precedent of its own."""
+    level = content_level_brief(course_input.content_level)
+    approaches = learning_approaches_brief(course_input.learning_approaches)
+    if not level and not approaches:
+        return ""
+    lines = [
+        "REQUESTED FOR THIS CHAPTER (the writer was asked for this - judge whether "
+        "the chapter's actual content delivers it, not just whether a matching block "
+        "type exists):"
+    ]
+    if level:
+        lines.append(level)
+    if approaches:
+        lines.append(approaches)
+    lines.append(
+        "- If a requested content level or learning approach above is not genuinely "
+        "reflected in this chapter's actual content, report it as an issue with "
+        "category 'approach_adherence' - severity 'major' if it is essentially "
+        "absent, 'minor' if it is present but weak. Never report this as 'blocker'."
+    )
+    return "\n".join(lines)
+
+
 def _course_context(course_input: CourseInput, template: CourseTemplate) -> str:
     toc_lines = []
     for index, item in enumerate(course_input.toc, start=1):
@@ -1033,7 +1084,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}{_appended(chapter_contract_brief(chapter))}
+{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}{_appended(chapter_contract_brief(chapter))}{_appended(approach_review_brief(course_input))}
 REQUIRED TEMPLATE SECTIONS: {", ".join(s.key for s in template.required_sections())}
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE REVIEW FOCUS:

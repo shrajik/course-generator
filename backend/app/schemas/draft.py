@@ -211,3 +211,24 @@ class ChapterInventoryIssue(BaseModel):
     chapter_id: str
     status: Literal["missing", "corrupt"]
     detail: str = ""
+
+
+class ChapterResearchIssue(BaseModel):
+    """One chapter whose persisted research artifact (see
+    StorageService.has_research/load_research) either records no citation
+    at all, or exists but could not be read (the citation-presence
+    counterpart to `ChapterInventoryIssue`, MOM quality-governance
+    follow-up, Phase 3.8C).
+
+    A non-blank `references[].url` is only evidence that a reference was
+    recorded - never proof that a claim is true or reliably sourced; see
+    app.services.quality_framework.research_findings for the exact finding
+    this becomes. `detail` carries the real read/parse/validation error for
+    `status == "unreadable"`; always "" for "uncited" (the artifact loaded
+    fine, it simply has no citation)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str
+    status: Literal["uncited", "unreadable"]
+    detail: str = ""

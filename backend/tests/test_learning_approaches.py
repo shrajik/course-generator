@@ -121,3 +121,243 @@ def test_course_input_rejects_an_invalid_learning_approach():
 
 def test_course_input_defaults_to_an_empty_list():
     assert _input().learning_approaches == []
+
+
+# --- approach_review_brief: giving the REVIEWER the same facts (Phase 3.10a) --
+# Previously `reviewer_user` never read `learning_approaches`/`content_level`
+# at all, even though `course_input` was already a parameter - the reviewer
+# was blind to what was requested. These tests cover the new
+# `approach_review_brief` helper directly (pure prompt-text, same style as
+# the `learning_approaches_brief` tests above) plus its actual wiring into
+# `reviewer_user`, without asserting unrelated full prompt contents.
+
+
+def test_approach_review_brief_is_empty_for_the_pre_existing_default():
+    """Default content_level=2, no approaches selected - must stay exactly
+    as silent as learning_approaches_brief([]) and content_level_brief(2)
+    themselves, the two contracts this helper is built on."""
+    from app.agents.prompts import _appended, approach_review_brief
+
+    brief = approach_review_brief(_input())
+    assert brief == ""
+    # The real splice point in reviewer_user uses _appended(...) - proving
+    # THAT composition is also a no-op (no stray newline) is what actually
+    # guarantees the reviewer prompt stays byte-for-byte unchanged, not just
+    # that the brief function itself returns "".
+    assert _appended(brief) == ""
+
+
+def test_approach_review_brief_includes_the_existing_hands_on_guidance_verbatim():
+    from app.agents.prompts import approach_review_brief, learning_approaches_brief
+
+    course_input = _input(learning_approaches=["hands_on"])
+    brief = approach_review_brief(course_input)
+    # Reused verbatim, never a second maintained copy of the same guidance.
+    assert learning_approaches_brief(["hands_on"]) in brief
+
+
+def test_approach_review_brief_includes_the_existing_level_3_guidance_verbatim():
+    from app.agents.prompts import approach_review_brief, content_level_brief
+
+    course_input = _input(content_level=3)
+    brief = approach_review_brief(course_input)
+    assert content_level_brief(3) in brief
+
+
+def test_approach_review_brief_caps_severity_at_major_or_minor():
+    from app.agents.prompts import approach_review_brief
+
+    brief = approach_review_brief(_input(learning_approaches=["hands_on"]))
+    assert "'major'" in brief
+    assert "'minor'" in brief
+    assert "Never report this as 'blocker'" in brief
+
+
+def test_approach_review_brief_never_claims_independent_verification():
+    """Quality-governance invariant: nothing in this prompt addition may
+    instruct the model to mark its own opinion as verified - that
+    classification is, and must remain, entirely downstream
+    (app.services.quality_framework always marks issue-sourced findings
+    "unverified" regardless of prompt wording)."""
+    from app.agents.prompts import approach_review_brief
+
+    brief = approach_review_brief(_input(learning_approaches=["hands_on"], content_level=3))
+    assert "verified" not in brief.lower()
+
+
+# --- integration: the brief actually reaches the real reviewer prompt --------
+
+
+def test_reviewer_prompt_is_unchanged_for_a_default_course():
+    from app.agents.prompts import ContinuityContext, reviewer_user
+    from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
+
+    template = load_template("technical_v1")
+    blueprint = CourseBlueprint(course_title="Test", audience="engineers", template_id="technical_v1")
+    chapter = BlueprintChapter(id="chapter_1", title="Test Chapter", order=1)
+
+    prompt = reviewer_user(
+        blueprint,
+        chapter,
+        template,
+        blocks=[{"type": "paragraph", "text": "content"}],
+        course_input=_input(),
+        continuity=ContinuityContext(),
+    )
+    assert "REQUESTED FOR THIS CHAPTER" not in prompt
+    assert "approach_adherence" not in prompt
+
+
+def test_reviewer_prompt_gains_approach_and_level_guidance_when_requested():
+    from app.agents.prompts import ContinuityContext, reviewer_user
+    from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
+
+    template = load_template("technical_v1")
+    blueprint = CourseBlueprint(course_title="Test", audience="engineers", template_id="technical_v1")
+    chapter = BlueprintChapter(id="chapter_1", title="Test Chapter", order=1)
+    course_input = _input(learning_approaches=["hands_on"], content_level=3)
+
+    prompt = reviewer_user(
+        blueprint,
+        chapter,
+        template,
+        blocks=[{"type": "paragraph", "text": "content"}],
+        course_input=course_input,
+        continuity=ContinuityContext(),
+    )
+    assert "REQUESTED FOR THIS CHAPTER" in prompt
+    assert "LEARNING APPROACH" in prompt
+    assert "CONTENT LEVEL 3" in prompt
+    assert "approach_adherence" in prompt
+
+
+# --- learning-approach deterministic enforcement (Phase 3.10b) ---------------
+# `_hands_on_issues` / `_scenario_approach_issues` are deliberately SEPARATE
+# from `_content_level_3_issues` (never modified, never touched here) and
+# from each other - each gets its own fixed StructuralFinding.check tag at
+# the `_apply_structural_checks` call site, never inferred from description
+# text (see the last test in this section).
+
+
+def _exercise(expected_outcome: str = "", steps=None, hints=None):
+    from app.schemas.blocks import BlockType
+    from app.schemas.document import Block
+
+    return Block(
+        type=BlockType.EXERCISE,
+        content={
+            "instructions": "Do the thing.",
+            "expected_outcome": expected_outcome,
+            "steps": steps or [],
+            "hints": hints or [],
+        },
+    )
+
+
+def _case_study(context: str = "", challenge: str = "", outcome: str = ""):
+    from app.schemas.blocks import BlockType
+    from app.schemas.document import Block
+
+    return Block(
+        type=BlockType.CASE_STUDY,
+        content={"context": context, "challenge": challenge, "outcome": outcome},
+    )
+
+
+def _prose():
+    from app.schemas.blocks import BlockType
+    from app.schemas.document import Block
+
+    return Block(type=BlockType.PARAGRAPH, content={"text": "abstract only"})
+
+
+def test_no_learning_approach_has_no_experiential_requirement():
+    from app.agents.reviewer import _hands_on_issues, _scenario_approach_issues
+
+    blocks = [_prose()]
+    assert _hands_on_issues(blocks, []) == []
+    assert _scenario_approach_issues(blocks, []) == []
+
+
+def test_hands_on_without_a_worked_exercise_is_flagged():
+    from app.agents.reviewer import _hands_on_issues
+
+    issues = _hands_on_issues([_prose()], ["hands_on"])
+    assert len(issues) == 1
+    assert "hands_on" in issues[0] and "exercise" in issues[0]
+
+
+def test_hands_on_with_a_real_worked_exercise_is_not_flagged():
+    from app.agents.reviewer import _hands_on_issues
+
+    blocks = [_exercise(expected_outcome="A working fix.", steps=["Do X", "Do Y"])]
+    assert _hands_on_issues(blocks, ["hands_on"]) == []
+
+
+def test_scenario_based_without_a_scenario_is_flagged():
+    from app.agents.reviewer import _scenario_approach_issues
+
+    issues = _scenario_approach_issues([_prose()], ["scenario_based"])
+    assert len(issues) == 1
+    assert "scenario_based" in issues[0] and "case_study" in issues[0]
+    assert "situation_based" not in issues[0]  # never names an approach that wasn't requested
+
+
+def test_scenario_based_with_a_real_case_study_is_not_flagged():
+    from app.agents.reviewer import _scenario_approach_issues
+
+    blocks = [
+        _case_study(
+            context="A team missing targets.",
+            challenge="No shared definition of done.",
+            outcome="Forecasting improved.",
+        )
+    ]
+    assert _scenario_approach_issues(blocks, ["scenario_based"]) == []
+
+
+def test_situation_based_without_a_scenario_states_the_two_response_limitation():
+    from app.agents.reviewer import _scenario_approach_issues
+
+    issues = _scenario_approach_issues([_prose()], ["situation_based"])
+    assert len(issues) == 1
+    assert "situation_based" in issues[0]
+    assert "does NOT verify" in issues[0]
+    assert "two plausible responses" in issues[0]
+
+
+def test_situation_based_with_a_valid_scenario_produces_no_finding_at_all():
+    """The corrected behaviour: a valid scenario must never be sent to
+    revision solely over the unverifiable two-response requirement - the
+    limitation is documented in the function's own docstring, never
+    emitted as its own unconditional finding."""
+    from app.agents.reviewer import _scenario_approach_issues
+
+    blocks = [_case_study(context="x", challenge="y", outcome="z")]
+    assert _scenario_approach_issues(blocks, ["situation_based"]) == []
+
+
+def test_level_3_behavior_is_unchanged_by_this_addition():
+    """Regression guard: _content_level_3_issues itself was not modified."""
+    from app.agents.reviewer import _content_level_3_issues
+
+    issues = _content_level_3_issues([_prose()], 3)
+    assert any("exercise` or `challenge`" in i for i in issues)
+    assert any("case_study` block" in i for i in issues)
+
+
+def test_apply_structural_checks_assigns_distinct_check_tags_not_inferred_from_text():
+    from app.agents.reviewer import ReviewerAgent
+    from app.schemas.review import ChapterReview
+
+    review = ChapterReview(approved=True)
+    course_input = _input(learning_approaches=["hands_on", "scenario_based"])
+    deterministic = ReviewerAgent._apply_structural_checks(
+        review, load_template("technical_v1"), [_prose()], None, course_input
+    )
+    checks = {f.check for f in deterministic}
+    assert "learning_approach_hands_on" in checks
+    assert "learning_approach_scenario" in checks
+    assert any("hands_on" in m for m in review.missing_required_blocks)
+    assert any("scenario_based" in m for m in review.missing_required_blocks)
+    assert review.needs_revision() is True

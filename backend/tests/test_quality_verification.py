@@ -20,9 +20,10 @@ from app.services.quality_framework import (
     build_course_quality_report,
     document_findings,
     inventory_findings,
+    research_findings,
     visual_findings,
 )
-from app.schemas.draft import ChapterInventoryIssue
+from app.schemas.draft import ChapterInventoryIssue, ChapterResearchIssue
 
 
 def _image_block(**content) -> Block:
@@ -394,3 +395,66 @@ def test_build_course_quality_report_with_no_inventory_issues_is_unaffected():
         course_id="c1", chapters=[], document=None, inventory_issues=[]
     )
     assert report_explicit_empty.findings == []
+
+
+# --- research_findings: citation-presence (Phase 3.8C) ----------------------
+# Per-chapter service behaviour (has_research/mode/missing-reference logic)
+# lives in test_chapter_research_citations.py - these cover only the pure
+# ChapterResearchIssue -> QualityFinding conversion, mirroring the
+# inventory_findings tests above.
+
+
+def test_research_uncited_finding_is_major_accuracy_independently_verified():
+    issues = [ChapterResearchIssue(chapter_id="chapter_5", status="uncited")]
+    findings = research_findings(issues)
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.dimension == "accuracy"
+    assert finding.severity == "major"
+    assert finding.reason == "chapter_research_uncited"
+    assert finding.verification_status == "independently_verified"
+    assert finding.verifier == "research_citation_check"
+
+
+def test_research_unreadable_finding_is_blocker_fail_closed_with_the_real_error():
+    issues = [
+        ChapterResearchIssue(chapter_id="chapter_6", status="unreadable", detail="Expecting value")
+    ]
+    findings = research_findings(issues)
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.dimension == "accuracy"
+    assert finding.severity == "blocker"
+    assert finding.reason == "chapter_research_unreadable"
+    assert finding.verification_status == "verification_failed"
+    assert finding.verification_error == "Expecting value"
+    assert "Expecting value" in finding.description
+
+
+def test_build_course_quality_report_with_no_research_issues_is_unaffected():
+    """Additive/backward-compatible, mirroring the inventory_issues guard
+    above: existing callers that never pass research_issues get exactly the
+    same findings as before this parameter existed."""
+    report = build_course_quality_report(course_id="c1", chapters=[], document=None)
+    assert report.findings == []
+    report_explicit_empty = build_course_quality_report(
+        course_id="c1", chapters=[], document=None, research_issues=[]
+    )
+    assert report_explicit_empty.findings == []
+
+
+def test_build_course_quality_report_folds_in_research_issues():
+    uncited = ChapterResearchIssue(chapter_id="chapter_7", status="uncited")
+    unreadable = ChapterResearchIssue(chapter_id="chapter_8", status="unreadable", detail="boom")
+    report = build_course_quality_report(
+        course_id="c1", chapters=[], document=None, research_issues=[uncited, unreadable]
+    )
+    assert len(report.findings) == 2
+    # "major" never blocks approval or counts as a hard failure.
+    uncited_finding = next(f for f in report.findings if f.reason == "chapter_research_uncited")
+    assert uncited_finding not in report.hard_failures
+    assert uncited_finding not in report.approval_blocking_findings
+    # "blocker" + verification_failed is fail-closed: blocks both.
+    unreadable_finding = next(f for f in report.findings if f.reason == "chapter_research_unreadable")
+    assert unreadable_finding in report.hard_failures
+    assert unreadable_finding in report.approval_blocking_findings

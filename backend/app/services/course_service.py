@@ -65,7 +65,12 @@ from app.schemas.course import (
     WorkspaceActivityEntry,
 )
 from app.schemas.document import CourseDocument
-from app.schemas.draft import ChapterInventoryIssue, GeneratedChapter, StructuralFinding
+from app.schemas.draft import (
+    ChapterInventoryIssue,
+    ChapterResearchIssue,
+    GeneratedChapter,
+    StructuralFinding,
+)
 from app.schemas.memory import GenerationRunEntry
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
@@ -344,6 +349,58 @@ class CourseService:
         expected_ids = [c.chapter_id for c in record.chapters]
         return self.storage.verify_chapter_inventory(record.course_id, expected_ids)
 
+    def _verify_research_citations(
+        self, course_id: str, chapters: list[GeneratedChapter]
+    ) -> list[ChapterResearchIssue]:
+        """Deterministic, chapter-level check (MOM quality-governance
+        follow-up, Phase 3.8C): does this chapter's persisted research
+        artifact record at least one non-blank reference URL? A non-blank
+        URL is only evidence a reference was recorded - it never proves a
+        claim is true or reliably sourced (see
+        app.services.quality_framework.research_findings for the exact
+        finding this becomes, and ChapterResearchIssue's own docstring).
+
+        Deliberately narrow:
+        - A genuinely MISSING research artifact is skipped, not flagged -
+          many chapters predate this check and never had one; that is
+          legacy-compatible, not a defect.
+        - A successfully-loaded `mode == "mock"` artifact is exempt -
+          offline/test-pipeline research is not real research.
+        - An EXISTING but unreadable/corrupt artifact fails closed
+          (`status="unreadable"`) rather than being silently treated as
+          "missing" - `has_research` already confirmed its presence, so
+          its unreadability is itself the finding."""
+        issues: list[ChapterResearchIssue] = []
+        for chapter in chapters:
+            if not self.storage.has_research(course_id, chapter.chapter_id, chapter.chapter_number):
+                continue  # genuinely absent - legacy compatibility, never a finding
+            try:
+                research = self.storage.load_research(
+                    course_id, chapter.chapter_id, chapter.chapter_number
+                )
+            except (NotFoundError, ValueError, OSError) as exc:
+                # Narrow, expected failure modes for an artifact `has_research`
+                # just confirmed exists: ValueError covers a JSON parse
+                # failure, a text-decoding failure, and a pydantic schema-
+                # validation failure (all ValueError subclasses); OSError
+                # covers a filesystem read failure; NotFoundError covers the
+                # narrow TOCTOU race where the file is removed between the
+                # `has_research` check above and this read. Anything else is
+                # a genuine bug and must propagate, never be reclassified as
+                # "the artifact is corrupt".
+                issues.append(
+                    ChapterResearchIssue(
+                        chapter_id=chapter.chapter_id, status="unreadable", detail=str(exc)[:500]
+                    )
+                )
+                continue
+            if research.mode == "mock":
+                continue  # offline/test-pipeline research, not real research
+            has_citation = any(str(ref.url or "").strip() for ref in research.payload.references)
+            if not has_citation:
+                issues.append(ChapterResearchIssue(chapter_id=chapter.chapter_id, status="uncited"))
+        return issues
+
     async def _evaluate_quality_for_approval(
         self, record: CourseRecord
     ) -> tuple[list[ChapterInventoryIssue], QualityReport | None, Exception | None]:
@@ -363,12 +420,14 @@ class CourseService:
                 if await self._has_document(record.course_id)
                 else None
             )
+            research_issues = self._verify_research_citations(record.course_id, chapters)
             report = build_course_quality_report(
                 course_id=record.course_id,
                 document_id=document.document_id if document else "",
                 chapters=chapters,
                 document=document,
                 inventory_issues=inventory_issues,
+                research_issues=research_issues,
             )
         except Exception as exc:  # noqa: BLE001 - reported to the caller, never swallowed silently
             eval_error = exc
@@ -613,11 +672,13 @@ class CourseService:
             document = (
                 await self._load_document(course_id) if await self._has_document(course_id) else None
             )
+            research_issues = self._verify_research_citations(course_id, chapters)
             return build_course_quality_report(
                 course_id=course_id,
                 document_id=document.document_id if document else "",
                 chapters=chapters,
                 document=document,
+                research_issues=research_issues,
             )
         except Exception as exc:  # noqa: BLE001 - a crashed computation is its own distinct category
             raise QualityEvaluationFailedError(

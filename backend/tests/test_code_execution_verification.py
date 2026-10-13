@@ -551,3 +551,107 @@ async def test_a_compile_failure_feeds_missing_required_blocks_and_flips_approve
     assert any("SyntaxError" in m for m in review.missing_required_blocks)
     assert review.approved is False
     assert review.needs_revision() is True
+
+
+# --- declared-expected-output correctness check (quality-governance -------
+# follow-up, Phase 3.8B). `expected_stdout` is HUMAN-declared only - these
+# tests set it directly on the fixture block, exactly as a manual document
+# save (PUT /api/documents/{document_id}) would persist it; none of this
+# goes through the writer prompt.
+
+
+def _result(stdout: str, *, truncated: bool = False) -> dict:
+    return {
+        "status": "success", "stdout": stdout, "stderr": "", "execution_time": 0.1,
+        "phase": "run", "exit_code": 0, "truncated": truncated,
+    }
+
+
+async def test_a_declared_expected_output_mismatch_produces_a_finding():
+    """The exact scenario named in the brief: expected 4, program prints 5,
+    execution succeeds - execution success alone must not count as
+    correctness."""
+    fake = FakeExecutor(result_for=lambda body: _result("5\n"))
+    cell = _cell(expected_stdout="4")
+
+    findings = await _verify_code_cells([cell], code_execution=_service(fake), settings=_settings())
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.check == "code_cell_output_mismatch"
+    assert finding.dimension == "accuracy"
+    assert "'4'" in finding.description and "'5'" in finding.description
+
+    blocking = _final_blocking_findings(findings)
+    assert len(blocking) == 1
+    assert blocking[0].verification_status == "independently_verified"
+    assert blocking[0].severity == "blocker"
+
+
+async def test_a_declared_expected_output_match_produces_no_finding():
+    fake = FakeExecutor(result_for=lambda body: _result("4\n"))
+    cell = _cell(expected_stdout="4")
+
+    findings = await _verify_code_cells([cell], code_execution=_service(fake), settings=_settings())
+
+    assert findings == []
+
+
+async def test_missing_expected_output_is_unchanged_behaviour():
+    """No `expected_stdout` declared (the default, and every pre-existing
+    cell) - a successful run must still produce no finding, exactly as
+    before this field existed."""
+    fake = FakeExecutor(result_for=lambda body: _result("anything at all\n"))
+    cell = _cell()  # no expected_stdout
+
+    findings = await _verify_code_cells([cell], code_execution=_service(fake), settings=_settings())
+
+    assert findings == []
+
+
+async def test_truncated_output_never_claims_a_confident_match_or_mismatch():
+    """A declared expectation that would otherwise mismatch must still
+    produce NOTHING when the captured output was truncated - a partial
+    capture is not a trustworthy basis for either verdict."""
+    fake = FakeExecutor(result_for=lambda body: _result("5\n", truncated=True))
+    cell = _cell(expected_stdout="4")
+
+    findings = await _verify_code_cells([cell], code_execution=_service(fake), settings=_settings())
+
+    assert findings == []
+
+
+async def test_old_format_content_without_the_field_remains_compatible():
+    """A genuinely pre-existing, already-persisted code_cell's raw content
+    dict has no `expected_stdout` key at all (not even `None`) - unlike a
+    freshly-constructed Block, whose own content normalization already
+    fills in every CodeCellContent field's default (confirmed separately:
+    `Block(...).content` always contains the key once this field exists).
+    Mutating it out after construction is the only way to reproduce what a
+    document.json written before this field existed actually looks like."""
+    old_format_block = Block(
+        type=BlockType.CODE_CELL, content={"language": "python", "code": "print(30)"}
+    )
+    del old_format_block.content["expected_stdout"]
+    assert "expected_stdout" not in old_format_block.content
+
+    fake = FakeExecutor(result_for=lambda body: _result("30\n"))
+    findings = await _verify_code_cells(
+        [old_format_block], code_execution=_service(fake), settings=_settings()
+    )
+    assert findings == []
+
+
+async def test_a_mismatch_finding_still_never_writes_block_content_execution():
+    """The learner-facing `execution` field (set only by the editor's Run
+    action) must stay untouched even when the new correctness check fires -
+    mirrors test_execution_verification_never_writes_block_content_execution
+    above for this new code path specifically."""
+    fake = FakeExecutor(result_for=lambda body: _result("5\n"))
+    cell = _cell(expected_stdout="4")
+    assert cell.content.get("execution") is None
+
+    findings = await _verify_code_cells([cell], code_execution=_service(fake), settings=_settings())
+
+    assert any(f.check == "code_cell_output_mismatch" for f in findings)
+    assert cell.content.get("execution") is None  # still untouched

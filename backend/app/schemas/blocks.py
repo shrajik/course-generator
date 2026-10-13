@@ -198,6 +198,17 @@ class CodeCellContent(_Content):
     code: str = ""
     caption: str = ""
     execution: CodeExecution | None = None
+    # Correctness check follow-up (quality-governance, Phase 3.8B) - a
+    # HUMAN-declared expected stdout value, never writer-supplied: the
+    # writer prompt (app.agents.prompts.code_cell_guidance) explicitly
+    # forbids inventing output ("an output you invent could be wrong"), so
+    # this field must only ever be set by a course author through the
+    # existing manual document-save path (PUT /api/documents/{document_id}
+    # already persists any additional content key - see _Content's own
+    # extra="allow" docstring), never by generation. `None` (the default)
+    # means no expectation was declared - ReviewerAgent._verify_code_cells
+    # then behaves exactly as before this field existed.
+    expected_stdout: str | None = None
 
 
 def execution_is_current(content: dict[str, Any]) -> bool:

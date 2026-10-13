@@ -913,12 +913,48 @@ class OpenAIClient(AIClient):
                 metrics.call_finished()
 
     # --- embeddings ----------------------------------------------------------
+    def _embedding_client(self, model_override: str | None) -> tuple[Any, str, str]:
+        """(client, api_model_name, provider) for an embedding call.
+
+        The Azure embedding deployment (`azure_embedding_*`) wins whenever
+        it's fully configured - matches `_client_for`'s own "all fields
+        required together, validated at call time" contract, but for a
+        single optional resource rather than a required lookup table: an
+        incompletely-configured Azure embedding deployment (e.g. endpoint
+        set but key blank) falls back to the direct OpenAI client rather
+        than raising, since (unlike the three Azure TEXT models, which are
+        the only way to reach those models at all) embeddings already have
+        a working, pre-existing fallback path that must keep working
+        unattended. `model_override` (an explicit caller-supplied logical
+        model name) only ever applies to that OpenAI fallback - once Azure
+        is active the DEPLOYMENT name is what the API call's `model` field
+        must carry (see `_client_for`'s own docstring on deployment vs
+        logical names), not whatever logical name a caller happened to
+        pass."""
+        endpoint = self.settings.azure_embedding_endpoint
+        api_key = self.settings.azure_embedding_api_key
+        deployment = self.settings.azure_embedding_deployment
+        if endpoint.strip() and api_key.strip() and deployment.strip():
+            if endpoint not in self._azure_clients:
+                try:
+                    from openai import AsyncOpenAI
+                except ImportError as exc:  # pragma: no cover
+                    raise AIServiceError("The `openai` package is not installed") from exc
+                self._azure_clients[endpoint] = AsyncOpenAI(
+                    base_url=endpoint,
+                    api_key=api_key,
+                    timeout=self.settings.request_timeout,
+                    max_retries=0,  # we handle retries ourselves
+                )
+            return self._azure_clients[endpoint], deployment, "azure"
+        return self.client, model_override or self.settings.embedding_model, "openai"
+
     async def embed(
         self, *, texts: list[str], model: str | None = None, phase: str = "embedding"
     ) -> list[list[float]]:
         if not texts:
             return []
-        model_name = model or self.settings.embedding_model
+        client, model_name, provider = self._embedding_client(model)
         started = time.perf_counter()
         metrics = current_metrics()
         if metrics:
@@ -928,7 +964,17 @@ class OpenAIClient(AIClient):
 
         async def call():
             nonlocal usage
-            response = await self.client.embeddings.create(model=model_name, input=texts)
+            kwargs: dict[str, Any] = {"model": model_name, "input": texts}
+            if provider == "azure":
+                # text-embedding-3-* supports truncating its native output to
+                # a smaller width - requested here so the EXISTING pgvector
+                # column width (embedding_dimensions) never needs a new
+                # migration just to switch providers (see that setting's own
+                # docstring). Only requested for Azure: the pre-existing
+                # direct-OpenAI path is left byte-for-byte unchanged so an
+                # existing deployment's behaviour never shifts underneath it.
+                kwargs["dimensions"] = self.settings.embedding_dimensions
+            response = await client.embeddings.create(**kwargs)
             usage = getattr(response, "usage", None)
             return response
 
@@ -949,7 +995,7 @@ class OpenAIClient(AIClient):
                 retries=retries,
                 usage=usage,
                 failed=failed,
-                provider="openai",
+                provider=provider,
             )
             if metrics:
                 metrics.call_finished()

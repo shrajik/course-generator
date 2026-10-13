@@ -273,6 +273,25 @@ class Settings(BaseSettings):
     #  requires a new migration, not just a config change.
     embedding_dimensions: int = Field(default=1536, ge=1, le=4096)
     embedding_batch_size: int = Field(default=64, ge=1, le=512)
+    #  Optional single Azure embedding deployment (e.g. text-embedding-3-large)
+    #  - same /openai/v1/ compatibility pattern as the Azure text models above
+    #  (plain AsyncOpenAI client, base_url+api_key, deployment name in the
+    #  request body - see OpenAIClient._embedding_client). Purely additive:
+    #  when any of these three is blank, embed() uses the existing direct
+    #  OpenAI client (openai_api_key) and `embedding_model` exactly as
+    #  before this setting existed - an existing deployment with only
+    #  OPENAI_API_KEY configured is completely unaffected. When all three
+    #  are set, every embedding call requests `embedding_dimensions` back
+    #  from the Azure deployment (text-embedding-3-* models support
+    #  truncating their native output to a smaller width) rather than the
+    #  model's full native size, so the EXISTING pgvector column width
+    #  (see embedding_dimensions' own docstring) never needs a new
+    #  migration just to switch providers - widening it for the model's
+    #  full native dimensionality is a deliberate separate decision, not
+    #  something this flag makes silently.
+    azure_embedding_endpoint: str = ""
+    azure_embedding_api_key: str = ""
+    azure_embedding_deployment: str = ""
     #  Below this cosine similarity (0..1), a semantic match is discarded
     #  rather than merged into results - keeps irrelevant nearest-neighbours
     #  out of the prompt. Tune per embedding model if this one changes.

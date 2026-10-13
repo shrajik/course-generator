@@ -58,7 +58,7 @@ from app.course.document.layout_validator import DOCUMENT_LEVEL, validate_docume
 from app.schemas.blocks import BlockType
 from app.schemas.course import QualitySnapshot
 from app.schemas.document import CourseDocument
-from app.schemas.draft import ChapterInventoryIssue, GeneratedChapter
+from app.schemas.draft import ChapterInventoryIssue, ChapterResearchIssue, GeneratedChapter
 
 log = get_logger(__name__)
 
@@ -740,6 +740,68 @@ def inventory_findings(issues: list[ChapterInventoryIssue]) -> list[QualityFindi
     return findings
 
 
+def research_findings(issues: list[ChapterResearchIssue]) -> list[QualityFinding]:
+    """One finding per chapter-research citation issue (MOM quality-
+    governance follow-up, Phase 3.8C - see CourseService._verify_research_citations
+    and ChapterResearchIssue's own docstring for exactly what is, and is
+    not, checked).
+
+    Both statuses are deterministic (a string-presence check, or a read/
+    parse/validation failure - never a judgment call), so both are always
+    "independently_verified"/"verification_failed", never "unverified":
+
+    - "uncited": the artifact loaded fine but records no non-blank
+      reference URL - "major"/accuracy, `independently_verified`. Never
+      "blocker": the absence of a recorded citation is not, on its own,
+      proof the chapter's claims are wrong - see the module-level note on
+      never treating `accuracy` findings as a fact-check.
+    - "unreadable": `has_research` confirmed the artifact exists but it
+      could not be read - fail-closed, "blocker"/accuracy,
+      `verification_failed`, same fail-closed shape as every other
+      verifier-itself-failed finding in this module."""
+    findings: list[QualityFinding] = []
+    for issue in issues:
+        artifact = f"chapter:{issue.chapter_id}"
+        if issue.status == "uncited":
+            findings.append(
+                QualityFinding(
+                    artifact=artifact,
+                    dimension="accuracy",
+                    severity="major",
+                    reason="chapter_research_uncited",
+                    description=(
+                        f"Chapter '{issue.chapter_id}' has a persisted research artifact with no "
+                        "recorded reference URL."
+                    ),
+                    remediation="Re-run research for this chapter, or add at least one source "
+                    "reference to its research artifact.",
+                    source="research",
+                    verification_status="independently_verified",
+                    verifier="research_citation_check",
+                    verified_at=utc_now_iso(),
+                )
+            )
+        else:
+            findings.append(
+                QualityFinding(
+                    artifact=artifact,
+                    dimension="accuracy",
+                    severity="blocker",
+                    reason="chapter_research_unreadable",
+                    description=(
+                        f"Chapter '{issue.chapter_id}' has a research artifact that exists but "
+                        f"could not be read and could not be evaluated: {issue.detail}"
+                    ),
+                    remediation="Investigate the persisted research artifact; it may be malformed.",
+                    source="research",
+                    verification_status="verification_failed",
+                    verifier="research_citation_check",
+                    verification_error=issue.detail[:500],
+                )
+            )
+    return findings
+
+
 def build_course_quality_report(
     *,
     course_id: str,
@@ -747,14 +809,15 @@ def build_course_quality_report(
     chapters: list[GeneratedChapter],
     document: CourseDocument | None = None,
     inventory_issues: list[ChapterInventoryIssue] | None = None,
+    research_issues: list[ChapterResearchIssue] | None = None,
 ) -> QualityReport:
     """The one place that assembles a whole course's quality findings from
     already-persisted artifacts - no AI calls, no re-generation, safe to run
     as often as a caller (an admin page, the finalisation gate) wants.
 
-    `inventory_issues` (MOM quality-governance follow-up) is optional and
-    additive: existing callers that never pass it get exactly the same
-    findings as before this parameter existed."""
+    `inventory_issues` and `research_issues` (both MOM quality-governance
+    follow-ups) are optional and additive: existing callers that never pass
+    them get exactly the same findings as before either parameter existed."""
     findings: list[QualityFinding] = []
     for chapter in chapters:
         findings.extend(chapter_findings(chapter))
@@ -763,4 +826,6 @@ def build_course_quality_report(
         findings.extend(document_findings(document))
     if inventory_issues:
         findings.extend(inventory_findings(inventory_issues))
+    if research_issues:
+        findings.extend(research_findings(research_issues))
     return QualityReport(course_id=course_id, document_id=document_id, findings=findings)

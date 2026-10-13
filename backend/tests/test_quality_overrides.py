@@ -170,6 +170,51 @@ async def test_a_fresh_recomputation_after_the_verifier_recovers_approves_normal
     assert approved.review_history[-1].action == "approved"  # no override needed
 
 
+async def test_a_reviewer_call_failure_during_generation_is_overridable_as_verification_failed(
+    service, technical_input, monkeypatch
+):
+    """Quality-governance follow-up (Phase 3.8A): a chapter whose reviewer
+    call failed DURING generation (not during approval's own evaluation,
+    unlike the layout-verifier-flakiness test above) must still reach
+    `approve_course` as a real, overridable verification_failed blocker -
+    proving the existing override mechanism needs no change to handle this
+    new failure category, exactly as app.agents.reviewer.review_chapter's
+    own fix intends."""
+    from app.services.mock_ai import MockAIClient
+
+    original_structured = MockAIClient.structured
+
+    async def _fails_for_chapter_review(self, *, schema, **kwargs):
+        if schema.__name__ == "ChapterReview":
+            raise RuntimeError("synthetic reviewer outage")
+        return await original_structured(self, schema=schema, **kwargs)
+
+    # Only the reviewer's own structured() call fails - every other caller
+    # during the same generation run (planner, writer, ...) uses this same
+    # MockAIClient with a different schema and must keep working normally,
+    # so this patches the one schema, never the whole client.
+    monkeypatch.setattr(MockAIClient, "structured", _fails_for_chapter_review)
+
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    with pytest.raises(QualityApprovalBlockedError) as excinfo:
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    findings = excinfo.value.details["findings"]
+    assert any(f["reason"] == "reviewer_call_failed" for f in findings)
+    assert all(f["verification_status"] == "verification_failed" for f in findings)
+
+    approved = await service.approve_course_override_verification_failed(
+        record.course_id, "admin-1", "Reviewer outage confirmed resolved; content reviewed manually."
+    )
+    assert approved.review_status == "approved"
+    entry = approved.review_history[-1]
+    assert entry.action == "override_approved_verification_failed"
+    assert entry.override_evidence.verifier == "reviewer_call"
+    assert "synthetic reviewer outage" in (entry.override_evidence.verification_error or "")
+
+
 # --- override_approved_evaluation_failure -----------------------------------
 
 

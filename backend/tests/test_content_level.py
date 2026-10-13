@@ -43,6 +43,40 @@ def test_each_level_produces_distinct_text():
     assert briefs[1] != briefs[3]
 
 
+# --- approach_review_brief: the reviewer also learns the content level --------
+# (Phase 3.10a) - complements test_learning_approaches.py's coverage of the
+# same helper; this file adds the content_level=1 case specifically.
+
+
+def test_approach_review_brief_includes_the_level_1_guidance_verbatim():
+    from app.agents.prompts import approach_review_brief, content_level_brief
+    from app.schemas.course import CourseInput
+
+    course_input = CourseInput(
+        course_title="Test",
+        toc=[{"title": "Chapter One"}],
+        target_audience="engineers",
+        template="technical",
+        content_level=1,
+    )
+    brief = approach_review_brief(course_input)
+    assert content_level_brief(1) in brief
+
+
+def test_approach_review_brief_is_empty_at_level_2_with_no_approaches():
+    from app.agents.prompts import approach_review_brief
+    from app.schemas.course import CourseInput
+
+    course_input = CourseInput(
+        course_title="Test",
+        toc=[{"title": "Chapter One"}],
+        target_audience="engineers",
+        template="technical",
+    )
+    assert course_input.content_level == 2
+    assert approach_review_brief(course_input) == ""
+
+
 # --- end-to-end: the structural backstop (not just the prompt) ----------------
 
 

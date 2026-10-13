@@ -95,30 +95,60 @@ class ReviewerAgent:
             len(template.required_sections()),
         )
         payload = [block.model_dump(mode="json") for block in blocks]
-        memory = await self.memory.build_context(
-            stage="reviewer",
-            course_title=blueprint.course_title,
-            chapter_title=chapter.title,
-            template=template,
-        )
-        review = await self.ai.structured(
-            schema=ChapterReview,
-            system=prompts.REVIEWER_SYSTEM,
-            user=prompts.reviewer_user(
-                blueprint,
-                chapter,
-                template,
-                payload,
-                course_input=course_input,
-                continuity=continuity,
-                limit=self.settings.reviewer_context_chars,
-                memory=memory.render(),
-            ),
-            model=self.settings.reviewer_model,
-            purpose=f"reviewer:{chapter.id}",
-            phase="reviewer",
-        )
-        review.reviewed_at = utc_now_iso()
+        reviewer_call_failed: StructuralFinding | None = None
+        try:
+            memory = await self.memory.build_context(
+                stage="reviewer",
+                course_title=blueprint.course_title,
+                chapter_title=chapter.title,
+                template=template,
+            )
+            review = await self.ai.structured(
+                schema=ChapterReview,
+                system=prompts.REVIEWER_SYSTEM,
+                user=prompts.reviewer_user(
+                    blueprint,
+                    chapter,
+                    template,
+                    payload,
+                    course_input=course_input,
+                    continuity=continuity,
+                    limit=self.settings.reviewer_context_chars,
+                    memory=memory.render(),
+                ),
+                model=self.settings.reviewer_model,
+                purpose=f"reviewer:{chapter.id}",
+                phase="reviewer",
+            )
+            review.reviewed_at = utc_now_iso()
+        except Exception as exc:  # noqa: BLE001 - the reviewer call itself (memory
+            # context, the model call, or a malformed structured response) must
+            # never be mistaken for "reviewed and found clean" - the OLD bug this
+            # fixes: the caller's own advisory except-block (CourseService.
+            # _generate_chapter) left `review=None`, silently skipping BOTH this
+            # LLM judgement AND every deterministic check below for the whole
+            # chapter, with only a server log line - never visible on the course,
+            # never blocking anything. A blank `ChapterReview()` here lets every
+            # check below still run against the REAL blocks, and this finding
+            # (fail-closed, exactly like `_verification_failed_finding` below)
+            # ensures the failure survives into the quality report and blocks
+            # approval until a fresh review succeeds or an admin override is used.
+            log.warning("Reviewer call failed for %s: %s", chapter.id, exc)
+            review = ChapterReview(reviewed_at=utc_now_iso())
+            reviewer_call_failed = StructuralFinding(
+                check="reviewer_call_failed",
+                description=(
+                    f"The reviewer could not evaluate this chapter: {str(exc)[:_DIAGNOSTIC_CHARS]} "
+                    "- this chapter's content has NOT been reviewed; treat it as unverified, "
+                    "never as confirmed clean."
+                ),
+                dimension="accuracy",
+                severity="blocker",
+                reason="reviewer_call_failed",
+                verification_status="verification_failed",
+                verifier="reviewer_call",
+                verification_error=str(exc)[:_DIAGNOSTIC_CHARS],
+            )
         structural_findings = self._apply_structural_checks(
             review, template, blocks, course_input.learner_profile, course_input
         )
@@ -126,11 +156,15 @@ class ReviewerAgent:
         # which must stay synchronous/backward-compatible - see its own
         # docstring): runs on every review pass, including each revision, so
         # a rewritten cell is always re-executed rather than trusting a
-        # verdict about the code that used to be there.
+        # verdict about the code that used to be there. Runs regardless of
+        # whether the reviewer call above succeeded - it depends only on
+        # `blocks`/`settings`, never on `review`.
         code_cell_findings = await _verify_code_cells(
             blocks, code_execution=self.code_execution, settings=self.settings
         )
         structural_findings = structural_findings + code_cell_findings
+        if reviewer_call_failed is not None:
+            structural_findings.append(reviewer_call_failed)
         for finding in code_cell_findings:
             # Only an ACTUAL content defect (the cell itself doesn't run) is
             # revision-worthy - an infrastructure failure or a budget-capped
@@ -224,6 +258,17 @@ class ReviewerAgent:
             deterministic.append(
                 StructuralFinding(check="content_level_3", description=text, dimension="pedagogy")
             )
+        learning_approaches = course_input.learning_approaches if course_input is not None else []
+        for text in _hands_on_issues(blocks, learning_approaches):
+            missing.append(text)
+            deterministic.append(
+                StructuralFinding(check="learning_approach_hands_on", description=text, dimension="pedagogy")
+            )
+        for text in _scenario_approach_issues(blocks, learning_approaches):
+            missing.append(text)
+            deterministic.append(
+                StructuralFinding(check="learning_approach_scenario", description=text, dimension="pedagogy")
+            )
         for text in _section_completeness_issues(blocks):
             missing.append(text)
             deterministic.append(
@@ -288,10 +333,15 @@ async def _verify_code_cells(
 
     A successful run only proves the program executed without a reported
     error - never that it correctly demonstrates the concept it was written
-    to teach. There is no ground truth to check that against: the writer is
-    explicitly told never to invent expected output (see `code_cell_guidance`
-    in app.agents.prompts), so a clean run produces no finding at all, the
-    same convention every other clean structural check already follows."""
+    to teach. There is normally no ground truth to check that against: the
+    writer is explicitly told never to invent expected output (see
+    `code_cell_guidance` in app.agents.prompts), so a clean run with no
+    declared expectation produces no finding at all, the same convention
+    every other clean structural check already follows. The one exception
+    (quality-governance follow-up, Phase 3.8B) is a HUMAN-declared
+    `CodeCellContent.expected_stdout` - never writer-supplied, see that
+    field's own docstring - compared against the real `stdout` only when
+    the run succeeded and the captured output was not truncated."""
     if not settings.enable_code_cell_execution_verification:
         return []
 
@@ -406,7 +456,30 @@ async def _verify_code_cells(
             continue
 
         if result.status == "success":
-            continue  # proves only that it ran - never reported as a finding
+            # Correctness check (quality-governance follow-up, Phase 3.8B):
+            # ONLY against a HUMAN-declared `expected_stdout` (see
+            # CodeCellContent's own field docstring for why this is never
+            # writer-supplied) - a successful run alone still proves nothing
+            # beyond "it ran" otherwise. Skipped entirely when the captured
+            # output was truncated: a partial capture is not a trustworthy
+            # basis for either a match or a mismatch claim, never guessed at.
+            expected = block.content.get("expected_stdout")
+            if expected is not None and str(expected).strip() and not result.truncated:
+                actual = (result.stdout or "").strip()
+                if actual != str(expected).strip():
+                    findings.append(
+                        StructuralFinding(
+                            check="code_cell_output_mismatch",
+                            description=(
+                                f"code cell verification: block {index} ran without error, but its "
+                                "output does not match the expected output declared for it. "
+                                f"Expected: {str(expected).strip()[:_DIAGNOSTIC_CHARS]!r}. "
+                                f"Actual: {actual[:_DIAGNOSTIC_CHARS]!r}."
+                            ),
+                            dimension="accuracy",
+                        )
+                    )
+            continue  # a genuine match, or no declared expectation, needs no finding
         if result.status == "timeout":
             findings.append(
                 StructuralFinding(
@@ -676,6 +749,99 @@ def _content_level_3_issues(blocks: list[Block], content_level: int) -> list[str
     return issues
 
 
+# Learning-approach deterministic enforcement (quality-governance follow-up,
+# Phase 3.10b). Deliberately TWO separate, standalone functions - never
+# folded into `_content_level_3_issues` (unmodified, same signature, same
+# content_level==3-only trigger as before this phase) and never merged with
+# each other into one function returning ambiguously-sourced text: each
+# gets its own fixed `StructuralFinding.check` tag at its own call site in
+# `_apply_structural_checks`, matching every other check in this module -
+# the tag is never inferred from the returned description text.
+#
+# Each reuses the SAME structural shapes `_content_level_3_issues` already
+# established (worked exercise; realistic scenario) - duplicated here
+# rather than shared, specifically so this phase can never change that
+# function's own tested behaviour. The two trigger conditions are
+# orthogonal (content_level==3 vs a requested learning_approaches entry)
+# and can both fire on the same chapter without conflict - they just
+# produce separately-worded, separately-tagged findings.
+def _hands_on_issues(blocks: list[Block], learning_approaches: list[str]) -> list[str]:
+    if "hands_on" not in learning_approaches:
+        return []
+
+    has_worked_exercise = False
+    for block in blocks:
+        if block.type not in (BlockType.EXERCISE, BlockType.CHALLENGE):
+            continue
+        content = block.content
+        if str(content.get("expected_outcome", "")).strip() and (
+            content.get("steps") or content.get("hints")
+        ):
+            has_worked_exercise = True
+            break
+    if has_worked_exercise:
+        return []
+
+    return [
+        "learning approach 'hands_on': this chapter needs at least one `exercise` or "
+        "`challenge` block with a concrete `expected_outcome` plus `steps` or `hints` - a "
+        "hands-on activity with real instructions and a worked, checkable result, not just "
+        "a heading."
+    ]
+
+
+# `situation_based` scope note (read before changing this check): its own
+# prompt guidance (learning_approaches_brief in app.agents.prompts) asks
+# for a situation with AT LEAST TWO evaluated responses - this check
+# verifies only the presence of a real scenario block, the same minimum
+# bar `scenario_based` gets, never the two-response structure itself,
+# which has no dedicated schema field to check deterministically. That
+# limitation is stated directly in the finding text ONLY when the minimum
+# bar itself is unmet (so a revision pass receives an honest instruction
+# about what's actually being asked for) - it is NEVER added as its own
+# separate, unconditional issue, so a chapter that already satisfies the
+# minimum bar is not flagged or sent to a pointless revision over a scope
+# limitation it cannot fix.
+def _scenario_approach_issues(blocks: list[Block], learning_approaches: list[str]) -> list[str]:
+    approaches = [a for a in ("scenario_based", "situation_based") if a in learning_approaches]
+    if not approaches:
+        return []
+
+    has_realistic_scenario = False
+    for block in blocks:
+        if block.type is BlockType.CASE_STUDY:
+            content = block.content
+            if (
+                str(content.get("context", "")).strip()
+                and str(content.get("challenge", "")).strip()
+                and (content.get("outcome") or content.get("lessons"))
+            ):
+                has_realistic_scenario = True
+                break
+        elif block.type is BlockType.STORY:
+            content = block.content
+            if str(content.get("text", "")).strip() and str(content.get("takeaway", "")).strip():
+                has_realistic_scenario = True
+                break
+    if has_realistic_scenario:
+        return []
+
+    names = "'/'".join(approaches)
+    text = (
+        f"learning approach '{names}': this chapter needs at least one `case_study` block "
+        "(with `context`, `challenge`, and an `outcome` or `lessons`) or `story` block (with "
+        "`text` and a `takeaway`) presenting a realistic scenario - not purely abstract "
+        "explanation."
+    )
+    if "situation_based" in approaches:
+        text += (
+            " (This is the minimum structural bar for 'situation_based' - it does NOT verify "
+            "evaluating at least two plausible responses, which remains unverified regardless "
+            "of this finding.)"
+        )
+    return [text]
+
+
 # MOM Phase 7 - section completeness: the OBJECTIVE half of completeness
 # checking (see chapter_contract_brief in app.agents.prompts for the
 # meaning-dependent half, handled by the reviewer model's own judgement).
@@ -739,4 +905,61 @@ def _section_completeness_issues(blocks: list[Block]) -> list[str]:
                     f"section completeness: block {index}'s Python code does not parse "
                     f"({exc.msg} at line {exc.lineno}) - fix the syntax error."
                 )
+
+    # Required-content-block emptiness (quality-governance follow-up, Phase
+    # 3.9a): structurally present but genuinely empty, the same class of
+    # defect as a placeholder heading or a code block with no code above -
+    # true regardless of content_level/learning_approaches, so unlike
+    # `_content_level_3_issues` this never checks WHICH fields are set
+    # (expected_outcome+steps/hints for a level-3 exercise), only whether
+    # the block's OWN core content is blank. Each check targets exactly the
+    # field(s) with no schema default distinguishing them as optional (see
+    # each block's own content model) - never a field the schema itself
+    # already treats as optional, which would make valid optional content
+    # mandatory with no evidence for it.
+    for index, block in enumerate(blocks):
+        if block.type is BlockType.LEARNING_OBJECTIVES:
+            items = block.content.get("items") or []
+            if not any(str(item).strip() for item in items):
+                issues.append(
+                    f"section completeness: block {index} is a learning objectives block "
+                    "with no real objectives listed - add at least one, or remove the block."
+                )
+        elif block.type is BlockType.QUIZ:
+            questions = block.content.get("questions") or []
+            if not questions:
+                issues.append(
+                    f"section completeness: block {index} is a quiz with no questions in it."
+                )
+        elif block.type is BlockType.SUMMARY:
+            # `next_steps` is deliberately NOT checked here - nothing in the
+            # template/prompt contracts evidences it as always required
+            # (unlike `key_takeaways`, a summary's own defining content), so
+            # flagging it would make valid optional content mandatory with
+            # no evidence for that requirement.
+            takeaways = block.content.get("key_takeaways") or []
+            if not any(str(item).strip() for item in takeaways):
+                issues.append(
+                    f"section completeness: block {index} is a summary with no key "
+                    "takeaways listed - a summary with nothing to take away isn't "
+                    "summarizing anything."
+                )
+        elif block.type in (BlockType.EXERCISE, BlockType.CHALLENGE):
+            # Both block types share ExerciseContent (see BLOCK_CONTENT_MODELS)
+            # and `_content_level_3_issues` already treats them identically -
+            # this does too. Only `instructions` - the one ExerciseContent
+            # field with no schema default (see its own class), unlike
+            # `steps`/`hints`/`expected_outcome`, which the schema itself
+            # already treats as optional-by-default and which
+            # `_content_level_3_issues` below already has its own, stricter,
+            # level-3-specific requirement for (never duplicated here).
+            instructions = str(block.content.get("instructions", "")).strip()
+            if not instructions:
+                kind = "exercise" if block.type is BlockType.EXERCISE else "challenge"
+                issues.append(
+                    f"section completeness: block {index} is an {kind} with no "
+                    "instructions - a learner can't do an exercise that doesn't say what "
+                    "to do."
+                )
+
     return issues
