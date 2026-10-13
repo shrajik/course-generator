@@ -62,6 +62,11 @@ class AdminCourseResponse(BaseModel):
     has_document: bool = False
     last_error: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    # Additive reflection of CourseRecord.quality_snapshot.outcome (see its
+    # docstring in app.schemas.course) - distinct from `status`, which never
+    # changes because of a quality finding. `None` when no snapshot exists
+    # (never generated, or evaluation itself failed at that time).
+    quality_outcome: Literal["passed", "failed"] | None = None
     run_state: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime

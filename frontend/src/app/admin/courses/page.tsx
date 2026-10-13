@@ -61,6 +61,14 @@ function StatusBadge({ status }: { status: string }) {
   return <AdminStatusBadge tone={failed ? "danger" : ready ? "success" : active ? "warning" : "neutral"}>{status}</AdminStatusBadge>;
 }
 
+/** Separate from StatusBadge on purpose - a quality-gate finding never
+ * changes `status` (see CourseRecord.quality_snapshot), so it gets its own,
+ * clearly distinct indicator rather than relabeling the generation status. */
+function QualityOutcomeBadge({ outcome }: { outcome: "passed" | "failed" | null }) {
+  if (outcome !== "failed") return null;
+  return <AdminStatusBadge tone="warning">Quality attention</AdminStatusBadge>;
+}
+
 function DetailRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="grid gap-1 border-b border-line py-3 last:border-0 sm:grid-cols-[160px_1fr] sm:gap-4">
@@ -304,7 +312,10 @@ export default function AdminCoursesPage() {
                       {item.owner ?? "Not tracked"}
                     </td>
                     <td className="px-4 py-3">
-                      <StatusBadge status={item.status} />
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <StatusBadge status={item.status} />
+                        <QualityOutcomeBadge outcome={item.quality_outcome} />
+                      </div>
                     </td>
                     <td className="max-w-[170px] truncate px-4 py-3 font-mono text-[12px] text-[#A9A29A]">
                       {item.document_id}
@@ -367,6 +378,18 @@ export default function AdminCoursesPage() {
             <DetailRow label="Document ID" value={<span className="font-mono text-[12px]">{selectedCourse.document_id}</span>} />
             <DetailRow label="Owner" value={selectedCourse.owner ?? "Not tracked"} />
             <DetailRow label="Status" value={<StatusBadge status={selectedCourse.status} />} />
+            <DetailRow
+              label="Quality outcome"
+              value={
+                selectedCourse.quality_outcome === "failed" ? (
+                  <AdminStatusBadge tone="warning">Needs attention</AdminStatusBadge>
+                ) : selectedCourse.quality_outcome === "passed" ? (
+                  <AdminStatusBadge tone="success">Passed</AdminStatusBadge>
+                ) : (
+                  "Not evaluated yet"
+                )
+              }
+            />
             <DetailRow label="Run state" value={selectedCourse.run_state ?? "Not running"} />
             <DetailRow label="Template" value={selectedCourse.template_id} />
             <DetailRow label="Target audience" value={selectedCourse.target_audience ?? "Not provided"} />

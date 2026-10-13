@@ -183,6 +183,32 @@ class ReviewHistoryEntry(BaseModel):
     comment: str | None = None
 
 
+class QualitySnapshot(BaseModel):
+    """The audit-trail record of the last time this course's quality was
+    evaluated (see `CourseRecord.quality_snapshot` below, and
+    `app.services.quality_framework.quality_snapshot_from_report`, which is
+    the only place that ever constructs one - this module stays a plain
+    schema with no app/services dependency, matching every other schema
+    file). Distinct from the LIVE `QualityReport` a caller gets from
+    `get_quality_report()`, which always reflects the course's CURRENT state
+    under whatever standards version the code currently defines - this
+    snapshot instead answers "what did evaluation conclude back when this
+    course finished generating."
+
+    `outcome` is this COURSE's pass/fail against the (proposed) standards at
+    that time - never a claim that the standards themselves are formally
+    approved; `standards_status` carries that distinction through unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    standards_version: str
+    standards_status: str
+    evaluated_at: str
+    outcome: str  # "passed" | "failed"
+    hard_failure_count: int
+    warning_count: int
+
+
 class CourseRecord(BaseModel):
     """Everything we persist about a course besides blueprint/research/chapters."""
 
@@ -212,6 +238,19 @@ class CourseRecord(BaseModel):
     pdf_path: str | None = None
     last_error: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    # MOM Phase 9 follow-up (quality audit TASK 2) - the audit-trail snapshot
+    # from the LAST time `CourseService._finalise` evaluated this course's
+    # quality (see QualitySnapshot's own docstring in
+    # app.services.quality_framework for why this is distinct from the LIVE
+    # report `get_quality_report()` recomputes). `None` for a course that
+    # has never finished generating, or whose evaluation itself failed -
+    # never fabricated. Not in COURSE_RECORD_COLUMN_FIELDS (app/db/service.py),
+    # so it flows through the existing generic `metadata_json` sweep in DB
+    # mode with no migration, and through the existing whole-record JSON
+    # write in filesystem mode - a course saved before this field existed
+    # simply has it as None on load, same contract as every other optional
+    # CourseRecord field.
+    quality_snapshot: QualitySnapshot | None = None
 
 
 # --- API payloads -----------------------------------------------------------
@@ -287,6 +326,14 @@ class GenerateResponse(BaseModel):
     course_id: str
     document_id: str
     status: CourseStatus
+    # Additive, read-only reflection of `record.quality_snapshot.outcome`
+    # (see QualitySnapshot) - deliberately NOT a new CourseStatus value and
+    # never written back anywhere: `status` keeps its existing meaning
+    # ("the pipeline ran and a document exists"), this just answers the
+    # separate question "did it pass the configured quality gate." `None`
+    # when no snapshot exists yet (evaluation itself failed, or - for an
+    # older course record - this field didn't exist when it last finished).
+    quality_outcome: Literal["passed", "failed"] | None = None
     chapters_generated: list[str] = Field(default_factory=list)
     chapters_failed: list[str] = Field(default_factory=list)
     images_generated: int = 0

@@ -290,6 +290,36 @@ async def get_course_document(
     return await service.load_document(course_id)
 
 
+@router.get("/{course_id}/quality")
+async def get_course_quality_report(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """MOM Phase 9/10 - the unified quality report (app.services.quality_framework),
+    computed on demand from already-persisted data (no AI calls). Same owner
+    gate as the document/chapters endpoints above - this is course-detail
+    information for whoever can already see the course, not admin-only
+    (provider/model metadata is the thing that stays admin-only, via
+    app.api.admin's own model-usage endpoint).
+
+    Returns both the LIVE report (`report`, always freshly recomputed from
+    current data) and `historical_snapshot` (TASK 2, quality audit follow-up)
+    - the audit-trail record saved at the moment generation last finished,
+    which can legitimately differ from the live report if the document was
+    hand-edited since, or if QUALITY_STANDARDS_VERSION has changed. `null`
+    when the course has never finished generating, or its evaluation failed
+    at that time - never fabricated to match the live report."""
+    record = await get_owned_course(course_id, current_user, service)
+    report = await service.get_quality_report(course_id)
+    return {
+        "report": report.model_dump(mode="json"),
+        "historical_snapshot": (
+            record.quality_snapshot.model_dump(mode="json") if record.quality_snapshot else None
+        ),
+    }
+
+
 @router.get("/{course_id}/chapters/{chapter_id}")
 async def get_chapter(
     course_id: str,

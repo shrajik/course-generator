@@ -225,6 +225,12 @@ def _to_admin_course_response(course: Course) -> AdminCourseResponse:
     run_state = run.get("state") if isinstance(run, dict) and isinstance(run.get("state"), str) else None
     chapters = metadata.get("chapters")
     warnings = metadata.get("warnings")
+    quality_snapshot = metadata.get("quality_snapshot")
+    quality_outcome = (
+        quality_snapshot.get("outcome")
+        if isinstance(quality_snapshot, dict) and quality_snapshot.get("outcome") in ("passed", "failed")
+        else None
+    )
     return AdminCourseResponse(
         id=course.id,
         course_id=course.course_id,
@@ -242,6 +248,7 @@ def _to_admin_course_response(course: Course) -> AdminCourseResponse:
         has_document=bool(metadata.get("has_document")),
         last_error=metadata.get("last_error") if isinstance(metadata.get("last_error"), str) else None,
         warnings=warnings if isinstance(warnings, list) else [],
+        quality_outcome=quality_outcome,
         run_state=run_state,
         metadata=metadata,
         created_at=course.created_at,

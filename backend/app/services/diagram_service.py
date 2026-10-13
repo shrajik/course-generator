@@ -35,6 +35,7 @@ from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluat
 from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.quality_framework import visual_qa_finding_entries
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
@@ -609,6 +610,25 @@ class DiagramService:
             log.info(
                 "Diagram for %s still has %s rendered layout issue(s) after retry - falling back",
                 block.id, len(issues),
+            )
+            # TASK 3 (quality audit follow-up) - persist the real structured
+            # issues onto the block BEFORE falling back, so the quality
+            # report can later show what happened here instead of this being
+            # visible only in this log line. The caller (ImageService) still
+            # owns this block and will overwrite its content with the
+            # fallback illustration's own fields - visual_qa_findings
+            # deliberately survives that (see merge_content/ImageContent,
+            # extra="allow" + an explicit field), since it describes this
+            # attempt, not the fallback's own result.
+            block.content = merge_content(
+                block.type,
+                block.content,
+                {
+                    "visual_qa_findings": visual_qa_finding_entries(
+                        [(issue.kind, issue.detail) for issue in issues],
+                        resolution="fell_back_to_illustration",
+                    )
+                },
             )
             return False
 

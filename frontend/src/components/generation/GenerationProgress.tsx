@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, RotateCcw, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowRight, RotateCcw, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { ProgressRing } from "./ProgressRing";
@@ -275,6 +275,20 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
               ) : null}
             </div>
           )}
+
+          {view.finished && detail?.course.quality_snapshot?.outcome === "failed" ? (
+            <div
+              role="alert"
+              className="flex items-start gap-2.5 rounded-card border border-amber-200 bg-amber-50 px-4 py-3"
+            >
+              <AlertTriangle size={15} className="mt-[1px] shrink-0 text-amber-600" aria-hidden />
+              <p className="text-[12.5px] leading-[1.5] text-amber-800">
+                This course finished generating, but didn&apos;t pass the configured quality
+                checks. Open the editor and check the Quality panel for details before
+                publishing — not every finding there is necessarily severe.
+              </p>
+            </div>
+          ) : null}
 
           {detail?.course.warnings.length ? (
             <ul className="space-y-1">

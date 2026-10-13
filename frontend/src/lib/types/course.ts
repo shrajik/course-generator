@@ -270,6 +270,11 @@ export interface CourseRecord {
   pdf_path: string | null;
   last_error: string | null;
   warnings: string[];
+  /** The last time generation finished evaluating this course's quality -
+   * see QualitySnapshot below. `null` when the course has never finished
+   * generating, or evaluation itself failed that time. Distinct from
+   * `status`, which never changes because of a quality finding. */
+  quality_snapshot: QualitySnapshot | null;
 }
 
 // --- TOC improvement --------------------------------------------------------
@@ -363,6 +368,12 @@ export interface GenerateResponse {
   course_id: string;
   document_id: string;
   status: CourseStatus;
+  /** Additive reflection of quality_snapshot.outcome - see CourseRecord's
+   * own field for the full explanation. Not used by this app's own
+   * generation-progress UI (which always polls GET /api/courses/{id} and
+   * reads `course.quality_snapshot` there instead), but present for any
+   * caller of the synchronous (`mode: "sync"`) generate endpoint. */
+  quality_outcome: "passed" | "failed" | null;
   chapters_generated: string[];
   chapters_failed: string[];
   images_generated: number;
@@ -447,4 +458,54 @@ export interface GeneratedChapterSummary {
 export interface ChapterDetailResponse {
   chapter: GeneratedChapterSummary;
   research_available: boolean;
+}
+
+// --- quality report (MOM Phase 8/9) ------------------------------------------
+// Mirrors backend/app/services/quality_framework.py - keep the two in sync.
+
+export type QualityDimension = "accuracy" | "completeness" | "pedagogy" | "visual" | "document";
+export type QualitySeverity = "blocker" | "major" | "minor";
+
+export interface QualityFinding {
+  artifact: string;
+  dimension: QualityDimension;
+  severity: QualitySeverity;
+  reason: string;
+  description: string;
+  remediation: string;
+  source: string;
+}
+
+export interface QualityReport {
+  course_id: string;
+  document_id: string;
+  /** "proposed" until a stakeholder formally signs off on these thresholds -
+   * see quality_framework.py's own docstring. Never render this as a claim
+   * of certified quality. */
+  standards_version: string;
+  standards_status: "proposed" | "approved";
+  generated_at: string;
+  findings: QualityFinding[];
+}
+
+/** The audit-trail record from the last time generation finished evaluating
+ * this course - distinct from the live `report` above, which always
+ * reflects the course's CURRENT state. See QualitySnapshot's own docstring
+ * in backend/app/schemas/course.py. */
+export interface QualitySnapshot {
+  standards_version: string;
+  standards_status: "proposed" | "approved";
+  evaluated_at: string;
+  outcome: "passed" | "failed";
+  hard_failure_count: number;
+  warning_count: number;
+}
+
+/** GET /api/courses/{id}/quality's actual response shape - the live report
+ * plus (when one exists) the historical snapshot from the last finished
+ * generation, kept visibly distinct per the quality-gate audit's own
+ * requirement rather than conflated into one object. */
+export interface QualityReportResponse {
+  report: QualityReport;
+  historical_snapshot: QualitySnapshot | null;
 }

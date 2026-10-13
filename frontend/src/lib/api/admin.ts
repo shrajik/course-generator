@@ -54,6 +54,10 @@ export interface AdminCourse {
   has_document: boolean;
   last_error: string | null;
   warnings: string[];
+  /** Additive reflection of the course's quality_snapshot.outcome - see
+   * CourseRecord in lib/types/course.ts. `null` when no snapshot exists
+   * yet. Distinct from `status`, which never changes for a quality finding. */
+  quality_outcome: "passed" | "failed" | null;
   run_state: string | null;
   metadata: Record<string, unknown>;
   created_at: string;

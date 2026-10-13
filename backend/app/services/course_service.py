@@ -66,6 +66,13 @@ from app.services.image_service import ImageService
 from app.services.memory_embedding_sync import sync_embedding
 from app.services.memory_embedding_text import generation_run_text
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.quality_framework import (
+    QualityReport,
+    build_course_quality_report,
+    quality_gate_evaluation_failed_warning,
+    quality_gate_warning,
+    quality_snapshot_from_report,
+)
 from app.services.research_service import ResearchService
 from app.services.storage_service import StorageService, get_storage
 
@@ -930,14 +937,68 @@ class CourseService:
             pages = len(document.pages)
             record.has_document = True
 
+            # MOM Phase 9 - final document completeness gate. Reuses the
+            # EXISTING `warnings` channel (already shown to the user for
+            # continuity/research issues above) rather than a new status or
+            # a new field: `status` keeps meaning "the pipeline ran and a
+            # document exists" (its established, already-tested meaning
+            # across the rest of this service), while a quality-gate hard
+            # failure is surfaced as a specific, visible warning so a course
+            # with real, unresolved gaps is never indistinguishable from a
+            # clean one just because it reached "ready". The full structured
+            # findings remain available on demand via `get_quality_report`
+            # (no AI calls, reads only already-persisted data) rather than
+            # being snapshotted here, so they can never go stale relative to
+            # a later hand-edit.
+            quality_report: QualityReport | None = None
+            try:
+                quality_chapters = self.storage.load_all_chapters(record.course_id)
+                quality_report = build_course_quality_report(
+                    course_id=record.course_id,
+                    document_id=document.document_id,
+                    chapters=quality_chapters,
+                    document=document,
+                )
+                gate_warning = quality_gate_warning(quality_report)
+                if gate_warning:
+                    warnings.append(gate_warning)
+            except Exception as exc:  # noqa: BLE001 - the gate is advisory, never fatal to generation
+                # An evaluation that could not run must never be silently
+                # indistinguishable from "evaluated and clean" - this used to
+                # only log server-side, so the course shipped with zero
+                # quality-related warnings on a genuine evaluation failure.
+                log.warning("Quality report failed for %s: %s", record.course_id, exc)
+                warnings.append(quality_gate_evaluation_failed_warning(exc))
+
+            # TASK 2 (quality audit follow-up) - the audit trail snapshot:
+            # standards version/status, when this was evaluated, and the
+            # outcome, persisted alongside the course record (see
+            # CourseRecord.quality_snapshot and COURSE_RECORD_COLUMN_FIELDS
+            # in app/db/service.py - any new CourseRecord field not in that
+            # frozenset flows into the existing `metadata_json` column
+            # automatically, no migration needed). `None` when evaluation
+            # itself failed - never fabricate an outcome that wasn't
+            # actually produced.
+            if quality_report is not None:
+                record.quality_snapshot = quality_snapshot_from_report(quality_report)
+
         record.status = "failed" if failed and not generated else "ready"
         record.last_error = f"chapters failed: {', '.join(failed)}" if failed else None
         record.warnings = warnings
 
         summary = metrics_summary
-        if summary is None and metrics_obj is not None:
-            summary = metrics_obj.summary()
-            metrics_obj.log_waterfall(f"course {record.course_id}")
+        model_usage: list[dict[str, Any]] = []
+        if metrics_obj is not None:
+            if summary is None:
+                summary = metrics_obj.summary()
+                metrics_obj.log_waterfall(f"course {record.course_id}")
+            # The full per-call list (see CallRecord) - `summary` above is
+            # only ever a rolled-up aggregate (counts/totals/top-5-slowest),
+            # not enough to answer "which model actually wrote chapter 3" -
+            # see MOM Phase 2.2 (AI Model Transparency). Persisted as-is into
+            # GenerationRun.payload_json below; never logged or exposed to a
+            # non-admin caller (see the admin-gated model-usage endpoint).
+            model_usage = [dataclasses.asdict(call) for call in metrics_obj.calls]
 
         record.run = RunInfo(
             job_id=job_id or (record.run.job_id if record.run else ""),
@@ -962,12 +1023,14 @@ class CourseService:
             failed=failed,
             warnings=warnings,
             error=record.last_error,
+            model_usage=model_usage,
         )
 
         return GenerateResponse(
             course_id=record.course_id,
             document_id=record.document_id,
             status=record.status,
+            quality_outcome=record.quality_snapshot.outcome if record.quality_snapshot else None,
             chapters_generated=generated,
             chapters_failed=failed,
             images_generated=images,

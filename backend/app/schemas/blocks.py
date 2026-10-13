@@ -131,6 +131,17 @@ class ImageContent(_Content):
     # future course-quality audit) can tell "verified" from "shipped
     # anyway" instead of assuming every generated image is correct.
     text_verified: bool | None = None
+    # MOM Phase 2 (quality audit follow-up) - a bounded, deduplicated summary
+    # of the REAL structured QA issues the diagram/concept-visual generation
+    # pipeline already produces (RenderQAIssue/DiagramQAIssue - see
+    # app.services.diagram_service.generate_for_block and
+    # app.services.concept_visual_service.generate_for_block, the only two
+    # places this is ever written), captured at the exact point those
+    # pipelines decide to fall back or ship anyway - never reconstructed from
+    # log text. Each entry: {"type": <stable reason code>, "detail": <short
+    # description>, "resolution": <what ultimately happened to this block>}.
+    # Empty list (not None) when nothing was ever flagged - the common case.
+    visual_qa_findings: list[dict] = Field(default_factory=list)
 
 
 class QuoteContent(_Content):

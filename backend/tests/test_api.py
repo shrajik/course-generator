@@ -105,6 +105,33 @@ def test_generate_produces_chapters_document_and_images(client):
     assert {"heading", "paragraph", "quiz", "summary", "exercise"} <= types
 
 
+def test_quality_endpoint_returns_a_report_after_generation(client):
+    course = _create(client)
+    course_id = course["course_id"]
+    client.post(f"/api/courses/{course_id}/generate", json={"mode": "sync"})
+
+    body = client.get(f"/api/courses/{course_id}/quality").json()
+    report = body["report"]
+    assert report["course_id"] == course_id
+    assert report["standards_status"] == "proposed"
+    assert "findings" in report
+    # TASK 2 (quality audit follow-up): a course that just finished
+    # generating has a real historical snapshot from that same evaluation,
+    # distinct from (but consistent with) the live report above.
+    snapshot = body["historical_snapshot"]
+    assert snapshot is not None
+    assert snapshot["standards_version"] == report["standards_version"]
+    assert snapshot["outcome"] in ("passed", "failed")
+
+
+def test_quality_endpoint_before_generation_has_no_findings(client):
+    course_id = _create(client)["course_id"]
+    body = client.get(f"/api/courses/{course_id}/quality").json()
+    assert body["report"]["findings"] == []
+    # Never generated - no evaluation has ever run, so no snapshot exists yet.
+    assert body["historical_snapshot"] is None
+
+
 def test_get_course_reports_artifacts(client):
     course_id = _create(client)["course_id"]
     client.post(f"/api/courses/{course_id}/generate", json={"mode": "sync"})
