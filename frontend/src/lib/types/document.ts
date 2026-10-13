@@ -95,12 +95,22 @@ export interface Page {
   blocks: Block[];
 }
 
+/** Mirrors backend/app/schemas/document.py's SourceRecord - one deduplicated
+ * external source, with every chapter that cited it. */
+export interface DocumentSource {
+  title: string;
+  url: string;
+  note: string;
+  chapter_ids: string[];
+}
+
 export interface DocumentMeta {
   audience: string;
   template_name: string;
   chapter_ids: string[];
   theme: Record<string, unknown>;
   generated_with: string;
+  sources: DocumentSource[];
 }
 
 export interface CourseDocument {

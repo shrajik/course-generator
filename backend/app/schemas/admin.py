@@ -74,3 +74,38 @@ class AdminCourseListResponse(BaseModel):
     limit: int
     offset: int
     statuses: list[str] = Field(default_factory=list)
+
+
+class ModelUsageRecord(BaseModel):
+    """One real AI call made while generating a course - the admin-facing
+    shape of `app.core.metrics.CallRecord`, persisted into a
+    `GenerationRun.payload_json["model_usage"]` row at the end of a run (see
+    CourseService._finalise). MOM Phase 2.2 - AI Model Transparency.
+
+    `provider`/`used_fallback` distinguish "which Azure resource/deployment
+    actually answered" and "was this the originally-requested model or the
+    configured fallback" from the bare model name alone. A deterministic
+    stage (an SVG diagram, a concept_experience HTML render) never appears
+    here at all - it never calls a model, so there's nothing to log; it is
+    not represented as a fabricated "deterministic" entry, it is simply
+    absent, same as the real CallRecord list this is read from."""
+
+    kind: str
+    purpose: str
+    model: str
+    provider: str = ""
+    seconds: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    retries: int = 0
+    failed: bool = False
+    used_fallback: bool = False
+    timestamp: str = ""
+
+
+class AdminModelUsageResponse(BaseModel):
+    course_id: str
+    job_id: str | None = None
+    run_state: str | None = None
+    run_created_at: datetime | None = None
+    calls: list[ModelUsageRecord] = Field(default_factory=list)

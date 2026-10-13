@@ -348,23 +348,25 @@ async def test_unsupported_image_provider_fails_clearly(monkeypatch):
         await client.image(prompt="p")
 
 
-async def test_image_provider_defaults_to_openai_when_unset(monkeypatch):
-    """Settings.image_provider's own default - confirms OpenAI stays the
-    default behaviour with no configuration changes at all."""
-    settings = Settings(openai_api_key="test-fake-openai-key")
-    assert settings.image_provider == "openai"
+async def test_image_provider_defaults_to_azure_when_unset(monkeypatch):
+    """Settings.image_provider's own default - confirms FLUX.2-flex (Azure)
+    is the default behaviour with no configuration changes at all. Changed
+    from "openai" after the OpenAI account's image-generation credit ran
+    out - gpt-image-1 is no longer used anywhere by default."""
+    settings = Settings()
+    assert settings.image_provider == "azure"
     client = OpenAIClient(settings)
 
-    async def fake_openai(**_kwargs):
-        return b"openai-bytes"
+    async def fake_azure(**_kwargs):
+        return b"azure-bytes"
 
     async def fail_if_called(**_kwargs):
-        raise AssertionError("azure path should never be used by default")
+        raise AssertionError("openai (gpt-image-1) should never be used by default")
 
-    monkeypatch.setattr(client, "_image_openai", fake_openai)
-    monkeypatch.setattr(client, "_image_azure", fail_if_called)
+    monkeypatch.setattr(client, "_image_azure", fake_azure)
+    monkeypatch.setattr(client, "_image_openai", fail_if_called)
 
-    assert await client.image(prompt="p") == b"openai-bytes"
+    assert await client.image(prompt="p") == b"azure-bytes"
 
 
 async def test_image_provider_param_overrides_the_configured_default(monkeypatch):

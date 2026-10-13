@@ -124,6 +124,10 @@ def test_owner_can_access_their_own_course(owner_client):
     # actual lookup, rather than blocking them.
     assert owner_client.get(f"/api/courses/{course_id}/blueprint").status_code == 404
     assert owner_client.get(f"/api/courses/{course_id}/document").status_code == 404
+    # No document yet, but the quality report degrades gracefully rather than
+    # 404ing (see test_finalization_gate.py's own equivalent pre-generation
+    # case) - still gated by ownership, just not by document existence.
+    assert owner_client.get(f"/api/courses/{course_id}/quality").status_code == 200
 
 
 def test_user_cannot_access_another_users_course(owner_client):
@@ -140,6 +144,7 @@ def test_user_cannot_access_another_users_course(owner_client):
     assert owner_client.get(f"/api/courses/{course_id}/run").status_code == 403
     assert owner_client.get(f"/api/courses/{course_id}/blueprint").status_code == 403
     assert owner_client.get(f"/api/courses/{course_id}/document").status_code == 403
+    assert owner_client.get(f"/api/courses/{course_id}/quality").status_code == 403
     assert (
         owner_client.get(f"/api/courses/{course_id}/chapters/chapter_1").status_code == 403
     )
@@ -162,6 +167,9 @@ def test_user_cannot_access_another_users_course(owner_client):
         == 403
     )
     assert owner_client.post(f"/api/documents/{document_id}/export/pdf").status_code == 403
+    assert (
+        owner_client.get(f"/api/documents/{document_id}/export/pdf/download").status_code == 403
+    )
     assert (
         owner_client.get(f"/api/documents/{document_id}/assets/whatever.png").status_code == 403
     )

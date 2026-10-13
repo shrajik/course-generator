@@ -110,28 +110,6 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   return (await response.json()) as T;
 }
 
-export async function requestBlob(
-  path: string,
-  options: RequestOptions = {},
-): Promise<Blob> {
-  const { method = "GET", body, signal, query } = options;
-  let response: Response;
-  try {
-    response = await fetch(apiUrl(path, query), {
-      method,
-      headers: body === undefined ? undefined : { "content-type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal,
-      cache: "no-store",
-      credentials: "include",
-    });
-  } catch {
-    throw new ApiError(`Cannot reach the backend at ${API_BASE_URL}.`, 0, "network_error");
-  }
-  if (!response.ok) throw await toApiError(response);
-  return response.blob();
-}
-
 /** Multipart upload (e.g. a template file). The browser sets the
  * multipart boundary itself from the FormData body - never set
  * `content-type` manually here, or the boundary gets lost and the backend

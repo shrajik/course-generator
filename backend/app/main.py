@@ -42,13 +42,13 @@ async def lifespan(app: FastAPI):
         settings.app_name,
         settings.app_version,
         settings.data_dir,
-        "mock" if settings.use_mock_ai else "openai",
+        "mock" if settings.use_mock_ai else "azure",
         settings.research_mode,
     )
     if settings.use_mock_ai:
         log.warning(
-            "No OPENAI_API_KEY configured (or MOCK_OPENAI=true): generation will "
-            "return offline placeholder content."
+            "No Azure text-model deployment configured (or MOCK_OPENAI=true): "
+            "generation will return offline placeholder content."
         )
     # Best-effort: an unreachable database at startup must not block the app -
     # it just means DB-backed templates aren't available until the next write

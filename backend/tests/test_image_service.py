@@ -897,6 +897,33 @@ async def test_textbook_illustration_uses_the_textbook_image_provider_override()
     assert seen_providers == ["openai"]
 
 
+async def test_textbook_illustration_defaults_to_azure_mai_not_gpt_image_1():
+    """The migration this test guards: `textbook_image_provider`'s own
+    DEFAULT (no override at all) must resolve to "azure_mai" - Azure
+    MAI-Image-2.6 - not fall through to the OpenAI gpt-image-1 path, which
+    is exactly what this category used to default to before the migration.
+    Unrelated illustrations are unaffected (see the next test) - only this
+    category's default changed."""
+    settings = get_settings().model_copy(update={"image_provider": "openai"})
+    assert settings.textbook_image_provider == "azure_mai"  # the new default
+    svc = ImageService(ai=_FakeAI(is_mock=False), settings=settings)
+    seen_providers = []
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        seen_providers.append(provider)
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    block = _image_block(illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_default_textbook_provider", block=block, template=template, course_title="Test Course",
+    )
+    assert ok is True
+    assert seen_providers == ["azure_mai"]
+
+
 async def test_non_textbook_illustration_does_not_override_the_provider():
     """Regression guard: the override is scoped to `illustration_style ==
     "textbook"` only - a decorative/section_intro illustration must keep
@@ -921,6 +948,37 @@ async def test_non_textbook_illustration_does_not_override_the_provider():
     )
     assert ok is True
     assert seen_providers == [None]
+
+
+async def test_section_intro_and_default_style_illustrations_default_to_azure_flux_not_gpt_image_1():
+    """gpt-image-1 is no longer used anywhere by default - the OpenAI
+    account's image-generation credit ran out. `image_provider` (what every
+    section_intro/default-style illustration resolves to, since they never
+    set the textbook override) now defaults to "azure" (FLUX.2-flex), not
+    "openai". These categories don't need MAI-Image-2.6's text-rendering
+    strength (section_intro enforces a strict no-text rule), so the cheaper
+    FLUX.2-flex provider is the right default for them specifically."""
+    settings = get_settings()
+    assert settings.image_provider == "azure"
+    svc = ImageService(ai=_FakeAI(is_mock=False), settings=settings)
+    seen_providers = []
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        seen_providers.append(provider)
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    template = load_template("technical")
+
+    for style in ("section_intro", ""):
+        block = _image_block(illustration_style=style) if style else _image_block()
+        ok = await svc._generate_illustration(
+            course_id="course_unaffected_styles", block=block, template=template, course_title="Test Course",
+        )
+        assert ok is True
+    # None == "use settings.image_provider" (azure) - never forced to
+    # azure_mai (textbook-only) or openai (no longer the default anywhere).
+    assert seen_providers == [None, None]
 
 
 # ---------------------------------------------------------------------------

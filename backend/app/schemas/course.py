@@ -15,6 +15,22 @@ TEMPLATE_IDS: dict[str, str] = {
     "non_technical": "non_technical_v1",
 }
 
+# MOM Phase 5 - learning approaches: HOW a concept is taught, independent of
+# content_level (WHICH presentation assets accompany it) and of
+# learner_profile (WHO it's tailored for) - see learning_approaches_brief in
+# app/agents/prompts.py for exactly what each value asks the writer for, and
+# which existing block types it reuses (never a new block type). A course
+# can select several; the writer is asked to combine them coherently rather
+# than produce one generic section per approach.
+LearningApproach = Literal[
+    "explanatory",
+    "example_driven",
+    "scenario_based",
+    "situation_based",
+    "hands_on",
+    "conversational",
+]
+
 
 class TocItem(BaseModel):
     """One chapter of the table of contents."""
@@ -59,6 +75,31 @@ class CourseInput(BaseModel):
     # it is None the generation prompts are byte-identical to what they were.
     # See app/course/pedagogy.py for how it becomes a constraints brief.
     learner_profile: LearnerProfile | None = None
+    # MOM Phase 4 - content level, independent of learner_profile/learning
+    # approach (MOM 4.4: these are separate dimensions, never forced into one
+    # rigid mode). 2 (the existing default behaviour: text + diagrams/images
+    # where the writer judges them useful) keeps every pre-existing course's
+    # prompts byte-identical - see content_level_brief in app/agents/prompts.py
+    # for the "" it returns at level 2. 1 = text-only, no generated visual
+    # assets at all (also enforced structurally, not just by prompt - see
+    # CourseService.generate's own generate_images override). 3 is the MOM's
+    # own provisional/not-yet-finalised experiential-learning mode (realistic
+    # scenarios, hands-on exercises, decisions under incomplete information) -
+    # implemented as a prompt-level framing shift for now, not a separate
+    # generation pipeline; see content_level_brief's own docstring for exactly
+    # what it does and does not yet do.
+    content_level: Literal[1, 2, 3] = 2
+    # MOM Phase 5 - [] (the pre-existing default: the writer judges which
+    # approach fits each section on its own, exactly as before this field
+    # existed) keeps every pre-existing course's prompts byte-identical -
+    # see learning_approaches_brief in app/agents/prompts.py for the "" it
+    # returns for an empty list. Independent of content_level/
+    # presentation - a Level 1 (text-only) course can still be
+    # conversational or example-driven; selecting "hands_on" doesn't force
+    # Level 3 or disable diagrams. A plain list, not a single value -
+    # multiple approaches can be combined (see learning_approaches_brief's
+    # own "combine coherently, do not repeat" instruction).
+    learning_approaches: list[LearningApproach] = Field(default_factory=list)
 
     @field_validator("toc", mode="before")
     @classmethod

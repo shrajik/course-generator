@@ -13,6 +13,7 @@ Two performance decisions live here:
 
 from __future__ import annotations
 
+import ast
 import re
 
 from app.agents import prompts
@@ -110,7 +111,7 @@ class ReviewerAgent:
         )
         review.reviewed_at = utc_now_iso()
         self._apply_structural_checks(
-            review, template, blocks, course_input.learner_profile
+            review, template, blocks, course_input.learner_profile, course_input
         )
         # Keep the reviewer honest: structural gaps always block approval.
         if review.missing_required_blocks:
@@ -151,6 +152,7 @@ class ReviewerAgent:
         template: CourseTemplate,
         blocks: list[Block],
         profile: LearnerProfile | None = None,
+        course_input: CourseInput | None = None,
     ) -> None:
         present_types = {block.type for block in blocks}
         present_sections = {block.meta.section_key for block in blocks if block.meta.section_key}
@@ -164,13 +166,19 @@ class ReviewerAgent:
             if section.key not in present_sections and not (allowed & present_types):
                 missing.append(f"section '{section.key}'")
         missing.extend(_visual_balance_issues(blocks))
+        content_level = course_input.content_level if course_input is not None else 2
+        missing.extend(_content_level_3_issues(blocks, content_level))
+        missing.extend(_section_completeness_issues(blocks))
         # Deduplicate while preserving order.
         review.missing_required_blocks = list(dict.fromkeys(missing))
 
         # Pedagogy/style violations carry a block_index, so they route to the
         # surgical revision path (writer.revise_chapter) rather than forcing a
         # whole-chapter rewrite the way `missing_required_blocks` does.
-        review.issues.extend(_pedagogy_issues(blocks, profile))
+        effective_profile = profile if profile is not None else (
+            course_input.learner_profile if course_input is not None else None
+        )
+        review.issues.extend(_pedagogy_issues(blocks, effective_profile))
 
 
 def _block_word_count(block: Block) -> int:
@@ -319,4 +327,138 @@ def _visual_balance_issues(blocks: list[Block]) -> list[str]:
             f"long needs roughly {expected_visuals} spread through it, not clustered in one "
             "place, to keep a roughly 60/40 text-to-visual balance."
         )
+    return issues
+
+
+# MOM Phase 4 - Content Level 3 ("experiential") is a prompt-level framing
+# shift (see content_level_brief), but a framing shift alone can be ignored
+# by the model with nothing to catch it - this is the actual generation
+# validation path the MOM requires: a deterministic, post-hoc check that the
+# chapter really contains the experiential elements the level promises,
+# reusing the EXISTING EXERCISE/CHALLENGE/CASE_STUDY/STORY schemas (no new
+# block type, no new content field) and the EXISTING missing_required_blocks
+# -> full-rewrite retry path (see CourseService._generate_chapter's
+# `max_review_revisions` loop) rather than a parallel validation system.
+#
+# "Worked, hands-on practice" maps onto ExerciseContent's own fields:
+# `expected_outcome` is the required expected output, and `steps`/`hints`
+# are the required step-by-step/constraint guidance - a block with neither
+# is just a labelled heading, exactly what the MOM says not to accept.
+# "Realistic scenario with a decision and a reflection" maps onto
+# CaseStudyContent's `context`+`challenge` (the situation and its decision
+# point) plus `outcome`/`lessons` (the evaluation/reflection), or StoryContent's
+# `text`+`takeaway` for a lighter-weight narrative scenario.
+def _content_level_3_issues(blocks: list[Block], content_level: int) -> list[str]:
+    if content_level != 3:
+        return []
+
+    has_worked_exercise = False
+    for block in blocks:
+        if block.type not in (BlockType.EXERCISE, BlockType.CHALLENGE):
+            continue
+        content = block.content
+        if str(content.get("expected_outcome", "")).strip() and (
+            content.get("steps") or content.get("hints")
+        ):
+            has_worked_exercise = True
+            break
+
+    has_realistic_scenario = False
+    for block in blocks:
+        if block.type is BlockType.CASE_STUDY:
+            content = block.content
+            if (
+                str(content.get("context", "")).strip()
+                and str(content.get("challenge", "")).strip()
+                and (content.get("outcome") or content.get("lessons"))
+            ):
+                has_realistic_scenario = True
+                break
+        elif block.type is BlockType.STORY:
+            content = block.content
+            if str(content.get("text", "")).strip() and str(content.get("takeaway", "")).strip():
+                has_realistic_scenario = True
+                break
+
+    issues: list[str] = []
+    if not has_worked_exercise:
+        issues.append(
+            "content level 3 (experiential): this chapter needs at least one `exercise` or "
+            "`challenge` block with a concrete `expected_outcome` plus `steps` or `hints` - a "
+            "hands-on activity with real instructions and a worked, checkable result, not just "
+            "a heading."
+        )
+    if not has_realistic_scenario:
+        issues.append(
+            "content level 3 (experiential): this chapter needs at least one `case_study` block "
+            "(with `context`, `challenge`, and an `outcome` or `lessons`) or `story` block (with "
+            "`text` and a `takeaway`) presenting a realistic scenario or situation-based decision, "
+            "not purely abstract explanation."
+        )
+    return issues
+
+
+# MOM Phase 7 - section completeness: the OBJECTIVE half of completeness
+# checking (see chapter_contract_brief in app.agents.prompts for the
+# meaning-dependent half, handled by the reviewer model's own judgement).
+# These three failure modes are structural, not matters of interpretation -
+# an empty heading, a chapter that just stops, or Python that doesn't parse
+# are true regardless of what the chapter was supposed to be about, so they
+# don't need - and shouldn't wait on - a model call to catch.
+_PLACEHOLDER_HEADING_TEXT = {
+    "",
+    "todo",
+    "tbd",
+    "tba",
+    "untitled",
+    "untitled section",
+    "section title",
+    "placeholder",
+    "[placeholder]",
+    "heading",
+    "title",
+}
+
+
+def _section_completeness_issues(blocks: list[Block]) -> list[str]:
+    issues: list[str] = []
+
+    for index, block in enumerate(blocks):
+        if block.type is BlockType.HEADING:
+            text = str(block.content.get("text", "")).strip()
+            if text.lower() in _PLACEHOLDER_HEADING_TEXT:
+                issues.append(
+                    f"section completeness: block {index} is a heading with no real title "
+                    f"({text!r}) - give it a specific, descriptive heading or remove it."
+                )
+
+    # A chapter that ends on a heading (or on a heading followed only by
+    # dividers) started a section and never filled it in.
+    for block in reversed(blocks):
+        if block.type is BlockType.DIVIDER:
+            continue
+        if block.type is BlockType.HEADING:
+            issues.append(
+                "section completeness: the chapter ends immediately after a heading with no "
+                "content following it - finish that section instead of leaving it empty."
+            )
+        break
+
+    for index, block in enumerate(blocks):
+        if block.type is not BlockType.CODE:
+            continue
+        language = str(block.content.get("language", "")).strip().lower()
+        code = str(block.content.get("code", "")).strip()
+        if not code:
+            issues.append(
+                f"section completeness: block {index} is a code block with no code in it."
+            )
+        elif language in ("python", "py"):
+            try:
+                ast.parse(code)
+            except SyntaxError as exc:
+                issues.append(
+                    f"section completeness: block {index}'s Python code does not parse "
+                    f"({exc.msg} at line {exc.lineno}) - fix the syntax error."
+                )
     return issues

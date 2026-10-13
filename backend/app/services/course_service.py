@@ -21,8 +21,10 @@ Performance shape of this module:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import uuid
+from typing import Any
 
 from app.agents.planner import PlannerAgent
 from app.agents.prompts import ContinuityContext
@@ -361,6 +363,32 @@ class CourseService:
         async with get_database_service() as db:
             return await db.list_generation_runs(course_id, limit, offset)
 
+    async def get_latest_model_usage(self, course_id: str) -> dict | None:
+        """Admin-only (see app.api.admin's model-usage endpoint) - the full
+        per-call AI model usage list from the most recent generation run.
+        None when nothing has ever been generated/persisted for this
+        course (mock mode, or no run yet) - never fabricated."""
+        if not self.use_db:
+            return None
+        async with get_database_service() as db:
+            return await db.get_latest_generation_run_model_usage(course_id)
+
+    async def get_quality_report(self, course_id: str) -> QualityReport:
+        """On-demand quality report for a course - available any time after
+        generation, not only at the moment `_finalise` runs (see that
+        method's own comment on why it isn't snapshotted). Reads only
+        already-persisted chapters/document, so it reflects the course's
+        CURRENT state, including any hand-edits made since generation."""
+        await self.get_course_record(course_id)  # raises NotFoundError if unknown
+        chapters = self.storage.load_all_chapters(course_id)
+        document = await self._load_document(course_id) if await self._has_document(course_id) else None
+        return build_course_quality_report(
+            course_id=course_id,
+            document_id=document.document_id if document else "",
+            chapters=chapters,
+            document=document,
+        )
+
     # --- phase 1: plan -----------------------------------------------------
     async def plan_course(self, record: CourseRecord) -> CourseBlueprint:
         with metrics_phase("planner"):
@@ -393,7 +421,15 @@ class CourseService:
         record = await self._load_course(course_id)
 
         if request.mode == "sync":
-            return await self.generate(course_id, request)
+            # A real, confirmed gap: a sync-mode call used to run `generate()`
+            # with no job_id at all (`job_id=""` is the parameter's own
+            # default), which made `_record_generation_run`'s own `if not
+            # self.use_db or not job_id: return` guard silently skip
+            # persisting that run's history AND its model-usage record (see
+            # MOM Phase 2.2) - every sync-mode generation left no audit trail
+            # whatsoever. Background mode already mints a job_id up front
+            # (`new_id("job")` just below); sync mode now does the same.
+            return await self.generate(course_id, request, job_id=new_id("job"))
 
         existing = self._jobs.get(course_id)
         if existing is not None and not existing.done():
@@ -500,6 +536,7 @@ class CourseService:
                         started=started,
                         job_id=job_id,
                         metrics_summary=metrics.summary(),
+                        metrics_obj=metrics,
                     )
                 raise ValidationFailedError("No matching chapters to generate")
 
@@ -853,6 +890,17 @@ class CourseService:
                 if request.generate_images is None
                 else request.generate_images
             )
+            # MOM Phase 4 - Content Level 1 (text-only) structural backstop:
+            # the writer is already prompted not to plan any image block (see
+            # content_level_brief in app/agents/prompts.py), but this is a
+            # second, independent guarantee that no visual generation runs at
+            # all for a Level 1 course even if the model asks for one anyway
+            # or the request explicitly passed generate_images=True. Always
+            # wins over the request's own override - Content Level is the
+            # user's explicit choice for THIS course, not a default to be
+            # silently overridden per-call.
+            if record.input.content_level == 1:
+                generate_images = False
             if generate_images:
                 # Images run after the document is already readable, so they are
                 # never what the user is waiting on to start editing.
@@ -942,9 +990,15 @@ class CourseService:
         failed: list[str] | None = None,
         warnings: list[str] | None = None,
         error: str | None = None,
+        model_usage: list[dict[str, Any]] | None = None,
     ) -> None:
         """One row per generation attempt (see GenerationRun/generation_runs) -
-        best-effort and never allowed to affect the run it's recording."""
+        best-effort and never allowed to affect the run it's recording.
+
+        `model_usage` (see CallRecord/MOM Phase 2.2) is the full per-call AI
+        model usage list for this run - admin-only; see
+        app.api.admin's model-usage endpoint, which is the only reader of
+        this field. Never surfaced to a non-admin caller or logged here."""
         if not self.use_db or not job_id:
             return
         try:
@@ -957,6 +1011,7 @@ class CourseService:
                         "chapters_generated": generated or [],
                         "chapters_failed": failed or [],
                         "warnings": warnings or [],
+                        "model_usage": model_usage or [],
                     },
                     error=error,
                 )

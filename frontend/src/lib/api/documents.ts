@@ -1,4 +1,4 @@
-import { apiUrl, request, requestBlob } from "./client";
+import { apiUrl, request } from "./client";
 import type {
   AiEditRequest,
   AiEditResponse,
@@ -54,9 +54,26 @@ export function updateConceptVisualSpec(
   );
 }
 
-/** The backend renders the PDF (HTML -> CSS -> Playwright). We only download it. */
-export function exportPdf(documentId: string): Promise<Blob> {
-  return requestBlob(`/api/documents/${documentId}/export/pdf`, { method: "POST" });
+/** Triggers the render without transferring the PDF body - a small JSON
+ * response (`{ size_bytes, ... }`), reliable even for a 10+ MB course where
+ * downloading the body straight through `fetch()` can have its connection
+ * drop mid-transfer (CourseEditor's handleExport pairs this with
+ * `exportedPdfDownloadUrl` below for a native, far-more-resilient browser
+ * download instead of buffering the whole file through JS). */
+export function generateExportedPdf(documentId: string): Promise<{ size_bytes: number }> {
+  return request(`/api/documents/${documentId}/export/pdf`, {
+    method: "POST",
+    query: { download: false },
+  });
+}
+
+/** The already-exported PDF (see generateExportedPdf, which must be called
+ * first - this never regenerates it) as a plain GET URL, meant for a
+ * native browser download (an `<a href>` click/`window.open`), not fetch -
+ * the OS/browser download manager streams straight to disk and tolerates a
+ * mid-transfer connection hiccup fetch().blob() cannot. */
+export function exportedPdfDownloadUrl(documentId: string): string {
+  return apiUrl(`/api/documents/${documentId}/export/pdf/download`);
 }
 
 /** API-relative path for a document-relative asset such as "assets/image_001.png". */

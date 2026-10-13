@@ -12,7 +12,17 @@ import { improveToc } from "@/lib/api/courses";
 import { classifyTemplateType } from "@/lib/api/course-templates";
 import { ApiError } from "@/lib/api/client";
 import { useCourseDraft } from "@/lib/state/course-draft";
-import type { TocItem } from "@/lib/types/course";
+import {
+  CONTENT_LEVEL_HELP,
+  CONTENT_LEVEL_LABELS,
+  LEARNING_APPROACH_OPTIONS,
+  LEVEL_OPTIONS,
+  type ContentLevel,
+  type LearningApproach,
+  type TocItem,
+} from "@/lib/types/course";
+
+const CONTENT_LEVELS: ContentLevel[] = [1, 2, 3];
 
 export function CreateCourseForm() {
   const router = useRouter();
@@ -26,6 +36,18 @@ export function CreateCourseForm() {
     const timer = window.setTimeout(() => setSaved(false), 2200);
     return () => window.clearTimeout(timer);
   }, [saved]);
+
+  // A draft persisted before "Level" became a fixed dropdown (or one built
+  // by hand) can hold a target_audience string that matches none of the
+  // three options - left alone, the <select> would silently DISPLAY the
+  // first option while actually still submitting that stale/arbitrary text.
+  // Normalise it once hydration completes so what's shown always matches
+  // what's sent.
+  useEffect(() => {
+    if (!hydrated) return;
+    if (LEVEL_OPTIONS.some((option) => option.value === draft.targetAudience)) return;
+    update({ targetAudience: LEVEL_OPTIONS[1].value });
+  }, [hydrated, draft.targetAudience, update]);
 
   const canContinue =
     hydrated && draft.courseTitle.trim().length > 0 && draft.targetAudience.trim().length > 0;
@@ -154,21 +176,105 @@ export function CreateCourseForm() {
               htmlFor="target-audience"
               className="mb-1.5 block text-[12.5px] font-medium text-ink-700"
             >
-              Target Audience
+              Level
             </label>
-            <input
+            <select
               id="target-audience"
               className="field"
               value={draft.targetAudience}
               onChange={(event) => update({ targetAudience: event.target.value })}
-              placeholder="Beginners to intermediate developers who want to master Python."
-            />
+            >
+              {LEVEL_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
 
           <LearnerProfilePanel
             value={draft.learnerProfile}
             onChange={(learnerProfile) => update({ learnerProfile })}
           />
+
+          <div>
+            <p className={"mb-1.5 text-[12.5px] font-medium text-ink-700"}>Content Level</p>
+            <div className="grid gap-2.5 sm:grid-cols-3">
+              {CONTENT_LEVELS.map((level) => (
+                <button
+                  key={level}
+                  type="button"
+                  onClick={() => update({ contentLevel: level })}
+                  aria-pressed={draft.contentLevel === level}
+                  className={
+                    "rounded-card border px-3.5 py-3 text-left transition " +
+                    (draft.contentLevel === level
+                      ? "border-brand-400 bg-brand-50"
+                      : "border-line bg-white hover:border-brand-200")
+                  }
+                >
+                  <p className="text-[12.5px] font-semibold text-ink-800">
+                    Level {level} — {CONTENT_LEVEL_LABELS[level]}
+                  </p>
+                  <p className="mt-1 text-[11.5px] leading-snug text-ink-400">
+                    {CONTENT_LEVEL_HELP[level]}
+                  </p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <p className="mb-1.5 text-[12.5px] font-medium text-ink-700">
+              Learning Approach
+              <span className="ml-2 font-normal text-ink-400">
+                Optional — select any that fit; leave blank to let the writer decide per section
+              </span>
+            </p>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {LEARNING_APPROACH_OPTIONS.map((option) => {
+                const checked = draft.learningApproaches.includes(option.value);
+                const toggle = () => {
+                  const next: LearningApproach[] = checked
+                    ? draft.learningApproaches.filter((a) => a !== option.value)
+                    : [...draft.learningApproaches, option.value];
+                  update({ learningApproaches: next });
+                };
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={toggle}
+                    aria-pressed={checked}
+                    className={
+                      "flex items-start gap-2.5 rounded-card border px-3.5 py-2.5 text-left transition " +
+                      (checked
+                        ? "border-brand-400 bg-brand-50"
+                        : "border-line bg-white hover:border-brand-200")
+                    }
+                  >
+                    <span
+                      className={
+                        "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border " +
+                        (checked ? "border-brand-500 bg-brand-500 text-white" : "border-line bg-white")
+                      }
+                      aria-hidden
+                    >
+                      {checked ? <CheckCircle2 size={12} /> : null}
+                    </span>
+                    <span>
+                      <span className="block text-[12.5px] font-semibold text-ink-800">
+                        {option.label}
+                      </span>
+                      <span className="block text-[11.5px] leading-snug text-ink-400">
+                        {option.help}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
             <RuleList

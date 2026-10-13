@@ -70,6 +70,7 @@ class MockAIClient(AIClient):
                     purpose=purpose or kind,
                     model="mock",
                     seconds=time.perf_counter() - started,
+                    provider="mock",
                 )
             )
         return started

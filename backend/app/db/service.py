@@ -421,6 +421,27 @@ class DatabaseService:
         rows = await self.generation_runs.list_for_course(course.id, limit, offset)
         return [self._to_generation_run_entry(row) for row in rows]
 
+    async def get_latest_generation_run_model_usage(self, course_id: str) -> dict | None:
+        """Admin-only reader for `GenerationRun.payload_json["model_usage"]`
+        (see CourseService._finalise) - the one place that raw field is ever
+        read back. Returns None when the course has no recorded run at all
+        (e.g. mock mode never persisted one, or nothing has been generated
+        yet) - never a fabricated empty-but-present run."""
+        course = await self.courses.get_by_course_id(course_id)
+        if course is None:
+            raise NotFoundError(f"Course '{course_id}' not found")
+        rows = await self.generation_runs.list_for_course(course.id, limit=1, offset=0)
+        if not rows:
+            return None
+        row = rows[0]
+        payload = row.payload_json or {}
+        return {
+            "job_id": row.job_id,
+            "state": row.state,
+            "created_at": row.created_at,
+            "model_usage": payload.get("model_usage") or [],
+        }
+
     @staticmethod
     def _to_generation_run_entry(row: GenerationRun) -> GenerationRunEntry:
         payload = row.payload_json or {}

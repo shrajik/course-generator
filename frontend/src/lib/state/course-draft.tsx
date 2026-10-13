@@ -15,7 +15,14 @@ import {
   useMemo,
   useState,
 } from "react";
-import type { LearnerProfile, TemplateKind, TocItem } from "@/lib/types/course";
+import {
+  LEVEL_OPTIONS,
+  type ContentLevel,
+  type LearnerProfile,
+  type LearningApproach,
+  type TemplateKind,
+  type TocItem,
+} from "@/lib/types/course";
 import type { CourseTemplateType } from "@/lib/api/course-templates";
 
 /** The uploaded reference document (or the hardcoded "Default Template")
@@ -63,6 +70,12 @@ export interface CourseDraft {
   /** Panels A-C of the creator interface. Null until the designer opens the
    * Learner Profile section, which keeps it genuinely optional end to end. */
   learnerProfile: LearnerProfile | null;
+  /** MOM Phase 4 - Content Level. Always sent explicitly (not omitted) so
+   * the choice is visible in the payload even at its default value. */
+  contentLevel: ContentLevel;
+  /** MOM Phase 5 - HOW each concept is taught. Empty means "let the writer
+   * judge per section", the pre-existing default behaviour. */
+  learningApproaches: LearningApproach[];
   toc: TocItem[];
   /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
    * a previous course) - see CreateCourseForm's regeneration check. */
@@ -88,12 +101,14 @@ export const DEFAULT_DONTS = [
 
 export const EMPTY_DRAFT: CourseDraft = {
   courseTitle: "",
-  targetAudience: "",
+  targetAudience: LEVEL_OPTIONS[1].value,
   dos: DEFAULT_DOS,
   donts: DEFAULT_DONTS,
   template: "technical",
   selectedTemplate: null,
   learnerProfile: null,
+  contentLevel: 2,
+  learningApproaches: [],
   toc: [],
   tocDraftedFor: null,
   courseId: null,

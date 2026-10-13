@@ -178,6 +178,8 @@ export function TocEditor() {
           // Only an uploaded template sets this; the built-in pair is
           // resolved from `template` server-side exactly as before.
           template_id_override: draft.selectedTemplate?.templateId ?? null,
+          content_level: draft.contentLevel,
+          learning_approaches: draft.learningApproaches,
         },
         { runPlanner: false },
       );

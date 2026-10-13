@@ -29,8 +29,33 @@ export interface TocItem {
   notes: string;
 }
 
+/** Sent as `target_audience` - a short descriptive sentence rather than a
+ * bare word, so the planner/writer prompts keep enough context to work
+ * with (replaces what used to be a free-text audience description). The
+ * first option is this course draft's default (see EMPTY_DRAFT). */
+export const LEVEL_OPTIONS: { value: string; label: string }[] = [
+  {
+    value: "Beginners with little to no prior experience in this subject.",
+    label: "Beginner",
+  },
+  {
+    value:
+      "Intermediate learners with some practical experience who want to deepen their skills.",
+    label: "Intermediate",
+  },
+  {
+    value: "Advanced practitioners seeking expert-level depth and nuance.",
+    label: "Advanced",
+  },
+];
+
 export type AgeGroup = "KG_PRIMARY" | "MIDDLE_SECONDARY" | "HIGHER_ED" | "PROFESSIONAL";
 export type EduLevel = "PRIMARY" | "SECONDARY" | "BACHELORS" | "MASTERS_PHD";
+/** Only meaningful when age_group === "PROFESSIONAL" - see
+ * backend/app/course/pedagogy.py's professional_profile_brief/seniority_brief,
+ * which apply the same gating. null = no opinion (no effect on generation). */
+export type ProfessionalProfile = "generalist" | "specialist";
+export type Seniority = "junior" | "middle" | "senior";
 
 /** Mirrors backend/app/schemas/learner.py - keep the two in sync. */
 export interface LearnerProfile {
@@ -43,7 +68,63 @@ export interface LearnerProfile {
   gamification_index: number;
   chunk_word_cap: number;
   manual_override: boolean;
+  professional_profile?: ProfessionalProfile | null;
+  seniority?: Seniority | null;
 }
+
+/** 1 = text only, 2 = text + diagrams/images (the default, unchanged
+ * pre-existing behaviour), 3 = provisional experiential-learning framing.
+ * See backend/app/agents/prompts.py's content_level_brief and
+ * backend/app/schemas/course.py's own field docstring. */
+export type ContentLevel = 1 | 2 | 3;
+
+export const CONTENT_LEVEL_LABELS: Record<ContentLevel, string> = {
+  1: "Text only",
+  2: "Text + diagrams/images",
+  3: "Experiential (scenarios & hands-on)",
+};
+
+export const CONTENT_LEVEL_HELP: Record<ContentLevel, string> = {
+  1: "No generated diagrams, flowcharts or illustrations - every concept explained in text alone.",
+  2: "The default. Text plus diagrams, flowcharts and illustrations where they genuinely help.",
+  3: "Provisional: in addition to level 2's content, prioritises realistic scenarios, decisions and hands-on practice where the topic supports them.",
+};
+
+/** HOW a concept is taught - independent of ContentLevel (which assets
+ * accompany it) and LearnerProfile (who it's for). Mirrors backend/app/
+ * schemas/course.py's LearningApproach Literal - keep the two in sync. */
+export type LearningApproach =
+  | "explanatory"
+  | "example_driven"
+  | "scenario_based"
+  | "situation_based"
+  | "hands_on"
+  | "conversational";
+
+export const LEARNING_APPROACH_OPTIONS: { value: LearningApproach; label: string; help: string }[] = [
+  { value: "explanatory", label: "Explanatory", help: "Conceptual understanding - what and why." },
+  { value: "example_driven", label: "Example-driven", help: "Real worked examples, step by step." },
+  {
+    value: "scenario_based",
+    label: "Scenario-based",
+    help: "Realistic contexts with objectives, constraints and decisions.",
+  },
+  {
+    value: "situation_based",
+    label: "Situation-based",
+    help: "A specific situation, evaluated across multiple possible responses.",
+  },
+  {
+    value: "hands_on",
+    label: "Hands-on",
+    help: "Actionable exercises with instructions and evaluation criteria.",
+  },
+  {
+    value: "conversational",
+    label: "Conversational",
+    help: "Written dialogue / guided Q&A, not live interactive tutoring.",
+  },
+];
 
 export interface CourseInput {
   course_title: string;
@@ -60,6 +141,10 @@ export interface CourseInput {
    * pair (resolved from `template`); set to `uploaded:{uuid}` when the user
    * picked an uploaded DOCX template. */
   template_id_override?: string | null;
+  /** Defaults to 2 server-side when omitted - see ContentLevel above. */
+  content_level?: ContentLevel;
+  /** Defaults to [] server-side when omitted - see LearningApproach above. */
+  learning_approaches?: LearningApproach[];
 }
 
 export interface CreateCourseRequest extends CourseInput {

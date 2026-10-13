@@ -145,6 +145,132 @@ def code_cell_guidance(template: CourseTemplate) -> str:
 """
 
 
+def content_level_brief(content_level: int) -> str:
+    """MOM Phase 4 - "" at level 2 (the existing default/only behaviour
+    before this feature existed), which is what keeps every pre-existing
+    course's prompts byte-identical, same contract as `learner_brief`
+    returning "" for `profile=None`.
+
+    Level 1 is enforced in TWO places, not just here: this prompt line
+    tells the writer not to plan/request any image block in the first
+    place (so the document never contains an empty/ungenerated visual
+    placeholder - a real, confirmed failure mode this avoids), and
+    CourseService.generate separately forces `generate_images=False`
+    regardless of the request's own override, as a structural backstop in
+    case the model asks for one anyway.
+
+    Level 3 is explicitly the MOM's own PROVISIONAL interpretation, not a
+    finalised spec - this is a prompt-level framing shift only (ask for
+    realistic scenarios/decisions/hands-on activities where the topic
+    supports them), not a separate generation pipeline or a new block type;
+    it still goes through the exact same block types (exercise/challenge/
+    case_study/story) the writer already has, just asked for more
+    deliberately and more often."""
+    if content_level == 1:
+        return (
+            "CONTENT LEVEL 1 - TEXT ONLY: do not plan or request any `image` "
+            "block of any kind (no diagrams, no flowcharts, no illustrations, "
+            "no section-intro icons) for this course. Every concept must be "
+            "explained in text alone - use headings, definitions, examples, "
+            "tables and code blocks as needed, but never an image block."
+        )
+    if content_level == 3:
+        return (
+            "CONTENT LEVEL 3 - EXPERIENTIAL LEARNING: beyond the course's "
+            "normal explanatory content, prioritise realistic scenarios, "
+            "situation-based decisions and hands-on practice wherever the "
+            "topic genuinely supports them - use `story`/`case_study` blocks "
+            "for realistic scenarios, `exercise`/`challenge` blocks for "
+            "hands-on activities with clear instructions and expected "
+            "outputs, and favour decisions made under realistic, sometimes "
+            "incomplete information over purely abstract explanation. This "
+            "is additive to the course's normal content, not a replacement "
+            "for explaining the underlying concepts clearly."
+        )
+    return ""
+
+
+# MOM Phase 5 - learning approaches: HOW a concept is taught. Each entry
+# names the EXISTING block type(s) it reuses (never invents a new one, per
+# the MOM's own "reuse existing content primitives" instruction) and states
+# the concrete content shape, not just a label - the MOM explicitly warns
+# against "merely inserting a heading such as 'Case Study' without
+# meaningful content", so every instruction below ties the approach to a
+# real structural requirement the reviewer can actually check for.
+_LEARNING_APPROACH_GUIDANCE: dict[str, str] = {
+    # The pre-existing default behaviour (conceptual explanation via
+    # paragraphs/definitions) - included for completeness and for when it's
+    # combined with other approaches, but adds no new instruction on its own.
+    "explanatory": (
+        "Explanatory: focus on conceptual understanding - what the concept is, "
+        "why it works, and how its parts relate. This is the baseline the "
+        "course already provides; when combined with other approaches below, "
+        "keep the conceptual explanation intact rather than replacing it."
+    ),
+    "example_driven": (
+        "Example-driven: include genuinely worked examples, not just a labelled "
+        "heading - show the concrete input, the step-by-step working, and the "
+        "resulting output (a `code`/`code_cell` block for a technical worked "
+        "example, a `callout` or `paragraph` walkthrough otherwise). Include at "
+        "least one common mistake and its correction where that is realistic "
+        "for the topic."
+    ),
+    "scenario_based": (
+        "Scenario-based: use `story`/`case_study` blocks to set up a realistic, "
+        "specific context with an explicit objective, real constraints, a "
+        "decision actually made, and the plausible consequences of that "
+        "decision - not a generic, interchangeable anecdote. State what was "
+        "decided and why, not just what happened."
+    ),
+    "situation_based": (
+        "Situation-based: use a `case_study` or `exercise` block to present ONE "
+        "specific situation that requires judgment, then evaluate at least two "
+        "plausible responses to it - explain concretely why each response is "
+        "suitable or unsuitable in this situation, not in the abstract."
+    ),
+    "hands_on": (
+        "Hands-on: use `exercise`/`challenge` blocks with everything the "
+        "learner actually needs to DO the activity - clear step-by-step "
+        "instructions, any required inputs/prerequisites, exactly what "
+        "deliverable is expected, and explicit criteria for judging whether "
+        "it was done correctly. For a technical topic, prefer a `code_cell` "
+        "the learner can actually run over a purely descriptive exercise."
+    ),
+    "conversational": (
+        "Conversational: present the explanation as a realistic dialogue or a "
+        "sequence of guided questions-and-answers (a learner's likely question, "
+        "followed by a direct answer, building progressively) rather than a "
+        "lecture-style block of prose. This is a STATIC, written dialogue "
+        "format (this application does not provide live interactive tutoring) "
+        "- never claim or imply the reader can actually ask a follow-up "
+        "question."
+    ),
+}
+
+
+def learning_approaches_brief(approaches: list[str]) -> str:
+    """"" for an empty list - the pre-existing default (the writer judges
+    which approach fits each section on its own) - same contract as
+    `content_level_brief` returning "" at level 2. For 2+ approaches, asks
+    the writer to combine them coherently within the same content rather
+    than generating one repetitive section per approach - a real, MOM-
+    flagged failure mode ("combine coherently, not repetitive content") this
+    line exists specifically to prevent."""
+    valid = [a for a in approaches if a in _LEARNING_APPROACH_GUIDANCE]
+    if not valid:
+        return ""
+    lines = ["LEARNING APPROACH(ES) FOR THIS COURSE - apply throughout, not just in one section:"]
+    lines.extend(f"- {_LEARNING_APPROACH_GUIDANCE[a]}" for a in valid)
+    if len(valid) > 1:
+        lines.append(
+            "- When combining the approaches above, weave them into the SAME "
+            "content coherently (e.g. a scenario that then poses a hands-on "
+            "exercise) rather than generating one repetitive, separate section "
+            "per approach."
+        )
+    return "\n".join(lines)
+
+
 def _course_context(course_input: CourseInput, template: CourseTemplate) -> str:
     toc_lines = []
     for index, item in enumerate(course_input.toc, start=1):
@@ -169,7 +295,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}"""
+{_appended(learner_brief(course_input.learner_profile))}{_appended(content_level_brief(course_input.content_level))}{_appended(learning_approaches_brief(course_input.learning_approaches))}"""
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +886,12 @@ any other issue.
 Set `technical_correctness` for technical courses (also judging code quality) and
 `practical_relevance` for non-technical courses. Leave the other one null.
 
+When the prompt includes a CHAPTER CONTRACT, treat it as the planner's own
+definition of what this chapter must cover - check the written chapter against
+it and report any planned section, key point or key concept it doesn't
+actually address (in substance, not necessarily the exact wording) as an
+issue with category "completeness", per the severity rule stated there.
+
 Set `approved` to false only when something must change before publication.
 Report every problem as an issue with a severity of blocker, major or minor, the
 index of the offending block, and a concrete suggested fix. Do not rewrite the
@@ -828,6 +960,54 @@ def chapter_projection(blocks: list[dict], limit: int = 20000) -> str:
     return rendered
 
 
+def chapter_contract_brief(chapter: BlueprintChapter) -> str:
+    """MOM Phase 7 - section completeness contract.
+
+    The planner already produces a real, per-chapter contract
+    (`BlueprintChapter.objective`/`sections[].key_points`/`key_concepts`/
+    `prerequisites`) - this is not a new schema, just the first thing that
+    actually SHOWS it to the reviewer so coverage can be judged against it.
+    Before this, the reviewer only ever saw the chapter title; it had no way
+    to know what topics the chapter was supposed to cover, so nothing could
+    ever flag a missing one. Topic/concept coverage is meaning-dependent
+    (a model can cover "memory layout" without using that exact phrase), so
+    this is deliberately handled by the reviewer's own semantic judgement
+    (see REVIEWER_SYSTEM's "CHAPTER CONTRACT" instruction) rather than a
+    brittle keyword-match - the deterministic half of completeness checking
+    (empty headings, abrupt endings, broken code) lives in
+    `_section_completeness_issues` instead, which doesn't need judgement.
+
+    Returns "" when the chapter carries none of this (e.g. a hand-built
+    chapter in a test, or a blueprint from before this field existed) so
+    the reviewer prompt is unchanged for those - same contract as every
+    other `_brief` function in this module.
+    """
+    sections = [s for s in chapter.sections if s.title.strip()]
+    has_content = bool(
+        chapter.objective.strip() or sections or chapter.key_concepts or chapter.prerequisites
+    )
+    if not has_content:
+        return ""
+    lines = ["CHAPTER CONTRACT (what the planner intended this chapter to cover):"]
+    if chapter.objective.strip():
+        lines.append(f"- Objective: {chapter.objective.strip()}")
+    if chapter.prerequisites:
+        lines.append(f"- Assumes the reader already knows: {', '.join(chapter.prerequisites)}")
+    for section in sections:
+        points = ", ".join(section.key_points) if section.key_points else "(no key points listed)"
+        lines.append(f"- Planned section \"{section.title}\": {points}")
+    if chapter.key_concepts:
+        lines.append(f"- Key concepts that must be covered: {', '.join(chapter.key_concepts)}")
+    lines.append(
+        "- Check the chapter against this contract: if a planned section, key point or key "
+        "concept above is not actually covered anywhere in the chapter (not just absent from "
+        "a heading - the content may cover it under different wording), report it as an issue "
+        "with category 'completeness' - severity 'major' if an entire planned section or key "
+        "concept is missing, 'minor' if it's present but only thinly covered."
+    )
+    return "\n".join(lines)
+
+
 def reviewer_user(
     blueprint: CourseBlueprint,
     chapter: BlueprintChapter,
@@ -853,7 +1033,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}
+{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}{_appended(chapter_contract_brief(chapter))}
 REQUIRED TEMPLATE SECTIONS: {", ".join(s.key for s in template.required_sections())}
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE REVIEW FOCUS:

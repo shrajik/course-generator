@@ -187,6 +187,46 @@ async def export_pdf(
     )
 
 
+@router.get("/{document_id}/export/pdf/download")
+async def download_exported_pdf(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> FileResponse:
+    """Serve the already-exported PDF (written by `export_pdf` above) as a
+    plain GET, for the frontend to trigger as a native browser download
+    (an `<a href>`/`window.open` navigation) instead of a `fetch().blob()`.
+
+    A real, confirmed bug this exists to work around: this project's own
+    course PDFs run 10+ MB, and `fetch()`'s `.blob()` needs the ENTIRE
+    response body to arrive as one unbroken stream before it resolves - a
+    connection hiccup partway through a large transfer over a local Docker
+    port-forward (seen reproducibly, not just once) throws a bare, generic
+    error client-side even though the server had already finished writing
+    every byte (its own logs show 200 OK every time). A native browser
+    download doesn't have that all-or-nothing requirement - the OS/browser
+    download manager streams straight to disk and is far more resilient to
+    exactly this kind of mid-transfer blip. POST .../export/pdf (above)
+    still does the actual rendering (and still works as a direct download
+    for a caller that doesn't need this extra resilience, e.g. a script);
+    this endpoint only serves what's already on disk, never regenerates it,
+    so GETting it before an export has ever run is a 404, not silent
+    nonsense."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    path = service.storage.pdf_path(course_id)
+    if not path.exists():
+        from app.core.errors import NotFoundError
+
+        raise NotFoundError("No exported PDF yet for this document - call export/pdf first")
+    document = await service.load(document_id)
+    return FileResponse(
+        path=str(path),
+        media_type="application/pdf",
+        filename=f"{slugify(document.course_title)}.pdf",
+    )
+
+
 @router.get("/{document_id}/preview", response_class=HTMLResponse)
 async def preview_html(
     document_id: str,

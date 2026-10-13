@@ -114,6 +114,25 @@ class Page(BaseModel):
     blocks: list[Block] = Field(default_factory=list)
 
 
+class SourceRecord(BaseModel):
+    """One external source cited anywhere in the document - the structured
+    counterpart to the "Sources" page `document.document.builder` renders as
+    plain content blocks. Deduplicated by `url` across the whole course (see
+    `_collect_sources`); `chapter_ids` records every chapter that cited it,
+    so a reference used in two chapters appears once here, not twice.
+
+    Sourced from `ChapterResearch.payload.references` (app.schemas.research),
+    which itself only ever holds real API-returned citations or references
+    the model explicitly offered during research - never invented here."""
+
+    model_config = ConfigDict(extra="allow")
+
+    title: str = ""
+    url: str = ""
+    note: str = ""
+    chapter_ids: list[str] = Field(default_factory=list)
+
+
 class DocumentMeta(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -122,6 +141,14 @@ class DocumentMeta(BaseModel):
     chapter_ids: list[str] = Field(default_factory=list)
     theme: dict[str, Any] = Field(default_factory=dict)
     generated_with: str = ""
+    # Every distinct external source cited anywhere in the course, deduped by
+    # URL - the same data the rendered "Sources" page (end of document) is
+    # built from, kept here too in structured form for the API/admin view.
+    # Empty when no chapter's research returned any real citation (e.g. mock
+    # mode, or research skipped) - the rendered page discloses that basis
+    # instead of inventing references; this list simply stays empty, it is
+    # never backfilled with anything fabricated.
+    sources: list[SourceRecord] = Field(default_factory=list)
 
 
 class CourseDocument(BaseModel):

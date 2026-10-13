@@ -21,6 +21,7 @@ from app.schemas.document import (
     DocumentMeta,
     Page,
     PageSize,
+    SourceRecord,
 )
 from app.schemas.draft import GeneratedChapter
 from app.schemas.template import CourseTemplate
@@ -235,6 +236,89 @@ def _toc_page(
     )
 
 
+# --- sources (MOM Phase 2.1) -------------------------------------------------
+
+
+def _collect_sources(
+    chapters: list[GeneratedChapter], storage: StorageService, course_id: str
+) -> list[SourceRecord]:
+    """Every distinct external source cited anywhere in the course - read
+    back from each chapter's own already-persisted research artifact (see
+    ResearchAgent._merge_citations / storage.save_research), deduplicated by
+    URL, in first-seen order. Never invents a reference: a chapter with no
+    research on disk (mock mode, research skipped, a course generated before
+    this feature existed) simply contributes none - see "never fabricate...
+    sources" in the MOM."""
+    by_url: dict[str, SourceRecord] = {}
+    order: list[str] = []
+    for chapter in chapters:
+        if not storage.has_research(course_id, chapter.chapter_id, chapter.chapter_number):
+            continue
+        try:
+            research = storage.load_research(course_id, chapter.chapter_id, chapter.chapter_number)
+        except Exception:  # noqa: BLE001 - a corrupt/missing research file must never break document assembly
+            log.warning("Could not load research for %s while collecting sources", chapter.chapter_id)
+            continue
+        for reference in research.payload.references:
+            url = reference.url.strip()
+            if not url:
+                continue
+            record = by_url.get(url)
+            if record is None:
+                by_url[url] = SourceRecord(
+                    title=reference.title or url,
+                    url=url,
+                    note=reference.note,
+                    chapter_ids=[chapter.chapter_id],
+                )
+                order.append(url)
+            elif chapter.chapter_id not in record.chapter_ids:
+                record.chapter_ids.append(chapter.chapter_id)
+    return [by_url[url] for url in order]
+
+
+#  Every source block carries this section_key - NOT a distinct page `kind`,
+#  so it keeps ordinary "content" page rendering (page footer, validator
+#  coverage, etc.) exactly like a real chapter page. `reflow_document` below
+#  uses this marker to keep sources out of the general chapter-content remix
+#  after an edit, so they stay together at the end instead of getting
+#  reshuffled in among whichever chapter content they happen to reflow next to.
+SOURCES_SECTION_KEY = "sources"
+
+
+def _source_blocks(sources: list[SourceRecord]) -> list[Block]:
+    """Heading + one paragraph per source, laid out by the same `flow_blocks`
+    every other page already uses - no bespoke renderer. When `sources` is
+    empty, discloses the real basis of the content instead of silently
+    omitting the section or inventing references (MOM Phase 2.1: "If an
+    output is based entirely on... internal knowledge, accurately disclose
+    the basis of the content")."""
+    meta = BlockMeta(origin="system", section_key=SOURCES_SECTION_KEY)
+    blocks: list[Block] = [
+        Block(type=BlockType.HEADING, content={"text": "Sources", "level": 1}, meta=meta.model_copy())
+    ]
+    if not sources:
+        blocks.append(
+            Block(
+                type=BlockType.PARAGRAPH,
+                content={
+                    "text": (
+                        "This course was generated without citable external web sources - its "
+                        "content is based on the writing model's own training knowledge rather "
+                        "than retrieved research material."
+                    )
+                },
+                meta=meta.model_copy(),
+            )
+        )
+        return blocks
+    for source in sources:
+        label = source.title or source.url
+        text = f"{label} — {source.url}" if source.url and source.url != label else label
+        blocks.append(Block(type=BlockType.PARAGRAPH, content={"text": text}, meta=meta.model_copy()))
+    return blocks
+
+
 def blocks_from_chapters(chapters: list[GeneratedChapter]) -> list[Block]:
     blocks: list[Block] = []
     for chapter in chapters:
@@ -261,6 +345,7 @@ def build_document(
     # The template's own page box - built-ins declare none and therefore get
     # exactly the box the layout engine has always used.
     geometry = template.theme.geometry()
+    storage = storage or get_storage()
     content_blocks = blocks_from_chapters(chapters)
     pages: list[Page] = []
 
@@ -273,7 +358,7 @@ def build_document(
                     template,
                     course_title=blueprint.course_title,
                     course_id=course_id,
-                    storage=storage or get_storage(),
+                    storage=storage,
                 )
             )
 
@@ -284,6 +369,24 @@ def build_document(
             Page(
                 id=page_id(number),
                 page_number=number,
+                kind="content",
+                size=_page_size_for(page_blocks, geometry),
+                background=template.theme.page_background,
+                blocks=page_blocks,
+            )
+        )
+
+    # Sources - always appended at the end (MOM Phase 2.1). A separate
+    # flow_blocks pass, never mixed into the chapter content loop above, so
+    # it reliably starts on its own fresh page(s) rather than tacking onto
+    # whatever space happened to be left on the last chapter's page.
+    sources = _collect_sources(chapters, storage, course_id)
+    source_blocks = _source_blocks(sources)
+    for page_blocks in flow_blocks(source_blocks, geometry=geometry):
+        pages.append(
+            Page(
+                id=page_id(len(pages) + 1),
+                page_number=len(pages) + 1,
                 kind="content",
                 size=_page_size_for(page_blocks, geometry),
                 background=template.theme.page_background,
@@ -305,6 +408,7 @@ def build_document(
             chapter_ids=[chapter.chapter_id for chapter in chapters],
             theme=template.theme.model_dump(mode="json"),
             generated_with="course-creator-poc",
+            sources=sources,
         ),
         pages=pages,
     )
@@ -323,16 +427,36 @@ def reflow_document(document: CourseDocument, template: CourseTemplate) -> Cours
     """Re-paginate content pages after an edit, preserving front matter."""
     geometry = template.theme.geometry()
     front = [page for page in document.pages if page.kind in {"cover", "toc"}]
-    content_blocks = [
+    all_content_blocks = [
         block for page in document.pages if page.kind == "content" for block in page.blocks
     ]
+    # Sources (see _source_blocks/SOURCES_SECTION_KEY) are real "content"-kind
+    # pages (so they keep normal footer/rendering), but must never get
+    # reshuffled in among chapter content by a generic reflow - keep them out
+    # of the main remix and re-flow them separately, still at the end.
+    content_blocks = [
+        block for block in all_content_blocks if block.meta.section_key != SOURCES_SECTION_KEY
+    ]
+    source_blocks = [
+        block for block in all_content_blocks if block.meta.section_key == SOURCES_SECTION_KEY
+    ]
     pages = list(front)
-    for index, page_blocks in enumerate(flow_blocks(content_blocks, geometry=geometry), start=1):
-        number = len(front) + index
+    for page_blocks in flow_blocks(content_blocks, geometry=geometry):
         pages.append(
             Page(
-                id=page_id(number),
-                page_number=number,
+                id=page_id(len(pages) + 1),
+                page_number=len(pages) + 1,
+                kind="content",
+                size=_page_size_for(page_blocks, geometry),
+                background=template.theme.page_background,
+                blocks=page_blocks,
+            )
+        )
+    for page_blocks in flow_blocks(source_blocks, geometry=geometry):
+        pages.append(
+            Page(
+                id=page_id(len(pages) + 1),
+                page_number=len(pages) + 1,
                 kind="content",
                 size=_page_size_for(page_blocks, geometry),
                 background=template.theme.page_background,

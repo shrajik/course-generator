@@ -33,7 +33,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AIServiceError
 from app.core.logging import get_logger
 from app.core.metrics import CallRecord, current_metrics
-from app.services import azure_image_provider
+from app.services import azure_image_provider, azure_mai_image_provider
 
 log = get_logger(__name__)
 
@@ -230,11 +230,17 @@ class OpenAIClient(AIClient):
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._client = None
+        self._azure_clients: dict[str, Any] = {}  # keyed by endpoint URL
         self._unavailable_models: set[str] = set()
 
     # --- plumbing ---------------------------------------------------------
     @property
     def client(self):
+        """The plain OpenAI client - used for ONE thing only as of the Azure
+        text-model migration: `embed()`. Every text-generation path
+        (`structured`/`research`) goes through `_client_for` instead, which
+        never reads `openai_api_key` - see that setting's own docstring for
+        why embeddings alone stayed on direct OpenAI."""
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
@@ -251,6 +257,67 @@ class OpenAIClient(AIClient):
                 kwargs["base_url"] = self.settings.openai_base_url
             self._client = AsyncOpenAI(**kwargs)
         return self._client
+
+    # Logical model name -> which Settings fields carry its Azure resource.
+    # Every text-generation request in this application names one of these
+    # three logical models (writer_model/editor_model/.../deep_research_model
+    # all default to one of them) - a name outside this table is a real
+    # misconfiguration, not a value this method should silently guess at.
+    _AZURE_TEXT_MODELS: dict[str, tuple[str, str, str]] = {
+        "gpt-5": ("azure_gpt5_endpoint", "azure_gpt5_api_key", "azure_gpt5_deployment"),
+        "gpt-5-mini": ("azure_gpt5_mini_endpoint", "azure_gpt5_mini_api_key", "azure_gpt5_mini_deployment"),
+        "gpt-5.5": ("azure_gpt55_endpoint", "azure_gpt55_api_key", "azure_gpt55_deployment"),
+    }
+
+    def _client_for(self, model_name: str) -> tuple[Any, str]:
+        """Resolve a logical model name (e.g. "gpt-5-mini", from
+        settings.writer_model/.../deep_research_model) to the (client,
+        deployment_name) pair the actual API call must use.
+
+        Each of the 3 models is its own Azure resource with its own
+        endpoint/key/deployment - confirmed from Microsoft's own docs
+        (the "Web search with the Responses API" how-to): Azure's
+        `/openai/v1/` compatibility endpoint works with the PLAIN
+        `AsyncOpenAI` SDK client unmodified, just `base_url`+`api_key`
+        pointed at that resource - no `AsyncAzureOpenAI`, no `api-version`.
+        One client per resource is cached (keyed by endpoint) rather than
+        rebuilt per call. The `model` field on the actual request must be
+        the DEPLOYMENT name, never the logical name, unless they happen to
+        be spelled the same - callers use the returned `deployment_name`
+        for that field, never `model_name` itself.
+
+        Raises AIServiceError with a specific, actionable message (naming
+        the exact missing env vars) for an unrecognised model name or an
+        incompletely-configured resource - never silently falls through to
+        the plain OpenAI client (see `client` above, which this method
+        never touches)."""
+        fields = self._AZURE_TEXT_MODELS.get(model_name)
+        if fields is None:
+            raise AIServiceError(
+                f"Unknown model {model_name!r} - no Azure deployment is configured for it. "
+                f"Expected one of: {', '.join(self._AZURE_TEXT_MODELS)}"
+            )
+        endpoint_field, api_key_field, deployment_field = fields
+        endpoint = getattr(self.settings, endpoint_field)
+        api_key = getattr(self.settings, api_key_field)
+        deployment = getattr(self.settings, deployment_field)
+        if not (endpoint.strip() and api_key.strip() and deployment.strip()):
+            raise AIServiceError(
+                f"Azure configuration for model {model_name!r} is incomplete - set "
+                f"{endpoint_field.upper()}, {api_key_field.upper()} and {deployment_field.upper()}"
+            )
+        if endpoint not in self._azure_clients:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError as exc:  # pragma: no cover
+                raise AIServiceError("The `openai` package is not installed") from exc
+            self._azure_clients[endpoint] = AsyncOpenAI(
+                base_url=endpoint,
+                api_key=api_key,
+                timeout=self.settings.request_timeout,
+                max_retries=0,  # we handle retries ourselves
+            )
+        return self._azure_clients[endpoint], deployment
 
     def _resolve_model(self, model: str) -> str:
         """Swap a model we already know is unavailable for the fallback."""
@@ -315,6 +382,8 @@ class OpenAIClient(AIClient):
         retries: int,
         usage: Any = None,
         failed: bool = False,
+        provider: str = "",
+        used_fallback: bool = False,
     ) -> None:
         metrics = current_metrics()
         if metrics is None:
@@ -339,6 +408,8 @@ class OpenAIClient(AIClient):
                 output_tokens=int(output_tokens),
                 retries=retries,
                 failed=failed,
+                provider=provider,
+                used_fallback=used_fallback,
             )
         )
 
@@ -385,8 +456,9 @@ class OpenAIClient(AIClient):
             stream_sink: StreamSink | None = None,
         ) -> str:
             nonlocal usage
+            client, deployment = self._client_for(name)
             kwargs: dict[str, Any] = {
-                "model": name,
+                "model": deployment,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -397,7 +469,7 @@ class OpenAIClient(AIClient):
                 kwargs["max_completion_tokens"] = max_output_tokens
 
             if stream_sink is None:
-                completion = await self.client.chat.completions.create(**kwargs)
+                completion = await client.chat.completions.create(**kwargs)
                 usage = getattr(completion, "usage", None)
                 return completion.choices[0].message.content or ""
 
@@ -407,7 +479,7 @@ class OpenAIClient(AIClient):
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
             parts: list[str] = []
-            stream = await self.client.chat.completions.create(**kwargs)
+            stream = await client.chat.completions.create(**kwargs)
             async for event in stream:
                 if getattr(event, "usage", None) is not None:
                     usage = event.usage
@@ -491,6 +563,8 @@ class OpenAIClient(AIClient):
                 retries=retries,
                 usage=usage,
                 failed=failed,
+                provider="azure",
+                used_fallback=model_name != requested,
             )
             if metrics:
                 metrics.call_finished()
@@ -513,7 +587,16 @@ class OpenAIClient(AIClient):
     ) -> ResearchResult:
         requested = self.settings.deep_research_model if deep else self.settings.research_model
         model_name = self._resolve_model(requested)
-        tool = {"type": "web_search_preview"} if deep else {"type": "web_search"}
+        # Both fast and deep use the current, recommended `web_search` tool -
+        # per Microsoft's own docs, the OLDER `web_search_preview` "is
+        # supported but not recommended. It has limitations." Deep research
+        # used `web_search_preview` before this migration because the old
+        # `o4-mini-deep-research` model was OpenAI's own specialised
+        # deep-research model with its own tool-variant expectations; now
+        # that deep research is `gpt-5.5` + `reasoning.effort` like any other
+        # Responses API call (see deep_research_reasoning_effort below), there
+        # is no reason left for fast/deep to use different tool types.
+        tool = {"type": "web_search"}
         instructions = system or "You are a meticulous research assistant."
         label = f"research[{'deep' if deep else 'fast'}]"
         started = time.perf_counter()
@@ -524,8 +607,9 @@ class OpenAIClient(AIClient):
         want_structured = schema is not None and self.settings.single_call_research
 
         async def call(tools: list[dict[str, Any]] | None, structured_output: bool):
+            client, deployment = self._client_for(model_name)
             kwargs: dict[str, Any] = {
-                "model": model_name,
+                "model": deployment,
                 "input": prompt,
                 "instructions": instructions,
             }
@@ -540,8 +624,14 @@ class OpenAIClient(AIClient):
                         "strict": False,
                     }
                 }
+            if deep and self.settings.deep_research_reasoning_effort:
+                # Genuine multi-step/agentic search, not just a bigger model
+                # doing one shallow search - see deep_research_reasoning_
+                # effort's own docstring (Settings) for why this is required,
+                # not optional, to preserve the old deep-research behaviour.
+                kwargs["reasoning"] = {"effort": self.settings.deep_research_reasoning_effort}
             if on_event is None:
-                return await self.client.responses.create(**kwargs)
+                return await client.responses.create(**kwargs)
 
             # Streaming path: same call, `stream=True`, translating the
             # web-search tool's own progress events into short lines while
@@ -550,7 +640,7 @@ class OpenAIClient(AIClient):
             # returns - every line below this function is unaffected by
             # which path produced that object.
             kwargs["stream"] = True
-            stream = await self.client.responses.create(**kwargs)
+            stream = await client.responses.create(**kwargs)
             final_response = None
             async for event in stream:
                 event_type = getattr(event, "type", None)
@@ -572,6 +662,7 @@ class OpenAIClient(AIClient):
         retries = 0
         response = None
         payload: dict[str, Any] | None = None
+        failed = True
 
         try:
             if want_structured:
@@ -613,6 +704,7 @@ class OpenAIClient(AIClient):
                             label + ":no-tools", phase, lambda: call(None, False)
                         )
 
+            failed = False
             return ResearchResult(
                 text=self._response_text(response),
                 citations=self._citations(response),
@@ -628,6 +720,9 @@ class OpenAIClient(AIClient):
                 started=started,
                 retries=retries,
                 usage=getattr(response, "usage", None),
+                failed=failed,
+                provider="azure",
+                used_fallback=model_name != requested,
             )
             if metrics:
                 metrics.call_finished()
@@ -665,19 +760,28 @@ class OpenAIClient(AIClient):
         self, *, prompt: str, size: str | None = None, phase: str = "image", provider: str | None = None
     ) -> bytes:
         """Dispatches on `provider` if given, else `settings.image_provider`
-        - "openai" (default) keeps the exact behaviour this method always
-        had; "azure" routes through app.services.azure_image_provider
-        instead. Never silently falls back from one to the other on an
-        unrecognised value - that could mask a real production
-        misconfiguration, so it fails clearly instead (see the user's own
-        "Do not silently fall back" requirement). Either path still returns
-        the same (prompt, size) -> PNG bytes contract every caller
-        (ImageService) already relies on."""
-        resolved = (provider or self.settings.image_provider or "openai").strip().lower()
+        (default "azure", FLUX.2-flex - see that field's own docstring for
+        why gpt-image-1 is no longer the default anywhere); "azure_mai"
+        routes through app.services.azure_mai_image_provider (MAI-Image-2.6)
+        instead; "openai" still works if explicitly configured. Never
+        silently falls back from one to another on an unrecognised value -
+        that could mask a real production misconfiguration, so it fails
+        clearly instead (see the user's own "Do not silently fall back"
+        requirement). The blank-config guard below also now defaults to
+        "azure", not "openai" - a genuinely unconfigured deployment fails
+        clearly on a missing Azure endpoint/key rather than silently
+        reaching gpt-image-1. Every path still returns the same (prompt,
+        size) -> PNG bytes contract every caller (ImageService) already
+        relies on."""
+        resolved = (provider or self.settings.image_provider or "azure").strip().lower()
         if resolved == "azure":
             return await self._image_azure(prompt=prompt, size=size, phase=phase)
+        if resolved == "azure_mai":
+            return await self._image_azure_mai(prompt=prompt, size=size, phase=phase)
         if resolved != "openai":
-            raise AIServiceError(f"Unsupported image_provider {resolved!r} - expected 'openai' or 'azure'")
+            raise AIServiceError(
+                f"Unsupported image_provider {resolved!r} - expected 'openai', 'azure' or 'azure_mai'"
+            )
         return await self._image_openai(prompt=prompt, size=size, phase=phase)
 
     async def _image_openai(
@@ -699,11 +803,13 @@ class OpenAIClient(AIClient):
             )
 
         retries = 0
+        failed = True
         try:
             response, retries = await self._with_retries("image", phase, call)
             item = response.data[0]
             b64 = getattr(item, "b64_json", None)
             if b64:
+                failed = False
                 return base64.b64decode(b64)
             url = getattr(item, "url", None)
             if url:
@@ -712,6 +818,7 @@ class OpenAIClient(AIClient):
                 async with httpx.AsyncClient(timeout=120) as http:
                     fetched = await http.get(url)
                     fetched.raise_for_status()
+                    failed = False
                     return fetched.content
             raise AIServiceError("Image response contained neither b64_json nor url")
         finally:
@@ -721,6 +828,8 @@ class OpenAIClient(AIClient):
                 model=self.settings.image_model,
                 started=started,
                 retries=retries,
+                failed=failed,
+                provider="openai",
             )
             if metrics:
                 metrics.call_finished()
@@ -756,6 +865,49 @@ class OpenAIClient(AIClient):
                 started=started,
                 retries=0,
                 failed=failed,
+                provider="azure",
+            )
+            if metrics:
+                metrics.call_finished()
+
+    async def _image_azure_mai(
+        self, *, prompt: str, size: str | None, phase: str
+    ) -> bytes:
+        """Microsoft Foundry MAI-Image-2.6 - see app.services.
+        azure_mai_image_provider.generate_image for the actual HTTP call,
+        retry policy and error handling (deliberately NOT a reuse of
+        `_with_retries`/`_is_retryable`, which assume OpenAI SDK exception
+        shapes - same reasoning as `_image_azure` above, and deliberately
+        NOT a reuse of azure_image_provider itself, since MAI-Image-2.6's
+        auth header and request body differ from FLUX.2-flex - see that
+        module's own docstring). This wrapper only adds the same
+        call-metrics recording every other image path gets, so generation
+        stays observable the same way regardless of which provider
+        answered. Any failure here propagates to the caller unchanged -
+        never silently retried against a different provider, since the
+        whole point of this route is to stop spending OpenAI credits on
+        textbook-style images."""
+        started = time.perf_counter()
+        metrics = current_metrics()
+        if metrics:
+            metrics.call_started()
+        failed = False
+        try:
+            return await azure_mai_image_provider.generate_image(
+                prompt=prompt, size=size or self.settings.image_size, settings=self.settings
+            )
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._record(
+                kind="image",
+                purpose="image",
+                model="MAI-Image-2.6",
+                started=started,
+                retries=0,
+                failed=failed,
+                provider="azure_mai",
             )
             if metrics:
                 metrics.call_finished()
@@ -797,6 +949,7 @@ class OpenAIClient(AIClient):
                 retries=retries,
                 usage=usage,
                 failed=failed,
+                provider="openai",
             )
             if metrics:
                 metrics.call_finished()

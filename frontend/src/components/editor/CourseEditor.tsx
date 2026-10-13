@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils/cn";
 import { AiAssistant } from "./AiAssistant";
 import { BlocksPanel } from "./BlocksPanel";
 import { Canvas } from "./Canvas";
@@ -11,11 +12,13 @@ import { EditorToolbar } from "./EditorToolbar";
 import { LeftRail, type RailPanel } from "./LeftRail";
 import { PageSidebar } from "./PageSidebar";
 import { PropertiesPanel } from "./PropertiesPanel";
+import { QualityPanel } from "./QualityPanel";
 import { UploadsPanel } from "./UploadsPanel";
 import { ApiError } from "@/lib/api/client";
 import {
   aiEdit,
-  exportPdf,
+  exportedPdfDownloadUrl,
+  generateExportedPdf,
   getDocument,
   saveDocument,
   updateConceptVisualSpec,
@@ -325,10 +328,23 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       if (editor.dirty && editor.document) {
         await saveManualEdits(editor.document);
       }
-      const blob = await exportPdf(documentId);
-      const url = URL.createObjectURL(blob);
+      // Real, confirmed, REPEATABLE (not just a one-off blip) failure this
+      // project's own 50+ page course hit: fetch().blob() needs a large
+      // (10+ MB) response to arrive as one unbroken stream before it
+      // resolves, and a connection hiccup partway through over a local
+      // Docker port-forward broke that 3 times in a row even though the
+      // server itself finished successfully every single time (its own
+      // logs showed 200 OK each time). Retrying the same fetch().blob()
+      // approach more didn't help - the fix is to not need an unbroken
+      // single JS-buffered transfer at all. generateExportedPdf (POST) does
+      // the actual rendering and returns a small, reliable JSON response;
+      // the real file then comes down via a NATIVE browser download
+      // (exportedPdfDownloadUrl, a GET navigation) - the OS/browser's own
+      // download manager streams straight to disk and tolerates exactly
+      // this kind of mid-transfer blip, unlike fetch().blob().
+      await generateExportedPdf(documentId);
       const link = document.createElement("a");
-      link.href = url;
+      link.href = exportedPdfDownloadUrl(documentId);
       link.download = `${(editor.document?.course_title ?? "course")
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
@@ -336,10 +352,18 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       document.body.appendChild(link);
       link.click();
       link.remove();
-      URL.revokeObjectURL(url);
       if (courseId) refreshActivity(courseId);
     } catch (caught) {
-      setAiError(caught instanceof ApiError ? caught.message : "PDF export failed.");
+      // A real, confirmed gap: this used to show the generic "PDF export
+      // failed." for ANY non-ApiError exception - including a real Error
+      // thrown by the save step, or by the generate/link-click code right
+      // above - discarding whatever `.message` it actually carried.
+      // Broadened to any Error instance so the real cause surfaces instead
+      // of a dead end, and logged in full (with its stack) so a future
+      // recurrence is diagnosable from the browser console even when the
+      // on-screen message is still generic (e.g. a thrown non-Error value).
+      console.error("PDF export failed:", caught);
+      setAiError(caught instanceof Error ? caught.message : "PDF export failed.");
     } finally {
       setExporting(false);
     }
@@ -429,10 +453,16 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       <div className="flex min-h-0 flex-1">
         <LeftRail panel={panel} onPanelChange={setPanel} />
 
-        <div className="w-[128px] shrink-0 border-r border-line bg-white">
+        <div
+          className={cn(
+            "shrink-0 border-r border-line bg-white",
+            panel === "quality" ? "w-[280px]" : "w-[128px]",
+          )}
+        >
           {panel === "pages" ? <PageSidebar /> : null}
           {panel === "blocks" ? <BlocksPanel /> : null}
           {panel === "uploads" ? <UploadsPanel /> : null}
+          {panel === "quality" ? <QualityPanel /> : null}
         </div>
 
         <div className="flex min-w-0 flex-1 flex-col">

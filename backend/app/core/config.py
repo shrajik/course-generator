@@ -23,9 +23,58 @@ class Settings(BaseSettings):
         protected_namespaces=(),
     )
 
-    # --- OpenAI -------------------------------------------------------------
+    # --- OpenAI ---------------------------------------------------------------
+    #  As of the Azure text-model migration, this key is used for ONE thing
+    #  only: `embed()` (app.services.openai_service) - text embeddings for
+    #  semantic memory. None of the three Azure deployments below are an
+    #  embedding model, so this subsystem was explicitly left out of the
+    #  migration's scope rather than silently routed anywhere - see
+    #  `enable_embeddings`'s own docstring; it already fails soft to
+    #  keyword-only search with no key configured at all. Every OTHER text
+    #  workflow (writer/editor/planner/reviewer/research/deep research) now
+    #  goes through the azure_gpt5*/azure_gpt55* settings below instead, and
+    #  never reads this key - see OpenAIClient._client_for.
     openai_api_key: str = ""
     openai_base_url: str | None = None
+
+    # --- Azure text models ----------------------------------------------------
+    #  Three separate Azure resources/deployments, one per model, each with
+    #  its own endpoint/key/deployment-name (confirmed from the official
+    #  "Web search with the Responses API" doc: Azure's /openai/v1/
+    #  compatibility endpoint works with the plain `AsyncOpenAI` SDK client
+    #  unmodified - just `base_url` + `api_key` pointed at Azure, no
+    #  `AsyncAzureOpenAI`, no `api-version` query param - so OpenAIClient
+    #  keeps using the same SDK class, just one instance per resource. The
+    #  `model` field on every actual request must be the DEPLOYMENT NAME
+    #  (`azure_gpt5_deployment` etc.), never the literal "gpt-5" unless that
+    #  happens to also be what you named the deployment - see
+    #  `_client_for`'s own docstring. `azure_*_endpoint` is the resource's
+    #  base `https://<resource>.openai.azure.com/openai/v1/` URL (NOT a
+    #  model-specific path - the deployment name goes in the request body,
+    #  not the URL, same convention as azure_mai_image_endpoint). All three
+    #  fields for a given model are required together - validated at call
+    #  time (OpenAIClient._client_for), not here, so constructing Settings
+    #  never fails just because a deployment isn't configured yet. Never
+    #  logged, never returned to a caller, never exposed to the frontend -
+    #  read server-side only, exactly like openai_api_key above.
+    azure_gpt5_endpoint: str = ""
+    azure_gpt5_api_key: str = ""
+    azure_gpt5_deployment: str = ""
+    azure_gpt5_mini_endpoint: str = ""
+    azure_gpt5_mini_api_key: str = ""
+    azure_gpt5_mini_deployment: str = ""
+    azure_gpt55_endpoint: str = ""
+    azure_gpt55_api_key: str = ""
+    azure_gpt55_deployment: str = ""
+    #  Genuine multi-step "deep research" behaviour on gpt-5.5 needs this
+    #  set explicitly - per Microsoft's own docs, the model alone doesn't
+    #  imply deep/agentic search; "Use this mode with o3-deep-research, or
+    #  with gpt-5.5 and reasoning.effort set to high or xhigh" (the old
+    #  `o4-mini-deep-research` model baked this behaviour in by itself,
+    #  which is exactly what's being replaced). Only ever sent on the `deep`
+    #  research call, never on a plain chat/structured call, and only when
+    #  the resolved model is reasoning-capable - see `research()`.
+    deep_research_reasoning_effort: str = "high"
 
     # Authoring quality matters most for the writer; planning, reviewing and
     # note-shaping are judgement/formatting tasks that a faster tier handles
@@ -36,7 +85,11 @@ class Settings(BaseSettings):
     planner_model: str = "gpt-5-mini"
     reviewer_model: str = "gpt-5-mini"
     research_model: str = "gpt-5-mini"
-    deep_research_model: str = "o4-mini-deep-research"
+    #  Migrated from "o4-mini-deep-research" (an OpenAI-specific specialised
+    #  deep-research model) to "gpt-5.5" - see deep_research_reasoning_effort
+    #  above for what actually makes this genuinely "deep" rather than a
+    #  single shallow search on a bigger model.
+    deep_research_model: str = "gpt-5.5"
     fallback_model: str = "gpt-5"
     image_model: str = "gpt-image-1"
     image_size: str = "1024x1024"
@@ -45,29 +98,51 @@ class Settings(BaseSettings):
     diagram_model: str = "gpt-5-mini"
 
     # --- image provider ------------------------------------------------------
-    #  "openai" (default) keeps the existing gpt-image-1 behaviour exactly as
-    #  before. "azure" routes raster image generation through Microsoft Azure
-    #  AI Foundry's FLUX.2-flex instead (see app.services.azure_image_provider)
-    #  - selected explicitly via configuration; OpenAIClient.image() never
-    #  silently falls back from one to the other, since that could mask a
-    #  real production misconfiguration rather than surface it.
-    image_provider: str = "openai"
-    #  A real, confirmed trade-off from a direct side-by-side comparison (3
-    #  topics, both providers, identical prompts): Azure's FLUX.2-flex
-    #  renders a cleaner, more consistent background/composition, but is
-    #  meaningfully less reliable at precise text - one real run produced a
-    #  genuinely garbled label ("Irrlstior" instead of "Indicator") and
-    #  missed requested labels outright on 2 of 3 topics (text_verified=
-    #  False), while gpt-image-1 rendered every requested label correctly,
-    #  spelled right, on all 3. A `textbook`-style illustration's whole job
-    #  is accurately depicting and labelling a real apparatus/structure (see
-    #  ImageContent.illustration_style / TEXTBOOK_ILLUSTRATION_GUIDANCE) -
-    #  text/label correctness matters far more there than for a purely
-    #  decorative illustration, so it overrides `image_provider` with this
-    #  setting instead (see ImageService._generate_illustration) rather than
-    #  switching every illustration over and paying gpt-image-1's higher
-    #  cost for pictures that never carry text in the first place.
-    textbook_image_provider: str = "openai"
+    #  Migrated from "openai" to "azure" (default, as of this setting):
+    #  gpt-image-1 is no longer used anywhere by default - the OpenAI account
+    #  this project was using ran out of image-generation credit, so every
+    #  raster illustration category now defaults to an Azure provider
+    #  instead. "azure" routes through Microsoft Azure AI Foundry's
+    #  FLUX.2-flex (see app.services.azure_image_provider) - this is what
+    #  section_intro icons and every other non-textbook illustration use.
+    #  "azure_mai" routes through Microsoft Foundry's MAI-Image-2.6 instead
+    #  (see app.services.azure_mai_image_provider, and
+    #  textbook_image_provider below, which overrides this default
+    #  specifically for `illustration_style: "textbook"`) - a separate value
+    #  from "azure" because its request/auth contract is genuinely different
+    #  from FLUX.2-flex (api-key header vs Bearer, deployment name in the
+    #  body), not just a different endpoint. "openai" still exists and still
+    #  works (e.g. for local testing against a different account) but is no
+    #  longer selected by default anywhere. Selected explicitly via
+    #  configuration; OpenAIClient.image() never silently falls back between
+    #  providers, since that could mask a real production misconfiguration
+    #  rather than surface it - so a genuinely unconfigured Azure deployment
+    #  fails clearly (a missing-endpoint/key error) rather than quietly
+    #  spending OpenAI credit again.
+    image_provider: str = "azure"
+    #  Migrated from "openai" to "azure_mai": textbook-style images now use
+    #  Microsoft Foundry's MAI-Image-2.6 (see app.services.
+    #  azure_mai_image_provider) instead of OpenAI's gpt-image-1, to use our
+    #  Azure deployment rather than OpenAI credits for this category.
+    #
+    #  History this override exists at all: an earlier real, confirmed
+    #  side-by-side comparison (3 topics, both providers, identical prompts)
+    #  found Azure's FLUX.2-flex meaningfully less reliable at precise text -
+    #  one real run produced a genuinely garbled label ("Irrlstior" instead
+    #  of "Indicator") and missed requested labels outright on 2 of 3 topics
+    #  (text_verified=False), while gpt-image-1 rendered every requested
+    #  label correctly on all 3. MAI-Image-2.6 is a different model with
+    #  Microsoft's own documented "stronger text rendering" claim versus
+    #  earlier MAI generations - not the same FLUX.2-flex tradeoff - but
+    #  `_verify_generated_text`'s bounded verify-and-retry in ImageService
+    #  stays in place regardless, so a real label failure is still caught
+    #  and flagged (text_verified=False) rather than silently shipped.
+    #  A `textbook`-style illustration's whole job is accurately depicting
+    #  and labelling a real apparatus/structure (see ImageContent.
+    #  illustration_style / TEXTBOOK_ILLUSTRATION_GUIDANCE), which is why
+    #  this category gets its own override instead of inheriting
+    #  `image_provider` (see ImageService._generate_illustration).
+    textbook_image_provider: str = "azure_mai"
     #  Azure AI Foundry FLUX.2-flex. Both are required only when
     #  image_provider == "azure" - validated at call time (in
     #  azure_image_provider.generate_image), not here, so constructing
@@ -76,6 +151,25 @@ class Settings(BaseSettings):
     #  read server-side only, exactly like openai_api_key above.
     azure_flux_endpoint: str = ""
     azure_flux_api_key: str = ""
+    #  Microsoft Foundry MAI-Image-2.6. All three are required only when
+    #  image_provider (or the per-call override, e.g. textbook_image_
+    #  provider) == "azure_mai" - validated at call time (in
+    #  azure_mai_image_provider.generate_image), not here, so constructing
+    #  Settings never fails just because Azure isn't configured. Never
+    #  logged, never returned to a caller, never exposed to the frontend -
+    #  read server-side only, exactly like openai_api_key above.
+    #  `azure_mai_image_endpoint` is the FULL generations URL (same
+    #  convention as azure_flux_endpoint above), e.g.
+    #  "https://<resource-name>.services.ai.azure.com/mai/v1/images/generations"
+    #  - not just the resource's base URL. `azure_mai_image_deployment` is
+    #  the deployment name assigned when the model was deployed in Foundry;
+    #  the API's own `model` request field must carry this deployment name,
+    #  never the literal string "MAI-Image-2.6" (see the official docs this
+    #  provider was built against: https://learn.microsoft.com/en-us/azure/
+    #  foundry/foundry-models/how-to/use-foundry-models-mai-image).
+    azure_mai_image_endpoint: str = ""
+    azure_mai_image_api_key: str = ""
+    azure_mai_image_deployment: str = ""
 
     # --- pipeline behaviour -------------------------------------------------
     research_mode: ResearchMode = "fast"
@@ -205,8 +299,27 @@ class Settings(BaseSettings):
     # --- derived ------------------------------------------------------------
     @property
     def use_mock_ai(self) -> bool:
-        """Mock client is used explicitly, or implicitly when no key is configured."""
-        return self.mock_openai or not self.openai_api_key.strip()
+        """Mock client is used explicitly, or implicitly when NOTHING at all is
+        configured for real text generation. Updated for the Azure migration:
+        `openai_api_key` alone no longer gates this - it's scoped to
+        embeddings only now (see its own docstring) and configuring it
+        alone must not make the app think real text generation is ready.
+        Real generation needs at least one of the three Azure text
+        deployments; `openai_api_key` is included in the OR only so a
+        pre-migration .env (key set, no Azure vars) still falls back to
+        mock cleanly instead of constructing a client that can't actually
+        serve writer/editor/etc - it never substitutes for a configured
+        Azure deployment once any text request is actually attempted (see
+        OpenAIClient._client_for, which never reads this key)."""
+        any_azure_text_model = any(
+            key.strip()
+            for key in (
+                self.azure_gpt5_api_key,
+                self.azure_gpt5_mini_api_key,
+                self.azure_gpt55_api_key,
+            )
+        )
+        return self.mock_openai or not (any_azure_text_model or self.openai_api_key.strip())
 
     @property
     def courses_dir(self) -> Path:
