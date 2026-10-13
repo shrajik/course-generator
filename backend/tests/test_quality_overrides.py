@@ -98,7 +98,10 @@ async def test_normal_approval_is_blocked_by_a_verification_failure(
     def _boom(document):
         raise RuntimeError("document mid-rebuild")
 
-    monkeypatch.setattr(qf_module, "validate_document", _boom)
+    # document_findings() now calls validate_document_structured() directly
+    # (Phase 3.3/3.4: structured layout findings) - patch that real call
+    # site, not the legacy validate_document() wrapper it no longer invokes.
+    monkeypatch.setattr(qf_module, "validate_document_structured", _boom)
     record = await service.create_course(technical_input)
     await service.generate(record.course_id, GenerateRequest(mode="sync"))
     await service.submit_for_review(record.course_id, actor_id=None)
@@ -115,7 +118,7 @@ async def test_override_approved_verification_failed_succeeds_with_evidence(
     def _boom(document):
         raise RuntimeError("document mid-rebuild")
 
-    monkeypatch.setattr(qf_module, "validate_document", _boom)
+    monkeypatch.setattr(qf_module, "validate_document_structured", _boom)
     record = await service.create_course(technical_input)
     await service.generate(record.course_id, GenerateRequest(mode="sync"))
     await service.submit_for_review(record.course_id, actor_id=None)
@@ -146,7 +149,7 @@ async def test_a_fresh_recomputation_after_the_verifier_recovers_approves_normal
     await service.submit_for_review(record.course_id, actor_id=None)
 
     calls = {"n": 0}
-    original = qf_module.validate_document
+    original = qf_module.validate_document_structured
 
     def _flaky(document):
         calls["n"] += 1
@@ -154,7 +157,10 @@ async def test_a_fresh_recomputation_after_the_verifier_recovers_approves_normal
             raise RuntimeError("transient failure")
         return original(document)
 
-    monkeypatch.setattr(qf_module, "validate_document", _flaky)
+    # document_findings() now calls validate_document_structured() directly
+    # (Phase 3.3/3.4: structured layout findings) - patch that real call
+    # site, not the legacy validate_document() wrapper it no longer invokes.
+    monkeypatch.setattr(qf_module, "validate_document_structured", _flaky)
 
     with pytest.raises(QualityApprovalBlockedError):
         await service.approve_course(record.course_id, reviewer_id="reviewer-1")

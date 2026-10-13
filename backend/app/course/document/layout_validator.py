@@ -24,6 +24,9 @@ page-splitting brief asks to catch.
 from __future__ import annotations
 
 import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from app.course.document.layout import BLOCK_GAP
 from app.schemas.blocks import VISUAL_BLOCK_TYPES, BlockType
@@ -39,6 +42,38 @@ from app.schemas.document import PAGE_MARGIN_BOTTOM, PAGE_MARGIN_TOP, Block, Cou
 # `.split("_c")` is wrong: this must only ever match a real `_c1` suffix
 # anchored to the end of the string.
 _SPLIT_SUFFIX_RE = re.compile(r"(?:_c1)+$")
+
+# Stable reason codes (quality-governance follow-up) - a caller (see
+# app.services.quality_framework.document_findings) classifies on THIS,
+# never on `LayoutFinding.message`'s English wording, which stays free to
+# be reworded without silently breaking severity/dimension policy.
+LayoutFindingReason = Literal[
+    "overlap",
+    "page_overflow",
+    "orphaned_fragment",
+    "stranded_visual_density",
+    "content_reordering",
+]
+
+
+class LayoutFinding(BaseModel):
+    """One structured layout-validation finding - the real detection output
+    of `validate_page_structured`/`validate_document_structured` below.
+    `validate_page`/`validate_document` (their existing, pre-this-change
+    names) are now thin derivations of these two - same detection logic,
+    same returned English text, just also available here with a stable
+    `reason` instead of only a sentence to parse.
+
+    `page_number` is the finding's own page, or the module's `DOCUMENT_LEVEL`
+    sentinel for the one cross-page check (`reason="content_reordering"`),
+    exactly matching the convention `validate_document`'s dict keys already
+    used before this model existed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: LayoutFindingReason
+    page_number: int
+    message: str
 
 
 def original_id(block_id: str) -> str:
@@ -137,36 +172,74 @@ def overlapping_pairs(page_blocks: list[Block]) -> list[tuple[str, str]]:
     return pairs
 
 
-def validate_page(page: Page) -> list[str]:
-    """Plain-English validation findings for one already-paginated page.
-    Empty list = the page is structurally sound. Only ever called on
-    content pages that have blocks - an empty page or a non-content page
-    (cover/toc) is a caller's decision, not a finding here."""
-    findings: list[str] = []
+def validate_page_structured(page: Page) -> list[LayoutFinding]:
+    """The real detection logic for one already-paginated page - the single
+    source of truth `validate_page` below derives its plain-English list
+    from, never a parallel reimplementation. Empty list = the page is
+    structurally sound. Only ever called on content pages that have blocks -
+    an empty page or a non-content page (cover/toc) is a caller's decision,
+    not a finding here."""
+    findings: list[LayoutFinding] = []
 
     overflow = page_overflow(page)
     if overflow > _TOLERANCE:
-        findings.append(f"content overflows page {page.page_number} by {overflow:.0f}px")
+        findings.append(
+            LayoutFinding(
+                reason="page_overflow",
+                page_number=page.page_number,
+                message=f"content overflows page {page.page_number} by {overflow:.0f}px",
+            )
+        )
 
     for a_id, b_id in overlapping_pairs(page.blocks):
-        findings.append(f"blocks '{a_id}' and '{b_id}' overlap on page {page.page_number}")
+        findings.append(
+            LayoutFinding(
+                reason="overlap",
+                page_number=page.page_number,
+                message=f"blocks '{a_id}' and '{b_id}' overlap on page {page.page_number}",
+            )
+        )
 
     total_height = sum(b.layout.height for b in page.blocks)
     if 0 < total_height < MIN_PAGE_CONTENT_HEIGHT:
         findings.append(
-            f"page {page.page_number} holds almost no content ({total_height:.0f}px) - "
-            "likely an orphaned fragment left behind by a split"
+            LayoutFinding(
+                reason="orphaned_fragment",
+                page_number=page.page_number,
+                message=(
+                    f"page {page.page_number} holds almost no content ({total_height:.0f}px) - "
+                    "likely an orphaned fragment left behind by a split"
+                ),
+            )
         )
 
     has_visual = any(b.type in VISUAL_BLOCK_TYPES for b in page.blocks)
     density = page_content_density(page)
     if has_visual and 0 < density < MIN_CONTENT_DENSITY:
         findings.append(
-            f"page {page.page_number} uses only {density:.0%} of the available page height - "
-            "likely a visual stranded with no accompanying content"
+            LayoutFinding(
+                reason="stranded_visual_density",
+                page_number=page.page_number,
+                message=(
+                    f"page {page.page_number} uses only {density:.0%} of the available page height - "
+                    "likely a visual stranded with no accompanying content"
+                ),
+            )
         )
 
     return findings
+
+
+def validate_page(page: Page) -> list[str]:
+    """Plain-English validation findings for one already-paginated page.
+    Empty list = the page is structurally sound. Only ever called on
+    content pages that have blocks - an empty page or a non-content page
+    (cover/toc) is a caller's decision, not a finding here.
+
+    Backward-compatible string view, derived from `validate_page_structured`
+    - identical wording/behaviour to before that function existed; see it
+    for the stable, English-independent reason codes."""
+    return [finding.message for finding in validate_page_structured(page)]
 
 
 # Key used in `validate_document`'s result for a finding that isn't about
@@ -175,27 +248,26 @@ def validate_page(page: Page) -> list[str]:
 DOCUMENT_LEVEL = 0
 
 
-def validate_document(
+def validate_document_structured(
     document: CourseDocument, *, original_block_order: list[str] | None = None
-) -> dict[int, list[str]]:
-    """Every content page's findings, keyed by page_number - only pages
-    with at least one finding are included. `original_block_order`, when
-    given, additionally checks that content wasn't reordered relative to
-    the full document's pre-layout sequence, checked GLOBALLY across every
-    content page (not just within one) since a real reordering bug could
-    just as easily swap material across a page boundary as within one page.
-    Ids not present in `original_block_order` (a block inserted after the
-    fact, e.g. by visual repair) are ignored by this check entirely - it is
-    never a finding for a document to have gained new content, only for its
-    original content to have been shuffled. Any mismatch is reported once,
-    under `DOCUMENT_LEVEL`, rather than attributed to a single page number."""
-    problems: dict[int, list[str]] = {}
+) -> list[LayoutFinding]:
+    """The real detection logic for a whole document - the single source of
+    truth `validate_document` below derives its existing dict[int, list[str]]
+    shape from, never a parallel reimplementation. `original_block_order`,
+    when given, additionally checks that content wasn't reordered relative
+    to the full document's pre-layout sequence, checked GLOBALLY across
+    every content page (not just within one) since a real reordering bug
+    could just as easily swap material across a page boundary as within one
+    page. Ids not present in `original_block_order` (a block inserted after
+    the fact, e.g. by visual repair) are ignored by this check entirely - it
+    is never a finding for a document to have gained new content, only for
+    its original content to have been shuffled. Any mismatch is reported
+    once, at `DOCUMENT_LEVEL`, rather than attributed to a single page."""
+    findings: list[LayoutFinding] = []
     for page in document.pages:
         if page.kind != "content" or not page.blocks:
             continue
-        findings = validate_page(page)
-        if findings:
-            problems[page.page_number] = findings
+        findings.extend(validate_page_structured(page))
 
     if original_block_order is not None:
         known = set(original_block_order)
@@ -219,10 +291,31 @@ def validate_document(
             rendered_known_order.append(bid)
         expected_order = [bid for bid in original_block_order if bid in set(rendered_known_order)]
         if rendered_known_order != expected_order:
-            problems.setdefault(DOCUMENT_LEVEL, []).append(
-                "original content was reordered relative to its pre-layout sequence"
+            findings.append(
+                LayoutFinding(
+                    reason="content_reordering",
+                    page_number=DOCUMENT_LEVEL,
+                    message="original content was reordered relative to its pre-layout sequence",
+                )
             )
 
+    return findings
+
+
+def validate_document(
+    document: CourseDocument, *, original_block_order: list[str] | None = None
+) -> dict[int, list[str]]:
+    """Every content page's findings, keyed by page_number - only pages
+    with at least one finding are included. See
+    `validate_document_structured` for the full behavioural contract
+    (original_block_order semantics included) and for the stable,
+    English-independent reason codes this derives from.
+
+    Backward-compatible dict[int, list[str]] view - identical shape and
+    wording to before `validate_document_structured` existed."""
+    problems: dict[int, list[str]] = {}
+    for finding in validate_document_structured(document, original_block_order=original_block_order):
+        problems.setdefault(finding.page_number, []).append(finding.message)
     return problems
 
 

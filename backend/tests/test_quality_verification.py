@@ -201,7 +201,10 @@ def test_document_findings_failure_is_verification_failed_not_an_exception(monke
     def _boom(document):
         raise RuntimeError("document mid-rebuild")
 
-    monkeypatch.setattr(qf_module, "validate_document", _boom)
+    # document_findings() now calls validate_document_structured() directly
+    # (Phase 3.3/3.4: structured layout findings) - patch that real call
+    # site, not the legacy validate_document() wrapper it no longer invokes.
+    monkeypatch.setattr(qf_module, "validate_document_structured", _boom)
     document = _document([_image_block(path="a.png", generated=True, error=None)])
     findings = document_findings(document)  # must not raise
     assert len(findings) == 1
@@ -215,6 +218,57 @@ def test_document_findings_failure_is_verification_failed_not_an_exception(monke
     # report computation (QualityEvaluationFailedError is a distinct category).
     report = build_course_quality_report(course_id="c1", chapters=[], document=document)
     assert report.approval_blocking_findings  # blocks approval, fail-closed
+
+
+# --- document_findings: structured reason codes, severity policy unchanged -
+# (Phase 3.3/3.4 - structured layout findings). No severity-policy decision
+# was approved as part of this change: every reason code below must still
+# map to "major", exactly as before validate_document_structured existed.
+
+
+def test_all_layout_reason_codes_currently_map_to_major_severity():
+    """Direct, exhaustive guard on the severity table itself - flipping any
+    of these to "blocker" is an unapproved policy change (see
+    QUALITY_STANDARDS_STATUS's own "proposed" status) this pass does not
+    make. Every reason code document_findings() can ever produce must be
+    present here, held at "major"."""
+    assert qf_module._LAYOUT_REASON_SEVERITY == {
+        "overlap": "major",
+        "page_overflow": "major",
+        "orphaned_fragment": "major",
+        "stranded_visual_density": "major",
+        "content_reordering": "major",
+    }
+
+
+def test_document_findings_classifies_a_genuine_overlap_as_major_with_a_stable_reason_code():
+    """End-to-end through document_findings() itself (not just the
+    severity table in isolation) - a real, structurally-detected overlap
+    must still be "major", classified via LayoutFinding.reason, with the
+    PUBLIC QualityFinding.reason staying the pre-existing "layout_defect"
+    (never split into per-category values, per this pass's explicit
+    backward-compatibility requirement)."""
+    a = Block(type=BlockType.PARAGRAPH, content={"text": "x"})
+    b = Block(type=BlockType.PARAGRAPH, content={"text": "y"})
+    a.layout.y = 100.0
+    a.layout.height = 60.0
+    b.layout.y = 100.0  # genuinely overlaps a
+    document = _document([a, b])
+
+    findings = document_findings(document)
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.severity == "major"
+    assert finding.reason == "layout_defect"
+    assert finding.verification_status == "independently_verified"
+    assert finding.verifier == "layout_validator"
+    assert f"'{a.id}' and '{b.id}'" in finding.description
+
+    report = build_course_quality_report(course_id="c1", chapters=[], document=document)
+    # "major", independently_verified severity never reaches the approval
+    # gate - approval_blocking_findings requires severity == "blocker".
+    assert report.approval_blocking_findings == []
+    assert report.hard_failures == []
 
 
 # --- visual_findings: deterministic vs vision-model judgment ----------------

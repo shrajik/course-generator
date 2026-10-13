@@ -54,7 +54,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
-from app.course.document.layout_validator import validate_document
+from app.course.document.layout_validator import DOCUMENT_LEVEL, validate_document_structured
 from app.schemas.blocks import BlockType
 from app.schemas.course import QualitySnapshot
 from app.schemas.document import CourseDocument
@@ -478,25 +478,48 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
     return findings
 
 
-def document_findings(document: CourseDocument) -> list[QualityFinding]:
-    """Wraps `app.course.document.layout_validator.validate_document` -
-    plain-string findings keyed by page number, normalised into the same
-    shape as every other dimension's findings. All layout findings are
-    "major": they indicate a rendering defect (clipped/overlapping content,
-    an orphaned page) a learner would actually see, but never block the
-    course from existing the way a missing required block does.
+# Severity policy for each structured layout reason code (quality-governance
+# follow-up, Phase 3.2/3.3 audit) - keyed by LayoutFinding.reason, a stable
+# code, never by matching `finding.message`'s English wording. Every value
+# below is deliberately "major", byte-identical to this module's
+# pre-existing behaviour: promoting any of these to "blocker" is a real
+# severity-POLICY change (see QUALITY_STANDARDS_STATUS's own "proposed"
+# status, and the Phase 3.2 audit's false-positive analysis for
+# "overlap"/"page_overflow" specifically) that no one has approved yet, and
+# this pass does not make it.
+_LAYOUT_REASON_SEVERITY: dict[str, str] = {
+    "overlap": "major",
+    "page_overflow": "major",
+    "orphaned_fragment": "major",
+    "stranded_visual_density": "major",
+    "content_reordering": "major",
+}
 
-    `validate_document` is a live call (recomputed on every report - see
-    `get_quality_report`'s own docstring) - a genuine verifier that can
-    itself fail transiently (e.g. a document mid-rebuild). A crash here is
-    reported as ONE "verification_failed" finding (fail-closed: severity
-    "blocker", so it still blocks approval until a fresh recomputation
-    succeeds or an admin override) rather than propagating and aborting the
-    whole report - a transient layout-check failure is a different, more
-    localized category of problem than the entire report computation
-    crashing (see QualityEvaluationFailedError)."""
+
+def document_findings(document: CourseDocument) -> list[QualityFinding]:
+    """Wraps `app.course.document.layout_validator.validate_document_structured`
+    - structured findings (a stable `reason` code plus the same English
+    `message` as before), normalised into the same shape as every other
+    dimension's findings. All layout findings are "major" today (see
+    `_LAYOUT_REASON_SEVERITY`): they indicate a rendering defect (clipped/
+    overlapping content, an orphaned page) a learner would actually see,
+    but never block the course from existing the way a missing required
+    block does. `QualityFinding.reason` stays the pre-existing
+    `"layout_defect"` for every category - only the internal severity
+    lookup is reason-coded, so no caller of the public quality report sees
+    a changed `reason` value.
+
+    `validate_document_structured` is a live call (recomputed on every
+    report - see `get_quality_report`'s own docstring) - a genuine verifier
+    that can itself fail transiently (e.g. a document mid-rebuild). A crash
+    here is reported as ONE "verification_failed" finding (fail-closed:
+    severity "blocker", so it still blocks approval until a fresh
+    recomputation succeeds or an admin override) rather than propagating
+    and aborting the whole report - a transient layout-check failure is a
+    different, more localized category of problem than the entire report
+    computation crashing (see QualityEvaluationFailedError)."""
     try:
-        problems = validate_document(document)
+        structured_findings = validate_document_structured(document)
     except Exception as exc:  # noqa: BLE001 - localize to the document dimension
         log.warning("Document layout verification failed for %s: %s", document.document_id, exc)
         return [
@@ -515,29 +538,30 @@ def document_findings(document: CourseDocument) -> list[QualityFinding]:
             )
         ]
 
-    from app.course.document.layout_validator import DOCUMENT_LEVEL
-
     findings: list[QualityFinding] = []
-    for page_number, texts in problems.items():
-        artifact = "document" if page_number == DOCUMENT_LEVEL else f"document:page_{page_number}"
-        for text in texts:
-            findings.append(
-                QualityFinding(
-                    artifact=artifact,
-                    dimension="document",
-                    severity="major",
-                    reason="layout_defect",
-                    description=text,
-                    remediation="Re-run pagination/layout for this document, or adjust the "
-                    "offending block's content so it fits its page.",
-                    source="layout_validator",
-                    # Pure geometry/structure checks (re.py + schema types
-                    # only, no AI dependency) - see layout_validator's own
-                    # module docstring.
-                    verification_status="independently_verified",
-                    verifier="layout_validator",
-                )
+    for finding in structured_findings:
+        artifact = (
+            "document"
+            if finding.page_number == DOCUMENT_LEVEL
+            else f"document:page_{finding.page_number}"
+        )
+        findings.append(
+            QualityFinding(
+                artifact=artifact,
+                dimension="document",
+                severity=_LAYOUT_REASON_SEVERITY[finding.reason],
+                reason="layout_defect",
+                description=finding.message,
+                remediation="Re-run pagination/layout for this document, or adjust the "
+                "offending block's content so it fits its page.",
+                source="layout_validator",
+                # Pure geometry/structure checks (re.py + schema types
+                # only, no AI dependency) - see layout_validator's own
+                # module docstring.
+                verification_status="independently_verified",
+                verifier="layout_validator",
             )
+        )
     return findings
 
 
