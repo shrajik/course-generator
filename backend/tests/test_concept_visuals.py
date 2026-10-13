@@ -42,7 +42,7 @@ from app.schemas.diagram import (
     VisualStep,
     VisualTransition,
 )
-from app.schemas.document import Block
+from app.schemas.document import Block, CourseDocument, Page
 from app.schemas.template import TemplateTheme
 from app.services import mock_ai as mock_ai_module
 from app.services.concept_qa import (
@@ -59,6 +59,7 @@ from app.services.concept_qa import (
 )
 from app.services.concept_visual_service import ConceptVisualService
 from app.services.mock_ai import MockAIClient
+from app.services.quality_framework import visual_findings
 from app.services.visual_planner import VisualPlanner
 from tests.test_pdf import needs_browser
 
@@ -1761,6 +1762,38 @@ class TestConceptQASemantic:
         assert CONCEPT_NOT_CLEAR in {i.reason for i in result.issues}
         assert "not actually shown" in result.feedback()
 
+    async def test_semantic_layer_issues_are_tagged_not_deterministic(self, monkeypatch):
+        """Quality-governance follow-up (Phase 3.7): this is the ONE LLM-
+        judged producer of DiagramQAIssue in the whole codebase - its output
+        must never carry the class's own `deterministic=True` default."""
+        def failing_critique(user: str) -> dict:
+            return {
+                "objective_verdicts": [], "core_message_delivered": True, "core_message_detail": "",
+                "criteria_verdicts": [], "structure_correct": False,
+                "structure_detail": "the relationship is backwards",
+            }
+
+        monkeypatch.setitem(mock_ai_module._BUILDERS, "ConceptCritique", failing_critique)
+        result = await evaluate_concept_experience(_good_metaphor_spec(), ai=MockAIClient(get_settings()), settings=get_settings())
+        assert not result.passed
+        assert result.issues  # a real finding exists to assert on
+        assert all(issue.deterministic is False for issue in result.issues)
+
+
+class TestConceptQAProvenance:
+    """Quality-governance follow-up (Phase 3.7): Layer 1 (structural) issues
+    must stay `deterministic=True` (the class default, never overridden) -
+    the direct counterpart to TestConceptQASemantic's own provenance test
+    above, proving the two layers are tagged oppositely, not just that one
+    of them happens to be."""
+
+    async def test_structural_layer_issues_stay_deterministic(self):
+        spec = _good_metaphor_spec(learning_objectives=[], core_message="", validation_criteria=[])
+        result = await evaluate_concept_experience(spec)
+        assert not result.passed
+        assert result.issues
+        assert all(issue.deterministic is True for issue in result.issues)
+
 
 # ---------------------------------------------------------------------------
 # ConceptVisualService: retry behaviour + ImageService wiring
@@ -1807,6 +1840,57 @@ async def test_concept_qa_failure_triggers_exactly_one_targeted_retry(monkeypatc
     assert received_feedback[0] == ""
     assert received_feedback[1] and "identical property values" in received_feedback[1].lower()
     assert block.content["path"].endswith(".html")
+
+
+async def test_a_persistent_semantic_failure_is_persisted_as_not_deterministic(monkeypatch):
+    """End-to-end through the REAL production call path (quality-governance
+    follow-up, Phase 3.7): ConceptVisualService.generate_for_block ->
+    evaluate_concept_experience's Layer 2 -> visual_qa_finding_entries ->
+    block.content["visual_qa_findings"] -> quality_framework.visual_findings.
+    The planner always returns the same structurally-good spec (so Layer 1
+    never fails and the retry can't "fix" anything structural); the critique
+    always fails the same way on both the original AND retried attempt, so
+    the semantic issue survives into the FINAL persisted state rather than
+    being replaced by a better retry - proving this isn't just a unit-level
+    dict fixture but the real pipeline's actual output."""
+    good_spec = _good_metaphor_spec()
+
+    async def fake_plan(self, **kwargs):
+        return good_spec.model_copy(deep=True)
+
+    def failing_critique(user: str) -> dict:
+        return {
+            "objective_verdicts": [], "core_message_delivered": True, "core_message_detail": "",
+            "criteria_verdicts": [], "structure_correct": False,
+            "structure_detail": "the relationship is backwards",
+        }
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ConceptCritique", failing_critique)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block()
+    ok = await service.generate_for_block(
+        course_id="course_concept_semantic", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    findings = block.content["visual_qa_findings"]
+    assert findings
+    assert all(f["deterministic"] is False for f in findings)
+
+    # The same real block content, read by the real quality-framework
+    # consumer - never a hand-built QualityFinding fixture.
+    document = CourseDocument(
+        document_id="d1", course_id="course_concept_semantic", course_title="t", template_id="technical_v1",
+        pages=[Page(blocks=[block])],
+    )
+    quality_findings = visual_findings(document)
+    visual_qa_findings = [f for f in quality_findings if f.reason.startswith("visual_qa_")]
+    assert visual_qa_findings
+    assert all(f.verification_status == "unverified" for f in visual_qa_findings)
+    assert all(f.verifier is None for f in visual_qa_findings)
 
 
 async def test_unusable_spec_falls_back_without_generating(monkeypatch):

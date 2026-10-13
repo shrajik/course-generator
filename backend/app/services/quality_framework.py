@@ -133,23 +133,35 @@ def _dimension_for_missing_block(text: str) -> str:
 # NOT captured by this pass - a documented limitation, not an oversight; see
 # the module docstring's existing note on diagram/concept QA persistence.
 def visual_qa_finding_entries(
-    issues: list[tuple[str, str]], *, resolution: str, limit: int = 5
+    issues: list[tuple[str, str, bool]], *, resolution: str, limit: int = 5
 ) -> list[dict]:
     """Bounded, deduplicated-by-type summary of real structured QA issues.
 
-    `issues` is `[(type, detail), ...]`, taken directly from the real QA
-    result object's own fields - a diagram can report the same issue type
-    dozens of times across many edges (e.g. twenty `edge_crosses_node`
-    entries), so one representative detail per distinct type is the useful
-    signal, not every repetition; capped at `limit` distinct types so this
-    never grows unbounded."""
-    seen: dict[str, str] = {}
-    for issue_type, detail in issues:
+    `issues` is `[(type, detail, deterministic), ...]`, taken directly from
+    the real QA result object's own fields (see `DiagramQAIssue`/
+    `RenderQAIssue`) - a diagram can report the same issue type dozens of
+    times across many edges (e.g. twenty `edge_crosses_node` entries), so
+    one representative detail per distinct type is the useful signal, not
+    every repetition; capped at `limit` distinct types so this never grows
+    unbounded.
+
+    `deterministic` (quality-governance follow-up, Phase 3.7) is explicit
+    provenance the CALLER already knows at construction time - never
+    inferred here from `type`/`detail` text. Required, not optional: a
+    caller must make an honest choice rather than silently defaulting to
+    "verified"."""
+    seen: dict[str, tuple[str, bool]] = {}
+    for issue_type, detail, deterministic in issues:
         if issue_type not in seen and len(seen) < limit:
-            seen[issue_type] = detail
+            seen[issue_type] = (detail, deterministic)
     return [
-        {"type": issue_type, "detail": detail[:200], "resolution": resolution}
-        for issue_type, detail in seen.items()
+        {
+            "type": issue_type,
+            "detail": detail[:200],
+            "resolution": resolution,
+            "deterministic": deterministic,
+        }
+        for issue_type, (detail, deterministic) in seen.items()
     ]
 
 
@@ -458,6 +470,20 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
         # no fallback) - a real, visible quality problem.
         severity = "major" if resolution == "rendered_with_unresolved_issues" else "minor"
         source = "diagram_qa" if resolution == "fell_back_to_illustration" else "concept_qa"
+        # Provenance (quality-governance follow-up, Phase 3.7): `deterministic`
+        # is explicit metadata set at issue-construction time (see
+        # DiagramQAIssue.deterministic / visual_qa_finding_entries) - never
+        # inferred here from `type`/`detail` text. An entry persisted BEFORE
+        # this field existed has no key at all: `fell_back_to_illustration`
+        # entries can still safely default to deterministic (diagram_render_qa
+        # has no LLM path, ever - a real historical fact, not a guess); a
+        # missing-key `rendered_with_unresolved_issues` entry is the
+        # genuinely ambiguous case (concept_qa's Layer 2 IS a real LLM call)
+        # and defaults to NOT deterministic - honest uncertainty, never a
+        # false claim of independent verification.
+        deterministic = entry.get("deterministic")
+        if deterministic is None:
+            deterministic = resolution == "fell_back_to_illustration"
         findings.append(
             QualityFinding(
                 artifact=artifact,
@@ -467,12 +493,8 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
                 description=str(entry.get("detail") or ""),
                 remediation="Review this visual's structure and content for the issue noted.",
                 source=source,
-                # The underlying diagram/concept-visual QA checks are real
-                # structural/geometric Python logic (edge crossings,
-                # property-key overlap, etc.), never an LLM judgment call -
-                # see app.services.diagram_render_qa / concept_qa.
-                verification_status="independently_verified",
-                verifier=f"{source}:{entry.get('type', 'unknown')}",
+                verification_status="independently_verified" if deterministic else "unverified",
+                verifier=f"{source}:{entry.get('type', 'unknown')}" if deterministic else None,
             )
         )
     return findings

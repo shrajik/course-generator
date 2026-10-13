@@ -299,6 +299,42 @@ def test_image_text_unverified_stays_unverified_even_when_it_blocks():
 
 
 def test_visual_qa_findings_are_independently_verified_deterministic_checks():
+    """Quality-governance follow-up (Phase 3.7): `resolution` alone never
+    decides this - the explicit `deterministic` key does (see
+    DiagramQAIssue.deterministic / visual_qa_finding_entries). This fixture
+    is a genuinely deterministic concept_qa Layer-1 (structural) issue that
+    reached `rendered_with_unresolved_issues` (concept_visual_service.py has
+    no fallback - it ships the best attempt either way, regardless of which
+    layer produced that attempt's issues)."""
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "generic_visual",
+                        "detail": "x",
+                        "resolution": "rendered_with_unresolved_issues",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].verification_status == "independently_verified"
+    assert findings[0].verifier == "concept_qa:generic_visual"
+
+
+def test_visual_qa_findings_without_a_deterministic_flag_default_to_unverified():
+    """The direct counterpart to the test above, and THE regression this
+    whole fix exists for: an entry persisted before `deterministic` existed
+    (old-format data) at the genuinely ambiguous `rendered_with_unresolved_
+    issues` resolution (concept_qa's Layer 2 IS a real LLM call) must never
+    default to "independently_verified" - that was the actual mislabeling
+    bug this fix corrects. The honest default is "unverified"."""
     document = _document(
         [
             _image_block(
@@ -312,8 +348,8 @@ def test_visual_qa_findings_are_independently_verified_deterministic_checks():
         ]
     )
     findings = visual_findings(document)
-    assert findings[0].verification_status == "independently_verified"
-    assert findings[0].verifier == "concept_qa:generic_visual"
+    assert findings[0].verification_status == "unverified"
+    assert findings[0].verifier is None
 
 
 def test_visual_finding_derivation_failure_is_isolated_to_that_block(monkeypatch):

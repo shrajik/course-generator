@@ -361,14 +361,35 @@ def test_the_quality_endpoint_distinguishes_historical_from_live(client):
 
 
 def test_visual_qa_finding_entries_deduplicates_by_type_and_caps_the_count():
-    issues = [("edge_crosses_node", f"edge {i}") for i in range(20)] + [
-        ("font_below_minimum", "too small")
+    # True (quality-governance follow-up, Phase 3.7): `deterministic` is now
+    # a required third element - this fixture's issues genuinely are all
+    # deterministic (diagram_render_qa-style), so True is correct, not a
+    # convenience default.
+    issues = [("edge_crosses_node", f"edge {i}", True) for i in range(20)] + [
+        ("font_below_minimum", "too small", True)
     ]
     entries = visual_qa_finding_entries(issues, resolution="fell_back_to_illustration", limit=5)
     types = [e["type"] for e in entries]
     assert types == sorted(set(types), key=types.index)  # no duplicate types
     assert len(entries) <= 5
     assert all(e["resolution"] == "fell_back_to_illustration" for e in entries)
+    assert all(e["deterministic"] is True for e in entries)
+
+
+def test_visual_qa_finding_entries_carries_a_false_deterministic_flag_through():
+    """The counterpart to the test above - an LLM-judged issue's
+    `deterministic=False` must survive into the persisted entry unchanged,
+    never silently flipped to True."""
+    issues = [("wrong_relationship", "structure is factually off", False)]
+    entries = visual_qa_finding_entries(issues, resolution="rendered_with_unresolved_issues")
+    assert entries == [
+        {
+            "type": "wrong_relationship",
+            "detail": "structure is factually off",
+            "resolution": "rendered_with_unresolved_issues",
+            "deterministic": False,
+        }
+    ]
 
 
 def test_visual_qa_finding_entries_is_empty_for_no_issues():
@@ -400,6 +421,13 @@ def test_a_diagram_that_fell_back_produces_an_informational_minor_finding():
     assert finding.severity == "minor"
     assert finding.source == "diagram_qa"
     assert report.passed is True
+    # Provenance (quality-governance follow-up, Phase 3.7): this fixture
+    # predates the `deterministic` key (old-format persisted data). Safe
+    # default for `fell_back_to_illustration`: diagram_render_qa has no LLM
+    # path, ever - a real historical fact, so this still correctly reads as
+    # independently_verified, not a guess.
+    assert finding.verification_status == "independently_verified"
+    assert finding.verifier == "diagram_qa:edge_crosses_node"
 
 
 def test_a_concept_visual_that_shipped_with_unresolved_issues_is_a_major_finding():
@@ -428,6 +456,75 @@ def test_a_concept_visual_that_shipped_with_unresolved_issues_is_a_major_finding
     assert finding.source == "concept_qa"
     # A major finding alone (no blocker) must not fail the whole report.
     assert report.passed is True
+    # Provenance (quality-governance follow-up, Phase 3.7) - THE regression
+    # this whole fix exists for: this fixture predates the `deterministic`
+    # key (old-format persisted data) and uses `rendered_with_unresolved_
+    # issues`, the genuinely ambiguous resolution (concept_qa's Layer 2 IS a
+    # real LLM call). Before this fix, every entry here was unconditionally
+    # "independently_verified" regardless of which layer produced it - an
+    # LLM opinion mislabeled as a deterministic fact. The honest default for
+    # missing provenance is "unverified", never a guessed "verified".
+    assert finding.verification_status == "unverified"
+    assert finding.verifier is None
+
+
+def test_a_new_format_deterministic_concept_finding_is_independently_verified():
+    """A Layer-1 (structural) concept_qa issue CAN reach
+    `rendered_with_unresolved_issues` too (concept_visual_service.py has no
+    fallback - it renders the spec either way, keeping the better of the
+    original/retried attempt, even when that attempt's issues came from
+    Layer 1, not Layer 2). With the new `deterministic` key explicitly
+    present and True, this must read as independently_verified - the
+    resolution string alone never decides this."""
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "missing_entity",
+                        "detail": "representation needs at least one entity",
+                        "resolution": "rendered_with_unresolved_issues",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    report = build_course_quality_report(course_id="c1", chapters=[], document=document)
+    finding = next(f for f in report.findings if f.reason.startswith("visual_qa_"))
+    assert finding.verification_status == "independently_verified"
+    assert finding.verifier == "concept_qa:missing_entity"
+
+
+def test_a_new_format_llm_judged_concept_finding_stays_unverified():
+    """The explicit-False counterpart - a NEW (post-fix) semantic/LLM
+    finding must read as unverified exactly like the old-format safe
+    default above, proving the explicit path and the safe-default path
+    agree."""
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "wrong_relationship",
+                        "detail": "structure is factually off",
+                        "resolution": "rendered_with_unresolved_issues",
+                        "deterministic": False,
+                    }
+                ],
+            )
+        ]
+    )
+    report = build_course_quality_report(course_id="c1", chapters=[], document=document)
+    finding = next(f for f in report.findings if f.reason.startswith("visual_qa_"))
+    assert finding.verification_status == "unverified"
+    assert finding.verifier is None
 
 
 def test_visual_qa_findings_never_invents_a_type_or_detail():

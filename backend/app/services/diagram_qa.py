@@ -70,6 +70,18 @@ _FOCAL_MIN_DOMINANCE = 0.85  # primary's area must be at least this fraction of 
 class DiagramQAIssue:
     reason: str
     detail: str
+    # Provenance (quality-governance follow-up, Phase 3.7): was this
+    # specific issue established by a deterministic check (pure Python -
+    # geometry, schema shape, structural presence), or by an LLM judgment
+    # call? Defaults to True because every pre-existing construction site in
+    # THIS file is deterministic (no AIClient import anywhere in this
+    # module) - byte-identical behaviour for all of them. The one place this
+    # must be explicitly overridden to False is app.services.concept_qa's
+    # `_semantic_issues`, the sole LLM-judged producer of this class -
+    # see app.services.quality_framework._visual_findings_for_block, the
+    # consumer that turns this into VerificationStatus, never inferring it
+    # from `reason`/`detail` text.
+    deterministic: bool = True
 
 
 @dataclass

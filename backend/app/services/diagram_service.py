@@ -625,7 +625,12 @@ class DiagramService:
                 block.content,
                 {
                     "visual_qa_findings": visual_qa_finding_entries(
-                        [(issue.kind, issue.detail) for issue in issues],
+                        # True (literal, quality-governance follow-up Phase
+                        # 3.7): RenderQAIssue (app.services.diagram_render_qa)
+                        # is pure SVG/geometry parsing - no AIClient import
+                        # anywhere in that module, so every issue here is
+                        # genuinely deterministic, never an LLM judgment call.
+                        [(issue.kind, issue.detail, True) for issue in issues],
                         resolution="fell_back_to_illustration",
                     )
                 },

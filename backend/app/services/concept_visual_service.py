@@ -154,7 +154,16 @@ class ConceptVisualService:
                 # DocumentService.update_concept_visual_spec.
                 "spec": spec.model_dump(mode="json"),
                 "visual_qa_findings": visual_qa_finding_entries(
-                    [(issue.reason, issue.detail) for issue in result.issues],
+                    # Carries each issue's own real provenance (quality-
+                    # governance follow-up, Phase 3.7) - Layer 1 (structural)
+                    # issues are deterministic=True, Layer 2 (concept_qa's
+                    # one LLM critique call) issues are deterministic=False;
+                    # never collapsed to one blanket value here, since a
+                    # single result can (by evaluate_concept_experience's
+                    # own short-circuit contract) only ever be ALL layer-1 or
+                    # ALL layer-2 - but reading each issue's own flag keeps
+                    # this correct even if that contract ever changes.
+                    [(issue.reason, issue.detail, issue.deterministic) for issue in result.issues],
                     resolution="rendered_with_unresolved_issues",
                 ),
             },

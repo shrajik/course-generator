@@ -459,6 +459,13 @@ Grade this specification.
 
 
 async def _semantic_issues(spec: DiagramSpec, *, ai: AIClient, settings: Settings) -> list[DiagramQAIssue]:
+    """The ONLY producer of `DiagramQAIssue` in this module (and the only
+    LLM-judged one across diagram_qa.py + concept_qa.py combined) that is
+    NOT a deterministic check - see `DiagramQAIssue.deterministic`'s own
+    docstring. Every issue built here explicitly sets `deterministic=False`,
+    never the class default, since an AI model's opinion about this spec's
+    conceptual correctness must never be mistaken downstream for a Python
+    structural check's proven fact."""
     critique = await ai.structured(
         schema=ConceptCritique,
         system=CRITIQUE_SYSTEM,
@@ -473,22 +480,26 @@ async def _semantic_issues(spec: DiagramSpec, *, ai: AIClient, settings: Setting
             issues.append(DiagramQAIssue(
                 CONCEPT_NOT_CLEAR,
                 f"Learning objective not achievable from this spec: \"{verdict.criterion}\" - {verdict.detail}",
+                deterministic=False,
             ))
     if not critique.core_message_delivered:
         issues.append(DiagramQAIssue(
             CORE_MESSAGE_NOT_DELIVERED,
             critique.core_message_detail or "The structure doesn't actually deliver `core_message`.",
+            deterministic=False,
         ))
     for verdict in critique.criteria_verdicts:
         if not verdict.passed:
             issues.append(DiagramQAIssue(
                 CONCEPT_NOT_CLEAR,
                 f"Validation criterion failed: \"{verdict.criterion}\" - {verdict.detail}",
+                deterministic=False,
             ))
     if not critique.structure_correct:
         issues.append(DiagramQAIssue(
             WRONG_RELATIONSHIP,
             critique.structure_detail or "The entity/relationship structure doesn't correctly represent the concept.",
+            deterministic=False,
         ))
     return issues
 
