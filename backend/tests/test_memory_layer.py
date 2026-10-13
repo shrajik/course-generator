@@ -195,6 +195,15 @@ async def test_visual_knowledge_register_validates_the_asset_exists():
 
 
 async def test_visual_knowledge_search_only_returns_approved_by_default():
+    """Isolation note (test-infra fix, not a production bug):
+    VisualKnowledgeService.list() searches globally across every course by
+    design (it's a reusable cross-course asset library), and the schema is
+    never wiped between pytest invocations (see db_schema in conftest.py) -
+    a fixed, reused topic like "eye anatomy" is permanently poisoned the
+    moment this same test approves one, on its very first-ever run. Uses a
+    `_RUN`-unique topic/search term instead, so this assertion can only ever
+    match a row this exact run created, regardless of database history."""
+    topic = f"eye anatomy {_RUN}"
     course = await _make_course("crs_vk2")
     storage = get_storage()
     storage.save_asset(course.course_id, b"<svg></svg>", extension="svg")
@@ -203,15 +212,15 @@ async def test_visual_knowledge_search_only_returns_approved_by_default():
         VisualKnowledgeCreateRequest(
             course_id=course.course_id,
             asset_path="assets/image_001.svg",
-            topic="eye anatomy",
+            topic=topic,
             description="a diagram",
         )
     )
-    items, total = await service.list(search="eye", approved_only=True)
+    items, total = await service.list(search=topic, approved_only=True)
     assert total == 0 and items == []
 
     await service.update(entry.id, VisualKnowledgeUpdateRequest(approved=True))
-    items, total = await service.list(search="eye", approved_only=True)
+    items, total = await service.list(search=topic, approved_only=True)
     assert total == 1
     assert items[0].id == entry.id
 

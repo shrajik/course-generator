@@ -215,13 +215,40 @@ async def test_hybrid_retrieval_does_not_let_one_method_hide_the_others_results(
     would find - both must appear; neither method is allowed to crowd the
     other out just by being fetched first.
 
-    Uses a `_RUN`-unique token (not just `_RUN`-suffixed ids) in the shared
-    vocabulary: with the schema no longer wiped between tests (see db_schema
-    in conftest.py), the course_sample table accumulates rows across every
-    past run against this database, and MAX_SAMPLE_NOTES=2 leaves no slack -
-    a reused, common word like "xylophone" could let older runs' rows
-    outrank this run's semantic-only entry for the top-2 slots. A token
-    unique to this run can only ever match this run's own two rows.
+    Isolation note (test-infra bug found/fixed by the Phase-3-followup
+    investigation, not a production retrieval defect): a `_RUN`-unique TOKEN
+    in the shared vocabulary alone is not enough. The schema is never wiped
+    between pytest invocations (see db_schema in conftest.py), so every past
+    run of THIS SAME TEST has already left behind a near-duplicate keyword
+    sample whose title is "Rare {ITS OWN tag} Tuning Query Phrase" - only the
+    tag differs between runs, so each one scores an identical ~0.60 mock-
+    embedding similarity against any OTHER run's query (shared words "Rare
+    Tuning Query Phrase" + the description "literally contains the query
+    phrase"), regardless of the tag. With MAX_SAMPLE_NOTES=2 and a 3x
+    oversample window, a handful of these accumulated twins alone fill every
+    semantic-candidate slot, permanently crowding out this run's own
+    semantic-only entry - confirmed by direct reproduction against the live
+    test database (see the investigation report).
+
+    The fix: make the semantic-only entry's OWN text share enough
+    *individual* words with the query (via `topic`/`tags`, not just the
+    title) - "rare"/"tuning"/"query"/"phrase", repeated across multiple
+    fields - to reliably outscore that ~0.60 ceiling (own measured score
+    ~0.67-0.70 across random tags), while never reproducing the literal
+    contiguous substring "Rare {tag} Tuning Query Phrase" the keyword/ILIKE
+    path matches on - the whole point of this sample staying semantic-ONLY.
+    That ~0.60 figure is a hard ceiling for every future accumulated twin
+    (it only depends on the shared FIXED words, never on which tag a twin
+    used), so this margin holds no matter how many more accumulate later.
+
+    Teardown (new): this test's own two samples (and their embeddings) are
+    deleted in a `finally` block so it stops contributing new twins to this
+    same pollution for whatever runs after it - using
+    CourseSampleService.delete(), which already deletes both the
+    course_samples row and its memory_embeddings row (see its docstring).
+    This does not retroactively clean up what the many past runs before this
+    fix already left behind - deleting those is a one-time data cleanup, not
+    a code change, and is intentionally out of scope here.
     """
     settings = get_settings().model_copy(update={"semantic_similarity_threshold": 0.15})
     keyword_course = await _make_course("crs_hybrid_kw", title="Keyword Match Course")
@@ -229,31 +256,54 @@ async def test_hybrid_retrieval_does_not_let_one_method_hide_the_others_results(
     sample_service = CourseSampleService()
     tag = f"zyx{_RUN}"
 
-    keyword_entry = await sample_service.register(
-        CourseSampleCreateRequest(
-            course_id=keyword_course.course_id,
-            title=f"Rare {tag} Tuning Query Phrase",
-            description="literally contains the query phrase",
+    keyword_entry = None
+    semantic_entry = None
+    try:
+        keyword_entry = await sample_service.register(
+            CourseSampleCreateRequest(
+                course_id=keyword_course.course_id,
+                title=f"Rare {tag} Tuning Query Phrase",
+                description="literally contains the query phrase",
+            )
         )
-    )
-    await sample_service.update(keyword_entry.id, CourseSampleUpdateRequest(approved=True))
+        await sample_service.update(keyword_entry.id, CourseSampleUpdateRequest(approved=True))
 
-    semantic_entry = await sample_service.register(
-        CourseSampleCreateRequest(
-            course_id=semantic_course.course_id,
-            title=f"{tag} tuning for percussion instrument technicians",
-            description="woodwork and mallet percussion tuning guidance",
+        semantic_entry = await sample_service.register(
+            CourseSampleCreateRequest(
+                course_id=semantic_course.course_id,
+                title=f"{tag} percussion tuning technique reference",
+                topic=f"rare tuning query phrase guidance note {tag}",
+                description=(
+                    "a rare practical phrase for tuning query technique - "
+                    "percussion instrument guidance"
+                ),
+                tags=["rare", "tuning", "query", "phrase"],
+            )
         )
-    )
-    await sample_service.update(semantic_entry.id, CourseSampleUpdateRequest(approved=True))
+        await sample_service.update(semantic_entry.id, CourseSampleUpdateRequest(approved=True))
 
-    query = f"Rare {tag} Tuning Query Phrase"
-    memory = MemoryService(samples=sample_service, settings=settings)
-    context = await memory.build_context(stage="writer", course_title=query)
+        query = f"Rare {tag} Tuning Query Phrase"
+        memory = MemoryService(samples=sample_service, settings=settings)
+        context = await memory.build_context(stage="writer", course_title=query)
 
-    sources = set(context.sources)
-    assert f"course_sample:{keyword_entry.id}" in sources
-    assert f"course_sample:{semantic_entry.id}" in sources
+        sources = set(context.sources)
+        assert f"course_sample:{keyword_entry.id}" in sources
+        assert f"course_sample:{semantic_entry.id}" in sources
+    finally:
+        # Only the records THIS test created - never a database-wide
+        # cleanup. Runs on assertion failure too (the whole point of
+        # `finally`), so a future failure here still doesn't add new
+        # pollution for whatever test runs after it.
+        for entry in (keyword_entry, semantic_entry):
+            if entry is not None:
+                await sample_service.delete(entry.id)
+        async with get_session_factory()() as session:
+            async with session.begin():
+                repo = CourseRepository(session)
+                for course in (keyword_course, semantic_course):
+                    row = await repo.get_by_id(course.id)
+                    if row is not None:
+                        await repo.delete(row)
 
 
 async def test_records_without_embeddings_remain_retrievable_via_keyword(monkeypatch):
