@@ -1,11 +1,13 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   BookOpen as BookOpenEmpty,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Eye,
   FileText,
   Loader2,
@@ -24,11 +26,15 @@ import {
 } from "@/components/admin/AdminUI";
 import {
   getAdminCourse,
+  getAdminCourseModelUsage,
   listAdminCourses,
   type AdminCourse,
   type AdminCourseListOptions,
   type AdminCourseListResponse,
+  type AdminModelUsageResponse,
 } from "@/lib/api/admin";
+import { summarizeModelUsage } from "@/lib/admin/modelUsage";
+import { createRequestGuard } from "@/lib/admin/requestGuard";
 
 const PAGE_SIZE = 25;
 const KNOWN_STATUSES = [
@@ -82,6 +88,75 @@ function yesNo(value: boolean): string {
   return value ? "Yes" : "No";
 }
 
+/** The per-call table and summary line for a loaded, non-empty model-usage
+ * response - split out from the page component purely to keep the JSX
+ * readable; still fetched/owned by the page above it. */
+function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
+  const summary = summarizeModelUsage(usage.calls);
+  return (
+    <>
+      <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-[#D8D0C7]">
+        <span>
+          {summary.totalCalls} call{summary.totalCalls === 1 ? "" : "s"}
+        </span>
+        <span>{summary.totalInputTokens.toLocaleString()} input tokens</span>
+        <span>{summary.totalOutputTokens.toLocaleString()} output tokens</span>
+        <span className={summary.failedCount > 0 ? "text-[#F0C4A6]" : undefined}>
+          {summary.failedCount} failed
+        </span>
+        <span>
+          {summary.fallbackCount} fallback{summary.fallbackCount === 1 ? "" : "s"}
+        </span>
+      </div>
+      <div className="overflow-x-auto rounded-[8px] border border-[#34312D]">
+        <table className="w-full min-w-[640px] text-left text-[12px]">
+          <thead className="bg-[#201C18] text-[10px] uppercase tracking-[0.08em] text-[#8E8780]">
+            <tr>
+              <th className="px-3 py-2 font-medium">Purpose</th>
+              <th className="px-3 py-2 font-medium">Kind</th>
+              <th className="px-3 py-2 font-medium">Model</th>
+              <th className="px-3 py-2 font-medium">Provider</th>
+              <th className="px-3 py-2 font-medium text-right">In</th>
+              <th className="px-3 py-2 font-medium text-right">Out</th>
+              <th className="px-3 py-2 font-medium text-right">Sec</th>
+              <th className="px-3 py-2 font-medium text-right">Retries</th>
+              <th className="px-3 py-2 font-medium">Flags</th>
+              <th className="px-3 py-2 font-medium">Timestamp</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#2A2520]">
+            {usage.calls.map((call, index) => (
+              <tr key={`${call.purpose}-${call.timestamp}-${index}`} className="text-[#D8D0C7]">
+                <td className="max-w-[220px] truncate px-3 py-2 font-mono text-[11px]" title={call.purpose}>
+                  {call.purpose}
+                </td>
+                <td className="px-3 py-2">{call.kind}</td>
+                <td className="px-3 py-2">{call.model}</td>
+                <td className="px-3 py-2">{call.provider || "—"}</td>
+                <td className="px-3 py-2 text-right">{call.input_tokens.toLocaleString()}</td>
+                <td className="px-3 py-2 text-right">{call.output_tokens.toLocaleString()}</td>
+                <td className="px-3 py-2 text-right">{call.seconds.toFixed(1)}</td>
+                <td className="px-3 py-2 text-right">{call.retries}</td>
+                <td className="px-3 py-2">
+                  <div className="flex flex-wrap gap-1">
+                    {call.failed ? <AdminStatusBadge tone="danger">Failed</AdminStatusBadge> : null}
+                    {call.used_fallback ? (
+                      <AdminStatusBadge tone="warning">Fallback</AdminStatusBadge>
+                    ) : null}
+                  </div>
+                </td>
+                <td className="whitespace-nowrap px-3 py-2 text-[11px] text-[#8E8780]">
+                  {call.timestamp ? formatDate(call.timestamp) : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
 export default function AdminCoursesPage() {
   const [page, setPage] = useState(0);
   const [searchInput, setSearchInput] = useState("");
@@ -95,6 +170,14 @@ export default function AdminCoursesPage() {
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [loadingDetailsId, setLoadingDetailsId] = useState<string | null>(null);
+  const [modelUsageOpen, setModelUsageOpen] = useState(false);
+  const [modelUsage, setModelUsage] = useState<AdminModelUsageResponse | null>(null);
+  const [modelUsageLoading, setModelUsageLoading] = useState(false);
+  const [modelUsageError, setModelUsageError] = useState<string | null>(null);
+  // Stable across renders (created once) - guards against a stale
+  // model-usage response (e.g. Course A's fetch resolving after the admin
+  // has already switched to Course B) overwriting the wrong course's state.
+  const modelUsageGuard = useRef(createRequestGuard()).current;
 
   const statusOptions = useMemo(
     () => Array.from(new Set([...(data?.statuses ?? []), ...KNOWN_STATUSES])).sort(),
@@ -140,6 +223,16 @@ export default function AdminCoursesPage() {
     setSelectedCourse(target);
     setDetailsError(null);
     setLoadingDetailsId(target.id);
+    // Switching courses - any previously loaded usage data belongs to the
+    // last course, not this one, so it must not linger on screen. Also
+    // invalidate any in-flight model-usage fetch for the PREVIOUS course,
+    // even if the admin never re-expands Model Usage for this one - without
+    // this, a slow fetch for the old course could still land later and
+    // silently overwrite this course's (closed) usage state.
+    setModelUsageOpen(false);
+    setModelUsage(null);
+    setModelUsageError(null);
+    modelUsageGuard.invalidate();
     try {
       const detail = await getAdminCourse(target.id);
       setSelectedCourse(detail);
@@ -147,6 +240,41 @@ export default function AdminCoursesPage() {
       setDetailsError(caught instanceof ApiError ? caught.message : "Course details could not be loaded.");
     } finally {
       setLoadingDetailsId(null);
+    }
+  };
+
+  const toggleModelUsage = async () => {
+    if (!selectedCourse) return;
+    const next = !modelUsageOpen;
+    setModelUsageOpen(next);
+    // Lazy: only fetch the first time it's expanded, not on every toggle
+    // and not when the detail panel itself first opens - this is extra
+    // data most admins won't need on every single course they glance at.
+    if (next && modelUsage === null && !modelUsageLoading) {
+      // A fresh id for THIS fetch - issued before the await, so a later
+      // fetch (a different course, or a retry) can supersede it. Every
+      // state update below only applies if this id is still the most
+      // recent one issued - a stale response (e.g. this course's own fetch
+      // resolving after the admin has already switched away, or a second
+      // overlapping fetch for the same course) is simply dropped.
+      const requestId = modelUsageGuard.start();
+      setModelUsageLoading(true);
+      setModelUsageError(null);
+      try {
+        // The course's own course_id (e.g. "crs_abc123"), NOT its database
+        // id (UUID) - this one admin endpoint's path parameter is the
+        // string course_id, unlike every other /admin/courses/{id} route.
+        const usage = await getAdminCourseModelUsage(selectedCourse.course_id);
+        if (!modelUsageGuard.isCurrent(requestId)) return;
+        setModelUsage(usage);
+      } catch (caught) {
+        if (!modelUsageGuard.isCurrent(requestId)) return;
+        setModelUsageError(
+          caught instanceof ApiError ? caught.message : "Model usage could not be loaded.",
+        );
+      } finally {
+        if (modelUsageGuard.isCurrent(requestId)) setModelUsageLoading(false);
+      }
     }
   };
 
@@ -360,7 +488,13 @@ export default function AdminCoursesPage() {
               type="button"
               variant="ghost"
               size="sm"
-              onClick={() => setSelectedCourse(null)}
+              onClick={() => {
+                setSelectedCourse(null);
+                setModelUsageOpen(false);
+                setModelUsage(null);
+                setModelUsageError(null);
+                modelUsageGuard.invalidate();
+              }}
               className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
             >
               Close
@@ -407,6 +541,48 @@ export default function AdminCoursesPage() {
             <DetailRow label="Created date" value={formatDate(selectedCourse.created_at)} />
             <DetailRow label="Updated date" value={formatDate(selectedCourse.updated_at)} />
           </dl>
+
+          <div className="mt-5 border-t border-[#34312D] pt-4">
+            <button
+              type="button"
+              onClick={() => void toggleModelUsage()}
+              className="flex w-full items-center justify-between text-left"
+            >
+              <span className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
+                Model Usage
+              </span>
+              {modelUsageOpen ? (
+                <ChevronUp size={16} className="text-[#D8D0C7]" />
+              ) : (
+                <ChevronDown size={16} className="text-[#D8D0C7]" />
+              )}
+            </button>
+
+            {modelUsageOpen ? (
+              <div className="mt-3">
+                {modelUsageLoading ? (
+                  <AdminLoading label="Loading model usage" />
+                ) : modelUsageError ? (
+                  <div className="flex items-center gap-2 rounded-[8px] border border-[#5A3529] bg-[#2A1D19] p-3 text-sm text-[#F0C4A6]">
+                    <AlertCircle size={16} />
+                    {modelUsageError}
+                  </div>
+                ) : modelUsage ? (
+                  modelUsage.job_id === null ? (
+                    <p className="text-[13px] text-[#D8D0C7]">
+                      No generation run recorded yet for this course.
+                    </p>
+                  ) : modelUsage.calls.length === 0 ? (
+                    <p className="text-[13px] text-[#D8D0C7]">
+                      The latest run ({modelUsage.run_state ?? "unknown"}) made no real AI calls.
+                    </p>
+                  ) : (
+                    <ModelUsageDetail usage={modelUsage} />
+                  )
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </AdminPanel>
       ) : null}
     </div>

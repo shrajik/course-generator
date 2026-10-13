@@ -123,3 +123,41 @@ export function listAdminCourses(
 export function getAdminCourse(courseId: string): Promise<AdminCourse> {
   return request<AdminCourse>(`/admin/courses/${courseId}`);
 }
+
+/** One real AI call made while generating a course - mirrors
+ * backend/app/schemas/admin.py's ModelUsageRecord exactly (MOM Phase 2.2 -
+ * AI Model Transparency). No cost field exists on the backend - tokens are
+ * captured, never converted to a dollar figure, so none is shown here. */
+export interface AdminModelUsageRecord {
+  kind: string;
+  purpose: string;
+  model: string;
+  provider: string;
+  seconds: number;
+  input_tokens: number;
+  output_tokens: number;
+  retries: number;
+  failed: boolean;
+  used_fallback: boolean;
+  timestamp: string;
+}
+
+/** Mirrors AdminModelUsageResponse. `job_id` is null when this course has
+ * never had a recorded generation run at all - distinct from a run that
+ * made zero real AI calls, where `calls` is `[]` but `job_id` is set. */
+export interface AdminModelUsageResponse {
+  course_id: string;
+  job_id: string | null;
+  run_state: string | null;
+  run_created_at: string | null;
+  calls: AdminModelUsageRecord[];
+}
+
+/** Takes the course's own `course_id` (e.g. "crs_abc123"), NOT its database
+ * `id` (UUID) - this one admin endpoint's path parameter is the string
+ * course_id, unlike GET /admin/courses/{id} which takes the UUID. Passing
+ * the UUID here silently 404s instead of erroring loudly, so this is easy
+ * to get wrong - see backend/app/api/admin.py's admin_course_model_usage. */
+export function getAdminCourseModelUsage(courseId: string): Promise<AdminModelUsageResponse> {
+  return request<AdminModelUsageResponse>(`/admin/courses/${courseId}/model-usage`);
+}
