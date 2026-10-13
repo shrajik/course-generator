@@ -206,6 +206,27 @@ class Settings(BaseSettings):
     # executor, so this can lag a deployment without ever showing a language
     # that cannot run.
     code_cell_languages: list[str] = ["python", "javascript", "cpp", "java"]
+    # Code-execution verification follow-up (quality governance) - whether
+    # the reviewer actually runs each `code_cell` in the sandboxed executor
+    # during review, vs. only the editor's own Run button doing so. Default
+    # on; a deployment without the executor reachable degrades to
+    # `verification_failed` findings per cell (fail-closed, never silently
+    # skipped) rather than needing this flipped off - but it exists as an
+    # explicit kill switch, same pattern as `enable_image_generation`.
+    enable_code_cell_execution_verification: bool = True
+    # Conservative per-chapter cap: a chapter with more runnable code cells
+    # than this has the excess ones explicitly marked "skipped" (never
+    # silently treated as verified) rather than executed - bounds how much
+    # latency one chapter's review can add regardless of how many cells a
+    # writer emits.
+    code_execution_max_cells_per_chapter: int = Field(default=5, ge=1, le=50)
+    # Its own concurrency phase (see concurrency_for below) - chapters review
+    # in parallel, and the executor's own global semaphore
+    # (code-executor/app/config.py MAX_CONCURRENT) is shared across every
+    # course currently generating, not just one. A conservative default here
+    # avoids this backend routinely hitting the executor's own 429 "busy"
+    # response under normal parallel-chapter load.
+    code_execution_concurrency: int = Field(default=2, ge=0, le=32)
     #  Trim the context handed to the writer / reviewer: input size is latency.
     research_context_chars: int = Field(default=6000, ge=1000, le=40000)
     reviewer_context_chars: int = Field(default=20000, ge=2000, le=120000)
@@ -338,6 +359,7 @@ class Settings(BaseSettings):
             "research": self.research_concurrency,
             "writer": self.writer_concurrency,
             "image": self.image_concurrency,
+            "code_execution": self.code_execution_concurrency,
         }.get(phase, 0)
         return override or self.max_concurrency
 

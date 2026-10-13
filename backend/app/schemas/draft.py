@@ -146,13 +146,33 @@ class StructuralFinding(BaseModel):
     produced this (e.g. "missing_block_type", "visual_balance",
     "content_level_3", "section_completeness") - narrowly scoped to what
     that check actually proves (see each check function's own docstring/
-    comment), never a broader claim about chapter quality."""
+    comment), never a broader claim about chapter quality.
+
+    `reason`/`severity`/`verification_status`/`verifier`/`verification_error`
+    are additive overrides (code-execution-verification follow-up): every
+    PRE-EXISTING check leaves them `None`, and
+    app.services.quality_framework._chapter_findings falls back to its
+    original hardcoded values (`reason="missing_required_block"`,
+    `severity="blocker"`, `verification_status="independently_verified"`)
+    exactly as before this change - so this is 100% backward compatible.
+    They exist because a NEW check (sandboxed code-cell execution) can
+    itself fail to run (the executor down/busy) or be deliberately skipped
+    (a per-chapter budget cap) - neither of those is a confirmed,
+    independently-verified content defect the way every prior structural
+    check's output always was, so they must be able to self-report their
+    own real `verification_status` instead of inheriting one that would be
+    dishonest for them specifically."""
 
     model_config = ConfigDict(extra="allow")
 
     check: str
     description: str
     dimension: str = "completeness"
+    reason: str | None = None
+    severity: str | None = None
+    verification_status: str | None = None
+    verifier: str | None = None
+    verification_error: str | None = None
 
 
 class GeneratedChapter(BaseModel):

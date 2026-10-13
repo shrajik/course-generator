@@ -257,19 +257,26 @@ def _chapter_findings(chapter: GeneratedChapter) -> list[QualityFinding]:
     # never is).
     structural_texts = {f.description for f in chapter.structural_findings}
     for finding in chapter.structural_findings:
+        # Every PRE-EXISTING check leaves these overrides unset, so this is
+        # byte-identical to before for them - see StructuralFinding's own
+        # docstring for why a NEW check (sandboxed code-cell execution) needs
+        # to be able to self-report a different verification_status/severity/
+        # reason than "a confirmed content defect" (it can itself fail to
+        # run, or be deliberately skipped by a budget cap - neither is that).
         findings.append(
             QualityFinding(
                 artifact=label,
                 dimension=finding.dimension,
-                severity="blocker",
-                reason="missing_required_block",
+                severity=finding.severity or "blocker",
+                reason=finding.reason or "missing_required_block",
                 description=finding.description,
                 remediation="Add the missing block/section, or (for content level 3 / section "
                 "completeness) the specific content named above, then re-review.",
                 source="reviewer",
-                verification_status="independently_verified",
-                verifier=f"structural_check:{finding.check}",
+                verification_status=finding.verification_status or "independently_verified",
+                verifier=finding.verifier or f"structural_check:{finding.check}",
                 verified_at=chapter.generated_at or None,
+                verification_error=finding.verification_error,
             )
         )
 

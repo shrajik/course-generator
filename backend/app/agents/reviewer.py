@@ -18,7 +18,9 @@ import re
 
 from app.agents import prompts
 from app.agents.prompts import ContinuityContext
+from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
+from app.core.errors import CodeExecutionUnavailableError, ValidationFailedError
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
 from app.course.pedagogy import BANNED_OBJECTIVE_VERBS
@@ -30,6 +32,7 @@ from app.schemas.draft import StructuralFinding
 from app.schemas.learner import LearnerProfile
 from app.schemas.review import ChapterReview, ContinuityReport, ReviewIssue
 from app.schemas.template import CourseTemplate
+from app.services.code_execution import CodeExecutionService, get_code_execution_service
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 
@@ -65,10 +68,15 @@ class ReviewerAgent:
         ai: AIClient | None = None,
         settings: Settings | None = None,
         memory: MemoryService | None = None,
+        code_execution: CodeExecutionService | None = None,
     ) -> None:
         self.ai = ai or get_ai_client()
         self.settings = settings or get_settings()
         self.memory = memory or get_memory_service()
+        # Injectable so tests exercise the sandboxed-execution check with an
+        # httpx.MockTransport-backed CodeExecutionService instead of a live
+        # executor container - same pattern already used by test_code_cells.py.
+        self.code_execution = code_execution or get_code_execution_service()
 
     async def review_chapter(
         self,
@@ -114,6 +122,23 @@ class ReviewerAgent:
         structural_findings = self._apply_structural_checks(
             review, template, blocks, course_input.learner_profile, course_input
         )
+        # Sandboxed code-cell execution (separate from _apply_structural_checks,
+        # which must stay synchronous/backward-compatible - see its own
+        # docstring): runs on every review pass, including each revision, so
+        # a rewritten cell is always re-executed rather than trusting a
+        # verdict about the code that used to be there.
+        code_cell_findings = await _verify_code_cells(
+            blocks, code_execution=self.code_execution, settings=self.settings
+        )
+        structural_findings = structural_findings + code_cell_findings
+        for finding in code_cell_findings:
+            # Only an ACTUAL content defect (the cell itself doesn't run) is
+            # revision-worthy - an infrastructure failure or a budget-capped
+            # skip is not something rewriting the chapter can fix, so those
+            # must never force the full-chapter-rewrite retry loop.
+            if finding.check in _CODE_CELL_REVISION_TRIGGERING_CHECKS:
+                if finding.description not in review.missing_required_blocks:
+                    review.missing_required_blocks.append(finding.description)
         # Keep the reviewer honest: structural gaps always block approval.
         if review.missing_required_blocks:
             review.approved = False
@@ -216,6 +241,222 @@ class ReviewerAgent:
         review.issues.extend(_pedagogy_issues(blocks, effective_profile))
 
         return deterministic
+
+
+# Code-execution verification follow-up (quality governance). Deliberately a
+# separate, standalone async function - never folded into
+# `_apply_structural_checks`, which several tests call synchronously today
+# and whose own contract explicitly stays unchanged by this feature. Only
+# these three checks represent an actual CONTENT defect the writer could fix
+# by rewriting the chapter; the executor being unavailable or a cell being
+# skipped under the per-chapter budget are never content defects, so they
+# must never trigger the existing missing_required_blocks retry loop (see
+# the caller in review_chapter).
+_CODE_CELL_REVISION_TRIGGERING_CHECKS = frozenset(
+    {
+        "code_cell_no_code",
+        "code_cell_execution_failed",
+        "code_cell_execution_timeout",
+        "code_cell_unsupported_language",
+    }
+)
+
+# Truncation length for stderr/diagnostic text folded into a finding
+# description - the sandbox's own `minimal_env` (code-executor/app/sandbox.py)
+# already keeps real secrets/backend credentials out of the executed
+# process's environment in the first place (a structural guarantee this
+# function doesn't re-implement), so this bound exists only to keep a
+# verbose or repetitive stack trace from producing an unbounded finding, the
+# same convention already used elsewhere for `verification_error`.
+_DIAGNOSTIC_CHARS = 500
+
+
+async def _verify_code_cells(
+    blocks: list[Block],
+    *,
+    code_execution: CodeExecutionService,
+    settings: Settings,
+) -> list[StructuralFinding]:
+    """Runs every `code_cell` block through the sandboxed executor and
+    classifies the result - never `code` (see `CodeContent`'s own docstring:
+    static samples are explicitly allowed to be fragments that cannot run on
+    their own) and never writes `block.content["execution"]` (that field's
+    contract, per `CodeCellContent`'s own docstring, is "only ever set by
+    the Run action" - this produces a separate, review-time-only finding
+    instead, so verification can never be mistaken for the editor's
+    user-triggered run).
+
+    A successful run only proves the program executed without a reported
+    error - never that it correctly demonstrates the concept it was written
+    to teach. There is no ground truth to check that against: the writer is
+    explicitly told never to invent expected output (see `code_cell_guidance`
+    in app.agents.prompts), so a clean run produces no finding at all, the
+    same convention every other clean structural check already follows."""
+    if not settings.enable_code_cell_execution_verification:
+        return []
+
+    cells = [(index, block) for index, block in enumerate(blocks) if block.type is BlockType.CODE_CELL]
+    if not cells:
+        return []
+
+    budget = settings.code_execution_max_cells_per_chapter
+    checked, skipped = cells[:budget], cells[budget:]
+
+    findings: list[StructuralFinding] = []
+    if skipped:
+        findings.append(
+            StructuralFinding(
+                check="code_cell_execution_skipped",
+                description=(
+                    f"code cell verification: this chapter has {len(cells)} runnable code "
+                    f"cells, over the per-chapter budget of {budget} - block(s) "
+                    f"{', '.join(str(index) for index, _ in skipped)} were not executed and "
+                    "their correctness is unknown, not confirmed."
+                ),
+                dimension="accuracy",
+                # Never "independently_verified" (the default every other
+                # structural check gets): a skipped cell is explicitly NOT
+                # verified, not a confirmed defect - this is honest about
+                # that rather than relying on the blanket default.
+                severity="major",
+                reason="code_cell_execution_skipped",
+                verification_status="unverified",
+            )
+        )
+
+    limiter = get_limiter("code_execution", settings.concurrency_for("code_execution"))
+    executor_unavailable_detail: str | None = None
+
+    for index, block in checked:
+        if executor_unavailable_detail is not None:
+            # The executor already failed for an earlier cell THIS review
+            # pass - every remaining cell would fail identically, so this
+            # avoids N redundant timeout-prone HTTP calls while remaining
+            # equally honest: nothing here was skipped out of neglect.
+            findings.append(
+                _verification_failed_finding(index, executor_unavailable_detail)
+            )
+            continue
+
+        language = str(block.content.get("language") or "").strip()
+        code = str(block.content.get("code") or "")
+
+        if not code.strip():
+            findings.append(
+                StructuralFinding(
+                    check="code_cell_no_code",
+                    description=f"code cell verification: block {index} has no code in it.",
+                    dimension="completeness",
+                )
+            )
+            continue
+
+        try:
+            async with limiter.slot():
+                try:
+                    resolved = await code_execution.resolve_language(language)
+                except CodeExecutionUnavailableError as exc:
+                    executor_unavailable_detail = str(exc)[:_DIAGNOSTIC_CHARS]
+                    findings.append(_verification_failed_finding(index, executor_unavailable_detail))
+                    continue
+
+                if resolved is None:
+                    findings.append(
+                        StructuralFinding(
+                            check="code_cell_unsupported_language",
+                            description=(
+                                f"code cell verification: block {index} requests "
+                                f"language {language!r}, which this deployment's sandboxed "
+                                "executor does not support - use one of the supported "
+                                "runnable languages, or a static `code` block instead."
+                            ),
+                            dimension="accuracy",
+                        )
+                    )
+                    continue
+
+                try:
+                    result = await code_execution.execute(resolved.id, code)
+                except CodeExecutionUnavailableError as exc:
+                    executor_unavailable_detail = str(exc)[:_DIAGNOSTIC_CHARS]
+                    findings.append(_verification_failed_finding(index, executor_unavailable_detail))
+                    continue
+                except ValidationFailedError as exc:
+                    # By construction the only ValidationFailedError execute()
+                    # can still raise here (empty-code and unsupported-language
+                    # were already handled above) is the code-size ceiling.
+                    findings.append(
+                        StructuralFinding(
+                            check="code_cell_execution_failed",
+                            description=(
+                                f"code cell verification: block {index} could not be submitted "
+                                f"for execution: {str(exc)[:_DIAGNOSTIC_CHARS]}"
+                            ),
+                            dimension="accuracy",
+                        )
+                    )
+                    continue
+        except Exception as exc:  # noqa: BLE001 - a bug in this check must never
+            # discard the whole chapter's AI review (which the OUTER caller in
+            # course_service.py already treats as entirely advisory) nor crash
+            # the report computation - fail closed on just this one cell,
+            # same as every other verifier-crash path in this codebase.
+            log.warning("Unexpected code-cell verification error for block %s: %s", index, exc)
+            findings.append(_verification_failed_finding(index, str(exc)[:_DIAGNOSTIC_CHARS]))
+            continue
+
+        if result.status == "success":
+            continue  # proves only that it ran - never reported as a finding
+        if result.status == "timeout":
+            findings.append(
+                StructuralFinding(
+                    check="code_cell_execution_timeout",
+                    description=(
+                        f"code cell verification: block {index} did not finish within the "
+                        f"time budget ({result.execution_time:g}s) - this does not prove the "
+                        "program is conceptually wrong, only that it did not complete in time."
+                    ),
+                    dimension="accuracy",
+                )
+            )
+            continue
+        # result.status == "error": a real compile or runtime failure.
+        stderr = (result.stderr or "").strip()[:_DIAGNOSTIC_CHARS]
+        stage = "compile" if result.phase == "compile" else "run"
+        findings.append(
+            StructuralFinding(
+                check="code_cell_execution_failed",
+                description=(
+                    f"code cell verification: block {index} failed to {stage} in the "
+                    f"sandboxed executor"
+                    + (f": {stderr}" if stderr else ".")
+                ),
+                dimension="accuracy",
+            )
+        )
+    return findings
+
+
+def _verification_failed_finding(index: int, detail: str) -> StructuralFinding:
+    """The executor itself could not be asked (down, busy, unreachable) -
+    distinct from a confirmed content defect: this never implies the code is
+    wrong, and (per the fail-closed policy already established for every
+    other verifier in app.services.quality_framework) still blocks approval
+    at blocker severity until a fresh recomputation succeeds or an admin
+    override is used - it is never escalated into a whole-report
+    QualityEvaluationFailedError, since this is a per-cell verifier failure,
+    not the quality-report computation itself crashing."""
+    return StructuralFinding(
+        check="code_cell_execution_unavailable",
+        description=(
+            f"code cell verification: block {index} could not be verified - the sandboxed "
+            f"code executor was not available: {detail}"
+        ),
+        dimension="accuracy",
+        verification_status="verification_failed",
+        verifier="code_execution",
+        verification_error=detail,
+    )
 
 
 def _block_word_count(block: Block) -> int:
