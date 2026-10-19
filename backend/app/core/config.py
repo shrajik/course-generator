@@ -321,6 +321,52 @@ class Settings(BaseSettings):
     #  Tests that don't need a live database turn this off (see conftest.py);
     #  research/chapters/assets/exports always stay on the filesystem regardless.
     use_database: bool = True
+    # Gate 1 (client blueprint section 4): block chapter generation until the
+    # outline has been approved. Turn off only for scripts that build courses
+    # without a person in the loop.
+    require_outline_approval: bool = True
+
+    # --- uploaded source material (app/services/source_service.py) -----------
+    max_source_bytes: int = Field(default=20 * 1024 * 1024, ge=1024)
+    max_sources_per_course: int = Field(default=10, ge=1, le=50)
+    # How many passages, and how many characters of them, a chapter's writer
+    # is shown from the uploaded sources.
+    source_excerpts_per_chapter: int = Field(default=6, ge=1, le=20)
+    source_excerpt_chars: int = Field(default=6000, ge=500, le=30000)
+
+    # --- global knowledge library (app/services/knowledge_service.py) --------
+    # Admin-uploaded documents that every course searches while it is written.
+    enable_global_knowledge: bool = True
+    knowledge_excerpts_per_chapter: int = Field(default=4, ge=1, le=20)
+    knowledge_excerpt_chars: int = Field(default=4000, ge=500, le=30000)
+    # How close in meaning, and how much of the query's wording, a passage must
+    # have to be offered to a chapter at all. The library covers many subjects;
+    # these keep a chapter from being handed another subject's material.
+    knowledge_min_semantic: float = Field(default=0.3, ge=0.0, le=1.0)
+    knowledge_min_coverage: float = Field(default=0.25, ge=0.0, le=1.0)
+
+    # --- fact-check audit (app/services/audit_service.py) ---------------------
+    # Check a finished course against its source documents automatically.
+    enable_fact_check: bool = True
+    # Let a model read the doubtful sentences against their evidence (one call
+    # per chapter). Off, the rule-based findings stand on their own.
+    fact_check_ai: bool = True
+    fact_check_max_claims: int = Field(default=15, ge=1, le=60)
+
+    # --- review and notifications ---------------------------------------------
+    # Final approval of a course written from sources waits for the fact check
+    # to be run and its high-severity findings to be decided.
+    require_findings_resolved: bool = True
+    notifications_enabled: bool = True
+    # Email is sent only when a host is set; the in-app inbox is always written.
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+    # Where the app is served, so an email can link to the review screen.
+    public_app_url: str = ""
     log_level: str = "INFO"
     app_name: str = "AI Course Creation Platform - Backend POC"
     app_version: str = "0.2.0"

@@ -8,7 +8,7 @@ import { StepHeader } from "@/components/ui/StepHeader";
 import { ChapterItem, type DragState } from "./ChapterItem";
 import { ImproveTocDialog } from "./ImproveTocDialog";
 import { TocSummary } from "./TocSummary";
-import { createCourse, improveToc } from "@/lib/api/courses";
+import { approveOutline, createCourse, improveToc } from "@/lib/api/courses";
 import { ApiError } from "@/lib/api/client";
 import { useCourseDraft } from "@/lib/state/course-draft";
 import type { ImproveTocResponse, TocItem } from "@/lib/types/course";
@@ -175,6 +175,10 @@ export function TocEditor() {
           language: "en",
           tone: "",
           learner_profile: draft.learnerProfile,
+          style_guide: draft.styleGuide,
+          source_ids: draft.sourceIds ?? [],
+          design_models:
+            draft.designModels && draft.designModels.models.length > 0 ? draft.designModels : null,
           // Only an uploaded template sets this; the built-in pair is
           // resolved from `template` server-side exactly as before.
           template_id_override: draft.selectedTemplate?.templateId ?? null,
@@ -183,6 +187,9 @@ export function TocEditor() {
         },
         { runPlanner: false },
       );
+      // Clicking "Generate Course" on this screen is the person signing off the
+      // outline (Gate 1); the server refuses to generate until it is recorded.
+      await approveOutline(record.course_id);
       update({ courseId: record.course_id, documentId: record.document_id });
       router.push(`/generate/${record.course_id}`);
     } catch (caught) {

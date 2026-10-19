@@ -1,4 +1,4 @@
-"""AI memory layer: DB-backed templates, visual knowledge, course samples,
+"""AI memory layer: DB-backed templates
 generation history, and the bounded MemoryContext assembled from them.
 
 Reuses `CourseTemplate` (schemas/template.py) as the payload shape for a
@@ -75,100 +75,6 @@ class TemplateListResponse(BaseModel):
     offset: int
 
 
-# --- Visual knowledge ---------------------------------------------------------
-
-
-class VisualKnowledgeCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    course_id: str | None = Field(default=None, description="Course the asset was generated for.")
-    asset_path: str = Field(min_length=1, max_length=300, description="Course-relative path, e.g. 'assets/image_003.svg'.")
-    kind: Literal["illustration", "diagram"] = "illustration"
-    diagram_kind: str | None = None
-    topic: str = Field(default="", max_length=200)
-    description: str = Field(default="", max_length=2000)
-    tags: list[str] = Field(default_factory=list, max_length=20)
-
-
-class VisualKnowledgeUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    topic: str | None = Field(default=None, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
-    tags: list[str] | None = Field(default=None, max_length=20)
-    approved: bool | None = None
-
-
-class VisualKnowledgeEntry(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    id: UUID
-    course_id: str | None = None
-    asset_path: str
-    asset_url: str | None = None
-    kind: str
-    diagram_kind: str | None = None
-    topic: str
-    description: str
-    tags: list[str]
-    approved: bool
-    created_by: str | None = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class VisualKnowledgeListResponse(BaseModel):
-    items: list[VisualKnowledgeEntry]
-    total: int
-    limit: int
-    offset: int
-
-
-# --- Course samples ------------------------------------------------------------
-
-
-class CourseSampleCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    course_id: str = Field(min_length=1, description="An existing, already-generated course.")
-    title: str | None = Field(default=None, max_length=300, description="Defaults to the course title.")
-    topic: str = Field(default="", max_length=200)
-    description: str = Field(default="", max_length=2000)
-    tags: list[str] = Field(default_factory=list, max_length=20)
-
-
-class CourseSampleUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: str | None = Field(default=None, max_length=300)
-    topic: str | None = Field(default=None, max_length=200)
-    description: str | None = Field(default=None, max_length=2000)
-    tags: list[str] | None = Field(default=None, max_length=20)
-    approved: bool | None = None
-
-
-class CourseSampleEntry(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    id: UUID
-    course_id: str
-    title: str
-    topic: str
-    description: str
-    tags: list[str]
-    approved: bool
-    created_by: str | None = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class CourseSampleListResponse(BaseModel):
-    items: list[CourseSampleEntry]
-    total: int
-    limit: int
-    offset: int
-
-
 # --- Generation history --------------------------------------------------------
 
 
@@ -191,8 +97,6 @@ class GenerationRunListResponse(BaseModel):
 
 # --- Memory context (retrieval-time, not persisted) ----------------------------
 
-MAX_SAMPLE_NOTES = 2
-MAX_VISUAL_NOTES = 3
 MAX_HISTORY_NOTES = 2
 MAX_NOTE_CHARS = 320
 MAX_CONTEXT_CHARS = 1800
@@ -206,13 +110,11 @@ class MemoryContext(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     template_notes: str = ""
-    sample_notes: list[str] = Field(default_factory=list)
-    visual_notes: list[str] = Field(default_factory=list)
     history_notes: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)  # human-readable provenance, for /admin/memory/preview
 
     def is_empty(self) -> bool:
-        return not (self.template_notes or self.sample_notes or self.visual_notes or self.history_notes)
+        return not (self.template_notes or self.history_notes)
 
     def render(self) -> str:
         """A single prompt-ready block, or "" when there is nothing useful.
@@ -220,10 +122,6 @@ class MemoryContext(BaseModel):
         parts: list[str] = []
         if self.template_notes:
             parts.append(f"Template guidance: {self.template_notes}")
-        for note in self.sample_notes[:MAX_SAMPLE_NOTES]:
-            parts.append(f"Reference course example: {note}")
-        for note in self.visual_notes[:MAX_VISUAL_NOTES]:
-            parts.append(f"Existing relevant visual: {note}")
         for note in self.history_notes[:MAX_HISTORY_NOTES]:
             parts.append(f"Past generation note: {note}")
         text = "\n".join(parts)
@@ -267,8 +165,8 @@ class EmbeddingStatusResponse(BaseModel):
 class EmbeddingBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    source_types: list[Literal["template", "visual_knowledge", "course_sample", "generation_run"]] = Field(
-        default_factory=lambda: ["template", "visual_knowledge", "course_sample", "generation_run"]
+    source_types: list[Literal["template", "generation_run"]] = Field(
+        default_factory=lambda: ["template", "generation_run"]
     )
     dry_run: bool = False
     concurrency: int = Field(default=4, ge=1, le=16)

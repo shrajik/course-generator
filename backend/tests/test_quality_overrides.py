@@ -22,7 +22,9 @@ from app.core.errors import (
     QualityEvaluationFailedError,
     ValidationFailedError,
 )
+from app.schemas.audit import AuditFinding, AuditReport
 from app.schemas.course import GenerateRequest
+from app.services.audit_service import get_audit_service
 
 
 async def _submitted_level_3_course(service, technical_input):
@@ -337,3 +339,111 @@ async def test_the_four_override_actions_are_genuinely_distinct_values():
         "override_approved_incomplete_chapters",
     }
     assert len(actions) == 4  # sanity: no accidental collision in this test file's own usage
+
+
+# --- interaction with the source/fact-check audit gate ----------------------
+# origin/visual-and-flowchart's `approval_blockers` gate (course_service.py's
+# plain `approve_course`) predates none of the four overrides above - none of
+# them is scoped to lift it, so per this module's own stated contract ("an
+# override for one category never silently waves through a different,
+# unrelated problem") each must still enforce it exactly like plain
+# `approve_course` does. These pin that down directly, since no test before
+# this exercised an override and the audit gate together.
+
+
+def _audit_finding(severity="high", status="open") -> AuditFinding:
+    return AuditFinding(
+        finding_id=f"f-{severity}-{status}", block_id="b", chapter="Chapter 1", sentence="S",
+        kind="invalid_citation", severity=severity, status=status,
+    )
+
+
+def _audit_report(course_id: str, *findings: AuditFinding) -> AuditReport:
+    return AuditReport(
+        course_id=course_id, document_id=f"doc_{course_id}", generated_at="t", source_count=1,
+        findings=list(findings), sentences_checked=10, supported_sentences=4, cited_sentences=3,
+    )
+
+
+async def _submitted_level_3_course_with_a_source(service, technical_input):
+    """Same guaranteed confirmed-blocker fixture as `_submitted_level_3_course`
+    above, plus a source id so `has_sources` is true and the audit gate
+    engages. The id does not need to resolve to a real uploaded source:
+    `SourceService.load_library`/`excerpts_for` already skip a missing one
+    (NotFoundError -> warning -> continue), and generation's own auto-audit
+    (`CourseService._audit_after_generation`) never lets an audit failure
+    fail the course - it logs a warning and leaves no audit.json. Each test
+    below saves its own `AuditReport` directly afterward, the same technique
+    test_review_screen.py's approval-rule tests already use."""
+    level_3_input = technical_input.model_copy(
+        update={"content_level": 3, "source_ids": ["src_does_not_exist"]}
+    )
+    record = await service.create_course(level_3_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+    return record
+
+
+async def test_override_approved_blockers_is_still_blocked_by_an_unresolved_audit_finding(
+    service, technical_input
+):
+    """The override lifts ONLY the confirmed-blocker gate - an unresolved,
+    unrelated source/fact-check finding must still block it, exactly as it
+    already blocks plain approve_course (test_review_screen.py's
+    test_final_approval_is_blocked_until_high_findings_are_decided)."""
+    record = await _submitted_level_3_course_with_a_source(service, technical_input)
+    get_audit_service()._save(_audit_report(record.course_id, _audit_finding()))
+
+    with pytest.raises(ConflictError, match="Final approval is blocked.*high-severity"):
+        await service.approve_course_override_blockers(
+            record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+        )
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"  # never silently approved
+
+
+async def test_override_approved_blockers_succeeds_once_the_audit_finding_is_resolved(
+    service, technical_input
+):
+    record = await _submitted_level_3_course_with_a_source(service, technical_input)
+    get_audit_service()._save(_audit_report(record.course_id, _audit_finding(status="dismissed")))
+
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+    )
+    assert approved.review_status == "approved"
+
+
+async def test_override_approved_blockers_without_sources_is_unaffected_by_the_audit_gate(
+    service, technical_input
+):
+    """Regression anchor for the structural-quality override behaviour this
+    fix must leave unchanged: a course with no uploaded sources never
+    engages the audit gate (`approval_blockers(has_sources=False, ...)` is
+    always `[]`), sourced or not, before or after this fix."""
+    record = await _submitted_level_3_course(service, technical_input)
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+    )
+    assert approved.review_status == "approved"
+
+
+async def test_an_unreadable_audit_report_fails_closed_not_crashed_for_an_override(
+    service, technical_input
+):
+    """AuditService.load() returns None - never raises - for a corrupt
+    audit.json (see its own try/except ValueError). `approval_blockers`
+    treats a None audit on a sourced course as "not run yet" and blocks,
+    exactly the safe-failure policy plain approve_course already relies on.
+    The override must fail closed the same way, never crash with a raw
+    parse error and never silently approve past an audit that could not be
+    read."""
+    record = await _submitted_level_3_course_with_a_source(service, technical_input)
+    get_audit_service()._path(record.course_id).write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(ConflictError, match="fact check has not been run"):
+        await service.approve_course_override_blockers(
+            record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+        )
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"

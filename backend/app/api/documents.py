@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 from app.api.course_authorization import check_document_owner
 from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.ids import slugify
+from app.course.compliance import build_report
+from app.course.design_models import design_outputs
 from app.db.models import User
 from app.schemas.document import (
     CourseDocument,
@@ -154,6 +156,46 @@ async def repair_visual_coverage(
             course_id, str(current_user.id), current_user.email, "updated"
         )
     return response
+
+
+@router.get("/{document_id}/compliance")
+async def compliance_report(
+    document_id: str,
+    schema: str = Query(default="lom", pattern="^(lom|dublin_core)$"),
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """The end-of-course report card: QA checklist (8 checks), accessibility
+    flags and per-asset alt-text requirements, and a LOM or Dublin Core
+    metadata block. Computed from the saved document with no AI call."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    document = await service.load(document_id)
+    record = await course_service.get_course_record(course_id)
+    report = build_report(
+        document,
+        schema=schema,  # type: ignore[arg-type]
+        owner=current_user.email if current_user is not None else None,
+        language=record.input.language,
+        profile=record.input.learner_profile,
+    )
+    return report.to_dict()
+
+
+@router.get("/{document_id}/design-outputs")
+async def design_model_outputs(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """The plan documents the selected design models call for: ADDIE's
+    implementation and evaluation notes, Kirkpatrick's four-level plan. Built
+    from the saved course with no AI call; {} when no model asks for one."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    document = await service.load(document_id)
+    record = await course_service.get_course_record(course_id)
+    return design_outputs(document, record.input)
 
 
 @router.post("/{document_id}/export/pdf")

@@ -26,6 +26,9 @@ os.environ["LOG_LEVEL"] = "WARNING"
 # persistence has its own tests in test_database_foundation.py, which opt back
 # in with TEST_DATABASE_URL.
 os.environ["USE_DATABASE"] = "false"
+# The outline gate has its own tests (test_outline_gate.py); everything else
+# creates a course and generates it in one go.
+os.environ["REQUIRE_OUTLINE_APPROVAL"] = "false"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -33,7 +36,15 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.core.config import get_settings, reset_settings_cache  # noqa: E402
 from app.db.engine import dispose_engine  # noqa: E402
 from app.schemas.course import CourseInput  # noqa: E402
-from app.services import course_service, document_service, storage_service  # noqa: E402
+from app.services import (  # noqa: E402
+    audit_service,
+    course_service,
+    document_service,
+    knowledge_service,
+    notification_service,
+    source_service,
+    storage_service,
+)
 from app.services.embedding_service import reset_embedding_service  # noqa: E402
 from app.services.openai_service import set_ai_client  # noqa: E402
 
@@ -134,8 +145,16 @@ def isolated_data_dir(tmp_path, monkeypatch):
     document_service.reset_document_service()
     set_ai_client(None)
     reset_embedding_service()
+    source_service.reset_source_service()
+    audit_service.reset_audit_service()
+    knowledge_service.reset_knowledge_service()
+    notification_service.reset_notification_service()
     (tmp_path / "data" / "courses").mkdir(parents=True, exist_ok=True)
     yield
+    source_service.reset_source_service()
+    audit_service.reset_audit_service()
+    knowledge_service.reset_knowledge_service()
+    notification_service.reset_notification_service()
     reset_settings_cache()
     storage_service.reset_storage()
     course_service.reset_course_service()

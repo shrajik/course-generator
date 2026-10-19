@@ -126,6 +126,28 @@ export const LEARNING_APPROACH_OPTIONS: { value: LearningApproach; label: string
   },
 ];
 
+/** Mirrors backend app/schemas/style.py. */
+export interface StyleGuide {
+  base: "mstp" | "cmos";
+  citation_system: "author_date" | "notes_bibliography";
+  brand_terms: string[];
+  banned_words: string[];
+}
+
+export type DesignModelId = "addie" | "bloom" | "sam" | "gagne" | "kirkpatrick";
+export type BloomLevel = "Remember" | "Understand" | "Apply" | "Analyze" | "Evaluate" | "Create";
+
+/** Mirrors backend app/schemas/design.py. */
+export interface DesignModels {
+  models: DesignModelId[];
+  sam_loop: "SAM1" | "SAM2" | null;
+  sam_review_ready: string;
+  microlearning: boolean;
+  bloom_target_level: BloomLevel | null;
+  business_goal: string;
+  data_sources: "lms_only" | "lms_and_kpis";
+}
+
 export interface CourseInput {
   course_title: string;
   toc: TocItem[];
@@ -137,6 +159,12 @@ export interface CourseInput {
   tone: string;
   /** Optional: courses created before the pedagogy layer have no profile. */
   learner_profile?: LearnerProfile | null;
+  /** Optional instructional-design models (ADDIE, Bloom, SAM, Gagne, Kirkpatrick). */
+  design_models?: DesignModels | null;
+  /** Optional writing style guide and client overrides. */
+  style_guide?: StyleGuide | null;
+  /** Ids of the uploaded source documents this course is written from. */
+  source_ids?: string[];
   /** Registry template id. Omitted for the built-in technical/non_technical
    * pair (resolved from `template`); set to `uploaded:{uuid}` when the user
    * picked an uploaded DOCX template. */
@@ -221,6 +249,7 @@ export type ActivityAction =
   | "submitted_for_review"
   | "changes_requested"
   | "approved"
+  | "outline_approved"
   | "exported";
 
 export interface CourseActivityEntry {
@@ -262,6 +291,9 @@ export interface CourseRecord {
   reviewer_id: string | null;
   reviewed_at: string | null;
   review_history: ReviewHistoryEntry[];
+  /** Gate 1. null = created before the gate existed; false = awaiting sign-off. */
+  outline_approved?: boolean | null;
+  outline_approved_at?: string | null;
   created_at: string;
   updated_at: string;
   chapters: ChapterProgress[];
@@ -362,6 +394,8 @@ export interface GenerateRequest {
   mode?: "background" | "sync";
   resume?: boolean;
   deep_research_chapter_ids?: string[] | null;
+  /** SAM: the reviewer's feedback on the previous iteration. */
+  sam_feedback?: string;
 }
 
 export interface GenerateResponse {

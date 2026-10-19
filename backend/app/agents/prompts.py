@@ -19,7 +19,9 @@ from app.schemas.course import CourseInput, ImproveTocRequest
 from app.schemas.document import Block
 from app.schemas.research import ChapterResearch
 from app.schemas.review import ChapterReview
+from app.course.design_models import design_model_brief
 from app.course.pedagogy import learner_brief, pedagogy_rules_brief
+from app.course.style_guide import style_guide_brief
 from app.schemas.template import CourseTemplate
 
 
@@ -105,6 +107,44 @@ def _appended(section: str) -> str:
     material existed - the same contract `memory_section` relies on.
     """
     return f"\n{section}\n" if section else ""
+
+
+def _rules_brief(course_input: CourseInput) -> str:
+    """Methodology rules; an explicit style guide replaces the default writing rules."""
+    return pedagogy_rules_brief(
+        course_input.learner_profile, include_writing_style=course_input.style_guide is None
+    )
+
+
+def _style_brief(course_input: CourseInput) -> str:
+    return style_guide_brief(course_input.style_guide)
+
+
+def source_grounding_guidance(course_input: CourseInput) -> str:
+    """How to use the creator's uploaded documents. "" when there are none, so
+    prompts for a course without sources are byte-identical to before."""
+    if not course_input.source_ids:
+        return ""
+    return (
+        "UPLOADED SOURCE MATERIAL:\n"
+        "- The creator uploaded their own documents. Passages from them appear in each "
+        "chapter's research as UPLOADED SOURCE EXCERPTS, each with a reference such as [S1.3].\n"
+        "- Treat those passages as the ground truth. Where they and web research disagree, "
+        "follow the passages.\n"
+        "- State a fact that comes from a passage only as the passage supports it, and put its "
+        "reference in square brackets right after the statement. Never cite a reference that "
+        "was not given, and never attach a reference to a claim the passage does not make.\n"
+        "- If the passages do not cover something the chapter needs, say so plainly rather "
+        "than inventing details."
+    )
+
+
+def _design_brief(course_input: CourseInput) -> str:
+    """Rules for the selected instructional-design models ("" when none is)."""
+    return design_model_brief(
+        course_input.design_models,
+        bloom_already_stated=course_input.learner_profile is not None,
+    )
 
 
 def code_cell_guidance(template: CourseTemplate) -> str:
@@ -346,7 +386,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(content_level_brief(course_input.content_level))}{_appended(learning_approaches_brief(course_input.learning_approaches))}"""
+{_appended(learner_brief(course_input.learner_profile))}{_appended(content_level_brief(course_input.content_level))}{_appended(learning_approaches_brief(course_input.learning_approaches))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}"""
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +860,7 @@ ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE WRITING GUIDANCE: {template.writer_guidance}
 IMAGE STYLE GUIDANCE: {template.image_guidance}
-{_appended(code_cell_guidance(template))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}"""
+{_appended(code_cell_guidance(template))}{_appended(source_grounding_guidance(course_input))}{_appended(_rules_brief(course_input))}"""
 
 
 def writer_user(
@@ -1084,7 +1124,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}{_appended(chapter_contract_brief(chapter))}{_appended(approach_review_brief(course_input))}
+{_appended(learner_brief(course_input.learner_profile))}{_appended(chapter_contract_brief(chapter))}{_appended(approach_review_brief(course_input))}{_appended(_rules_brief(course_input))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}
 REQUIRED TEMPLATE SECTIONS: {", ".join(s.key for s in template.required_sections())}
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE REVIEW FOCUS:
@@ -1156,7 +1196,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(pedagogy_rules_brief(course_input.learner_profile))}
+{_appended(learner_brief(course_input.learner_profile))}{_appended(_rules_brief(course_input))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}
 REVIEWER ISSUES TO FIX:
 {chr(10).join(issues) or "(see summary)"}
 REVIEWER SUMMARY: {review.summary}

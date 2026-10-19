@@ -40,6 +40,12 @@ from app.core.errors import (
     QualityEvaluationFailedError,
     ValidationFailedError,
 )
+from app.course.review_brief import approval_blockers
+from app.schemas.research import ChapterResearch
+from app.services.audit_service import get_audit_service
+from app.services.knowledge_service import get_knowledge_service
+from app.services.notification_service import get_notification_service
+from app.services.source_service import get_source_service, owner_key_for
 from app.core.generation_stream import get_stream_hub, make_stream_sink
 from app.core.ids import course_id as new_course_id
 from app.core.ids import document_id_for_course, new_id, utc_now_iso
@@ -235,6 +241,7 @@ class CourseService:
             input=course_input,
             template_id=course_input.template_id,
             owner_id=owner_id,
+            outline_approved=False,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
         )
@@ -256,6 +263,31 @@ class CourseService:
                 return record
             record = await self._load_course(course_id)
         return record
+
+    # --- Gate 1: outline sign-off -------------------------------------------
+    async def approve_outline(self, course_id: str, actor_id: str | None) -> CourseRecord:
+        """Sign off the table of contents so generation may begin."""
+        record = await self._load_course(course_id)
+        if not record.input.toc:
+            raise ValidationFailedError("The outline has no chapters to approve")
+        if record.outline_approved:
+            return record  # idempotent: approving twice changes nothing
+        now = utc_now_iso()
+        record.outline_approved = True
+        record.outline_approved_at = now
+        record.outline_approved_by = actor_id
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Outline approved for %s by %s", course_id, actor_id)
+        return record
+
+    def _require_outline_approved(self, record: CourseRecord) -> None:
+        # None = a course from before the gate existed; never block it.
+        if self.settings.require_outline_approval and record.outline_approved is False:
+            raise ConflictError(
+                "The outline has not been approved yet. Review the table of contents and "
+                "approve it before generating the course."
+            )
 
     # --- review/approval workflow -------------------------------------------
     # draft -> in_review -> approved
@@ -300,6 +332,18 @@ class CourseService:
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Course %s submitted for review", course_id)
+        try:
+            notifier = get_notification_service()
+            await notifier.notify(
+                await notifier.reviewers(),
+                "review_requested",
+                f"Review requested: \u201c{record.input.course_title}\u201d",
+                "A course was submitted for your review.",
+                course_id=course_id,
+                link=f"/review/{record.document_id}",
+            )
+        except Exception as exc:  # noqa: BLE001 - never blocks the submission
+            log.warning("Could not notify reviewers for %s: %s", course_id, exc)
         return record
 
     async def approve_course(
@@ -331,6 +375,17 @@ class CourseService:
                 f"Course '{course_id}' has {len(blocking)} unresolved quality blocker(s)",
                 details={"findings": [f.model_dump(mode="json") for f in blocking]},
             )
+        # origin/visual-and-flowchart's separate, orthogonal gate - only
+        # engages for a course with uploaded sources, checking its
+        # fact-check audit rather than structural/code/reviewer findings.
+        # Preserved alongside the quality gate above, never replacing it.
+        if self.settings.require_findings_resolved:
+            blockers = approval_blockers(
+                has_sources=bool(record.input.source_ids),
+                audit=get_audit_service().load(course_id),
+            )
+            if blockers:
+                raise ConflictError("Final approval is blocked: " + " ".join(blockers))
         now = utc_now_iso()
         record.review_status = "approved"
         record.review_comment = comment
@@ -343,6 +398,10 @@ class CourseService:
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Course %s approved by %s", course_id, reviewer_id)
+        await self._tell_author(
+            record, "course_approved", f"\u201c{record.input.course_title}\u201d was approved",
+            comment or "A reviewer gave it final approval.",
+        )
         return record
 
     async def _verify_inventory(self, record: CourseRecord) -> list[ChapterInventoryIssue]:
@@ -439,8 +498,9 @@ class CourseService:
     # require `review_status == "in_review"` (the same precondition as plain
     # `approve_course`) and still run every OTHER gate normally: an override
     # for one category never silently waves through a different, unrelated
-    # problem. See ReviewHistoryEntry.action / OverrideEvidence for the
-    # audit-trail shape this persists.
+    # problem - including the source/fact-check audit gate below, which none
+    # of the four is scoped to lift. See ReviewHistoryEntry.action /
+    # OverrideEvidence for the audit-trail shape this persists.
     async def _approve_with_override(
         self,
         course_id: str,
@@ -531,6 +591,19 @@ class CourseService:
                 errors = [f.verification_error for f in verification_failed if f.verification_error]
                 evidence.verification_error = "; ".join(errors)[:1000] if errors else None
 
+        # None of the four actions above is scoped to the source/fact-check
+        # audit gate (origin/visual-and-flowchart) - per this method's own
+        # docstring, an override for one category must never silently waive
+        # a different, unrelated one. Same check, same failure policy, same
+        # error as plain `approve_course` below - just enforced here too.
+        if self.settings.require_findings_resolved:
+            blockers = approval_blockers(
+                has_sources=bool(record.input.source_ids),
+                audit=get_audit_service().load(course_id),
+            )
+            if blockers:
+                raise ConflictError("Final approval is blocked: " + " ".join(blockers))
+
         now = utc_now_iso()
         record.review_status = "approved"
         record.review_comment = reason
@@ -597,6 +670,9 @@ class CourseService:
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Course %s sent back for changes by %s", course_id, reviewer_id)
+        await self._tell_author(
+            record, "changes_requested", f"Changes requested on \u201c{record.input.course_title}\u201d", comment
+        )
         return record
 
     # --- activity log --------------------------------------------------------
@@ -715,6 +791,7 @@ class CourseService:
         away the whole run; the frontend already polls the course record.
         """
         record = await self._load_course(course_id)
+        self._require_outline_approved(record)
 
         if request.mode == "sync":
             # A real, confirmed gap: a sync-mode call used to run `generate()`
@@ -812,6 +889,10 @@ class CourseService:
             template = load_template(blueprint.template_id or record.template_id)
 
             targets = self._select_chapters(blueprint, request)
+            targets = self._sam_iteration_targets(course_id, record, blueprint, request, targets)
+            # Kept on the record (an extra field) so every chapter task of this
+            # run sees it; cleared when a run carries none.
+            record.sam_feedback = request.sam_feedback.strip()
             if request.resume:
                 targets = [
                     chapter
@@ -866,6 +947,12 @@ class CourseService:
                 for chapter in targets:
                     if chapter.id not in research_map:
                         warnings.append(f"{chapter.id}: research unavailable, wrote without it")
+
+            # --- the creator's own documents (ground truth) ----------------
+            research_map, source_warnings = await self._attach_source_excerpts(
+                record, targets, research_map
+            )
+            warnings.extend(source_warnings)
 
             # --- write + review --------------------------------------------
             record.status = "writing"
@@ -1063,7 +1150,7 @@ class CourseService:
                 blueprint=blueprint,
                 chapter=chapter,
                 template=template,
-                course_input=record.input,
+                course_input=self._run_input(record),
                 research=research,
                 continuity=continuity,
                 on_delta=make_stream_sink(record.course_id, chapter.id, "writing"),
@@ -1085,7 +1172,7 @@ class CourseService:
                     blueprint=blueprint,
                     chapter=chapter,
                     template=template,
-                    course_input=record.input,
+                    course_input=self._run_input(record),
                     blocks=blocks,
                     continuity=continuity,
                 )
@@ -1096,7 +1183,7 @@ class CourseService:
                         blueprint=blueprint,
                         chapter=chapter,
                         template=template,
-                        course_input=record.input,
+                        course_input=self._run_input(record),
                         research=research,
                         continuity=continuity,
                         review=review,
@@ -1109,7 +1196,7 @@ class CourseService:
                         blueprint=blueprint,
                         chapter=chapter,
                         template=template,
-                        course_input=record.input,
+                        course_input=self._run_input(record),
                         blocks=blocks,
                         continuity=continuity,
                     )
@@ -1225,6 +1312,9 @@ class CourseService:
                         record.course_id, len(repair.repaired), len(repair.still_deficient),
                     )
                 await self._save_document(document)
+            # The finished course is checked against the creator's own documents.
+            if record.input.source_ids and self.settings.enable_fact_check:
+                warnings.extend(await self._audit_after_generation(record, document))
             pages = len(document.pages)
             record.has_document = True
 
@@ -1286,6 +1376,11 @@ class CourseService:
         record.status = "failed" if failed and not generated else "ready"
         record.last_error = f"chapters failed: {', '.join(failed)}" if failed else None
         record.warnings = warnings
+        if record.status == "ready":
+            await self._tell_author(
+                record, "generation_done", f"\u201c{record.input.course_title}\u201d is ready",
+                f"{len(generated)} chapter(s) written." + (f" {warnings[-1]}" if warnings else ""),
+            )
 
         summary = metrics_summary
         model_usage: list[dict[str, Any]] = []
@@ -1464,6 +1559,132 @@ class CourseService:
                 )
 
     # --- helpers ----------------------------------------------------------
+    async def _tell_author(
+        self, record: CourseRecord, kind: str, title: str, message: str
+    ) -> None:
+        """Tell the course's author something happened to it. Best-effort."""
+        try:
+            notifier = get_notification_service()
+            person = await notifier.recipient(record.owner_id)
+            if person is not None:
+                await notifier.notify(
+                    [person], kind, title, message,  # type: ignore[arg-type]
+                    course_id=record.course_id,
+                    link=f"/editor/{record.document_id}",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not notify the author of %s: %s", record.course_id, exc)
+
+    async def _audit_after_generation(self, record: CourseRecord, document) -> list[str]:
+        """Fact-check the finished course; never let it fail the generation."""
+        try:
+            report = await get_audit_service().run(
+                document=document,
+                owner_key=owner_key_for(record.owner_id),
+                source_ids=record.input.source_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - an audit problem is a warning, not a failed course
+            log.warning("Fact check failed for %s: %s", record.course_id, exc)
+            return ["The fact check could not be run."]
+        counts = report.summary()["by_severity"]
+        serious = counts["high"] + counts["medium"]  # type: ignore[index]
+        if serious:
+            return [f"Fact check: {serious} statement(s) need review against the source documents."]
+        return []
+
+    async def _attach_source_excerpts(
+        self,
+        record: CourseRecord,
+        targets: list[BlueprintChapter],
+        research_map: dict,
+    ) -> tuple[dict, list[str]]:
+        """Give each chapter the best passages of what it may draw on besides the
+        web: the course's own uploaded sources, and the global knowledge library.
+
+        Attached for this run only (never stored with the cached research), so a
+        changed document is picked up next time. The library is searched for
+        every course; for most chapters nothing in it is relevant enough, and
+        then nothing is added.
+        """
+        has_course_sources = bool(record.input.source_ids)
+        library = get_knowledge_service()
+        if not has_course_sources and not library.has_documents():
+            return research_map, []
+        owner = owner_key_for(record.owner_id)
+        sources = get_source_service()
+        result = dict(research_map)
+        warnings: list[str] = []
+        for chapter in targets:
+            query = " ".join(
+                [chapter.title, chapter.objective, *chapter.key_concepts, *(s.title for s in chapter.sections)]
+            )
+            excerpts = []
+            if has_course_sources:
+                try:
+                    excerpts = await sources.excerpts_for(owner, record.input.source_ids, query)
+                    if not excerpts:
+                        warnings.append(f"{chapter.id}: no passage of the uploaded sources matched this chapter")
+                except Exception as exc:  # noqa: BLE001 - sources must never fail generation
+                    log.warning("Source retrieval failed for %s/%s: %s", record.course_id, chapter.id, exc)
+                    warnings.append(f"{chapter.id}: uploaded sources could not be searched")
+            knowledge = []
+            try:
+                knowledge = await library.search(query)
+            except Exception as exc:  # noqa: BLE001 - the library must never fail generation
+                log.warning("Knowledge search failed for %s/%s: %s", record.course_id, chapter.id, exc)
+            if not excerpts and not knowledge:
+                continue
+            research = result.get(chapter.id)
+            research = (
+                research.model_copy()
+                if research is not None
+                else ChapterResearch(chapter_id=chapter.id, chapter_title=chapter.title, mode="sources")
+            )
+            research.source_excerpts = excerpts
+            research.knowledge_excerpts = knowledge
+            result[chapter.id] = research
+        return result, warnings
+
+    @staticmethod
+    def _run_input(record: CourseRecord) -> CourseInput:
+        """The course input the writers see: the stored one, plus - for a SAM
+        iteration - the reviewer's feedback on the previous iteration, stated
+        as something the writer must apply. The stored input is never changed."""
+        feedback = str(getattr(record, "sam_feedback", "") or "").strip()
+        if not feedback:
+            return record.input
+        return record.input.model_copy(
+            update={"dos": [*record.input.dos, f"Apply this reviewer feedback from the previous iteration: {feedback}"]}
+        )
+
+    def _sam_iteration_targets(
+        self,
+        course_id: str,
+        record: CourseRecord,
+        blueprint: CourseBlueprint,
+        request: GenerateRequest,
+        targets: list[BlueprintChapter],
+    ) -> list[BlueprintChapter]:
+        """SAM never delivers the whole course in one pass: a run builds one
+        module, and the next waits for the reviewer's feedback on it."""
+        design = record.input.design_models
+        if design is None or not design.has("sam") or request.chapter_ids or request.resume:
+            return targets
+        pending = [
+            chapter
+            for chapter in targets
+            if not self.storage.has_chapter(course_id, chapter.id, chapter.order)
+        ]
+        if not pending:
+            return targets  # everything is built; a full regeneration is the user's call
+        already_built = len(blueprint.chapters) - len(pending)
+        if already_built > 0 and not request.sam_feedback.strip():
+            raise ConflictError(
+                "SAM builds one module per iteration. Provide the reviewer's feedback on the "
+                "previous iteration (sam_feedback) before generating the next one."
+            )
+        return [pending[0]]
+
     @staticmethod
     def _select_chapters(
         blueprint: CourseBlueprint, request: GenerateRequest

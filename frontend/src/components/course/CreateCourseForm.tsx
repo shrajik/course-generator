@@ -6,7 +6,10 @@ import { ArrowRight, CheckCircle2, FileText, Layers3, Loader2, Save } from "luci
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { CoursePreviewArt } from "./CoursePreviewArt";
+import { DesignModelsPanel } from "./DesignModelsPanel";
 import { LearnerProfilePanel } from "./LearnerProfilePanel";
+import { SourcesPanel } from "./SourcesPanel";
+import { StyleGuidePanel } from "./StyleGuidePanel";
 import { RuleList } from "./RuleList";
 import { improveToc } from "@/lib/api/courses";
 import { classifyTemplateType } from "@/lib/api/course-templates";
@@ -192,6 +195,11 @@ export function CreateCourseForm() {
             </select>
           </div>
 
+          <SourcesPanel
+            selected={draft.sourceIds ?? []}
+            onChange={(sourceIds) => update({ sourceIds })}
+          />
+
           <LearnerProfilePanel
             value={draft.learnerProfile}
             onChange={(learnerProfile) => update({ learnerProfile })}
@@ -275,6 +283,16 @@ export function CreateCourseForm() {
               })}
             </div>
           </div>
+
+          <DesignModelsPanel
+            value={draft.designModels}
+            onChange={(designModels) => update({ designModels })}
+          />
+
+          <StyleGuidePanel
+            value={draft.styleGuide}
+            onChange={(styleGuide) => update({ styleGuide })}
+          />
 
           <div className="grid gap-4 sm:grid-cols-2">
             <RuleList

@@ -6,6 +6,7 @@ export const ACTIVITY_LABELS: Record<ActivityAction, string> = {
   submitted_for_review: "submitted for review",
   changes_requested: "requested changes",
   approved: "approved the course",
+  outline_approved: "approved the outline",
   exported: "exported the PDF",
 };
 

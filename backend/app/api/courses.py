@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict
 
 from app.api.course_authorization import get_course_for_author_action, get_owned_course
 from app.api.dependencies import (
@@ -27,7 +28,14 @@ from app.course.templates.registry import (
     load_template,
 )
 from app.db.models import User
+from app.schemas.audit import AuditReport
 from app.schemas.blueprint import CourseBlueprint
+from app.services.document_service import DocumentService, get_document_service
+from app.course.compliance import build_report
+from app.course.review_brief import build_review_brief
+from app.services.audit_service import get_audit_service
+from app.services.knowledge_service import get_knowledge_service
+from app.services.source_service import get_source_service, owner_key_for
 from app.schemas.course import (
     ApproveCourseRequest,
     CourseActivityListResponse,
@@ -109,6 +117,9 @@ async def create_course(
             "uploaded" if is_uploaded_template_id(request.template_id_override) else "built_in",
         )
     owner_id = str(current_user.id) if current_user is not None else None
+    if course_input.source_ids:
+        # Only the creator's own, fully processed sources may ground a course.
+        get_source_service().validate_for_course(owner_key_for(owner_id), course_input.source_ids)
     record = await service.create_course(course_input, run_planner=request.run_planner, owner_id=owner_id)
     if current_user is not None:
         await service.record_activity(record.course_id, owner_id, current_user.email, "created")
@@ -203,6 +214,168 @@ async def get_blueprint(
 ) -> CourseBlueprint:
     await get_owned_course(course_id, current_user, service)
     return await service.get_blueprint(course_id)
+
+
+class FindingStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["open", "accepted", "dismissed"]
+
+
+def _audit_payload(report: AuditReport) -> dict[str, Any]:
+    return {**report.model_dump(mode="json"), "summary": report.summary()}
+
+
+@router.post("/{course_id}/audit")
+async def run_audit(
+    course_id: str,
+    use_ai: bool | None = Query(default=None),
+    service: CourseService = Depends(_service),
+    documents: DocumentService = Depends(get_document_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """Fact-check the course against its source documents (author or admin)."""
+    record = await get_course_for_author_action(course_id, current_user, service)
+    document = await documents.load(record.document_id)
+    report = await get_audit_service().run(
+        document=document,
+        owner_key=owner_key_for(record.owner_id),
+        source_ids=record.input.source_ids,
+        use_ai=use_ai,
+    )
+    return _audit_payload(report)
+
+
+@router.get("/{course_id}/audit")
+async def get_audit(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """The latest fact-check report (owner, admin, or a reviewer of a submitted course)."""
+    await get_owned_course(course_id, current_user, service)
+    report = get_audit_service().load(course_id)
+    if report is None:
+        raise NotFoundError("No fact check has been run for this course")
+    return _audit_payload(report)
+
+
+@router.patch("/{course_id}/audit/findings/{finding_id}")
+async def set_finding_status(
+    course_id: str,
+    finding_id: str,
+    request: FindingStatusRequest,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """Record a reviewer's decision on one finding: accepted, dismissed or open."""
+    await get_owned_course(course_id, current_user, service)
+    finding = get_audit_service().set_status(course_id, finding_id, request.status)
+    return finding.model_dump(mode="json")
+
+
+# --- the reviewer's screen --------------------------------------------------------
+# A reviewer is not the person who uploaded the source documents, so the
+# course's own sources are read through the course (anyone who may open the
+# course may read them), never through the owner-scoped /api/sources routes.
+
+
+@router.get("/{course_id}/sources")
+async def course_sources(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> list[dict[str, Any]]:
+    """The source documents this course was written from, numbered as its
+    references number them: [S1.3] is passage 3 of source 1."""
+    record = await get_owned_course(course_id, current_user, service)
+    found = get_source_service().course_sources(owner_key_for(record.owner_id), record.input.source_ids)
+    return [
+        {
+            "number": number,
+            "prefix": f"S{number}",
+            "source_id": source.source_id,
+            "filename": source.filename,
+            "kind": source.kind,
+            "page_count": source.page_count,
+            "chunk_count": source.chunk_count,
+            "status": source.status,
+        }
+        for number, source in found
+    ]
+
+
+@router.get("/{course_id}/sources/{number}/passages")
+async def course_source_passages(
+    course_id: str,
+    number: int,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> list[dict[str, Any]]:
+    record = await get_owned_course(course_id, current_user, service)
+    passages = get_source_service().passages_of(
+        owner_key_for(record.owner_id), record.input.source_ids, number, offset, limit
+    )
+    return [p.model_dump(mode="json") for p in passages]
+
+
+@router.get("/{course_id}/passages")
+async def course_passages(
+    course_id: str,
+    refs: str = Query(..., description="Comma-separated references such as S1.3,S2.1"),
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> list[dict[str, Any]]:
+    """The full text of specific cited passages."""
+    record = await get_owned_course(course_id, current_user, service)
+    wanted = [ref.strip() for ref in refs.split(",") if ref.strip()][:50]
+    found = get_source_service().passages_by_refs(
+        owner_key_for(record.owner_id), record.input.source_ids, [r for r in wanted if r.startswith("S")]
+    )
+    # [G2.5] is a passage of the global knowledge library.
+    found += get_knowledge_service().passages_by_refs([r for r in wanted if r.startswith("G")])
+    return [p.model_dump(mode="json") for p in found]
+
+
+@router.get("/{course_id}/review-brief")
+async def review_brief(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    documents: DocumentService = Depends(get_document_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """What a reviewer needs to know before deciding: blockers, advisories and
+    where the open findings are. Built from the saved course, with no AI call."""
+    record = await get_owned_course(course_id, current_user, service)
+    document = await documents.load(record.document_id)
+    compliance = build_report(
+        document, language=record.input.language, profile=record.input.learner_profile
+    )
+    return build_review_brief(
+        document=document,
+        audit=get_audit_service().load(course_id),
+        compliance=compliance,
+        has_sources=bool(record.input.source_ids),
+        review_status=record.review_status,
+    )
+
+
+@router.post("/{course_id}/approve-outline", response_model=CourseRecord)
+async def approve_outline(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> CourseRecord:
+    """Gate 1: sign off the table of contents. `/generate` refuses to start
+    until this has been called. Author (or admin) only."""
+    await get_course_for_author_action(course_id, current_user, service)
+    actor = str(current_user.id) if current_user is not None else None
+    record = await service.approve_outline(course_id, actor)
+    if current_user is not None:
+        await service.record_activity(course_id, actor, current_user.email, "outline_approved")
+    return record
 
 
 @router.post("/{course_id}/generate", response_model=GenerateResponse)

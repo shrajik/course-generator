@@ -7,6 +7,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.learner import LearnerProfile
+from app.schemas.design import DesignModels
+from app.schemas.style import StyleGuide
 
 TemplateKind = Literal["technical", "non_technical"]
 
@@ -100,6 +102,15 @@ class CourseInput(BaseModel):
     # multiple approaches can be combined (see learning_approaches_brief's
     # own "combine coherently, do not repeat" instruction).
     learning_approaches: list[LearningApproach] = Field(default_factory=list)
+    # Which instructional-design models to apply (app/schemas/design.py). Also
+    # optional: None or an empty list changes nothing about the prompts.
+    design_models: DesignModels | None = None
+    # The writing style guide and client overrides (app/schemas/style.py).
+    # Optional: None keeps today's behaviour exactly.
+    style_guide: StyleGuide | None = None
+    # Uploaded source documents (see app/services/source_service.py) whose text
+    # is the ground truth for this course. Ids of sources the creator owns.
+    source_ids: list[str] = Field(default_factory=list, max_length=50)
 
     @field_validator("toc", mode="before")
     @classmethod
@@ -273,6 +284,12 @@ class CourseRecord(BaseModel):
     reviewer_id: str | None = None
     reviewed_at: str | None = None
     review_history: list[ReviewHistoryEntry] = Field(default_factory=list)
+    # Gate 1: the outline (table of contents) must be signed off before any
+    # chapter is written. None means a course created before the gate existed,
+    # which generates exactly as it always did; False is "waiting for sign-off".
+    outline_approved: bool | None = None
+    outline_approved_at: str | None = None
+    outline_approved_by: str | None = None
     created_at: str
     updated_at: str
     chapters: list[ChapterProgress] = Field(default_factory=list)
@@ -361,6 +378,9 @@ class GenerateRequest(BaseModel):
     # Deep Research costs minutes per chapter, so it is opt-in per chapter rather
     # than a whole-course mode.
     deep_research_chapter_ids: list[str] | None = None
+    # SAM (design_models): each iteration after the first waits for the
+    # reviewer's feedback on the previous one, so it must be supplied here.
+    sam_feedback: str = Field(default="", max_length=4000)
 
 
 class GenerateResponse(BaseModel):
@@ -440,6 +460,7 @@ ActivityAction = Literal[
     "submitted_for_review",
     "changes_requested",
     "approved",
+    "outline_approved",
     "exported",
 ]
 

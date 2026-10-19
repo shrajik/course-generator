@@ -55,6 +55,49 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+/**
+ * Alt text for a picture, or the "decorative" mark that gives it empty alt text
+ * instead of an invented description. The text is committed when the field
+ * loses focus, so typing does not add one undo step per keystroke.
+ */
+function AltTextFields({
+  alt,
+  decorative,
+  onChange,
+}: {
+  alt: string;
+  decorative: boolean;
+  onChange: (patch: { alt?: string; decorative?: boolean }) => void;
+}) {
+  const [draft, setDraft] = useState(alt);
+  return (
+    <div className="space-y-2">
+      <label className="flex items-center gap-2 text-[12px] text-ink-700">
+        <input
+          type="checkbox"
+          checked={decorative}
+          onChange={(event) => onChange({ decorative: event.target.checked })}
+        />
+        Decorative (no alt text needed)
+      </label>
+      <Field label="Alt text">
+        <textarea
+          rows={3}
+          value={draft}
+          disabled={decorative}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={() => draft !== alt && onChange({ alt: draft })}
+          placeholder="Describe what the image shows…"
+          className={textareaClass}
+        />
+      </Field>
+      {!decorative && !draft.trim() ? (
+        <p className="text-[11px] text-amber-700">Missing: screen readers need a description.</p>
+      ) : null}
+    </div>
+  );
+}
+
 const inputClass =
   "h-8 w-full rounded-[7px] border border-line bg-white px-2 text-[12px] text-ink outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100";
 
@@ -333,6 +376,17 @@ export function PropertiesPanel({
             </div>
           </Section>
         </>
+      ) : null}
+
+      {block.type === "image" && block.content.kind !== "toc" ? (
+        <Section title="Accessibility">
+          <AltTextFields
+            key={block.id}
+            alt={typeof block.content.alt === "string" ? block.content.alt : ""}
+            decorative={block.content.decorative === true}
+            onChange={(patch) => editor.updateContent(block.id, patch)}
+          />
+        </Section>
       ) : null}
 
       {block.type === "image" ? (

@@ -23,32 +23,17 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.core.config import get_settings, reset_settings_cache
+from app.core.config import reset_settings_cache
 from app.core.ids import new_suffix
 from app.course.templates.registry import clear_cache, load_template
 from app.db.models import Course
-from app.db.repositories.course_samples import CourseSampleRepository
 from app.db.repositories.courses import CourseRepository
 from app.db.repositories.memory_embeddings import MemoryEmbeddingRepository
-from app.db.repositories.visual_knowledge import VisualKnowledgeRepository
 from app.db.session import get_session_factory
-from app.schemas.memory import (
-    MAX_SAMPLE_NOTES,
-    CourseSampleCreateRequest,
-    CourseSampleUpdateRequest,
-    TemplateCreateRequest,
-    TemplateUpdateRequest,
-    VisualKnowledgeCreateRequest,
-    VisualKnowledgeUpdateRequest,
-)
-from app.services.course_sample_service import CourseSampleService
+from app.schemas.memory import TemplateCreateRequest, TemplateUpdateRequest
 from app.services.course_service import CourseService
-from app.services.embedding_service import EmbeddingService, reset_embedding_service
-from app.services.hybrid_retriever import HybridRetriever
-from app.services.memory_service import MemoryService
-from app.services.storage_service import get_storage
+from app.services.embedding_service import reset_embedding_service
 from app.services.template_service import TemplateService
-from app.services.visual_knowledge_service import VisualKnowledgeService
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 # Appended to every hardcoded id/name this file uses, so re-running pytest
@@ -115,253 +100,55 @@ async def _get_embedding(source_type: str, source_id):
 
 
 # ---------------------------------------------------------------------------
-# embedding generation + persistence
+# MERGE NOTE (feature/visuals x origin/visual-and-flowchart): this section
+# used to test embedding generation/persistence and hybrid semantic+keyword
+# retrieval entirely through `CourseSampleService`, which origin/visual-and-
+# flowchart removed (replaced by app.services.knowledge_service /
+# source_service - a differently-shaped, upload-based architecture, not a
+# drop-in substitute: MemoryService no longer even accepts a `samples=`
+# constructor argument). Mechanically rewriting these 9 tests against the
+# new service without investigating its actual semantics risked fabricating
+# incorrect behaviour, so they were removed here rather than guessed at.
+#
+# Follow-up investigation (not guessed - read against the actual new code
+# and its own test files) found every one of the 9 removed tests' concerns
+# already has an equivalent, often more thorough, test elsewhere against the
+# real new architecture - nothing here was a silent, permanent loss:
+#   - embedding generation/persistence on upload -> test_source_service.py::
+#     test_a_text_upload_becomes_ready_with_counts_an_outline_and_files
+#   - disabled-embeddings keyword fallback -> test_source_service.py::
+#     test_embedding_being_unavailable_still_leaves_the_source_ready
+#   - semantic retrieval by meaning, no keyword overlap -> test_source_
+#     ingestion.py::test_semantic_ranking_uses_vectors_when_there_is_no_
+#     keyword_overlap, test_knowledge_library.py::test_semantic_search_
+#     matches_by_meaning_when_no_words_overlap
+#   - similarity-threshold rejection of weak matches -> test_knowledge_
+#     library.py::test_a_vector_that_is_not_close_enough_contributes_nothing
+#   - hybrid fusion not letting one method hide the other's results ->
+#     test_source_ingestion.py::test_fusion_rewards_agreement_between_
+#     keyword_and_semantic, test_knowledge_library.py::test_agreement_
+#     between_keywords_and_meaning_ranks_first_and_the_limit_holds
+#   - records without embeddings still retrievable via keyword ->
+#     test_source_ingestion.py::test_chunks_without_a_vector_still_rank_by_
+#     keywords, test_knowledge_library.py::test_passages_without_vectors_
+#     still_match_by_keyword_and_bad_vectors_are_ignored
+#   - embedding-failure resilience -> test_embeddings.py::test_embedding_
+#     service_failure_returns_none_not_raises (+ the same source_service
+#     test above, at the integration level)
+#   - delete removes the embedding too -> test_source_service.py::
+#     test_deleting_removes_everything (deletes the whole source folder,
+#     vectors.bin included)
+# The one capability with no equivalent anywhere - MemoryService's own
+# bounded-context guarantee (previously MAX_SAMPLE_NOTES on sample_notes,
+# now MAX_HISTORY_NOTES on history_notes) - has a new test in
+# test_memory_layer.py::test_memory_service_bounds_history_notes_to_the_
+# configured_maximum. "A course must exist before a sample can be
+# registered for it" has no equivalent either, but that's a confirmed,
+# intentional architecture change: an uploaded source is owner-scoped, not
+# course-scoped, so nothing needs a course to exist first.
 # ---------------------------------------------------------------------------
 
 
-async def test_embedding_is_generated_and_persisted_on_course_sample_register():
-    settings = get_settings()
-    course = await _make_course("crs_emb1", title="Intro to Vector Databases")
-    entry = await CourseSampleService().register(
-        CourseSampleCreateRequest(course_id=course.course_id, topic="vector databases")
-    )
-
-    row = await _get_embedding("course_sample", entry.id)
-
-    assert row is not None
-    assert row.model == settings.embedding_model
-    assert len(row.embedding) == settings.embedding_dimensions
-    assert row.content_hash
-
-
-async def test_disabling_embeddings_creates_no_row_and_keyword_path_still_works(monkeypatch):
-    # The lifecycle hooks (sync_embedding) read the *global* settings
-    # singleton via get_embedding_service(), so disabling the flag for real
-    # (env var + cache reset) rather than a local model_copy is what actually
-    # stops the embedding call.
-    monkeypatch.setenv("ENABLE_EMBEDDINGS", "false")
-    reset_settings_cache()
-    reset_embedding_service()
-    course = await _make_course("crs_emb2", title="Negotiation Basics")
-    sample_service = CourseSampleService()
-    entry = await sample_service.register(
-        CourseSampleCreateRequest(course_id=course.course_id, topic="Negotiation")
-    )
-    await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-
-    assert await _get_embedding("course_sample", entry.id) is None
-
-    memory = MemoryService(samples=sample_service, settings=get_settings())
-    context = await memory.build_context(stage="writer", course_title="Negotiation Basics")
-    assert any("Negotiation" in note for note in context.sample_notes)
-
-
-async def test_semantic_retrieval_surfaces_a_differently_worded_match():
-    """A sample that shares vocabulary with the query but not its exact
-    phrasing: ILIKE can't find it (proven below), but the semantic path
-    does. Threshold lowered for the mock's weaker lexical-overlap signal -
-    see module docstring."""
-    settings = get_settings().model_copy(update={"semantic_similarity_threshold": 0.15})
-    course = await _make_course("crs_emb3", title="Faraday coil course")
-    sample_service = CourseSampleService()
-    entry = await sample_service.register(
-        CourseSampleCreateRequest(
-            course_id=course.course_id,
-            title="Faraday's Law and Electromagnetic Induction Basics",
-            description="covers electromagnetic induction concepts using coils and magnets",
-        )
-    )
-    await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-
-    query = "Understanding Electromagnetic Induction in Coils"
-
-    # Keyword path alone genuinely finds nothing for this query - the ILIKE
-    # filter matches the *whole* query string as one substring.
-    keyword_only, _ = await sample_service.list(search=query, approved_only=True)
-    assert keyword_only == []
-
-    memory = MemoryService(samples=sample_service, settings=settings)
-    context = await memory.build_context(stage="writer", course_title=query)
-    assert any("Faraday" in note for note in context.sample_notes)
-
-
-async def test_semantic_similarity_threshold_rejects_weak_matches():
-    settings = get_settings().model_copy(update={"semantic_similarity_threshold": 0.95})
-    course = await _make_course("crs_emb4", title="Faraday coil course 2")
-    sample_service = CourseSampleService()
-    entry = await sample_service.register(
-        CourseSampleCreateRequest(
-            course_id=course.course_id,
-            title="Faraday's Law and Electromagnetic Induction Basics",
-            description="covers electromagnetic induction concepts using coils and magnets",
-        )
-    )
-    await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-
-    async with get_session_factory()() as session:
-        hits = await MemoryEmbeddingRepository(session).search(
-            source_type="course_sample",
-            query_vector=await EmbeddingService(settings=settings).embed_one(
-                "Understanding Electromagnetic Induction in Coils"
-            ),
-            limit=10,
-            threshold=settings.semantic_similarity_threshold,
-        )
-    assert hits == []
-
-
-async def test_hybrid_retrieval_does_not_let_one_method_hide_the_others_results():
-    """One sample only a keyword search would find, one only semantic search
-    would find - both must appear; neither method is allowed to crowd the
-    other out just by being fetched first.
-
-    Isolation note (test-infra bug found/fixed by the Phase-3-followup
-    investigation, not a production retrieval defect): a `_RUN`-unique TOKEN
-    in the shared vocabulary alone is not enough. The schema is never wiped
-    between pytest invocations (see db_schema in conftest.py), so every past
-    run of THIS SAME TEST has already left behind a near-duplicate keyword
-    sample whose title is "Rare {ITS OWN tag} Tuning Query Phrase" - only the
-    tag differs between runs, so each one scores an identical ~0.60 mock-
-    embedding similarity against any OTHER run's query (shared words "Rare
-    Tuning Query Phrase" + the description "literally contains the query
-    phrase"), regardless of the tag. With MAX_SAMPLE_NOTES=2 and a 3x
-    oversample window, a handful of these accumulated twins alone fill every
-    semantic-candidate slot, permanently crowding out this run's own
-    semantic-only entry - confirmed by direct reproduction against the live
-    test database (see the investigation report).
-
-    The fix: make the semantic-only entry's OWN text share enough
-    *individual* words with the query (via `topic`/`tags`, not just the
-    title) - "rare"/"tuning"/"query"/"phrase", repeated across multiple
-    fields - to reliably outscore that ~0.60 ceiling (own measured score
-    ~0.67-0.70 across random tags), while never reproducing the literal
-    contiguous substring "Rare {tag} Tuning Query Phrase" the keyword/ILIKE
-    path matches on - the whole point of this sample staying semantic-ONLY.
-    That ~0.60 figure is a hard ceiling for every future accumulated twin
-    (it only depends on the shared FIXED words, never on which tag a twin
-    used), so this margin holds no matter how many more accumulate later.
-
-    Teardown (new): this test's own two samples (and their embeddings) are
-    deleted in a `finally` block so it stops contributing new twins to this
-    same pollution for whatever runs after it - using
-    CourseSampleService.delete(), which already deletes both the
-    course_samples row and its memory_embeddings row (see its docstring).
-    This does not retroactively clean up what the many past runs before this
-    fix already left behind - deleting those is a one-time data cleanup, not
-    a code change, and is intentionally out of scope here.
-    """
-    settings = get_settings().model_copy(update={"semantic_similarity_threshold": 0.15})
-    keyword_course = await _make_course("crs_hybrid_kw", title="Keyword Match Course")
-    semantic_course = await _make_course("crs_hybrid_sem", title="Semantic Match Course")
-    sample_service = CourseSampleService()
-    tag = f"zyx{_RUN}"
-
-    keyword_entry = None
-    semantic_entry = None
-    try:
-        keyword_entry = await sample_service.register(
-            CourseSampleCreateRequest(
-                course_id=keyword_course.course_id,
-                title=f"Rare {tag} Tuning Query Phrase",
-                description="literally contains the query phrase",
-            )
-        )
-        await sample_service.update(keyword_entry.id, CourseSampleUpdateRequest(approved=True))
-
-        semantic_entry = await sample_service.register(
-            CourseSampleCreateRequest(
-                course_id=semantic_course.course_id,
-                title=f"{tag} percussion tuning technique reference",
-                topic=f"rare tuning query phrase guidance note {tag}",
-                description=(
-                    "a rare practical phrase for tuning query technique - "
-                    "percussion instrument guidance"
-                ),
-                tags=["rare", "tuning", "query", "phrase"],
-            )
-        )
-        await sample_service.update(semantic_entry.id, CourseSampleUpdateRequest(approved=True))
-
-        query = f"Rare {tag} Tuning Query Phrase"
-        memory = MemoryService(samples=sample_service, settings=settings)
-        context = await memory.build_context(stage="writer", course_title=query)
-
-        sources = set(context.sources)
-        assert f"course_sample:{keyword_entry.id}" in sources
-        assert f"course_sample:{semantic_entry.id}" in sources
-    finally:
-        # Only the records THIS test created - never a database-wide
-        # cleanup. Runs on assertion failure too (the whole point of
-        # `finally`), so a future failure here still doesn't add new
-        # pollution for whatever test runs after it.
-        for entry in (keyword_entry, semantic_entry):
-            if entry is not None:
-                await sample_service.delete(entry.id)
-        async with get_session_factory()() as session:
-            async with session.begin():
-                repo = CourseRepository(session)
-                for course in (keyword_course, semantic_course):
-                    row = await repo.get_by_id(course.id)
-                    if row is not None:
-                        await repo.delete(row)
-
-
-async def test_records_without_embeddings_remain_retrievable_via_keyword(monkeypatch):
-    """Simulates a row created before this feature (or while embeddings were
-    failing): no memory_embeddings row, but keyword retrieval must not care."""
-    monkeypatch.setenv("ENABLE_EMBEDDINGS", "false")
-    reset_settings_cache()
-    reset_embedding_service()
-    course = await _make_course("crs_emb5", title="Legacy Sample No Embedding")
-    sample_service = CourseSampleService()
-    entry = await sample_service.register(
-        CourseSampleCreateRequest(course_id=course.course_id, topic="legacy")
-    )
-    await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-    assert await _get_embedding("course_sample", entry.id) is None
-
-    # Embeddings re-enabled for retrieval, but this record still has none.
-    monkeypatch.setenv("ENABLE_EMBEDDINGS", "true")
-    reset_settings_cache()
-    reset_embedding_service()
-    memory = MemoryService(samples=sample_service, settings=get_settings())
-    context = await memory.build_context(stage="writer", course_title="Legacy Sample No Embedding")
-    assert any("Legacy Sample" in note for note in context.sample_notes)
-
-
-async def test_embedding_failure_falls_back_to_keyword_without_breaking_build_context(monkeypatch):
-    course = await _make_course("crs_emb6", title="Resilience Test Course")
-    sample_service = CourseSampleService()
-    entry = await sample_service.register(
-        CourseSampleCreateRequest(course_id=course.course_id, topic="resilience")
-    )
-    await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-
-    async def boom(self, query):
-        raise RuntimeError("embedding provider on fire")
-
-    monkeypatch.setattr(HybridRetriever, "_embed_query", boom)
-
-    memory = MemoryService(samples=sample_service, settings=get_settings())
-    context = await memory.build_context(stage="writer", course_title="Resilience Test Course")
-    assert any("Resilience" in note for note in context.sample_notes)
-
-
-async def test_memory_context_bounds_still_respected_with_hybrid_retrieval():
-    for i in range(MAX_SAMPLE_NOTES + 3):
-        course = await _make_course(f"crs_emb_bound{i}", title=f"Bounded Topic {i}")
-        sample_service = CourseSampleService()
-        entry = await sample_service.register(
-            CourseSampleCreateRequest(course_id=course.course_id, topic="Bounded Topic")
-        )
-        await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-
-    memory = MemoryService()
-    context = await memory.build_context(stage="writer", course_title="Bounded Topic")
-    assert len(context.sample_notes) <= MAX_SAMPLE_NOTES
-
-
-# ---------------------------------------------------------------------------
 # templates: versioned, independent embeddings
 # ---------------------------------------------------------------------------
 
@@ -439,28 +226,3 @@ async def test_generation_run_embedding_is_compact_not_the_raw_payload():
     # Not the raw 50-chapter payload - only a handful of chapter titles at most.
     assert len(row.embedded_text) < len("".join(long_chapter_list))
     assert row.embedded_text.count("Chapter") <= 5
-
-
-# ---------------------------------------------------------------------------
-# visual knowledge: delete removes the embedding too
-# ---------------------------------------------------------------------------
-
-
-async def test_deleting_visual_knowledge_deletes_its_embedding():
-    course = await _make_course("crs_emb_vk", title="Visual Embedding Course")
-    storage = get_storage()
-    storage.save_asset(course.course_id, b"<svg></svg>", extension="svg")
-    service = VisualKnowledgeService(storage)
-    entry = await service.register(
-        VisualKnowledgeCreateRequest(
-            course_id=course.course_id,
-            asset_path="assets/image_001.svg",
-            topic="embedding lifecycle",
-            description="a diagram",
-        )
-    )
-    assert await _get_embedding("visual_knowledge", entry.id) is not None
-
-    await service.delete(entry.id)
-
-    assert await _get_embedding("visual_knowledge", entry.id) is None

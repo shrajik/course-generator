@@ -175,7 +175,7 @@
         <div class="figure-box cev-pdf-wrap" style="height:{{ b.image_box }}px">{{ b.inline_html | safe }}</div>
       {% elif b.image_src %}
         <div class="figure-box" style="height:{{ b.image_box }}px">
-          <img class="figure" src="{{ b.image_src }}" alt="{{ c.get('alt', '') }}">
+          <img class="figure" src="{{ b.image_src }}" alt="{{ '' if c.get('decorative') else c.get('alt', '') }}">
         </div>
       {% else %}
         {#- A failed/pending generation NEVER shows its internal error here -

@@ -18,6 +18,9 @@ import {
   Undo2,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
+import Link from "next/link";
+import { ReportButton } from "./ReportButton";
+import { SamIterationButton } from "./SamIterationButton";
 import { IconButton } from "@/components/ui/IconButton";
 import { useEditor } from "@/lib/editor/store";
 import { asString } from "@/lib/editor/blocks";
@@ -275,6 +278,17 @@ export function EditorToolbar({
             <Redo2 size={14} />
           </IconButton>
         </div>
+
+        <SamIterationButton />
+
+        <ReportButton />
+
+        <Link
+          href={`/review/${doc?.document_id ?? ""}`}
+          className="inline-flex h-8 items-center gap-1.5 rounded-[8px] border border-line bg-white px-3 text-[12.5px] text-ink hover:border-brand-200 hover:bg-brand-50"
+        >
+          Review screen
+        </Link>
 
         <Button variant="outline" size="sm" onClick={onPreview}>
           <Eye size={13} />

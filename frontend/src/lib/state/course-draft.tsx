@@ -18,8 +18,10 @@ import {
 import {
   LEVEL_OPTIONS,
   type ContentLevel,
+  type DesignModels,
   type LearnerProfile,
   type LearningApproach,
+  type StyleGuide,
   type TemplateKind,
   type TocItem,
 } from "@/lib/types/course";
@@ -76,6 +78,13 @@ export interface CourseDraft {
   /** MOM Phase 5 - HOW each concept is taught. Empty means "let the writer
    * judge per section", the pre-existing default behaviour. */
   learningApproaches: LearningApproach[];
+  /** Instructional-design models. Null until one is picked, so a course made
+   * without touching it generates exactly as before. */
+  designModels: DesignModels | null;
+  /** Writing style guide and client overrides. Null = not chosen. */
+  styleGuide: StyleGuide | null;
+  /** Uploaded source documents to ground the course in. */
+  sourceIds: string[];
   toc: TocItem[];
   /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
    * a previous course) - see CreateCourseForm's regeneration check. */
@@ -109,6 +118,9 @@ export const EMPTY_DRAFT: CourseDraft = {
   learnerProfile: null,
   contentLevel: 2,
   learningApproaches: [],
+  designModels: null,
+  styleGuide: null,
+  sourceIds: [],
   toc: [],
   tocDraftedFor: null,
   courseId: null,

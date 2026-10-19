@@ -9,12 +9,12 @@ Usage:
 
     python -m app.scripts.backfill_embeddings                # backfill everything
     python -m app.scripts.backfill_embeddings --dry-run       # report only, no writes/API calls
-    python -m app.scripts.backfill_embeddings --source template,course_sample
+    python -m app.scripts.backfill_embeddings --source template
     python -m app.scripts.backfill_embeddings --concurrency 8 --batch-size 200
 
 A row is "valid" (skipped) when a memory_embeddings row already exists for it
 AND its content_hash matches the current text built from the row right now -
-so editing a sample/visual/template's text and re-running this script
+so editing a template's text and re-running this script
 re-embeds only what actually changed. A row with no embedding at all (created
 before this feature, or created while embeddings were failing/disabled) is
 always backfilled.
@@ -27,25 +27,18 @@ import asyncio
 import time
 
 from app.core.logging import configure_logging, get_logger
-from app.db.models import CourseSample, GenerationRun, Template, VisualKnowledge
-from app.db.repositories.course_samples import CourseSampleRepository
+from app.db.models import GenerationRun, Template
 from app.db.repositories.generation_runs import GenerationRunRepository
 from app.db.repositories.memory_embeddings import MemoryEmbeddingRepository
 from app.db.repositories.templates import TemplateRepository
-from app.db.repositories.visual_knowledge import VisualKnowledgeRepository
 from app.db.session import get_session_factory
 from app.services.embedding_service import content_hash, get_embedding_service
-from app.services.memory_embedding_text import (
-    generation_run_text,
-    sample_text,
-    template_text,
-    visual_text,
-)
+from app.services.memory_embedding_text import generation_run_text, template_text
 
 log = get_logger(__name__)
 
 PAGE_SIZE = 100
-ALL_SOURCE_TYPES = ("template", "visual_knowledge", "course_sample", "generation_run")
+ALL_SOURCE_TYPES = ("template", "generation_run")
 # One retry beyond the first attempt - a transient provider hiccup shouldn't
 # make an operator re-run the whole script; a persistent failure (bad model
 # name, no key) still fails fast rather than retrying forever.
@@ -168,24 +161,6 @@ async def backfill_templates(*, dry_run: bool, concurrency: int) -> BackfillRepo
     return await _embed_rows("template", rows, dry_run=dry_run, concurrency=concurrency)
 
 
-async def backfill_visual_knowledge(*, dry_run: bool, concurrency: int) -> BackfillReport:
-    async def fetch_page(limit: int, offset: int) -> list[VisualKnowledge]:
-        async with get_session_factory()() as session:
-            return list(await VisualKnowledgeRepository(session).list(limit=limit, offset=offset))
-
-    rows = await _paginate(fetch_page, lambda page: [(row.id, visual_text(row)) for row in page])
-    return await _embed_rows("visual_knowledge", rows, dry_run=dry_run, concurrency=concurrency)
-
-
-async def backfill_course_samples(*, dry_run: bool, concurrency: int) -> BackfillReport:
-    async def fetch_page(limit: int, offset: int) -> list[CourseSample]:
-        async with get_session_factory()() as session:
-            return list(await CourseSampleRepository(session).list(limit=limit, offset=offset))
-
-    rows = await _paginate(fetch_page, lambda page: [(row.id, sample_text(row)) for row in page])
-    return await _embed_rows("course_sample", rows, dry_run=dry_run, concurrency=concurrency)
-
-
 async def backfill_generation_runs(*, dry_run: bool, concurrency: int) -> BackfillReport:
     async def fetch_page(limit: int, offset: int) -> list[tuple[GenerationRun, object]]:
         async with get_session_factory()() as session:
@@ -200,8 +175,6 @@ async def backfill_generation_runs(*, dry_run: bool, concurrency: int) -> Backfi
 
 BACKFILL_FUNCS = {
     "template": backfill_templates,
-    "visual_knowledge": backfill_visual_knowledge,
-    "course_sample": backfill_course_samples,
     "generation_run": backfill_generation_runs,
 }
 

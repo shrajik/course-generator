@@ -11,6 +11,63 @@ export function getDocument(documentId: string, signal?: AbortSignal): Promise<C
   return request<CourseDocument>(`/api/documents/${documentId}`, { signal });
 }
 
+export interface ComplianceCheck {
+  id: string;
+  name: string;
+  pass_criterion: string;
+  status: "pass" | "fail" | "review";
+  note: string;
+}
+
+export interface ComplianceReport {
+  qa_checks: ComplianceCheck[];
+  unresolved_flags: string[];
+  accessibility_target: string;
+  accessibility_flags: { area: string; severity: "fail" | "review"; message: string; location: string }[];
+  asset_requirements: { asset: string; kind: string; location: string; requirement: string; present: boolean }[];
+  metadata_schema: "lom" | "dublin_core";
+  metadata: Record<string, string | string[]>;
+  summary: { pass: number; fail: number; review: number };
+  generated_at: string;
+}
+
+/** The end-of-course QA / accessibility / metadata report. */
+export function getComplianceReport(
+  documentId: string,
+  schema: "lom" | "dublin_core",
+): Promise<ComplianceReport> {
+  return request<ComplianceReport>(`/api/documents/${documentId}/compliance?schema=${schema}`);
+}
+
+/** Plan documents for the selected design models (ADDIE notes, Kirkpatrick plan). */
+export type DesignOutputs = {
+  addie?: {
+    implementation: {
+      sequencing: string;
+      modules: { module: string; prerequisite: string; tracking: string }[];
+      tracking_note: string;
+      rollout_note: string;
+    };
+    evaluation_summary: Record<string, string>;
+  };
+  kirkpatrick?: {
+    business_goal: string;
+    level_1_reaction: { timing: string; questions: string[] };
+    level_2_learning: {
+      timing: string;
+      items: { module: string; objective: string; bloom_level: string; assessment: string }[];
+    };
+    level_3_behavior: { timing: string; checklist: string[] };
+    level_4_results: { timing: string; measure: string; note: string };
+    data_sources: { lms_measurable_now: string[]; external_collection: string[]; note: string };
+    flags: string[];
+  };
+};
+
+export function getDesignOutputs(documentId: string): Promise<DesignOutputs> {
+  return request<DesignOutputs>(`/api/documents/${documentId}/design-outputs`);
+}
+
 export function getCourseDocument(courseId: string): Promise<CourseDocument> {
   return request<CourseDocument>(`/api/courses/${courseId}/document`);
 }
