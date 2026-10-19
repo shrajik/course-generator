@@ -1,5 +1,5 @@
-"""AI memory layer: templates, visual knowledge, course samples, generation
-history and MemoryService retrieval, against a real Postgres.
+"""AI memory layer: templates, generation history and MemoryService retrieval,
+against a real Postgres.
 
 Same convention as test_database_foundation.py: gated on TEST_DATABASE_URL so
 the default test run (no test database configured) never touches a real
@@ -15,27 +15,15 @@ from datetime import datetime, timezone
 import pytest
 
 from app.core.config import get_settings, reset_settings_cache
-from app.core.errors import ConflictError, NotFoundError, ValidationFailedError
+from app.core.errors import ConflictError, NotFoundError
 from app.core.ids import new_suffix
 from app.course.templates.registry import clear_cache, load_template, refresh_db_templates
 from app.db.models import Course
 from app.db.repositories.courses import CourseRepository
 from app.db.session import get_session_factory
-from app.schemas.memory import (
-    MAX_SAMPLE_NOTES,
-    CourseSampleCreateRequest,
-    CourseSampleUpdateRequest,
-    MemoryContext,
-    TemplateCreateRequest,
-    TemplateUpdateRequest,
-    VisualKnowledgeCreateRequest,
-    VisualKnowledgeUpdateRequest,
-)
-from app.services.course_sample_service import CourseSampleService
+from app.schemas.memory import MemoryContext, TemplateCreateRequest, TemplateUpdateRequest
 from app.services.memory_service import MemoryService
-from app.services.storage_service import get_storage
 from app.services.template_service import TemplateService
-from app.services.visual_knowledge_service import VisualKnowledgeService
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 # Appended to every hardcoded id/name this file uses, so re-running pytest
@@ -161,81 +149,6 @@ async def test_archiving_a_template_hides_it_from_new_course_picker_only():
 
 
 # ---------------------------------------------------------------------------
-# visual knowledge
-# ---------------------------------------------------------------------------
-
-
-async def test_visual_knowledge_register_validates_the_asset_exists():
-    course = await _make_course("crs_vk1")
-    storage = get_storage()
-    storage.save_asset(course.course_id, b"<svg></svg>", extension="svg")
-
-    service = VisualKnowledgeService(storage)
-    with pytest.raises(ValidationFailedError):
-        await service.register(
-            VisualKnowledgeCreateRequest(
-                course_id=course.course_id, asset_path="assets/does_not_exist.svg"
-            )
-        )
-
-    # The real one succeeds.
-    entry = await service.register(
-        VisualKnowledgeCreateRequest(
-            course_id=course.course_id,
-            asset_path="assets/image_001.svg",
-            kind="diagram",
-            diagram_kind="flow_chart",
-            topic="eye anatomy",
-            description="labelled diagram of the eye",
-            tags=["biology", "eye"],
-        )
-    )
-    assert entry.approved is False
-    assert entry.asset_url is not None
-
-
-async def test_visual_knowledge_search_only_returns_approved_by_default():
-    course = await _make_course("crs_vk2")
-    storage = get_storage()
-    storage.save_asset(course.course_id, b"<svg></svg>", extension="svg")
-    service = VisualKnowledgeService(storage)
-    entry = await service.register(
-        VisualKnowledgeCreateRequest(
-            course_id=course.course_id,
-            asset_path="assets/image_001.svg",
-            topic="eye anatomy",
-            description="a diagram",
-        )
-    )
-    items, total = await service.list(search="eye", approved_only=True)
-    assert total == 0 and items == []
-
-    await service.update(entry.id, VisualKnowledgeUpdateRequest(approved=True))
-    items, total = await service.list(search="eye", approved_only=True)
-    assert total == 1
-    assert items[0].id == entry.id
-
-
-# ---------------------------------------------------------------------------
-# course samples
-# ---------------------------------------------------------------------------
-
-
-async def test_course_sample_requires_an_existing_course():
-    service = CourseSampleService()
-    with pytest.raises(NotFoundError):
-        await service.register(CourseSampleCreateRequest(course_id="crs_missing"))
-
-
-async def test_course_sample_cannot_be_registered_twice():
-    course = await _make_course("crs_sample1", title="RAG Fundamentals")
-    service = CourseSampleService()
-    await service.register(CourseSampleCreateRequest(course_id=course.course_id, topic="RAG"))
-    with pytest.raises(ConflictError):
-        await service.register(CourseSampleCreateRequest(course_id=course.course_id, topic="RAG"))
-
-
-# ---------------------------------------------------------------------------
 # generation history
 # ---------------------------------------------------------------------------
 
@@ -277,28 +190,14 @@ async def test_memory_service_returns_empty_context_with_nothing_registered():
     assert context.render() == ""
 
 
-async def test_memory_service_bounds_sample_notes_to_the_configured_maximum():
-    for i in range(MAX_SAMPLE_NOTES + 3):
-        course = await _make_course(f"crs_bound{i}", title=f"Negotiation Basics {i}")
-        sample_service = CourseSampleService()
-        entry = await sample_service.register(
-            CourseSampleCreateRequest(course_id=course.course_id, topic="Negotiation")
-        )
-        await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-
-    service = MemoryService()
-    context = await service.build_context(stage="writer", course_title="Negotiation Basics")
-    assert len(context.sample_notes) <= MAX_SAMPLE_NOTES
-
-
 async def test_memory_service_fails_soft_when_retrieval_raises(monkeypatch):
     service = MemoryService()
 
     async def boom(*args, **kwargs):
         raise RuntimeError("db is on fire")
 
-    monkeypatch.setattr(service.samples, "list", boom)
-    context = await service.build_context(stage="writer", course_title="Anything")
+    monkeypatch.setattr(service, "_add_history_notes", boom)
+    context = await service.build_context(stage="reviewer", course_title="Anything")
     assert isinstance(context, MemoryContext)
     assert context.is_empty()
 
@@ -306,11 +205,5 @@ async def test_memory_service_fails_soft_when_retrieval_raises(monkeypatch):
 async def test_memory_service_is_a_noop_when_disabled():
     settings = get_settings().model_copy(update={"enable_memory_retrieval": False})
     service = MemoryService(settings=settings)
-    course = await _make_course("crs_disabled1", title="Should Not Be Found")
-    sample_service = CourseSampleService()
-    entry = await sample_service.register(
-        CourseSampleCreateRequest(course_id=course.course_id, topic="Should Not Be Found")
-    )
-    await sample_service.update(entry.id, CourseSampleUpdateRequest(approved=True))
-    context = await service.build_context(stage="writer", course_title="Should Not Be Found")
+    context = await service.build_context(stage="reviewer", course_title="Should Not Be Found")
     assert context.is_empty()

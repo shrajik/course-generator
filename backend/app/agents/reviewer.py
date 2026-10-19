@@ -20,13 +20,17 @@ from app.agents.prompts import ContinuityContext
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
-from app.course.pedagogy import BANNED_OBJECTIVE_VERBS
+from app.course.design_models import design_issues
+from app.course.pedagogy import BANNED_OBJECTIVE_VERBS, BLOOM_VERBS
+from app.course.style_guide import style_issues
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, VISUAL_BLOCK_TYPES, BlockType
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
+from app.schemas.design import DesignModels
 from app.schemas.document import Block
 from app.schemas.learner import LearnerProfile
 from app.schemas.review import ChapterReview, ContinuityReport, ReviewIssue
+from app.schemas.style import StyleGuide
 from app.schemas.template import CourseTemplate
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
@@ -110,7 +114,12 @@ class ReviewerAgent:
         )
         review.reviewed_at = utc_now_iso()
         self._apply_structural_checks(
-            review, template, blocks, course_input.learner_profile
+            review,
+            template,
+            blocks,
+            course_input.learner_profile,
+            course_input.design_models,
+            course_input.style_guide,
         )
         # Keep the reviewer honest: structural gaps always block approval.
         if review.missing_required_blocks:
@@ -151,6 +160,8 @@ class ReviewerAgent:
         template: CourseTemplate,
         blocks: list[Block],
         profile: LearnerProfile | None = None,
+        design: DesignModels | None = None,
+        style: StyleGuide | None = None,
     ) -> None:
         present_types = {block.type for block in blocks}
         present_sections = {block.meta.section_key for block in blocks if block.meta.section_key}
@@ -170,7 +181,10 @@ class ReviewerAgent:
         # Pedagogy/style violations carry a block_index, so they route to the
         # surgical revision path (writer.revise_chapter) rather than forcing a
         # whole-chapter rewrite the way `missing_required_blocks` does.
-        review.issues.extend(_pedagogy_issues(blocks, profile))
+        review.issues.extend(_pedagogy_issues(blocks, profile, style))
+        review.issues.extend(style_issues(blocks, style))
+        review.issues.extend(design_issues(blocks, design))
+        review.issues.extend(_standards_issues(blocks, profile, design))
 
 
 def _block_word_count(block: Block) -> int:
@@ -195,10 +209,17 @@ _STYLE_SLIPS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:e\.g\.|i\.e\.)", re.IGNORECASE), 'write "for example" or "that is"'),
     (re.compile(r"\bclick on\b", re.IGNORECASE), 'write "click", not "click on"'),
     (re.compile(r"\bplease\b", re.IGNORECASE), 'drop "please" from instructional copy'),
+    (re.compile(r"\bthank you\b", re.IGNORECASE), 'drop "thank you" from instructional copy'),
+    (
+        re.compile(r"\b(?:you|users?|learners?|students?)\s+should\b", re.IGNORECASE),
+        'use "must" for a required action; keep "should" for optional advice only',
+    ),
 )
 
 
-def _pedagogy_issues(blocks: list[Block], profile: LearnerProfile | None) -> list[ReviewIssue]:
+def _pedagogy_issues(
+    blocks: list[Block], profile: LearnerProfile | None, style: StyleGuide | None = None
+) -> list[ReviewIssue]:
     """Deterministic checks for the rules the pedagogy brief states.
 
     Only runs when the course carries a learner profile: courses created
@@ -249,7 +270,9 @@ def _pedagogy_issues(blocks: list[Block], profile: LearnerProfile | None) -> lis
                 )
             )
 
-        if block.type in TEXTUAL_BLOCK_TYPES:
+        # The MSTP slips are that guide's rules; a CMOS course has its own
+        # checks (app/course/style_guide.py) and e.g. "e.g." is acceptable there.
+        if block.type in TEXTUAL_BLOCK_TYPES and (style is None or style.base == "mstp"):
             text = str(block.content.get("text", ""))
             remedies = [remedy for pattern, remedy in _STYLE_SLIPS if pattern.search(text)]
             if remedies:
@@ -262,6 +285,101 @@ def _pedagogy_issues(blocks: list[Block], profile: LearnerProfile | None) -> lis
                         suggestion="; ".join(remedies) + ".",
                     )
                 )
+    return issues
+
+
+# Verbs allowed in a learning objective (Bloom's approved bank).
+_APPROVED_OBJECTIVE_VERBS = {verb for verbs in BLOOM_VERBS.values() for verb in verbs}
+_ABLE_TO_VERB_RE = re.compile(r"\bable to\s+([a-z']+)", re.IGNORECASE)
+# Levels whose assessment may never be a multiple-choice quiz (Methodologies,
+# Bloom rule 3: "never MCQ for Evaluate/Create").
+_HIGH_LEVELS = ("Evaluate", "Create")
+_NON_QUIZ_ASSESSMENTS = {
+    BlockType.EXERCISE, BlockType.CHALLENGE, BlockType.CASE_STUDY, BlockType.REFLECTION,
+}
+
+
+def _objective_verb(item: str) -> str:
+    match = _ABLE_TO_VERB_RE.search(item)
+    if match:
+        return match.group(1).casefold()
+    words = item.strip().split(" ")
+    return words[0].casefold().strip(".,:;") if words and words[0] else ""
+
+
+def _standards_issues(
+    blocks: list[Block], profile: LearnerProfile | None, design: DesignModels | None
+) -> list[ReviewIssue]:
+    """Accessibility and assessment-matching rules from the client's standards.
+
+    Like `_pedagogy_issues`, this runs only for a course that opted in (a
+    learner profile or a design model): older courses never agreed to these.
+    """
+    chosen = design is not None and bool(design.models)
+    if profile is None and not chosen:
+        return []
+    bloom_checked_elsewhere = design is not None and design.has("bloom")
+
+    issues: list[ReviewIssue] = []
+
+    def add(severity: str, category: str, index: int, description: str, suggestion: str) -> None:
+        issues.append(
+            ReviewIssue(
+                severity=severity,
+                category=category,
+                block_index=index,
+                description=description,
+                suggestion=suggestion,
+            )
+        )
+
+    # Images need alt text, or an explicit "decorative" mark.
+    for index, block in enumerate(blocks):
+        if block.type is not BlockType.IMAGE or block.content.get("kind") == "toc":
+            continue
+        if block.content.get("decorative") or str(block.content.get("alt") or "").strip():
+            continue
+        add("major", "accessibility", index, "Image has no alt text.",
+            "Write a short alt text describing what the image shows, or mark it decorative.")
+
+    # Heading levels may not skip (H2 straight to H4).
+    previous = 0
+    for index, block in enumerate(blocks):
+        if block.type is not BlockType.HEADING:
+            continue
+        level = int(block.content.get("level", 2) or 2)
+        if previous and level > previous + 1:
+            add("major", "accessibility", index,
+                f"Heading level jumps from H{previous} to H{level}.",
+                f"Use H{previous + 1} here so the heading hierarchy has no skipped level.")
+        previous = level
+
+    # Objectives: every verb must come from the approved bank (Bloom's own
+    # check covers this when Bloom is selected, so it is not reported twice).
+    levels: list[str] = []
+    for index, block in enumerate(blocks):
+        if block.type is not BlockType.LEARNING_OBJECTIVES:
+            continue
+        for item in block.content.get("items", []) or []:
+            text = str(item)
+            verb = _objective_verb(text)
+            if _BANNED_VERB_RE.search(text) or not verb:
+                continue  # unmeasurable verbs are reported by _pedagogy_issues
+            if verb in _APPROVED_OBJECTIVE_VERBS:
+                levels.extend(level for level, verbs in BLOOM_VERBS.items() if verb in verbs)
+            elif profile is not None and not bloom_checked_elsewhere:
+                add("minor", "pedagogy", index,
+                    f'Objective verb "{verb}" is not in the approved Bloom bank: {text[:140]}',
+                    "Use one verb from the approved bank that matches the task's cognitive level.")
+
+    # A Create/Evaluate objective cannot be assessed by a quiz alone.
+    if any(level in _HIGH_LEVELS for level in levels):
+        kinds = {b.type for b in blocks}
+        if BlockType.QUIZ in kinds and not (kinds & _NON_QUIZ_ASSESSMENTS):
+            add("major", "assessment", -1,
+                "An Evaluate or Create objective is assessed only by a multiple-choice quiz.",
+                "Add a case study with justification (Evaluate) or an open-ended project or "
+                "exercise (Create).")
     return issues
 
 

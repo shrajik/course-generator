@@ -292,7 +292,14 @@ def render_document_html(
                         "image_src": _image_src(block, asset_prefix),
                         "image_width": round(block.layout.width, 2),
                         "image_height": round(block.layout.height, 2),
-                        "alt": block.content.get("alt_text") or block.content.get("purpose") or "",
+                        "alt": ""
+                        if block.content.get("decorative")
+                        else (
+                            block.content.get("alt")
+                            or block.content.get("alt_text")
+                            or block.content.get("purpose")
+                            or ""
+                        ),
                         "inline_html": None,
                         "image_box": round(block.layout.height, 2),
                         "panel_css": "",

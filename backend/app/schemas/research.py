@@ -103,6 +103,40 @@ class ResearchPayload(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
 
 
+def render_source_excerpts(excerpts: list) -> str:
+    """The uploaded-source passages as the writer reads them, each with the
+    reference it must cite. "" when there are none."""
+    if not excerpts:
+        return ""
+    lines = [
+        "UPLOADED SOURCE EXCERPTS (the client's own documents - the ground truth for this "
+        "chapter; prefer them over web research, and cite each fact you take from one with "
+        "its reference in square brackets, for example [S1.3]):"
+    ]
+    for item in excerpts:
+        where = f"{item.filename}" + (f", page {item.page}" if item.page else "")
+        heading = f" - {item.heading}" if item.heading else ""
+        lines.append(f"[{item.ref}] ({where}{heading})\n{item.text}")
+    return "\n\n".join(lines)
+
+
+def render_knowledge_excerpts(excerpts: list) -> str:
+    """Passages of the global knowledge library, each with its `G` reference."""
+    if not excerpts:
+        return ""
+    lines = [
+        "KNOWLEDGE LIBRARY EXCERPTS (the organisation's approved reference documents: use them "
+        "where they bear on this chapter, and cite each fact you take from one with its reference "
+        "in square brackets, for example [G2.5]. Where they disagree with the course's own source "
+        "documents, follow the course's documents):"
+    ]
+    for item in excerpts:
+        where = f"{item.filename}" + (f", page {item.page}" if item.page else "")
+        heading = f" - {item.heading}" if item.heading else ""
+        lines.append(f"[{item.ref}] ({where}{heading})\n{item.text}")
+    return "\n\n".join(lines)
+
+
 class ChapterResearch(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -115,11 +149,24 @@ class ChapterResearch(BaseModel):
     payload: ResearchPayload = Field(default_factory=ResearchPayload)
 
     def compact_context(self, *, max_chars: int = 12000) -> str:
-        """A trimmed textual view handed to the writer."""
+        """A trimmed textual view handed to the writer.
+
+        Passages from the creator's uploaded sources (attached for a run, never
+        stored with the research) come first and are never trimmed away by the
+        web research: they are the ground truth the course is checked against.
+        """
         data = self.payload.model_dump(mode="json", exclude_defaults=False)
         import json
 
+        excerpts = "\n\n".join(
+            part
+            for part in (
+                render_source_excerpts(getattr(self, "source_excerpts", None) or []),
+                render_knowledge_excerpts(getattr(self, "knowledge_excerpts", None) or []),
+            )
+            if part
+        )
         text = json.dumps(data, ensure_ascii=False, indent=1)
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars] + "\n... [research truncated]"
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n... [research truncated]"
+        return f"{excerpts}\n\nWEB RESEARCH:\n{text}" if excerpts else text

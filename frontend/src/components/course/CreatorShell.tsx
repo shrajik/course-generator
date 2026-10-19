@@ -5,6 +5,7 @@ import { useState } from "react";
 import { BookOpen, Clock3, FileText, Menu, Plus, Sparkles, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils/cn";
+import { NotificationBell } from "./NotificationBell";
 
 const NAV_ITEMS = [
   { label: "Create Course", href: "/", icon: Plus },
@@ -45,7 +46,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
 function Sidebar({ mobile = false, onClose }: { mobile?: boolean; onClose?: () => void }) {
   return <aside className={cn("creator-sidebar", mobile && "creator-sidebar-mobile")}>
-    <div className="flex items-start justify-between"><Brand />{mobile ? <button type="button" onClick={onClose} className="creator-icon-button" aria-label="Close navigation"><X size={17} /></button> : null}</div>
+    <div className="flex items-start justify-between"><Brand /><NotificationBell />{mobile ? <button type="button" onClick={onClose} className="creator-icon-button" aria-label="Close navigation"><X size={17} /></button> : null}</div>
     <Navigation onNavigate={onClose} />
     <div className="creator-promo-card"><span className="creator-promo-icon"><Sparkles size={17} /></span><p className="mt-3 text-[13px] font-semibold leading-5 text-ink">Turn your knowledge<br />into engaging courses</p><p className="mt-2 text-[11px] leading-4 text-ink-500">AI-powered. Effortless.<br />For everyone.</p></div>
   </aside>;

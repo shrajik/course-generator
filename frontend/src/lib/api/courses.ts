@@ -47,6 +47,11 @@ export function createCourse(
   });
 }
 
+/** Gate 1: sign off the outline. Generation is refused until this is done. */
+export function approveOutline(courseId: string): Promise<CourseRecord> {
+  return request<CourseRecord>(`/api/courses/${courseId}/approve-outline`, { method: "POST" });
+}
+
 export function listCourses(): Promise<CourseListResponse> {
   return request<CourseListResponse>("/api/courses");
 }

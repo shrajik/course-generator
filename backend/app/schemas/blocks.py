@@ -80,6 +80,9 @@ class ImageContent(_Content):
     prompt: str = ""
     caption: str = ""
     alt: str = ""
+    # A purely decorative picture carries no information, so it gets alt=""
+    # (screen readers skip it) instead of an invented description.
+    decorative: bool = False
     path: str | None = None  # relative to the course directory
     asset_id: str | None = None
     generated: bool = False

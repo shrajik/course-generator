@@ -8,7 +8,7 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.roles import DEFAULT_ROLE
@@ -184,69 +184,6 @@ class Template(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class VisualKnowledge(Base):
-    """Registry of reusable visuals - points at an asset file that already
-    exists under a course's own `assets/` directory (see StorageService); the
-    bytes are never copied. This is what lets the AI memory layer discover
-    and reference past diagrams/illustrations instead of regenerating from
-    scratch every time.
-    """
-
-    __tablename__ = "visual_knowledge"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # Nullable: a visual can be registered without (or after losing) its
-    # source course - the asset_path is what actually resolves it.
-    course_pk: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("courses.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    # Course-relative path, e.g. "assets/image_003.svg" - resolved through
-    # the same StorageService.asset_abs_path() every other asset uses.
-    asset_path: Mapped[str] = mapped_column(String(300), nullable=False)
-    # Denormalised alongside course_pk (same reasoning as CourseActivity.user_email
-    # below): lets the registry keep reading sensibly, and avoids relationship
-    # lazy-loads, which don't work across SQLAlchemy's async session boundary.
-    course_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="illustration")
-    diagram_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    topic: Mapped[str] = mapped_column(String(200), nullable=False, default="")
-    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    tags: Mapped[list[str]] = mapped_column(ARRAY(String(64)), nullable=False, default=list)
-    # "Approved/locked" per the FRD - only approved visuals are offered back
-    # to generation by default; anything registered starts unapproved.
-    approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
-    created_by: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
-class CourseSample(Base):
-    """Marks an existing course as a reusable generation reference. Never
-    copies course content - `course_pk` points at the real Course/Document
-    rows, which are read fresh at retrieval time.
-    """
-
-    __tablename__ = "course_samples"
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    course_pk: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True, unique=True
-    )
-    course_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    title: Mapped[str] = mapped_column(String(300), nullable=False)
-    topic: Mapped[str] = mapped_column(String(200), nullable=False, default="")
-    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    tags: Mapped[list[str]] = mapped_column(ARRAY(String(64)), nullable=False, default=list)
-    approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
-    created_by: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-
 class CourseActivity(Base):
     """Append-only audit log: one row per notable action on a course."""
 
@@ -319,17 +256,13 @@ class CourseTemplateDocument(Base):
 
 
 class MemoryEmbedding(Base):
-    """One embedding vector for one memory source row - Template,
-    VisualKnowledge, CourseSample or GenerationRun, identified by
-    `(source_type, source_id)`. A dedicated table rather than a column on
-    each of those four tables: it reuses one repository/service instead of
-    duplicating embedding storage+invalidation four times, avoids altering
-    four existing tables, and lets a hybrid query search across types (or
-    just one) without four near-identical queries. `source_id` is a plain
-    UUID with no FK constraint - it can point at any of the four tables, and
-    a formal multi-table FK isn't expressible in SQL; services that hard-
-    delete a source row (VisualKnowledge/CourseSample) also delete its
-    embedding row explicitly.
+    """One embedding vector for one memory source row - a Template or a
+    GenerationRun, identified by `(source_type, source_id)`. A dedicated
+    table rather than a column on each source table: one repository/service
+    instead of duplicated embedding storage and invalidation, and a hybrid
+    query can search across types (or just one). `source_id` is a plain UUID
+    with no FK constraint - it can point at either table, and a formal
+    multi-table FK isn't expressible in SQL.
 
     No row here does NOT mean "broken" - it just means "not embedded yet"
     (a record created before this feature, or created while embeddings were

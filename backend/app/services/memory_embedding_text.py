@@ -8,7 +8,7 @@ longer matches its stored content_hash.
 
 from __future__ import annotations
 
-from app.db.models import CourseSample, GenerationRun, Template, VisualKnowledge
+from app.db.models import GenerationRun, Template
 from app.schemas.template import CourseTemplate
 
 # GenerationRun.payload_json can list every chapter in a long course - only a
@@ -32,21 +32,6 @@ def template_text(row: Template) -> str:
             "; ".join(config.review_focus),
         ]
     )
-
-
-def visual_text(row: VisualKnowledge) -> str:
-    return _join(
-        [
-            row.diagram_kind or row.kind,
-            row.topic,
-            row.description,
-            ", ".join(row.tags),
-        ]
-    )
-
-
-def sample_text(row: CourseSample) -> str:
-    return _join([row.title, row.topic, row.description, ", ".join(row.tags)])
 
 
 def generation_run_text(course_title: str, run: GenerationRun) -> str:

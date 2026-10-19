@@ -11,11 +11,9 @@ from app.api.dependencies import get_current_admin
 from app.core.config import get_settings
 from app.course.templates.registry import load_template
 from app.db.models import User
-from app.db.repositories.course_samples import CourseSampleRepository
 from app.db.repositories.generation_runs import GenerationRunRepository
 from app.db.repositories.memory_embeddings import MemoryEmbeddingRepository
 from app.db.repositories.templates import TemplateRepository
-from app.db.repositories.visual_knowledge import VisualKnowledgeRepository
 from app.db.session import get_session_factory
 from app.scripts.backfill_embeddings import BACKFILL_FUNCS
 from app.schemas.memory import (
@@ -65,16 +63,6 @@ async def embedding_status(current_admin: User = Depends(get_current_admin)) -> 
                 source_type="template",
                 total_rows=await TemplateRepository(session).count_all(),
                 embedded_rows=await embeddings.count(source_type="template"),
-            ),
-            EmbeddingSourceStatus(
-                source_type="visual_knowledge",
-                total_rows=await VisualKnowledgeRepository(session).count(),
-                embedded_rows=await embeddings.count(source_type="visual_knowledge"),
-            ),
-            EmbeddingSourceStatus(
-                source_type="course_sample",
-                total_rows=await CourseSampleRepository(session).count(),
-                embedded_rows=await embeddings.count(source_type="course_sample"),
             ),
             EmbeddingSourceStatus(
                 source_type="generation_run",

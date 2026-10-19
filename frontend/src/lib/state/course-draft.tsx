@@ -15,7 +15,7 @@ import {
   useMemo,
   useState,
 } from "react";
-import type { LearnerProfile, TemplateKind, TocItem } from "@/lib/types/course";
+import type { DesignModels, LearnerProfile, StyleGuide, TemplateKind, TocItem } from "@/lib/types/course";
 import type { CourseTemplateType } from "@/lib/api/course-templates";
 
 /** The uploaded reference document (or the hardcoded "Default Template")
@@ -63,6 +63,13 @@ export interface CourseDraft {
   /** Panels A-C of the creator interface. Null until the designer opens the
    * Learner Profile section, which keeps it genuinely optional end to end. */
   learnerProfile: LearnerProfile | null;
+  /** Instructional-design models. Null until one is picked, so a course made
+   * without touching it generates exactly as before. */
+  designModels: DesignModels | null;
+  /** Writing style guide and client overrides. Null = not chosen. */
+  styleGuide: StyleGuide | null;
+  /** Uploaded source documents to ground the course in. */
+  sourceIds: string[];
   toc: TocItem[];
   /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
    * a previous course) - see CreateCourseForm's regeneration check. */
@@ -94,6 +101,9 @@ export const EMPTY_DRAFT: CourseDraft = {
   template: "technical",
   selectedTemplate: null,
   learnerProfile: null,
+  designModels: null,
+  styleGuide: null,
+  sourceIds: [],
   toc: [],
   tocDraftedFor: null,
   courseId: null,

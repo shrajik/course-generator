@@ -418,10 +418,38 @@ def learner_brief(profile: LearnerProfile | None) -> str:
     return "\n".join(lines)
 
 
-def pedagogy_rules_brief(profile: LearnerProfile | None) -> str:
+def mstp_rule_lines() -> list[str]:
+    """The Microsoft Writing Style Guide house rules, one string per line.
+
+    Shared by the learner-profile brief and by an explicit style guide choice
+    (app/course/style_guide.py), so the wording exists once.
+    """
+    return [
+        "WRITING STYLE (Microsoft Writing Style Guide house rules):",
+        "- Use the serial comma, present tense and active voice.",
+        '- Address the learner as "you"; use "we" sparingly.',
+        "- Use imperative mood for every instruction or step.",
+        '- Never write "should" for a required action - the learner must do something, or the '
+        'system will do something. Reserve "should" for genuinely optional guidance.',
+        '- Never write "e.g." or "i.e." - write "for example" or "that is".',
+        '- Structure each step as context then action: "In the Settings menu, select '
+        'Notifications", never the reverse.',
+        "- One action per step.",
+        '- Write "click", never "click on".',
+        '- Separate consecutive navigation with >, as in "select File > Save As".',
+        '- Never write "please" or "thank you" in instructional copy.',
+    ]
+
+
+def pedagogy_rules_brief(
+    profile: LearnerProfile | None, *, include_writing_style: bool = True
+) -> str:
     """Methodology and house-style rules (Information Mapping, Bloom's verb
     bank, MSTP writing style). Separate from `learner_brief` because the
     writer and reviewer need it while the planner mostly does not.
+
+    `include_writing_style` is false when the course chose an explicit style
+    guide (app/course/style_guide.py), which then supplies the writing rules.
     """
     if profile is None:
         return ""
@@ -469,24 +497,9 @@ def pedagogy_rules_brief(profile: LearnerProfile | None) -> str:
         "- Sequence lower levels before the higher levels that depend on them."
     )
 
-    lines.append("")
-    lines.append("WRITING STYLE (Microsoft Writing Style Guide house rules):")
-    lines.append("- Use the serial comma, present tense and active voice.")
-    lines.append('- Address the learner as "you"; use "we" sparingly.')
-    lines.append("- Use imperative mood for every instruction or step.")
-    lines.append(
-        '- Never write "should" for a required action - the learner must do something, or the '
-        'system will do something. Reserve "should" for genuinely optional guidance.'
-    )
-    lines.append('- Never write "e.g." or "i.e." - write "for example" or "that is".')
-    lines.append(
-        '- Structure each step as context then action: "In the Settings menu, select '
-        'Notifications", never the reverse.'
-    )
-    lines.append("- One action per step.")
-    lines.append('- Write "click", never "click on".')
-    lines.append('- Separate consecutive navigation with >, as in "select File > Save As".')
-    lines.append('- Never write "please" or "thank you" in instructional copy.')
+    if include_writing_style:
+        lines.append("")
+        lines.extend(mstp_rule_lines())
 
     lines.append("")
     lines.append("ACCESSIBILITY (WCAG 2.1 AA, built in rather than reviewed later):")

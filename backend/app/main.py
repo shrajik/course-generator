@@ -13,15 +13,16 @@ from app.api import (
     admin,
     auth,
     code,
-    course_samples,
     course_templates,
     courses,
     documents,
     health,
     memory,
     pedagogy,
+    knowledge,
+    notifications,
+    sources,
     templates,
-    visual_knowledge,
 )
 from app.core.config import get_settings
 from app.core.errors import CourseCreatorError
@@ -99,8 +100,9 @@ app.include_router(activity.router)
 app.include_router(courses.router)
 app.include_router(documents.router)
 app.include_router(templates.router)
-app.include_router(visual_knowledge.router)
-app.include_router(course_samples.router)
 app.include_router(course_templates.router)
 app.include_router(memory.router)
 app.include_router(pedagogy.router)
+app.include_router(sources.router)
+app.include_router(notifications.router)
+app.include_router(knowledge.router)

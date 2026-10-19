@@ -5,9 +5,7 @@ C:\\Users\\Dell\\.claude\\plans\\linear-wobbling-puppy.md).
 
 Flow: plan (VisualPlanner) -> blueprint defaults (concept_visual_blueprints)
 -> QA (concept_qa) -> ONE targeted retry -> render (concept_experience_renderer)
--> save asset. Reuse-check (VisualKnowledgeService.find_approved_for_concept)
-and auto-registration land in Phase 5 - until then every call plans/renders
-fresh, exactly like DiagramService did before its own reuse layer existed.
+-> save asset. Every call plans and renders fresh.
 
 Any failure here (unusable spec, rendering error) returns False so the
 caller (ImageService) falls back to the raster illustration path - a
@@ -29,7 +27,6 @@ from app.services.concept_qa import DiagramQAResult, evaluate_concept_experience
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.storage_service import StorageService, get_storage
-from app.services.visual_knowledge_service import VisualKnowledgeService, get_visual_knowledge_service
 from app.services.visual_planner import VisualPlanner
 
 log = get_logger(__name__)
@@ -43,13 +40,11 @@ class ConceptVisualService:
         storage: StorageService | None = None,
         settings: Settings | None = None,
         memory: MemoryService | None = None,
-        visual_knowledge: VisualKnowledgeService | None = None,
     ) -> None:
         self.ai = ai or get_ai_client()
         self.storage = storage or get_storage()
         self.settings = settings or get_settings()
         self.memory = memory or get_memory_service()
-        self.visual_knowledge = visual_knowledge or get_visual_knowledge_service()
         self.planner = VisualPlanner(self.ai, self.settings, self.memory)
 
     async def _check(self, spec: DiagramSpec) -> DiagramQAResult:

@@ -1,6 +1,6 @@
 """Semantic memory data access - the only place that runs a pgvector query.
 
-Every source type (template/visual_knowledge/course_sample/generation_run)
+Every source type (template/generation_run)
 shares this one table and this one repository instead of four near-identical
 ones - see MemoryEmbedding in app/db/models.py for the storage design.
 """
