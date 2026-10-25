@@ -59,6 +59,7 @@ from app.schemas.course import (
     ImproveTocResponse,
     ReviewHistoryEntry,
     RunInfo,
+    SourceUse,
     WorkspaceActivityEntry,
 )
 from app.schemas.document import CourseDocument
@@ -1190,6 +1191,8 @@ class CourseService:
         has_course_sources = bool(record.input.source_ids)
         library = get_knowledge_service()
         if not has_course_sources and not library.has_documents():
+            for chapter in targets:
+                self._record_sources(record, chapter.id, [], [])
             return research_map, []
         owner = owner_key_for(record.owner_id)
         sources = get_source_service()
@@ -1213,6 +1216,7 @@ class CourseService:
                 knowledge = await library.search(query)
             except Exception as exc:  # noqa: BLE001 - the library must never fail generation
                 log.warning("Knowledge search failed for %s/%s: %s", record.course_id, chapter.id, exc)
+            self._record_sources(record, chapter.id, excerpts, knowledge)
             if not excerpts and not knowledge:
                 continue
             research = result.get(chapter.id)
@@ -1311,6 +1315,25 @@ class CourseService:
             waves_left = -(-remaining // concurrency)
             return round(elapsed_per_chapter * waves_left, 1)
         return round(elapsed_per_chapter * remaining, 1)
+
+    @staticmethod
+    def _record_sources(record: CourseRecord, chapter_id: str, uploads: list, knowledge: list) -> None:
+        """Note on the chapter's progress which documents it was given passages
+        from, so the progress screen can say where its content comes from."""
+        used: dict[tuple[str, str], SourceUse] = {}
+        for origin, excerpts in (("upload", uploads), ("knowledge", knowledge)):
+            for excerpt in excerpts:
+                entry = used.setdefault(
+                    (origin, excerpt.source_id),
+                    SourceUse(origin=origin, source_id=excerpt.source_id, filename=excerpt.filename),
+                )
+                entry.passages += 1
+                entry.refs.append(excerpt.ref)
+        for progress in record.chapters:
+            if progress.chapter_id == chapter_id:
+                progress.sources_checked = True
+                progress.sources_offered = list(used.values())
+                break
 
     async def _mark_progress(self, record: CourseRecord, chapter_id: str, **fields) -> None:
         for progress in record.chapters:

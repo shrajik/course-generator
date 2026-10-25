@@ -100,6 +100,18 @@ CourseStatus = Literal[
 ]
 
 
+class SourceUse(BaseModel):
+    """One document a chapter was given passages from while it was written."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    origin: Literal["knowledge", "upload"]  # the global knowledge library, or the creator's own upload
+    source_id: str
+    filename: str
+    passages: int = 0
+    refs: list[str] = Field(default_factory=list)  # e.g. ["G2.5", "G2.7"] - what the writer may cite
+
+
 class ChapterProgress(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -110,6 +122,11 @@ class ChapterProgress(BaseModel):
     reviewed: bool = False
     review_score: float | None = None
     error: str | None = None
+    # Documents searched for this chapter and what they supplied. Empty with
+    # `sources_checked` true means nothing matched: the chapter relies on web
+    # research only. `sources_checked` false = not looked up yet.
+    sources_checked: bool = False
+    sources_offered: list[SourceUse] = Field(default_factory=list)
 
 
 class RunInfo(BaseModel):

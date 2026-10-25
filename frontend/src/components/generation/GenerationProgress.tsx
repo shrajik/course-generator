@@ -9,6 +9,7 @@ import { ProgressRing } from "./ProgressRing";
 import { StageList } from "./StageList";
 import { StageDetailModal } from "./StageDetailModal";
 import { LiveDocumentPreview } from "./LiveDocumentPreview";
+import { SourcesUsed } from "./SourcesUsed";
 import { getCourse } from "@/lib/api/courses";
 import { generateCourse } from "@/lib/api/generation";
 import { getCourseDocument } from "@/lib/api/documents";
@@ -230,6 +231,8 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
           <div className="border-t border-line pt-6">
             <StageList stages={view.stages} onSelect={setSelectedStage} />
           </div>
+
+          <SourcesUsed chapters={detail?.course.chapters ?? []} />
 
           {error || view.failed ? (
             <div className="flex flex-col gap-3 rounded-card border border-red-200 bg-red-50 px-4 py-3">

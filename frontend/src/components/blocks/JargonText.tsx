@@ -2,9 +2,12 @@
 
 import { Fragment } from "react";
 import { parseJargon } from "@/lib/content/jargon";
+import { splitMarkers } from "@/lib/review/highlight";
+import { CitationBadge } from "./CitationBadge";
 
 /**
- * Renders text that may contain `<jargon term="...">` markup.
+ * Renders text that may contain `<jargon term="...">` markup and source
+ * markers such as `[G2.5]` (shown as citation badges).
  *
  * Built from parsed segments rather than injected HTML: the term and its
  * definition come from generated course content, so `dangerouslySetInnerHTML`
@@ -32,7 +35,19 @@ export function JargonText({ value }: { value: string }) {
             {segment.label}
           </span>
         ) : (
-          <Fragment key={index}>{segment.text}</Fragment>
+          <Fragment key={index}>
+            {/* Source markers ([G2.5] knowledge library, [S1.3] the creator's own
+                upload) become badges that say where the statement comes from. */}
+            {segment.text.includes("[")
+              ? splitMarkers(segment.text).map((part, i) =>
+                  part.kind === "ref" ? (
+                    <CitationBadge key={i} refId={part.ref} label={part.label} />
+                  ) : (
+                    <Fragment key={i}>{part.text}</Fragment>
+                  ),
+                )
+              : segment.text}
+          </Fragment>
         ),
       )}
     </>

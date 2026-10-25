@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  BookMarked,
   Blocks,
   Image as ImageIcon,
   LayoutGrid,
@@ -11,7 +12,7 @@ import {
 import { useEditor } from "@/lib/editor/store";
 import { cn } from "@/lib/utils/cn";
 
-export type RailPanel = "pages" | "blocks" | "uploads";
+export type RailPanel = "pages" | "blocks" | "uploads" | "sources";
 
 interface LeftRailProps {
   panel: RailPanel;
@@ -64,6 +65,13 @@ export function LeftRail({ panel, onPanelChange }: LeftRailProps) {
       Icon: Upload,
       active: panel === "uploads",
       onClick: () => onPanelChange("uploads"),
+    },
+    {
+      id: "sources",
+      label: "Sources",
+      Icon: BookMarked,
+      active: panel === "sources",
+      onClick: () => onPanelChange("sources"),
     },
   ];
 

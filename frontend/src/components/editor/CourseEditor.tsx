@@ -1,10 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, Loader2 } from "lucide-react";
+import { cn } from "@/lib/utils/cn";
 import { AiAssistant } from "./AiAssistant";
 import { BlocksPanel } from "./BlocksPanel";
+import { CitedSourcesPanel } from "./CitedSourcesPanel";
+import { PassageDialog } from "./PassageDialog";
+import { CitationContext } from "@/components/blocks/CitationBadge";
 import { Canvas } from "./Canvas";
 import { CanvasToolbar } from "./CanvasToolbar";
 import { EditorToolbar } from "./EditorToolbar";
@@ -37,6 +41,9 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   const editor = useEditor();
   const { user } = useAuth();
   const [panel, setPanel] = useState<RailPanel>("pages");
+  // The citation badge whose source passage is open ([G2.5], [S1.3]).
+  const [openCitation, setOpenCitation] = useState<string | null>(null);
+  const citations = useMemo(() => ({ open: (ref: string) => setOpenCitation(ref) }), []);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloading, setReloading] = useState(false);
@@ -426,13 +433,15 @@ export function CourseEditor({ documentId }: { documentId: string }) {
         activity={activity}
       />
 
+      <CitationContext.Provider value={citations}>
       <div className="flex min-h-0 flex-1">
         <LeftRail panel={panel} onPanelChange={setPanel} />
 
-        <div className="w-[128px] shrink-0 border-r border-line bg-white">
+        <div className={cn("shrink-0 border-r border-line bg-white", panel === "sources" ? "w-[280px]" : "w-[128px]")}>
           {panel === "pages" ? <PageSidebar /> : null}
           {panel === "blocks" ? <BlocksPanel /> : null}
           {panel === "uploads" ? <UploadsPanel /> : null}
+          {panel === "sources" ? <CitedSourcesPanel /> : null}
         </div>
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -459,6 +468,8 @@ export function CourseEditor({ documentId }: { documentId: string }) {
           visualSpecError={visualSpecError}
         />
       </div>
+      </CitationContext.Provider>
+      <PassageDialog courseId={courseId} refId={openCitation} onClose={() => setOpenCitation(null)} />
     </div>
   );
 }

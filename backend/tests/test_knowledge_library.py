@@ -413,3 +413,27 @@ def test_a_reviewer_can_read_a_cited_library_passage_through_the_course(admin):
     course = _course(admin)
     found = admin.get(f"/api/courses/{course['course_id']}/passages?refs=G1.3,G1.3,G9.9,S1.1").json()
     assert [p["ref"] for p in found] == ["G1.3"] and "billing team" in found[0]["text"]
+
+
+# --- the progress screen shows where each chapter's content comes from -------------
+
+
+async def test_chapter_progress_names_the_library_document_and_the_upload_it_drew_on(client, library):
+    await _add(library, "policy.txt", POLICY_TEXT)
+    own = client.post("/api/sources", files={"file": ("manual.txt", b"REFUND MANUAL\n\nAgents approve refunds for returned products using the refund form.\n", "text/plain")}).json()
+    _wait_source(client, own["source_id"])
+    course = _course(client, source_ids=[own["source_id"]])
+    client.post(f"/api/courses/{course['course_id']}/generate", json={"mode": "sync"})
+    chapter = client.get(f"/api/courses/{course['course_id']}").json()["course"]["chapters"][0]
+    assert chapter["sources_checked"] is True
+    used = {use["origin"]: use for use in chapter["sources_offered"]}
+    assert used["knowledge"]["filename"] == "policy.txt" and used["knowledge"]["passages"] >= 1
+    assert all(ref.startswith("G1.") for ref in used["knowledge"]["refs"])
+    assert used["upload"]["filename"] == "manual.txt" and used["upload"]["refs"][0].startswith("S1.")
+
+
+async def test_a_chapter_nothing_matched_is_marked_web_research_only(client):
+    course = _course(client, title="Quantum field theory", toc=("Lagrangian mechanics",))
+    client.post(f"/api/courses/{course['course_id']}/generate", json={"mode": "sync"})
+    chapter = client.get(f"/api/courses/{course['course_id']}").json()["course"]["chapters"][0]
+    assert chapter["sources_checked"] is True and chapter["sources_offered"] == []

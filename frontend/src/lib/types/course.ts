@@ -105,6 +105,15 @@ export type CourseStatus =
   | "ready"
   | "failed";
 
+/** A document a chapter was given passages from while it was written. */
+export interface SourceUse {
+  origin: "knowledge" | "upload";
+  source_id: string;
+  filename: string;
+  passages: number;
+  refs: string[];
+}
+
 export interface ChapterProgress {
   chapter_id: string;
   title: string;
@@ -113,6 +122,10 @@ export interface ChapterProgress {
   reviewed: boolean;
   review_score: number | null;
   error: string | null;
+  /** True once the chapter's documents were searched; with an empty list,
+   * nothing matched and the chapter relies on web research only. */
+  sources_checked?: boolean;
+  sources_offered?: SourceUse[];
 }
 
 export type RunState = "queued" | "running" | "done" | "failed" | "cancelled";

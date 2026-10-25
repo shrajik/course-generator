@@ -1,5 +1,6 @@
 "use client";
 
+import { CitedText } from "@/components/blocks/CitationBadge";
 import { useMemo } from "react";
 import { FileText, Loader2 } from "lucide-react";
 import { assetUrl } from "@/lib/api/documents";
@@ -323,14 +324,14 @@ function FlowBlock({ block, documentId }: { block: Block; documentId: string }) 
     case "story":
       return (
         <p className="gen-block-in mt-3 text-[13.5px] leading-[1.7] text-ink-700">
-          {asString(content.text)}
+          <CitedText value={asString(content.text)} />
         </p>
       );
 
     case "quote":
       return (
         <blockquote className="gen-block-in mt-4 border-l-2 border-brand-300 pl-4 text-[13.5px] italic leading-[1.6] text-ink-600">
-          {asString(content.text)}
+          <CitedText value={asString(content.text)} />
           {content.attribution ? (
             <footer className="mt-1 text-[12px] not-italic text-ink-400">
               — {asString(content.attribution)}
@@ -351,7 +352,9 @@ function FlowBlock({ block, documentId }: { block: Block; documentId: string }) 
       return (
         <div className={`gen-block-in mt-4 rounded-[10px] border px-4 py-3 text-[13px] ${tone}`}>
           {content.title ? <p className="font-semibold">{asString(content.title)}</p> : null}
-          <p className="mt-1 leading-[1.6]">{asString(content.text)}</p>
+          <p className="mt-1 leading-[1.6]">
+            <CitedText value={asString(content.text)} />
+          </p>
         </div>
       );
     }
@@ -367,7 +370,9 @@ function FlowBlock({ block, documentId }: { block: Block; documentId: string }) 
           ) : null}
           <ul className="mt-2 list-disc space-y-1 pl-5 text-[13px] leading-[1.6] text-ink-700">
             {items.map((item, index) => (
-              <li key={index}>{item}</li>
+              <li key={index}>
+                <CitedText value={item} />
+              </li>
             ))}
           </ul>
         </div>
