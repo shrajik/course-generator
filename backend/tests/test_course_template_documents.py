@@ -1,5 +1,6 @@
-"""Uploaded course template documents: any authenticated user (any role) can
-upload, list and view - DOCX/Markdown normalization to Markdown.
+"""Uploaded course templates through the API, against a real database:
+upload (any role), visibility (private by default, shared on request),
+delete, the processed blueprint, and failure handling.
 
 Backed by the same TEST_DATABASE_URL-gated Postgres fixture pattern as
 test_review_workflow.py.
@@ -197,11 +198,11 @@ def test_invalid_template_type_is_rejected(template_client, monkeypatch):
     assert response.status_code == 422, response.text
 
 
-def test_any_authenticated_user_can_list_and_view(template_client, monkeypatch):
+def test_any_authenticated_user_can_list_and_view_a_shared_template(template_client, monkeypatch):
     _make_admin(template_client, monkeypatch)
     upload = template_client.post(
         "/api/course-template-documents",
-        data={"name": "Listed", "template_type": "technical", "description": "d"},
+        data={"name": "Listed", "template_type": "technical", "description": "d", "visibility": "shared"},
         files={"file": ("x.md", b"# Listed Template", "text/markdown")},
     )
     template_id = upload.json()["id"]
@@ -274,3 +275,131 @@ def test_classify_type_requires_auth(template_client, monkeypatch):
     )
 
     assert response.status_code == 401, response.text
+
+
+# --- visibility, delete, blueprint, failure handling -------------------------
+
+_MD_BLUEPRINT = b"""# Support Desk Blueprint
+
+## Writing rules
+- Tone: calm and practical
+- Every chapter must end with a summary of key takeaways.
+
+## How It Works (required)
+Explain the process step by step.
+Add a flowchart labelled Request, Triage and Resolve after the explanation, with a caption.
+"""
+
+
+def _upload_md(client, name="Blueprint", visibility="private", content=_MD_BLUEPRINT):
+    return client.post(
+        "/api/course-template-documents",
+        data={"name": name, "template_type": "non_technical", "description": "", "visibility": visibility},
+        files={"file": ("blueprint.md", content, "text/markdown")},
+    )
+
+
+def test_upload_returns_the_processed_blueprint(template_client, monkeypatch):
+    _make_admin(template_client, monkeypatch)
+    response = _upload_md(template_client)
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["usable"] is True
+    assert body["template_id"] == f"uploaded:{body['id']}"
+    assert [section["key"] for section in body["sections"]] == ["how_it_works"]
+    blueprint = body["blueprint"]
+    assert blueprint["source_format"] == "md"
+    assert blueprint["text"]["tone"] == "calm and practical"
+    flowchart = blueprint["visuals"][0]
+    assert flowchart["section_key"] == "how_it_works"
+    assert flowchart["labels"] == ["Request", "Triage", "Resolve"]
+    assert flowchart["required"] is True
+
+
+def test_a_private_template_is_hidden_from_other_users_until_shared(template_client, monkeypatch):
+    _make_admin(template_client, monkeypatch)
+    template_client.post("/auth/logout")
+    owner_email = _email("tpl-owner")
+    _register(template_client, owner_email)
+    template_id = _upload_md(template_client, name="Owner Private").json()["id"]
+    template_client.post("/auth/logout")
+
+    _register(template_client, _email("tpl-other"))
+    names = [item["name"] for item in template_client.get("/api/course-template-documents").json()["templates"]]
+    assert "Owner Private" not in names
+    assert template_client.get(f"/api/course-template-documents/{template_id}").status_code == 404
+    # Someone else cannot share or delete it either.
+    assert template_client.patch(
+        f"/api/course-template-documents/{template_id}", json={"visibility": "shared"}
+    ).status_code == 404
+    template_client.post("/auth/logout")
+
+    _login(template_client, owner_email)
+    shared = template_client.patch(f"/api/course-template-documents/{template_id}", json={"visibility": "shared"})
+    assert shared.status_code == 200, shared.text
+    assert shared.json()["visibility"] == "shared"
+    template_client.post("/auth/logout")
+
+    _register(template_client, _email("tpl-other-2"))
+    listing = template_client.get("/api/course-template-documents").json()["templates"]
+    item = next(entry for entry in listing if entry["name"] == "Owner Private")
+    assert item["can_manage"] is False
+    assert template_client.delete(f"/api/course-template-documents/{template_id}").status_code == 403
+
+
+def test_a_deleted_template_cannot_start_a_course_but_still_resolves(template_client, monkeypatch):
+    from app.course.templates.registry import load_template
+
+    _make_admin(template_client, monkeypatch)
+    body = _upload_md(template_client, name="To Delete").json()
+    template_id = body["template_id"]
+    assert template_client.delete(f"/api/course-template-documents/{body['id']}").status_code == 204
+
+    names = [item["name"] for item in template_client.get("/api/course-template-documents").json()["templates"]]
+    assert "To Delete" not in names
+    created = template_client.post(
+        "/api/courses",
+        json={
+            "course_title": "Anything",
+            "toc": [{"title": "One"}],
+            "target_audience": "Anyone",
+            "template": "non_technical",
+            "template_id_override": template_id,
+            "run_planner": False,
+        },
+    )
+    assert created.status_code == 422, created.text
+    assert "deleted" in created.text
+    # A course made before the delete still renders with its template.
+    assert load_template(template_id).blueprint is not None
+
+
+def test_a_corrupted_docx_is_rejected_and_leaves_no_files(template_client, monkeypatch, tmp_path):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    reset_settings_cache()
+    _make_admin(template_client, monkeypatch)
+    response = template_client.post(
+        "/api/course-template-documents",
+        data={"name": "Broken", "template_type": "technical"},
+        files={"file": ("broken.docx", b"PK\x03\x04 this is not really a zip", "application/octet-stream")},
+    )
+    assert response.status_code == 422, response.text
+    assert "corrupted" in response.text or "not a valid .docx" in response.text
+    assert not (tmp_path / "templates").exists() or not any((tmp_path / "templates").iterdir())
+
+
+def test_a_failed_database_insert_removes_the_stored_files(template_client, monkeypatch, tmp_path):
+    from app.db.repositories.course_template_documents import CourseTemplateDocumentRepository
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    reset_settings_cache()
+    _make_admin(template_client, monkeypatch)
+
+    async def explode(self, document):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(CourseTemplateDocumentRepository, "create", explode)
+    with pytest.raises(RuntimeError):
+        _upload_md(template_client, name="Will Fail")
+    templates_dir = tmp_path / "templates"
+    assert not templates_dir.exists() or not any(templates_dir.iterdir())

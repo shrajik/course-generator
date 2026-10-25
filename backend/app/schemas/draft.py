@@ -98,6 +98,14 @@ class DraftBlock(BaseModel):
     # See ImageContent.expected_labels. Only meaningful when
     # illustration_style == "textbook".
     image_expected_labels: list[str] = Field(default_factory=list)
+    # Template blueprint links (see app.schemas.template_blueprint) - empty
+    # unless the course's template has a blueprint that asks for them:
+    # the visual rule this block satisfies ("V2"), the requested shape of a
+    # generated picture, and a template picture to reuse instead of
+    # generating one ("A1").
+    template_visual: str = ""
+    image_aspect: str = ""  # "" | landscape | portrait | square
+    template_asset: str = ""
 
 
 class BlockReplacement(BaseModel):

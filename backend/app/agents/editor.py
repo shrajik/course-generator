@@ -10,7 +10,7 @@ from app.agents import prompts
 from app.core.config import Settings, get_settings
 from app.core.errors import ValidationFailedError
 from app.core.logging import get_logger
-from app.course.templates.registry import load_template
+from app.course.templates.registry import ensure_template_loaded, load_template
 from app.schemas.document import Block, CourseDocument
 from app.schemas.patch import DocumentPatch
 from app.services.openai_service import AIClient, get_ai_client
@@ -50,6 +50,7 @@ class EditorAgent:
         instruction: str,
     ) -> DocumentPatch:
         selected = self._resolve_selection(document, selected_block_ids)
+        await ensure_template_loaded(document.template_id)
         template = load_template(document.template_id)
         patch = await self.ai.structured(
             schema=DocumentPatch,

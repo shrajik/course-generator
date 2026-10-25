@@ -342,6 +342,7 @@ def _extract_furniture(
     if footer and footer.strip().lower() not in ("page", "page of"):
         theme.footer_text = footer
         findings["footer_text"] = footer
-    if has_page_field:
-        theme.show_page_numbers = True
-        findings["page_numbers"] = True
+    # Explicit either way: a Word footer without a PAGE field means the
+    # document has no page numbers, which the PDF now honours.
+    theme.show_page_numbers = has_page_field
+    findings["page_numbers"] = has_page_field

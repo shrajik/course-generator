@@ -324,6 +324,33 @@ Produce the diagram specification for this visual.{pin}
 """
 
 
+def diagram_outline(spec: DiagramSpec) -> dict:
+    """A compact record of what a rendered diagram shows: its kind, the
+    labelled parts, and each arrow as "from -> to (label)" in drawn
+    direction. Stored on the block for app.services.visual_review."""
+    labels = {node.id: node.label for node in spec.nodes if node.id}
+    outline: dict = {
+        "kind": spec.normalised_kind(),
+        "title": spec.title,
+        "parts": [
+            {"label": node.label, "detail": node.detail} for node in spec.nodes if node.label.strip()
+        ][:40],
+        "arrows": [
+            {"from": labels.get(edge.source, edge.source), "to": labels.get(edge.target, edge.target), "label": edge.label}
+            for edge in spec.edges
+        ][:60],
+    }
+    shapes = list(spec.shapes) + [shape for state in spec.states for shape in state.shapes]
+    if shapes:
+        names = {shape.id: shape.label for shape in shapes if shape.id}
+        outline["parts"] += [{"label": shape.label, "detail": shape.sublabel} for shape in shapes if shape.label.strip()][:40]
+        outline["arrows"] += [
+            {"from": names.get(rel.source, rel.source), "to": names.get(rel.target, rel.target), "label": rel.type}
+            for rel in spec.relationships
+        ][:40]
+    return outline
+
+
 def _kind_conflicts(hint: str, actual: str) -> bool:
     """True only for a conflict worth correcting - e.g. a relationship kind
     was requested but the model reached for a sequential one (the exact bug
@@ -732,6 +759,9 @@ class DiagramService:
                 "error": None,
                 "width": width,
                 "height": height,
+                # What was actually drawn, so a later review can check the
+                # diagram against the text it sits beside.
+                "diagram_outline": diagram_outline(spec),
             },
         )
         log.info(

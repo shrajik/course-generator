@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -27,7 +29,11 @@ from app.api import (
 from app.core.config import get_settings
 from app.core.errors import CourseCreatorError
 from app.core.logging import configure_logging, get_logger
-from app.course.templates.registry import refresh_db_templates, refresh_uploaded_templates
+from app.course.templates.registry import (
+    refresh_db_templates,
+    refresh_templates_periodically,
+    refresh_uploaded_templates,
+)
 from app.db.engine import dispose_engine
 
 settings = get_settings()
@@ -58,7 +64,18 @@ async def lifespan(app: FastAPI):
     # Same best-effort contract: an unavailable database just means uploaded
     # templates resolve again after the next upload or restart.
     await refresh_uploaded_templates()
+    # Each worker caches templates in memory; this keeps a worker in step
+    # with templates created, edited or deleted through another one.
+    refresher = (
+        asyncio.create_task(refresh_templates_periodically(settings.template_refresh_seconds))
+        if settings.use_database and settings.template_refresh_seconds > 0
+        else None
+    )
     yield
+    if refresher is not None:
+        refresher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresher
     if settings.use_database:
         await dispose_engine()
 

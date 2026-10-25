@@ -14,7 +14,7 @@ from app.core.config import Settings, get_settings
 from app.core.generation_stream import get_stream_hub
 from app.core.logging import get_logger
 from app.core.metrics import phase as metrics_phase
-from app.course.templates.registry import load_template
+from app.course.templates.registry import ensure_template_loaded, load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
 from app.schemas.research import ChapterResearch
@@ -49,6 +49,7 @@ class ResearchService:
             log.info("Reusing cached research for %s/%s", course_id, chapter.id)
             return self.storage.load_research(course_id, chapter.id, chapter.order)
 
+        await ensure_template_loaded(blueprint.template_id or course_input.template_id)
         template = load_template(blueprint.template_id or course_input.template_id)
         hub = get_stream_hub()
         hub.start(course_id, chapter.id, "research")

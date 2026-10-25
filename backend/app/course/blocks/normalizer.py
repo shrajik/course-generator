@@ -34,7 +34,7 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
 
     if t is BlockType.IMAGE:
         kind = draft.image_kind.strip().lower()
-        return {
+        content = {
             "purpose": _first(draft.image_purpose, draft.title, draft.text),
             "prompt": _first(draft.image_prompt, draft.text),
             "caption": _first(draft.caption, draft.title),
@@ -44,6 +44,17 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
             "illustration_style": draft.illustration_style.strip().lower(),
             "expected_labels": [label.strip() for label in draft.image_expected_labels if label.strip()],
         }
+        # Blueprint links: only written when set, so blocks for templates
+        # without a blueprint carry exactly the keys they always did.
+        aspect = draft.image_aspect.strip().lower()
+        if draft.template_visual.strip():
+            content["blueprint_rule"] = draft.template_visual.strip()[:12]
+        if aspect in ("landscape", "portrait", "square"):
+            content["aspect"] = aspect
+        if draft.template_asset.strip():
+            content["template_asset"] = draft.template_asset.strip()[:12]
+            content["kind"] = "illustration"
+        return content
 
     if t is BlockType.QUOTE:
         return {"text": draft.text, "attribution": draft.attribution}
@@ -150,7 +161,7 @@ def is_empty_content(block_type: BlockType, content: dict[str, Any]) -> bool:
     """Drop blocks the model left blank instead of rendering empty boxes."""
     if block_type is BlockType.DIVIDER:
         return False
-    meaningful = ("text", "code", "instructions", "prompt", "context", "purpose")
+    meaningful = ("text", "code", "instructions", "prompt", "context", "purpose", "template_asset")
     if any(str(content.get(key, "")).strip() for key in meaningful):
         return False
     list_keys = (
@@ -218,6 +229,10 @@ def tag_section_intro_illustrations(blocks: list[Block]) -> None:
             continue
         if (content.get("illustration_style") or "").strip():
             continue
+        # A picture placed for a template blueprint rule keeps the size and
+        # shape the rule asked for; it is not a small section opener.
+        if content.get("blueprint_rule") or content.get("template_asset") or content.get("aspect"):
+            continue
         opens_a_section = index == 0 or blocks[index - 1].type == BlockType.HEADING
         followed_by_paragraph = index + 1 < len(blocks) and blocks[index + 1].type == BlockType.PARAGRAPH
         if opens_a_section and followed_by_paragraph:
@@ -248,5 +263,32 @@ def normalize_draft_blocks(
         )
         if block is not None:
             blocks.append(block)
-    tag_section_intro_illustrations(blocks)
+    return finish_chapter_blocks(blocks, template)
+
+
+def finish_chapter_blocks(blocks: list[Block], template: CourseTemplate) -> list[Block]:
+    """Last structural pass over a chapter's blocks, after writing or revising.
+
+    Without a template blueprint this is exactly the section_intro tagging it
+    always was. With one: images tagged for a blueprint rule are moved to the
+    place the rule names, and when the template forbids decorative pictures
+    any section-opening illustration is dropped (and none is derived).
+    """
+    if template.blueprint is None:
+        tag_section_intro_illustrations(blocks)
+        return blocks
+    from app.course.templates.blueprint.checks import place_template_visuals
+
+    if template.blueprint.section_intro_images is False:
+        blocks = [
+            block
+            for block in blocks
+            if not (
+                block.type is BlockType.IMAGE
+                and (block.content.get("illustration_style") or "") == "section_intro"
+            )
+        ]
+    else:
+        tag_section_intro_illustrations(blocks)
+    place_template_visuals(blocks, template)
     return blocks

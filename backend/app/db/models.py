@@ -207,17 +207,20 @@ class CourseActivity(Base):
 
 
 class CourseTemplateDocument(Base):
-    """An admin-uploaded course template (DOCX or Markdown).
+    """A user-uploaded course template (DOCX or Markdown).
 
-    The **original DOCX is the source of truth** (`source_path`): it is
-    re-parsed by app.course.templates.docx_parser into `template_json` (a
-    normalized CourseTemplate carrying sections, guidance and the extracted
-    theme) which is what the generation pipeline and the renderer actually
-    consume, addressed as `uploaded:{id}` through the template registry.
+    At upload the file is processed once (app.course.templates.blueprint)
+    into `template_json`: a normalized CourseTemplate with its sections and a
+    blueprint of writing rules, visual rules, worked examples and reusable
+    pictures. That is what generation and rendering consume, addressed as
+    `uploaded:{id}` through the template registry. An upload that cannot be
+    processed is rejected, so new rows always have a `template_json`; rows
+    from before blueprints may not, and cannot start new courses.
 
-    `markdown_content` is retained as a semantic, human-readable rendering of
-    the document. It carries no visual information (mammoth discards direct
-    formatting by design) and is never used as the template.
+    `markdown_content` is a human-readable rendering of the file, kept for
+    preview only. `visibility` is "private" (uploader and admins) or
+    "shared" (everyone). Deleting sets `is_active` false and keeps the row,
+    because courses already made from it still resolve their template.
     """
 
     __tablename__ = "course_template_documents"
@@ -234,11 +237,9 @@ class CourseTemplateDocument(Base):
     # Course-relative-style path under data/templates/{id}/... - optional,
     # retained only for reference/re-download, never read by the pipeline.
     source_path: Mapped[str | None] = mapped_column(String(400), nullable=True)
-    # The normalized CourseTemplate (app.schemas.template.CourseTemplate) this
-    # document parses to, including its extracted TemplateTheme. Nullable
-    # because rows predating the parser exist, and because a Markdown upload
-    # has no DOCX to extract structure or styling from - those rows fall back
-    # to the built-in template for their `template_type`.
+    # The normalized CourseTemplate (app.schemas.template.CourseTemplate),
+    # blueprint included. Nullable only for rows uploaded before uploads were
+    # processed into blueprints.
     template_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Parse report: what was detected, what could not be reproduced, which
     # placeholders are unsupported. Surfaced by the upload API.
@@ -247,6 +248,7 @@ class CourseTemplateDocument(Base):
     # identified as stale and re-run against the retained DOCX.
     parser_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="private", index=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

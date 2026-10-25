@@ -1,12 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getBlockRenderer } from "@/components/blocks/registry";
 import { wrapAroundFor } from "@/lib/editor/pairing";
 import { SelectionBox, type HandleId } from "./SelectionBox";
 import { blockBoxStyle } from "@/lib/editor/style";
 import { useEditor } from "@/lib/editor/store";
-import { CONTENT_WIDTH, PAGE_HEIGHT, PAGE_WIDTH, type Block } from "@/lib/types/document";
+import { CONTENT_WIDTH, PAGE_HEIGHT, type Block } from "@/lib/types/document";
+import { editorTheme } from "@/lib/editor/theme";
 import { cn } from "@/lib/utils/cn";
 
 const MIN_WIDTH = 80;
@@ -46,6 +47,11 @@ interface DragSession {
   origin: { x: number; y: number; width: number; height: number };
 }
 
+function runningMargin(theme: { marginX: number }): number {
+  // The PDF draws the running header/footer within the side margins.
+  return theme.marginX;
+}
+
 export function Canvas() {
   const editor = useEditor();
   const { document: doc, activePage, selectedIds, editingBlockId } = editor;
@@ -53,19 +59,28 @@ export function Canvas() {
   const [scale, setScale] = useState(1);
   const session = useRef<DragSession | null>(null);
 
-  // Fit the A4 page to the available width.
+  // The template's design, mirrored from the PDF; empty (the normal editor
+  // look) unless the course's template carries one.
+  const theme = useMemo(
+    () => editorTheme(doc?.meta?.theme, { course_title: doc?.course_title ?? "", audience: doc?.meta?.audience }),
+    [doc?.meta?.theme, doc?.course_title, doc?.meta?.audience],
+  );
+  // The page box the layout engine used: A4 unless the template set another size.
+  const pageWidth = theme.pageWidth;
+
+  // Fit the page to the available width.
   useEffect(() => {
     const element = frameRef.current;
     if (!element) return;
     const measure = () => {
       const available = element.clientWidth - 40;
-      setScale(Math.max(0.35, Math.min(1, available / PAGE_WIDTH)));
+      setScale(Math.max(0.35, Math.min(1, available / pageWidth)));
     };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(element);
     return () => observer.disconnect();
-  }, []);
+  }, [pageWidth]);
 
   const beginMove = useCallback(
     (block: Block, event: React.PointerEvent) => {
@@ -112,7 +127,7 @@ export function Canvas() {
         editor.updateLayout(
           blockId,
           {
-            x: Math.round(Math.max(0, Math.min(PAGE_WIDTH - origin.width, origin.x + dx))),
+            x: Math.round(Math.max(0, Math.min(pageWidth - origin.width, origin.x + dx))),
             y: Math.round(Math.max(0, origin.y + dy)),
           },
           true,
@@ -147,7 +162,7 @@ export function Canvas() {
         true,
       );
     },
-    [editor, scale],
+    [editor, scale, pageWidth],
   );
 
   // The layout stored with a course reserves room from an estimate of how tall
@@ -230,19 +245,37 @@ export function Canvas() {
     >
       <div
         className="mx-auto"
-        style={{ width: PAGE_WIDTH * scale, height: pageHeight * scale }}
+        style={{ width: pageWidth * scale, height: pageHeight * scale }}
       >
         <div
           data-canvas-page={activePage.page_number}
-          className="relative rounded-[3px] bg-white shadow-canvas"
+          className={cn("relative rounded-[3px] bg-white shadow-canvas", theme.applied && "doc-themed")}
           style={{
-            width: PAGE_WIDTH,
+            ...theme.style,
+            width: pageWidth,
             height: pageHeight,
             transform: `scale(${scale})`,
             transformOrigin: "top left",
             background: activePage.background ?? "#ffffff",
           }}
         >
+          {theme.applied && activePage.kind === "content" ? (
+            <>
+              {theme.header ? (
+                <div className="doc-running doc-running-head" style={{ left: runningMargin(theme), right: runningMargin(theme) }}>
+                  {theme.header}
+                </div>
+              ) : null}
+              <div className="doc-running doc-running-foot" style={{ left: runningMargin(theme), right: runningMargin(theme) }}>
+                <span>{theme.footer}</span>
+                {theme.showPageNumbers ? (
+                  <span>
+                    {activePage.page_number} / {doc.pages.length}
+                  </span>
+                ) : null}
+              </div>
+            </>
+          ) : null}
           {activePage.blocks.map((block) => {
             const selected = selectedIds.includes(block.id);
             const editing = editingBlockId === block.id;

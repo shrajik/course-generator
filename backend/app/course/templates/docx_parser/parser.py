@@ -1,4 +1,11 @@
-"""Turn an uploaded DOCX into a normalized `CourseTemplate` + a parse report.
+"""Turn a DOCX into a normalized `CourseTemplate` + a parse report.
+
+Superseded for uploads by app.course.templates.blueprint, which reads the
+whole document (instructions, examples, pictures) into a generation
+blueprint. Uploads still reuse this package's style extraction
+(`style.extract_theme`), placeholder allow-list and unsupported-feature scan;
+`parse_docx_template` itself is kept for its tests and as the reference for
+structure-only parsing.
 
 This is the bridge between the upload feature and the template architecture
 the rest of the app already speaks. The output is an ordinary

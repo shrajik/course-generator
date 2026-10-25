@@ -6,7 +6,7 @@ from app.agents import prompts
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
-from app.course.templates.registry import is_uploaded_template_id, load_template
+from app.course.templates.registry import ensure_template_loaded, is_uploaded_template_id, load_template
 from app.schemas.blueprint import (
     BlueprintChapter,
     ChapterSection,
@@ -34,6 +34,7 @@ class PlannerAgent:
 
     # --- blueprint --------------------------------------------------------
     async def plan(self, course_input: CourseInput) -> CourseBlueprint:
+        await ensure_template_loaded(course_input.template_id)
         template = load_template(course_input.template_id)
         log.info(
             "TEMPLATE_SENT_TO_PLANNER template_id=%s source=%s sections=%s",
@@ -53,6 +54,10 @@ class PlannerAgent:
             phase="planner",
         )
         chapters = self._reconcile_chapters(course_input, output)
+        if template.blueprint is not None and template.blueprint.text.words_per_chapter:
+            # A chapter length the template states is a rule, not a hint.
+            for chapter in chapters:
+                chapter.estimated_words = template.blueprint.text.words_per_chapter
         blueprint = CourseBlueprint(
             course_title=course_input.course_title,
             audience=course_input.target_audience,

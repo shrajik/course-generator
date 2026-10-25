@@ -602,3 +602,39 @@ body {
   .login-form-side { min-height: calc(100vh - 32px); border-radius: 16px; padding: 20px 12px; }
   .login-form-card { border: 0; box-shadow: none; padding: 28px 22px; }
 }
+
+/* Template design in the editor (lib/editor/theme.ts) - only set on a page
+   whose course template carries a design, mirroring the PDF renderer. */
+.doc-themed {
+  font-family: var(--doc-font);
+  color: var(--doc-ink, inherit);
+}
+.doc-themed :is(h1, h2, h3, h4) {
+  font-family: var(--doc-heading-font);
+  color: var(--doc-heading-ink);
+}
+.doc-themed :is(p, li) {
+  color: var(--doc-ink, inherit);
+}
+.doc-themed pre,
+.doc-themed code {
+  font-family: var(--font-mono, "JetBrains Mono", Consolas, monospace);
+}
+.doc-running {
+  position: absolute;
+  font-size: 11px;
+  color: var(--doc-muted, #4b5563);
+  pointer-events: none;
+}
+.doc-running-head {
+  top: 28px;
+  border-bottom: 1px solid var(--doc-border, #e5e7eb);
+  padding-bottom: 6px;
+}
+.doc-running-foot {
+  bottom: 34px;
+  display: flex;
+  justify-content: space-between;
+  border-top: 1px solid var(--doc-border, #e5e7eb);
+  padding-top: 8px;
+}

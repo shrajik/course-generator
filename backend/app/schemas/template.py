@@ -1,7 +1,9 @@
 """Template configuration schema.
 
-A template is *only* content structure + presentation rules. Both templates share
-one AI pipeline; the writer simply receives the selected configuration.
+A template is content structure + presentation rules, plus (optionally) a
+`TemplateBlueprint` of writing and visual rules parsed from an uploaded file.
+Every template shares one AI pipeline; the writer simply receives the selected
+configuration.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.blocks import BlockType
+from app.schemas.template_blueprint import TemplateBlueprint
 from app.schemas.document import (
     PAGE_HEIGHT,
     PAGE_MARGIN_BOTTOM,
@@ -86,12 +89,14 @@ class TemplateTheme(BaseModel):
     table_border_color: str = ""        # falls back to border_color
     paragraph_spacing_em: float = 0.4
 
-    # Page furniture. Rendered by Playwright's header/footer templates
-    # (app.services.pdf_service), not by the Jinja page markup, because only
-    # the print pipeline can repeat them on every physical page.
+    # Page furniture, drawn on every page by the Jinja page markup
+    # (app/render/templates/course.html.j2) and mirrored by the editor.
     header_text: str = ""
     footer_text: str = ""
-    show_page_numbers: bool = False
+    # None = not specified: the footer keeps its page number, as it always
+    # has. False is an explicit "no page numbers" (a DOCX footer without a
+    # PAGE field); True an explicit yes.
+    show_page_numbers: bool | None = None
 
     # None = "use the layout engine's built-in page box".
     page: PageGeometry | None = None
@@ -123,6 +128,9 @@ class CourseTemplate(BaseModel):
     image_guidance: str = ""
     theme: TemplateTheme = Field(default_factory=TemplateTheme)
     block_styles: dict[BlockType, dict[str, Any]] = Field(default_factory=dict)
+    # Writing/visual rules from an uploaded template. None for every template
+    # that predates blueprints, which keeps their prompts unchanged.
+    blueprint: TemplateBlueprint | None = None
 
     # --- helpers ---------------------------------------------------------
     def section_labels(self) -> list[str]:

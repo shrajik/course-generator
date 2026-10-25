@@ -45,7 +45,8 @@ from app.core.metrics import current_metrics, phase as metrics_phase, run_metric
 from app.course.document.builder import build_document, reflow_document
 from app.course.document.layout import image_generation_failed
 from app.course.document.visual_repair import audit_and_repair_visuals
-from app.course.templates.registry import load_template
+from app.services.visual_review import VisualReviewService
+from app.course.templates.registry import ensure_template_loaded, load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import (
     ChapterProgress,
@@ -536,6 +537,7 @@ class CourseService:
                 await self.plan_course(record)
                 record = await self._load_course(course_id)
             blueprint = await self._load_blueprint(course_id)
+            await ensure_template_loaded(blueprint.template_id or record.template_id)
             template = load_template(blueprint.template_id or record.template_id)
 
             targets = self._select_chapters(blueprint, request)
@@ -823,6 +825,7 @@ class CourseService:
                     course_input=self._run_input(record),
                     blocks=blocks,
                     continuity=continuity,
+                    research=research,
                 )
                 while review.needs_revision() and revisions < self.settings.max_review_revisions:
                     revisions += 1
@@ -847,6 +850,7 @@ class CourseService:
                         course_input=self._run_input(record),
                         blocks=blocks,
                         continuity=continuity,
+                        research=research,
                     )
             except Exception as exc:  # noqa: BLE001 - review is advisory, not fatal
                 log.warning("Review failed for %s: %s", chapter.id, exc)
@@ -947,6 +951,19 @@ class CourseService:
                         "Visual repair for %s: %s page(s) repaired, %s still deficient",
                         record.course_id, len(repair.repaired), len(repair.still_deficient),
                     )
+                # Check every real picture and diagram against its text, and
+                # regenerate only the ones that fail.
+                if self.settings.enable_visual_review:
+                    try:
+                        visual_report = await VisualReviewService(
+                            ai=self.ai, settings=self.settings, storage=self.storage, images=self.images
+                        ).review_document(document, template, fix=True)
+                        if visual_report.counts()["regenerated"]:
+                            reflow_document(document, template)
+                        warnings.extend(visual_report.warnings())
+                    except Exception as exc:  # noqa: BLE001 - a review problem never fails the course
+                        log.warning("Visual review failed for %s: %s", record.course_id, exc)
+                        warnings.append("The visual check could not be run.")
                 await self._save_document(document)
             # The finished course is checked against the creator's own documents.
             if record.input.source_ids and self.settings.enable_fact_check:
@@ -1071,6 +1088,7 @@ class CourseService:
 
     async def build_course_document(self, course_id: str) -> CourseDocument:
         blueprint = await self._load_blueprint(course_id)
+        await ensure_template_loaded(blueprint.template_id)
         template = load_template(blueprint.template_id)
         chapters = self.storage.load_all_chapters(course_id)
         if not chapters:

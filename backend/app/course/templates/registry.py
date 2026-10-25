@@ -1,26 +1,38 @@
 """Template registry - loads and validates template configurations.
 
-Two sources, merged:
+Three sources, merged:
 * Static JSON files under this directory (`technical_v1`, `non_technical_v1`)
-  - the built-in defaults, unchanged since before the AI memory layer.
-* DB-backed templates (app.db.models.Template, app.services.template_service)
-  - created/edited through the admin API. Every version is immutable once
-  created, so a course that stored `template_id="my_template_v3"` keeps
-  resolving to exactly that content forever, even after a newer version
-  becomes current.
+  - the built-in defaults.
+* DB-backed admin templates (app.db.models.Template,
+  app.services.template_service) - created/edited through the admin API.
+  Every version is immutable once created, so a course that stored
+  `template_id="my_template_v3"` keeps resolving to exactly that content
+  forever, even after a newer version becomes current.
+* Uploaded templates (`uploaded:{uuid}`, app.db.models.CourseTemplateDocument)
+  - DOCX/Markdown files processed once into a template with a generation
+  blueprint (app.course.templates.blueprint).
+
+Two different questions are answered here. `load_template` resolves any id a
+course was ever pinned to - archived, superseded and deleted templates
+included, so existing courses keep rendering. `check_selectable` decides
+whether a NEW course may use an id, and says why not.
 
 `load_template()` stays a plain, synchronous, cheap lookup - every existing
 caller (writer, reviewer, PDF export, dozens of call sites) calls it
 synchronously today, and keeping it that way avoids an async refactor with a
-huge blast radius. DB templates are instead kept in a small in-process cache,
-refreshed explicitly (`refresh_db_templates()`) right after any write and
-once, best-effort, at app startup - never on the read path, so a slow or
-unavailable database can never block a template lookup.
+huge blast radius. DB and uploaded templates are instead kept in small
+in-process caches, refreshed right after a write in this process, at startup,
+periodically (`refresh_templates_periodically`, for writes made by other
+workers) and on a cache miss in async entry points (`ensure_template_loaded`)
+- never on the synchronous read path, so a slow or unavailable database can
+never block a template lookup.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -36,6 +48,7 @@ _FILES = {
     "technical_v1": "technical_v1.json",
     "non_technical_v1": "non_technical_v1.json",
 }
+BUILT_IN_TEMPLATE_IDS = frozenset(_FILES)
 
 # template_id -> (config, is_current, is_archived). Populated by
 # refresh_db_templates(); empty (and therefore a no-op) until the database is
@@ -50,6 +63,20 @@ _db_templates: dict[str, tuple[CourseTemplate, bool, bool]] = {}
 # behaviour with no uploads is byte-identical to before.
 UPLOADED_PREFIX = "uploaded:"
 _uploaded_templates: dict[str, CourseTemplate] = {}
+
+
+@dataclass(frozen=True)
+class UploadedAccess:
+    """Who may start a NEW course from an uploaded template. Resolution by
+    id (`load_template`) ignores this on purpose: a course already pinned to
+    a template keeps working after the template is deleted or made private."""
+
+    is_active: bool
+    visibility: str  # private | shared
+    owner_id: str | None
+
+
+_uploaded_access: dict[str, UploadedAccess] = {}
 
 
 def is_uploaded_template_id(template_id: str) -> bool:
@@ -156,13 +183,20 @@ def clear_cache() -> None:
     load_template.cache_clear()
 
 
-def register_uploaded_template(template: CourseTemplate) -> None:
+def register_uploaded_template(
+    template: CourseTemplate,
+    *,
+    owner_id: str | None = None,
+    visibility: str = "shared",
+    is_active: bool = True,
+) -> None:
     """Make a just-parsed uploaded template resolvable immediately.
 
     Called straight after an upload commits so the user can select and use it
-    in the same session, without waiting for a restart-time refresh.
+    in the same session, without waiting for a refresh.
     """
     _uploaded_templates[template.template_id] = template
+    _uploaded_access[template.template_id] = UploadedAccess(is_active, visibility, owner_id)
     load_template.cache_clear()
     log.info(
         "TEMPLATE_LOADED template_id=%s source=uploaded sections=%s",
@@ -187,7 +221,7 @@ def is_known_template_id(template_id: str) -> bool:
 
 
 async def refresh_uploaded_templates() -> None:
-    """Load every active uploaded template that has a stored parse.
+    """Load every uploaded template that has a stored parse, plus who may use it.
 
     Same contract as `refresh_db_templates`: best-effort, never raises, and a
     single unparseable row is skipped rather than breaking the rest.
@@ -202,27 +236,105 @@ async def refresh_uploaded_templates() -> None:
         from app.db.models import CourseTemplateDocument
         from app.db.session import get_session_factory
 
+        # Every row, deleted ones included: courses pinned to a deleted
+        # template must still render. Who may start a new course from one is
+        # decided separately (`check_selectable`).
         async with get_session_factory()() as session:
-            rows = (
-                await session.scalars(
-                    select(CourseTemplateDocument).where(
-                        CourseTemplateDocument.is_active.is_(True),
-                        CourseTemplateDocument.template_json.isnot(None),
-                    )
-                )
-            ).all()
+            rows = (await session.scalars(select(CourseTemplateDocument))).all()
     except Exception as exc:  # noqa: BLE001 - never fatal, mirrors refresh_db_templates
         log.warning("Could not refresh uploaded templates: %s", exc)
         return
 
     fresh: dict[str, CourseTemplate] = {}
+    access: dict[str, UploadedAccess] = {}
     for row in rows:
+        template_id = f"{UPLOADED_PREFIX}{row.id}"
+        access[template_id] = UploadedAccess(
+            bool(row.is_active), getattr(row, "visibility", None) or "shared",
+            str(row.created_by) if row.created_by else None,
+        )
+        if row.template_json is None:
+            continue
         try:
-            fresh[f"{UPLOADED_PREFIX}{row.id}"] = CourseTemplate.model_validate(row.template_json)
+            fresh[template_id] = CourseTemplate.model_validate(row.template_json)
         except Exception as exc:  # noqa: BLE001 - one bad row must not break the rest
             log.warning("Skipping invalid uploaded template '%s': %s", row.id, exc)
 
     _uploaded_templates.clear()
     _uploaded_templates.update(fresh)
+    _uploaded_access.clear()
+    _uploaded_access.update(access)
     load_template.cache_clear()
     log.info("Loaded %s uploaded template(s)", len(fresh))
+
+
+def set_uploaded_access(template_id: str, *, is_active: bool, visibility: str, owner_id: str | None) -> None:
+    """Record a delete or visibility change made in this process."""
+    _uploaded_access[template_id] = UploadedAccess(is_active, visibility, owner_id)
+
+
+def check_selectable(template_id: str, *, user_id: str | None, is_admin: bool) -> None:
+    """Raise ValidationFailedError unless a NEW course may use this template.
+
+    Stricter than `is_known_template_id`, which only says an id resolves:
+    an archived or superseded admin template, and a deleted, unparsed or
+    someone else's private upload, all resolve (existing courses need them)
+    but cannot start a new course. Never falls back to another template.
+    """
+    resolved = TEMPLATE_IDS.get(template_id, template_id)
+    if resolved in _FILES:
+        return
+    if is_uploaded_template_id(resolved):
+        access = _uploaded_access.get(resolved)
+        if access is None:
+            raise ValidationFailedError(f"Unknown template_id_override '{template_id}'")
+        if not access.is_active:
+            raise ValidationFailedError(f"Template '{template_id}' was deleted and cannot be used for new courses.")
+        if access.visibility != "shared" and not is_admin and access.owner_id != user_id:
+            raise ValidationFailedError(f"Template '{template_id}' is private to the person who uploaded it.")
+        if resolved not in _uploaded_templates:
+            raise ValidationFailedError(
+                f"Template '{template_id}' could not be read when it was uploaded, so it cannot drive a course. "
+                "Upload the file again to process it."
+            )
+        return
+    cached = _db_templates.get(resolved)
+    if cached is not None:
+        _config, is_current, is_archived = cached
+        if is_archived:
+            raise ValidationFailedError(f"Template '{template_id}' is archived and cannot be used for new courses.")
+        if not is_current:
+            raise ValidationFailedError(
+                f"Template '{template_id}' is an older version; choose the current version of this template."
+            )
+        return
+    raise ValidationFailedError(
+        f"Unknown template_id_override '{template_id}'",
+        details={"available": sorted(available_template_ids())},
+    )
+
+
+async def refresh_all_templates() -> None:
+    await refresh_db_templates()
+    await refresh_uploaded_templates()
+
+
+async def ensure_template_loaded(template_id: str) -> None:
+    """Refresh the caches when this process has not seen `template_id` yet.
+
+    Each backend worker keeps its own cache; a template created or uploaded
+    through another worker is picked up here on first use instead of failing
+    until the next periodic refresh.
+    """
+    if not is_known_template_id(template_id):
+        await refresh_all_templates()
+
+
+async def refresh_templates_periodically(interval_seconds: float) -> None:
+    """Keep this worker's caches in step with writes made by other workers."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await refresh_all_templates()
+        except Exception as exc:  # noqa: BLE001 - never let the loop die
+            log.warning("Periodic template refresh failed: %s", exc)

@@ -1,9 +1,8 @@
-"""Uploaded course template documents (DOCX/Markdown -> normalized Markdown).
+"""API shapes for uploaded course templates (DOCX or Markdown).
 
-Deliberately separate from schemas/template.py (the JSONB block-schema the
-generation pipeline reads) and schemas/memory.py's TemplateRecord - this is a
-prose reference document, not a pipeline config, and shares nothing with
-either shape.
+An upload is processed into a `CourseTemplate` with a blueprint
+(app.schemas.template / app.schemas.template_blueprint); these models are the
+list, detail and upload views of it.
 """
 
 from __future__ import annotations
@@ -14,7 +13,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.template_blueprint import TemplateBlueprint
+
 TemplateType = Literal["technical", "non_technical"]
+Visibility = Literal["private", "shared"]
 
 
 class CourseTemplateDocumentSummary(BaseModel):
@@ -29,16 +31,25 @@ class CourseTemplateDocumentSummary(BaseModel):
     source_format: Literal["docx", "md"]
     content_format: Literal["markdown"]
     # The registry id to pass as `template_id_override` on course creation.
-    # None when the document has no usable parse (a Markdown upload, or a
-    # DOCX the parser could not read) - the UI uses this to tell the two
-    # apart rather than offering a template that cannot be loaded.
+    # None when the row has no processed template (only uploads from before
+    # blueprints) - the UI then disables "Use" instead of offering a
+    # template that cannot be loaded.
     template_id: str | None = None
-    # What the DOCX parser detected, could not reproduce, and did not
-    # recognise. See app.course.templates.docx_parser.parser.report().
+    # What processing detected and could not use.
+    # See app.course.templates.blueprint.builder.BuildResult.report().
     parse_report: dict[str, Any] | None = None
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime
+    visibility: Visibility = "shared"
+    # Whether the current user may delete it or change who can see it.
+    can_manage: bool = False
+    usable: bool = True
+    unusable_reason: str = ""
+    # The processed sections and blueprint: the "what the system understood"
+    # preview. Empty/None for rows without a processed template.
+    sections: list[dict[str, Any]] = Field(default_factory=list)
+    blueprint: TemplateBlueprint | None = None
 
 
 class CourseTemplateDocumentDetail(CourseTemplateDocumentSummary):
@@ -60,6 +71,17 @@ class CourseTemplateDocumentUploadForm(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     template_type: TemplateType
     description: str = Field(default="", max_length=2000)
+    visibility: Visibility = "private"
+    # Copy the DOCX's fonts, colours, page size and header/footer into the
+    # courses made from it. Off by default: a template teaches structure and
+    # patterns, not a look.
+    apply_design: bool = False
+
+
+class CourseTemplateDocumentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    visibility: Visibility
 
 
 # --- default template auto-classification ------------------------------------

@@ -39,12 +39,41 @@ class ReviewIssue(BaseModel):
     suggestion: str = ""
 
 
+class SectionCheck(BaseModel):
+    """A teacher's verdict on one section of a chapter.
+
+    Every judgement is a tri-state: True (checked, fine), False (checked, a
+    problem) or None (the reviewer did not or could not judge it). Nothing
+    defaults to "passed": an unanswered field stays None and is reported as
+    unchecked, never counted as a pass.
+    """
+
+    model_config = _AI
+
+    heading_index: int = -1  # the section's heading block
+    heading: str = ""
+    on_topic: bool | None = None  # belongs in THIS course and chapter
+    explains_heading: bool | None = None  # actually teaches what the heading promises
+    meets_objective: bool | None = None  # moves the learner toward the chapter objective
+    accurate: bool | None = None  # False = a claim is wrong; None = nothing it could be checked against
+    # True = specific claims (numbers, statistics, named facts) that the
+    # research does not cover: not shown to be wrong, but not verified either.
+    unsupported: bool | None = None
+    repeats_block: int | None = None  # index of an earlier block it re-teaches
+    problem_block: int = -1  # the block that needs fixing
+    problem: str = ""
+    fix: str = ""
+
+
 class ChapterReview(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     approved: bool = True
     scores: ReviewScores = Field(default_factory=ReviewScores)
     issues: list[ReviewIssue] = Field(default_factory=list)
+    section_checks: list[SectionCheck] = Field(default_factory=list)
+    # Headings of sections the reviewer returned no verdict for.
+    unchecked_sections: list[str] = Field(default_factory=list)
     missing_required_blocks: list[str] = Field(default_factory=list)
     dos_violations: list[str] = Field(default_factory=list)
     donts_violations: list[str] = Field(default_factory=list)

@@ -243,6 +243,10 @@ def render_document_html(
     theme["table_border"] = theme.get("table_border_color") or theme["border_color"]
     theme["table_header_bg"] = theme.get("table_header_background") or "transparent"
     theme.setdefault("paragraph_spacing_em", 0.4)
+    # Always the template's own value: documents built before this setting
+    # was honoured stored the old `false` default in meta.theme, which would
+    # otherwise strip the page numbers they have always shown.
+    theme["show_page_numbers"] = template.theme.show_page_numbers
     # A DOCX header/footer usually contains placeholders ("{{COURSE_TITLE}} |
     # {{CHAPTER_TITLE}}"). Resolve the ones this renderer can actually know;
     # anything unsupported stays visible as written rather than becoming an

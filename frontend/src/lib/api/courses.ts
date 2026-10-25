@@ -35,6 +35,9 @@ export interface TemplateSummary {
   description: string;
   sections: { key: string; label: string; required: boolean }[];
   required_block_types: string[];
+  /** built_in = Technical / Non-Technical; admin = made in Admin → Templates. */
+  source: "built_in" | "admin";
+  has_blueprint: boolean;
 }
 
 export function createCourse(

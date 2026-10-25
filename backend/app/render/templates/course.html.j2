@@ -306,7 +306,7 @@
   <div class="runhead">{{ theme.header_line }}</div>
   {% endif %}
   {% if page.show_footer %}
-  <div class="footer"><span>{{ theme.footer_line or document.course_title }}</span><span>{{ page.number }} / {{ pages|length }}</span></div>
+  <div class="footer"><span>{{ theme.footer_line or document.course_title }}</span>{% if theme.show_page_numbers is not sameas false %}<span>{{ page.number }} / {{ pages|length }}</span>{% endif %}</div>
   {% endif %}
 </div>
 {% endfor %}

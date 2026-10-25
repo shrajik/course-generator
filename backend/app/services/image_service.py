@@ -348,6 +348,8 @@ class ImageService:
             # block's `path` from silently replacing the colorful contents
             # grid with an unrelated raster image.
             return True
+        if block.content.get("template_asset"):
+            return self._reuse_template_asset(course_id=course_id, block=block, template=template)
         structured_fallback = False
         if kind == "diagram" and self.settings.enable_diagram_generation:
             ok = await self.diagrams.generate_for_block(
@@ -373,8 +375,59 @@ class ImageService:
             force_text_free=structured_fallback,
         )
 
+    def _reuse_template_asset(self, *, course_id: str, block: Block, template: CourseTemplate) -> bool:
+        """Copy a picture from the course's template into the course.
+
+        Only an asset the template blueprint marks as reusable (a logo, or a
+        picture the template says to include) is ever copied; an example
+        picture is never reused as course content. Anything else is an honest
+        failure on the block - never a generated stand-in reported as the
+        template's own picture.
+        """
+        asset_id = str(block.content.get("template_asset") or "")
+        blueprint = template.blueprint
+        asset = blueprint.reusable_asset(asset_id) if blueprint is not None else None
+        if asset is None or not asset.path:
+            reason = f"Template picture {asset_id} is not available for reuse"
+            block.content = merge_content(block.type, block.content, {"error": reason, "generated": False})
+            log.warning("%s (block %s, template %s)", reason, block.id, template.template_id)
+            return False
+        source = (self.settings.data_dir / asset.path).resolve()
+        templates_root = (self.settings.data_dir / "templates").resolve()
+        if templates_root not in source.parents or not source.is_file():
+            block.content = merge_content(
+                block.type, block.content, {"error": f"Template picture {asset_id} is missing", "generated": False}
+            )
+            return False
+        data = source.read_bytes()
+        relative = self.storage.save_asset(course_id, data, extension=self._detect_extension(data))
+        width, height = self._dimensions(data)
+        block.content = merge_content(
+            block.type,
+            block.content,
+            {
+                "path": relative,
+                "asset_id": relative.rsplit("/", 1)[-1],
+                "generated": False,
+                "error": None,
+                "width": width,
+                "height": height,
+            },
+        )
+        log.info("Reused template picture %s for block %s", asset_id, block.id)
+        return True
+
+    def _request_size(self, block: Block) -> str:
+        """The image-model request size: the configured default, or the
+        shape a template blueprint asked for."""
+        return {
+            "landscape": "1536x1024",
+            "portrait": "1024x1536",
+            "square": "1024x1024",
+        }.get(str(block.content.get("aspect") or ""), self.settings.image_size)
+
     async def _generate_with_text_check(
-        self, prompt: str, expected_labels: list[str], *, block_id: str
+        self, prompt: str, expected_labels: list[str], *, block_id: str, size: str | None = None
     ) -> tuple[bytes, bool]:
         """Generate a textbook illustration, verify its text is actually
         correct (see _verify_generated_text), and - if it isn't - retry ONCE
@@ -391,7 +444,7 @@ class ImageService:
         never mistake "we stopped retrying" for "this was confirmed
         correct" (see `_generate_illustration`'s `text_verified` field).
         Returns (image bytes, text_verified)."""
-        size = self.settings.image_size
+        size = size or self.settings.image_size
         data = await self.ai.image(prompt=prompt, size=size)
         missing = await self._verify_generated_text(data, expected_labels)
         if not missing:
@@ -475,13 +528,13 @@ class ImageService:
         text_verified: bool | None = None
         try:
             if force_text_free:
-                data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=self.settings.image_size)
+                data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=self._request_size(block))
             elif is_textbook and expected_labels:
                 data, text_verified = await self._generate_with_text_check(
-                    prompt, expected_labels, block_id=block.id
+                    prompt, expected_labels, block_id=block.id, size=self._request_size(block)
                 )
             else:
-                data = await self.ai.image(prompt=prompt, size=self.settings.image_size)
+                data = await self.ai.image(prompt=prompt, size=self._request_size(block))
         except Exception as exc:  # noqa: BLE001 - a failed image must not fail the course
             log.warning("Image generation failed for %s: %s", block.id, exc)
             block.content = merge_content(

@@ -175,6 +175,10 @@ class Settings(BaseSettings):
     # outline has been approved. Turn off only for scripts that build courses
     # without a person in the loop.
     require_outline_approval: bool = True
+    # How often each worker reloads templates written by other workers
+    # (app.course.templates.registry). 0 turns the background refresh off;
+    # a template a worker has never seen is still loaded on first use.
+    template_refresh_seconds: float = Field(default=60, ge=0)
 
     # --- uploaded source material (app/services/source_service.py) -----------
     max_source_bytes: int = Field(default=20 * 1024 * 1024, ge=1024)
@@ -183,6 +187,14 @@ class Settings(BaseSettings):
     # is shown from the uploaded sources.
     source_excerpts_per_chapter: int = Field(default=6, ge=1, le=20)
     source_excerpt_chars: int = Field(default=6000, ge=500, le=30000)
+
+    # --- visual review (app/services/visual_review.py) ------------------------
+    #  After images are generated, each real picture and diagram is checked
+    #  against its text, and a failed one is regenerated once.
+    enable_visual_review: bool = True
+    visual_review_max_images: int = Field(default=60, ge=0, le=500)
+    visual_review_max_fixes: int = Field(default=12, ge=0, le=200)
+    visual_review_model: str = ""  # empty = diagram_model (it already reads images)
 
     # --- global knowledge library (app/services/knowledge_service.py) --------
     # Admin-uploaded documents that every course searches while it is written.

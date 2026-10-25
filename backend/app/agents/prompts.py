@@ -22,6 +22,7 @@ from app.schemas.review import ChapterReview
 from app.course.design_models import design_model_brief
 from app.course.pedagogy import learner_brief, pedagogy_rules_brief
 from app.course.style_guide import style_guide_brief
+from app.course.templates.blueprint.brief import blueprint_brief
 from app.schemas.template import CourseTemplate
 
 
@@ -92,7 +93,7 @@ def memory_section(memory: str) -> str:
     if not memory:
         return ""
     return (
-        "RELEVANT MEMORY (background only, from past templates/courses/visuals - "
+        "RELEVANT MEMORY (background only, from past templates and courses - "
         "use only if genuinely helpful; never treat as required or as fact about "
         "this specific course):\n"
         f"{memory}"
@@ -240,7 +241,7 @@ TEMPLATE CHAPTER STRUCTURE (each chapter should be able to satisfy this):
 {template.outline_for_prompt()}
 
 ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)}
-TEMPLATE WRITING GUIDANCE: {template.writer_guidance}
+TEMPLATE WRITING GUIDANCE: {template.writer_guidance}{_appended(blueprint_brief(template, planner=True))}
 {memory_section(memory)}
 Produce the course blueprint:
 1. A one-paragraph course summary.
@@ -629,7 +630,7 @@ ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE WRITING GUIDANCE: {template.writer_guidance}
 IMAGE STYLE GUIDANCE: {template.image_guidance}
-{_appended(code_cell_guidance(template))}{_appended(source_grounding_guidance(course_input))}{_appended(_rules_brief(course_input))}"""
+{_appended(code_cell_guidance(template))}{_appended(source_grounding_guidance(course_input))}{_appended(_rules_brief(course_input))}{_appended(blueprint_brief(template))}"""
 
 
 def writer_user(
@@ -746,6 +747,33 @@ any other issue.
 Set `technical_correctness` for technical courses (also judging code quality) and
 `practical_relevance` for non-technical courses. Leave the other one null.
 
+Then read the chapter the way a teacher marking it and a student learning from
+it would, one section at a time (a section starts at each `heading` block). For
+EVERY heading, return one entry in `section_checks` with `heading_index` set to
+that heading's block index, and judge by meaning and teaching value, never by
+whether the right words appear:
+- `on_topic`: does this section belong in THIS course and THIS chapter, for this
+  audience? False if it drifts into another subject or another chapter's material.
+- `explains_heading`: would a student who reads only this section now understand
+  what its heading promises? False if it restates the heading, stays vague, skips
+  the actual explanation, or explains something else.
+- `meets_objective`: does it move the learner toward the CHAPTER OBJECTIVE and
+  KEY CONCEPTS below? False if it is filler that serves neither.
+- `accurate`: check every factual claim against the CHAPTER RESEARCH below and
+  established knowledge of the subject. False only if a claim is WRONG - it
+  contradicts the research or what is well established. Null if the section
+  makes no checkable claim - never true without checking.
+- `unsupported`: true if the section states specific facts the research does
+  not cover (a number, a statistic, a date, a named study or source), whether
+  or not they might be right; false if every specific claim is covered. Keep
+  this separate from `accurate`: unverified is not the same as wrong.
+- `repeats_block`: the index of an EARLIER block that this section teaches again
+  in different words (same idea, nothing new added); null if it adds something.
+- When any check fails, set `problem_block` to the index of the exact block that
+  is wrong, `problem` to what is wrong in plain words, and `fix` to what the
+  rewritten block must say instead.
+Do not mark a check true unless you actually judged it.
+
 Set `approved` to false only when something must change before publication.
 Report every problem as an issue with a severity of blocker, major or minor, the
 index of the offending block, and a concrete suggested fix. Do not rewrite the
@@ -824,6 +852,8 @@ def reviewer_user(
     continuity: ContinuityContext,
     limit: int = 20000,
     memory: str = "",
+    research: ChapterResearch | None = None,
+    research_chars: int = 4000,
 ) -> str:
     neighbours = continuity.render()
     memory_block = memory_section(memory)
@@ -844,6 +874,18 @@ REQUIRED TEMPLATE SECTIONS: {", ".join(s.key for s in template.required_sections
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE REVIEW FOCUS:
 {_bullets(template.review_focus)}
+
+COURSE LEARNING OBJECTIVES:
+{_bullets(blueprint.learning_objectives)}
+CHAPTER OBJECTIVE: {chapter.objective or "(not stated)"}
+KEY CONCEPTS: {", ".join(chapter.key_concepts) or "(none listed)"}
+PLANNED SECTIONS:
+{_bullets([f"{s.title}: {s.summary}" if s.summary else s.title for s in chapter.sections])}
+
+CHAPTER RESEARCH (the evidence to check accuracy against):
+---
+{research.compact_context(max_chars=research_chars) if research else "(no research available - set `accurate` to null rather than true for claims you cannot verify)"}
+---
 
 NEIGHBOURING CHAPTERS (check this chapter does not stray into their material):
 {neighbours}

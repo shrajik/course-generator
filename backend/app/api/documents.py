@@ -23,6 +23,8 @@ from app.schemas.document import (
 )
 from app.schemas.patch import AiEditRequest, AiEditResponse
 from app.services.course_service import CourseService, get_course_service
+from app.schemas.visual_review import VisualReviewReport
+from app.services.visual_review import load_visual_review
 from app.services.document_service import DocumentService, get_document_service
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -132,6 +134,35 @@ async def regenerate_visuals(
             course_id, str(current_user.id), current_user.email, "updated"
         )
     return response
+
+
+@router.post("/{document_id}/visual-review", response_model=VisualReviewReport)
+async def review_visuals(
+    document_id: str,
+    fix: bool = True,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> VisualReviewReport:
+    """Check every picture and diagram against the text beside it and, with
+    `fix` (the default), regenerate only the ones that fail."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    report = await service.review_visuals(document_id, fix=fix)
+    if current_user is not None and report.counts()["regenerated"]:
+        await course_service.record_activity(course_id, str(current_user.id), current_user.email, "updated")
+    return report
+
+
+@router.get("/{document_id}/visual-review", response_model=VisualReviewReport | None)
+async def get_visual_review(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> VisualReviewReport | None:
+    """The last visual check of this document, or null if none has run."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    return load_visual_review(service.storage, course_id)
 
 
 @router.post("/{document_id}/repair-visual-coverage", response_model=RepairVisualsResponse)

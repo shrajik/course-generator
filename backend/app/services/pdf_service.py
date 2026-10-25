@@ -13,7 +13,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import RenderError
 from app.core.logging import get_logger
 from app.course.document.print import paginate_for_print
-from app.course.templates.registry import is_uploaded_template_id, load_template
+from app.course.templates.registry import ensure_template_loaded, is_uploaded_template_id, load_template
 from app.render.html_renderer import render_document_html
 from app.schemas.document import PAGE_HEIGHT, PAGE_WIDTH, CourseDocument
 from app.services.storage_service import StorageService, get_storage
@@ -69,6 +69,7 @@ class PdfService:
         return path
 
     async def export_pdf(self, document: CourseDocument) -> Path:
+        await ensure_template_loaded(document.template_id)
         html_path = self.write_html(document)
         pdf_path = self.storage.pdf_path(document.course_id)
         pdf_path.parent.mkdir(parents=True, exist_ok=True)

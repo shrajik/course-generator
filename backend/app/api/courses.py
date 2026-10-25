@@ -17,8 +17,10 @@ from app.core.logging import get_logger
 from app.core.generation_stream import get_stream_hub
 from app.core.roles import Role
 from app.course.templates.registry import (
+    BUILT_IN_TEMPLATE_IDS,
     available_templates,
-    is_known_template_id,
+    check_selectable,
+    ensure_template_loaded,
     is_uploaded_template_id,
     load_template,
 )
@@ -64,7 +66,9 @@ def _storage() -> StorageService:
 
 @router.get("/templates")
 async def list_templates() -> dict[str, Any]:
-    """The two template configurations, for the future frontend picker."""
+    """Templates a new course can use: the built-ins and the current,
+    non-archived admin templates (uploaded ones are listed separately, per
+    user, by /api/course-template-documents)."""
     return {
         "templates": [
             {
@@ -72,6 +76,8 @@ async def list_templates() -> dict[str, Any]:
                 "kind": template.kind,
                 "name": template.name,
                 "description": template.description,
+                "source": "built_in" if template.template_id in BUILT_IN_TEMPLATE_IDS else "admin",
+                "has_blueprint": template.blueprint is not None,
                 "sections": [
                     {"key": s.key, "label": s.label, "required": s.required}
                     for s in template.sections
@@ -97,14 +103,16 @@ async def create_course(
     """
     course_input = CourseInput.model_validate(request.model_dump(exclude={"run_planner"}))
     if request.template_id_override:
-        # `is_known_template_id` also resolves uploaded templates
-        # (`uploaded:{uuid}`), which `available_templates()` deliberately
-        # excludes so the built-in picker is not flooded with them.
-        if not is_known_template_id(request.template_id_override):
-            raise ValidationFailedError(
-                f"Unknown template_id_override '{request.template_id_override}'",
-                details={"available": sorted(t.template_id for t in available_templates())},
-            )
+        # Picks up a template created through another worker, then refuses
+        # anything a new course may not use (archived or superseded admin
+        # templates; deleted, private or unprocessed uploads) - with the
+        # reason, never by quietly falling back to a default template.
+        await ensure_template_loaded(request.template_id_override)
+        check_selectable(
+            request.template_id_override,
+            user_id=str(current_user.id) if current_user is not None else None,
+            is_admin=current_user is not None and current_user.role == Role.ADMIN.value,
+        )
         log.info(
             "TEMPLATE_SELECTED template_id=%s source=%s",
             request.template_id_override,

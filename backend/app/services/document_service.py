@@ -12,7 +12,9 @@ from app.core.logging import get_logger
 from app.course.document.builder import reflow_document
 from app.course.document.patcher import apply_patch
 from app.course.document.visual_repair import audit_and_repair_visuals
-from app.course.templates.registry import load_template
+from app.course.templates.registry import ensure_template_loaded, load_template
+from app.schemas.visual_review import VisualReviewReport
+from app.services.visual_review import VisualReviewService
 from app.db.service import get_database_service
 from app.render.concept_experience_renderer import estimate_pixel_size, render_concept_experience_html
 from app.schemas.blocks import BlockType, merge_content
@@ -108,6 +110,7 @@ class DocumentService:
         # been created against a real template, so a bad id here means a
         # corrupt or tampered payload.
         try:
+            await ensure_template_loaded(incoming.template_id)
             load_template(incoming.template_id)
         except NotFoundError as exc:
             raise ValidationFailedError(f"Unknown template '{incoming.template_id}'") from exc
@@ -135,6 +138,7 @@ class DocumentService:
     # --- AI editing -------------------------------------------------------
     async def ai_edit(self, document_id: str, request: AiEditRequest) -> AiEditResponse:
         document = await self.load(document_id)
+        await ensure_template_loaded(document.template_id)
         template = load_template(document.template_id)
 
         patch = await self.editor.edit(
@@ -183,6 +187,25 @@ class DocumentService:
             pages=len(document.pages),
         )
 
+    # --- visual review ----------------------------------------------------------
+    async def review_visuals(self, document_id: str, *, fix: bool = True) -> VisualReviewReport:
+        """Check every picture and diagram of an existing document against its
+        text (app.services.visual_review). With `fix`, a failed one is
+        regenerated once and the pages re-flowed; nothing else changes."""
+        document = await self.load(document_id)
+        await ensure_template_loaded(document.template_id)
+        template = load_template(document.template_id)
+        report = await VisualReviewService(
+            ai=self.ai, settings=self.settings, storage=self.storage, images=self.images
+        ).review_document(
+            document, template, fix=fix
+        )
+        if report.counts()["regenerated"]:
+            reflow_document(document, template)
+        # The verdicts are stored on the blocks too, so the document is saved either way.
+        await self._save_document(document)
+        return report
+
     # --- bulk visual regeneration -------------------------------------------
     async def regenerate_all_visuals(
         self, document_id: str, kinds: list[str] | None = None
@@ -201,6 +224,7 @@ class DocumentService:
         concurrency limiting, same per-block failure isolation (one bad
         regeneration never aborts the rest)."""
         document = await self.load(document_id)
+        await ensure_template_loaded(document.template_id)
         template = load_template(document.template_id)
 
         wanted_kinds = {k.strip() for k in (kinds or []) if k.strip()}
@@ -242,6 +266,7 @@ class DocumentService:
         the target, never silently claiming success on one that couldn't be
         repaired within the bounded number of passes."""
         document = await self.load(document_id)
+        await ensure_template_loaded(document.template_id)
         template = load_template(document.template_id)
 
         report = await audit_and_repair_visuals(document, template, images=self.images, ai=self.ai)
@@ -277,6 +302,7 @@ class DocumentService:
         changed, the same way a regenerated image already does today.
         """
         document = await self.load(document_id)
+        await ensure_template_loaded(document.template_id)
         template = load_template(document.template_id)
 
         found = document.find_block(block_id)

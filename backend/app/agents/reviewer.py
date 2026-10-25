@@ -23,13 +23,15 @@ from app.core.logging import get_logger
 from app.course.design_models import design_issues
 from app.course.pedagogy import BANNED_OBJECTIVE_VERBS, BLOOM_VERBS
 from app.course.style_guide import style_issues
+from app.course.templates.blueprint.checks import blueprint_review
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, VISUAL_BLOCK_TYPES, BlockType
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import CourseInput
 from app.schemas.design import DesignModels
 from app.schemas.document import Block
 from app.schemas.learner import LearnerProfile
-from app.schemas.review import ChapterReview, ContinuityReport, ReviewIssue
+from app.schemas.research import ChapterResearch
+from app.schemas.review import ChapterReview, ContinuityReport, ReviewIssue, SectionCheck
 from app.schemas.style import StyleGuide
 from app.schemas.template import CourseTemplate
 from app.services.memory_service import MemoryService, get_memory_service
@@ -81,6 +83,7 @@ class ReviewerAgent:
         course_input: CourseInput,
         blocks: list[Block],
         continuity: ContinuityContext,
+        research: ChapterResearch | None = None,
     ) -> ChapterReview:
         log.info(
             "TEMPLATE_SENT_TO_REVIEWER template_id=%s chapter=%s required_sections=%s",
@@ -107,12 +110,15 @@ class ReviewerAgent:
                 continuity=continuity,
                 limit=self.settings.reviewer_context_chars,
                 memory=memory.render(),
+                research=research,
             ),
             model=self.settings.reviewer_model,
             purpose=f"reviewer:{chapter.id}",
             phase="reviewer",
         )
         review.reviewed_at = utc_now_iso()
+        apply_section_checks(review, blocks)
+        review.issues.extend(_duplicate_text_issues(blocks))
         self._apply_structural_checks(
             review,
             template,
@@ -175,6 +181,12 @@ class ReviewerAgent:
             if section.key not in present_sections and not (allowed & present_types):
                 missing.append(f"section '{section.key}'")
         missing.extend(_visual_balance_issues(blocks))
+        # Template blueprint rules: required visuals, their placement and
+        # captions, copied example wording, unresolved placeholders. A no-op
+        # for templates without a blueprint.
+        blueprint_missing, blueprint_issues = blueprint_review(blocks, template)
+        missing.extend(blueprint_missing)
+        review.issues.extend(blueprint_issues)
         # Deduplicate while preserving order.
         review.missing_required_blocks = list(dict.fromkeys(missing))
 
@@ -437,4 +449,150 @@ def _visual_balance_issues(blocks: list[Block]) -> list[str]:
             f"long needs roughly {expected_visuals} spread through it, not clustered in one "
             "place, to keep a roughly 60/40 text-to-visual balance."
         )
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# teacher checks: the reviewer's per-section verdicts, made actionable
+# ---------------------------------------------------------------------------
+
+_SECTION_FAILURES: tuple[tuple[str, str, str, str], ...] = (
+    # (field, category, severity, what a failure means)
+    ("on_topic", "relevance", "major", "is not relevant to this course and chapter"),
+    ("explains_heading", "clarity", "major", "does not actually explain what its heading promises"),
+    ("meets_objective", "objective", "major", "does not serve the chapter objective"),
+    ("accurate", "accuracy", "blocker", "contains information that is wrong"),
+)
+
+
+def _sections(blocks: list[Block]) -> list[tuple[int, int]]:
+    """(heading index, end index exclusive) for every heading-led section."""
+    starts = [index for index, block in enumerate(blocks) if block.type is BlockType.HEADING]
+    return [(start, starts[n + 1] if n + 1 < len(starts) else len(blocks)) for n, start in enumerate(starts)]
+
+
+def _target_block(blocks: list[Block], start: int, end: int, wanted: int) -> int:
+    """The block an issue points at: the reviewer's choice when it lies inside
+    the section, else the section's first block of prose."""
+    if start < wanted < end:
+        return wanted
+    for index in range(start + 1, end):
+        if blocks[index].type in TEXTUAL_BLOCK_TYPES:
+            return index
+    return start + 1 if start + 1 < end else start
+
+
+def apply_section_checks(review: ChapterReview, blocks: list[Block]) -> None:
+    """Turn the reviewer's per-section verdicts into issues on exact blocks.
+
+    A failed check becomes a major (or, for accuracy, blocker) issue carrying
+    the index of the block to rewrite, so the surgical revision changes only
+    that block. A section the reviewer returned no verdict for is recorded in
+    `unchecked_sections` and reported as a minor issue - it is never counted
+    as having passed.
+    """
+    checks: dict[int, SectionCheck] = {}
+    by_heading = {
+        str(block.content.get("text") or "").strip().lower(): index
+        for index, block in enumerate(blocks)
+        if block.type is BlockType.HEADING
+    }
+    for check in review.section_checks:
+        index = check.heading_index
+        if not (0 <= index < len(blocks) and blocks[index].type is BlockType.HEADING):
+            index = by_heading.get(check.heading.strip().lower(), -1)
+        if index >= 0:
+            checks.setdefault(index, check)
+
+    for start, end in _sections(blocks):
+        if end - start <= 1:
+            continue  # a heading with nothing under it is the structure check's business
+        heading = str(blocks[start].content.get("text") or "").strip()
+        check = checks.get(start)
+        answered = check is not None and any(
+            getattr(check, field) is not None for field, *_ in _SECTION_FAILURES
+        )
+        if check is None or not answered:
+            review.unchecked_sections.append(heading)
+            review.issues.append(
+                ReviewIssue(
+                    severity="minor",
+                    category="unchecked",
+                    block_index=start,
+                    description=f'The reviewer returned no verdict for section "{heading}", so it is unchecked.',
+                    suggestion="Review this section by hand.",
+                )
+            )
+            continue
+        target = _target_block(blocks, start, end, check.problem_block)
+        detail = f": {check.problem}" if check.problem else "."
+        for field, category, severity, meaning in _SECTION_FAILURES:
+            if getattr(check, field) is False:
+                review.issues.append(
+                    ReviewIssue(
+                        severity=severity,
+                        category=category,
+                        block_index=target,
+                        description=f'Section "{heading}" {meaning}{detail}',
+                        suggestion=check.fix or "Rewrite this block so the section does its job.",
+                    )
+                )
+        if check.unsupported is True:
+            review.issues.append(
+                ReviewIssue(
+                    severity="major",
+                    category="unsupported",
+                    block_index=target,
+                    description=f'Section "{heading}" states facts the research does not cover, so they are unverified{detail}',
+                    suggestion=check.fix or "Remove the unverified specifics or state only what the research supports.",
+                )
+            )
+        repeated = check.repeats_block
+        if repeated is not None and 0 <= repeated < start:
+            review.issues.append(
+                ReviewIssue(
+                    severity="major",
+                    category="repetition",
+                    block_index=target,
+                    description=f'Section "{heading}" re-teaches what block {repeated} already covered{detail}',
+                    suggestion=check.fix or "Replace the repeated material with something the learner has not seen yet.",
+                )
+            )
+
+
+_DUP_RUN = 5
+_DUP_SHARE = 0.85
+_DUP_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def _runs_of(text: str) -> set[tuple[str, ...]]:
+    words = _DUP_WORD_RE.findall(text.lower())
+    return {tuple(words[i : i + _DUP_RUN]) for i in range(max(0, len(words) - _DUP_RUN + 1))}
+
+
+def _duplicate_text_issues(blocks: list[Block]) -> list[ReviewIssue]:
+    """A floor under the reviewer's meaning-based repetition check: a block
+    that is almost word for word an earlier one is a duplicate whatever the
+    model said. Paraphrased repetition is judged by the reviewer itself."""
+    seen: list[tuple[int, set[tuple[str, ...]]]] = []
+    issues: list[ReviewIssue] = []
+    for index, block in enumerate(blocks):
+        if block.type not in TEXTUAL_BLOCK_TYPES:
+            continue
+        runs = _runs_of(str(block.content.get("text") or ""))
+        if len(runs) < 6:
+            continue
+        for earlier, earlier_runs in seen:
+            if len(runs & earlier_runs) / len(runs) >= _DUP_SHARE:
+                issues.append(
+                    ReviewIssue(
+                        severity="major",
+                        category="repetition",
+                        block_index=index,
+                        description=f"This block repeats block {earlier} almost word for word.",
+                        suggestion="Replace it with the next step of the explanation instead of saying it again.",
+                    )
+                )
+                break
+        seen.append((index, runs))
     return issues
