@@ -49,6 +49,7 @@ from app.services.concept_qa import (
     CONCEPT_NOT_CLEAR,
     DANGLING_TRANSITION,
     DISCONNECTED_CONCEPTS,
+    GARBLED_TEXT,
     GENERIC_VISUAL,
     MISSING_ENTITY,
     MISSING_LEARNING_OBJECTIVES,
@@ -972,13 +973,27 @@ class TestConceptMapRealBrowserGeometry:
             or b["y"] + b["height"] <= a["y"] + tolerance
         )
 
+    # A common real phone width (the viewport the task's own "narrow-screen"
+    # requirement means) - 667 tall is tall enough that the concept map's
+    # own height never becomes the limiting factor, the same reasoning
+    # 1600 does for the desktop viewport below: this exists to test WIDTH
+    # constraints specifically, not to also re-prove vertical scrolling.
+    NARROW_VIEWPORT = {"width": 375, "height": 667}
+    DESKTOP_VIEWPORT = {"width": 900, "height": 1600}
+
     @staticmethod
-    async def _measure(playwright, entities, relationships, *, title: str = "") -> dict:
+    async def _measure(playwright, entities, relationships, *, title: str = "", viewport: dict | None = None) -> dict:
         """Renders a real concept_experience HTML fragment in an actual
         Chromium page and returns the ACTUAL CSS-rendered geometry -
         pure-Python geometry tests elsewhere in this module can only ever
         estimate a card's size (_concept_map_card_height); this is the one
-        place that measures what a browser really draws."""
+        place that measures what a browser really draws. `viewport`
+        defaults to the original desktop size this class was built around;
+        passing a narrower one (see `NARROW_VIEWPORT`) is what actually
+        proves responsive correctness - a real, confirmed gap this fixes:
+        every test here used to hardcode the SAME 900px-wide viewport, so
+        nothing ever confirmed the same markup doesn't overlap or clip at a
+        realistic phone width."""
         spec = DiagramSpec(
             kind="concept_experience", representation="relationship", title=title,
             entities=entities, relationships=relationships,
@@ -988,7 +1003,7 @@ class TestConceptMapRealBrowserGeometry:
 
         browser = await playwright.chromium.launch(args=["--no-sandbox"])
         try:
-            page = await browser.new_page(viewport={"width": 900, "height": 1600})
+            page = await browser.new_page(viewport=viewport or TestConceptMapRealBrowserGeometry.DESKTOP_VIEWPORT)
             await page.set_content(html, wait_until="load")
             root_box = await page.eval_on_selector(".cev-root", "el => el.getBoundingClientRect().toJSON()")
             container = await page.query_selector(".cev-cmap")
@@ -1016,9 +1031,10 @@ class TestConceptMapRealBrowserGeometry:
         return [hub] + sats, rels
 
     async def _assert_clean_layout(
-        self, playwright, entities, relationships, *, expect_compact: bool | None = None, title: str = ""
+        self, playwright, entities, relationships, *,
+        expect_compact: bool | None = None, title: str = "", viewport: dict | None = None,
     ) -> dict:
-        result = await self._measure(playwright, entities, relationships, title=title)
+        result = await self._measure(playwright, entities, relationships, title=title, viewport=viewport)
         nodes = result["nodes"]
         assert len(nodes) == len(entities)  # every entity rendered exactly once, none dropped/duplicated
 
@@ -1116,6 +1132,47 @@ class TestConceptMapRealBrowserGeometry:
         entities, relationships = self._hub_spec_entities(n)
         async with async_playwright() as playwright:
             await self._assert_clean_layout(playwright, entities, relationships, title="Hub Concept")
+
+    @needs_browser
+    async def test_dense_hub_case_has_no_internal_overlap_or_clipping_at_a_narrow_viewport(self):
+        """Phase 4 (responsive QA) requirement: do not assume one viewport
+        proves responsive correctness. Reuses the SAME dense (n=8) case
+        `test_dense_short_label_hub_cases_have_no_overlap_even_at_normal_or_
+        compact_tier` already proves clean at the 900px desktop viewport,
+        now measured at a real 375px phone width instead.
+
+        Real, confirmed finding from writing this test: `.cev-cmap`'s width
+        is computed server-side from hub/satellite count (see
+        estimate_pixel_size/the layout engine), never from the viewport, so
+        a dense case legitimately renders WIDER than a narrow phone screen
+        (measured: 612px at a 375px viewport) even with zero internal
+        layout defects - this is a genuine, intentional characteristic (the
+        diagram's own content determines its size), not a bug to "fix" at
+        this level. What WAS a real gap: frontend/src/components/blocks/
+        ImageBlock.tsx's concept_experience/toc wrapper had no horizontal
+        overflow containment at all (unlike its sibling branch, which sets
+        overflow-hidden) - fixed there (overflow-x-auto), turning an
+        unbounded bleed past the block's own column into a horizontal
+        scroll on a narrow screen. Not exercised by this backend-only test
+        (it renders the bare fragment, not the React wrapper) - this test's
+        job is only to keep proving the fragment ITSELF stays internally
+        clean (no overlap/self-clipping) at a narrow viewport, which is
+        exactly what `_assert_clean_layout` above already checked."""
+        from playwright.async_api import async_playwright
+
+        entities, relationships = self._hub_spec_entities(8)
+        async with async_playwright() as playwright:
+            result = await self._assert_clean_layout(
+                playwright, entities, relationships, title="Hub Concept",
+                viewport=self.NARROW_VIEWPORT,
+            )
+        root = result["root"]
+        fits_without_horizontal_overflow = root["width"] <= self.NARROW_VIEWPORT["width"] + 1.0
+        print(
+            f"[responsive] dense hub (n=8) at {self.NARROW_VIEWPORT['width']}px viewport: "
+            f".cev-root rendered {root['width']:.0f}px wide "
+            f"({'fits' if fits_without_horizontal_overflow else 'OVERFLOWS the viewport'})"
+        )
 
     @needs_browser
     async def test_operating_system_case_has_no_overlap(self):
@@ -1574,6 +1631,66 @@ class TestConceptQAStructural:
         ])
         result = await evaluate_concept_experience(spec)
         assert TOO_DENSE not in {i.reason for i in result.issues}
+
+    async def test_a_realistic_sentence_length_step_description_is_not_flagged(self):
+        """Regression guard: the renderer's own auto-scaling already handles
+        a description exactly this long gracefully (see
+        test_height_is_capped_even_for_many_steps_with_long_descriptions
+        below), so the density check must never reject it - only a
+        description that has grown well past one sentence."""
+        spec = _good_metaphor_spec(steps=[
+            VisualStep(
+                id="s1", label="Step 1", order=0,
+                description="A long, sentence-length description of exactly what this "
+                "step does, the kind a real chapter would actually write.",
+            )
+        ])
+        result = await evaluate_concept_experience(
+            spec, ai=MockAIClient(get_settings()), settings=get_settings()
+        )
+        assert TOO_DENSE not in {i.reason for i in result.issues}
+
+    async def test_a_multi_sentence_step_description_is_flagged_as_too_dense(self):
+        spec = _good_metaphor_spec(steps=[
+            VisualStep(
+                id="s1", label="Step 1", order=0,
+                description="This description runs on for far longer than a short caption "
+                "should. It keeps going with a second sentence, and then a third one, well "
+                "past what belongs in a small visual card rather than the chapter prose, and "
+                "even adds a fourth clause just to be completely sure it crosses the cap.",
+            )
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert TOO_DENSE in {i.reason for i in result.issues}
+
+    async def test_garbled_entity_label_is_flagged(self):
+        """Reproduces the real reported bug through the concept_experience
+        pipeline specifically - the same corrupted-text failure mode
+        (Latin letters swapped mid-word for Cyrillic/Greek lookalikes)
+        can reach an entity label, not only a schematic annotation."""
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template", label="Check _cplumlous macro tr Conɪoтй ηµoge konges mode"),
+            VisualEntity(id="a", role="instance", properties={"x": "1"}),
+            VisualEntity(id="b", role="instance", properties={"x": "2"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert GARBLED_TEXT in {i.reason for i in result.issues}
+
+    async def test_garbled_step_description_is_flagged(self):
+        spec = _good_metaphor_spec(steps=[
+            VisualStep(
+                id="s1", label="Step 1", order=0,
+                description="Check _cplumlous macro tr Conɪoтй ηµoge konges mode",
+            )
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert GARBLED_TEXT in {i.reason for i in result.issues}
+
+    async def test_clean_text_is_never_flagged_as_garbled(self):
+        result = await evaluate_concept_experience(
+            _good_metaphor_spec(), ai=MockAIClient(get_settings()), settings=get_settings()
+        )
+        assert GARBLED_TEXT not in {i.reason for i in result.issues}
 
     async def test_instances_sharing_no_common_property_are_flagged_as_disconnected(self):
         """Reproduces the reported bug exactly: 4 distinct physics

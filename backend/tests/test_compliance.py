@@ -5,6 +5,7 @@ from __future__ import annotations
 from app.course.compliance import build_report, contrast_ratio
 from app.schemas.blocks import BlockType
 from app.schemas.document import Block, CourseDocument, Page
+from app.schemas.standards import AccessibilitySettings, MetadataSettings, PackagingSettings
 
 
 def _block(block_type: BlockType, **content) -> Block:
@@ -150,6 +151,128 @@ def test_unresolved_flags_list_everything_that_did_not_pass():
 def test_an_empty_course_fails_every_check_instead_of_crashing():
     report = build_report(_doc([]))
     assert all(c.status == "fail" for c in report.qa_checks)
+
+
+# --- Content Studio Phase 1: packaging & tracking ----------------------------
+
+
+def test_no_packaging_keeps_the_exact_pre_existing_wording():
+    """Regression guard: a course that never sets `packaging` (every course
+    before this field existed, and every one that still doesn't use it)
+    must get byte-identical Course Technology / metadata Source text."""
+    report = build_report(_doc(_good_chapter()))
+    tech = next(c for c in report.qa_checks if c.name == "Course technology")
+    assert tech.note == (
+        "Delivered as an editable course document and PDF. No LMS packaging standard "
+        "(SCORM, xAPI, cmi5) is selected or exportable yet."
+    )
+    assert report.metadata["Source standard"] == (
+        "Instructional model: not specified. Packaging standard: none (PDF / editable course document)."
+    )
+
+
+def test_a_chosen_packaging_standard_is_reflected_in_both_places():
+    packaging = PackagingSettings(standard="xapi", authoring_tool="articulate_storyline")
+    report = build_report(_doc(_good_chapter()), packaging=packaging)
+    tech = next(c for c in report.qa_checks if c.name == "Course technology")
+    assert "Packaged for xAPI via Articulate Storyline." in tech.note
+    assert tech.status == "review"  # still needs a human, this phase never exports a real package
+    assert report.metadata["Source standard"] == (
+        "Instructional model: not specified. Packaging standard: xAPI via Articulate Storyline."
+    )
+
+
+def test_off_lms_tracking_without_a_confirmed_lrs_is_flagged():
+    packaging = PackagingSettings(standard="xapi", track_beyond_lms=True, lrs_confirmed=False)
+    report = build_report(_doc(_good_chapter()), packaging=packaging)
+    tech = next(c for c in report.qa_checks if c.name == "Course technology")
+    assert "Learning Record Store is not yet confirmed" in tech.note
+
+
+def test_a_confirmed_lrs_is_reflected_too():
+    packaging = PackagingSettings(standard="xapi", track_beyond_lms=True, lrs_confirmed=True)
+    report = build_report(_doc(_good_chapter()), packaging=packaging)
+    tech = next(c for c in report.qa_checks if c.name == "Course technology")
+    assert "LRS confirmed." in tech.note
+
+
+def test_a_standard_with_no_authoring_tool_omits_the_via_clause():
+    packaging = PackagingSettings(standard="scorm_2004")
+    report = build_report(_doc(_good_chapter()), packaging=packaging)
+    tech = next(c for c in report.qa_checks if c.name == "Course technology")
+    assert "Packaged for SCORM 2004." in tech.note
+    assert "via" not in tech.note
+
+
+# --- Content Studio Phase 2: accessibility target/extras/brand colors ------
+
+
+def test_no_accessibility_settings_keeps_the_exact_pre_existing_target():
+    report = build_report(_doc(_good_chapter()))
+    assert report.accessibility_target == "WCAG 2.1/2.2 AA"
+
+
+def test_a_chosen_compliance_target_is_reflected():
+    report = build_report(_doc(_good_chapter()), accessibility=AccessibilitySettings(compliance_target="wcag21_aa"))
+    assert report.accessibility_target == "WCAG 2.1 AA"
+
+
+def test_a_failing_brand_color_is_flagged_against_white():
+    report = build_report(
+        _doc(_good_chapter()), accessibility=AccessibilitySettings(brand_colors=["#F5A623"])
+    )
+    assert any("#F5A623" in f.message and "required for text" in f.message for f in report.accessibility_flags)
+
+
+def test_a_passing_brand_color_is_not_flagged():
+    report = build_report(
+        _doc(_good_chapter()), accessibility=AccessibilitySettings(brand_colors=["#0E6E66"])
+    )
+    assert not any("#0E6E66" in f.message for f in report.accessibility_flags)
+
+
+def test_extra_requirements_are_each_flagged_for_review():
+    report = build_report(
+        _doc(_good_chapter()),
+        accessibility=AccessibilitySettings(extra_requirements=["section_508", "en_301_549"]),
+    )
+    assert any("Section 508" in f.message for f in report.accessibility_flags)
+    assert any("EN 301 549" in f.message for f in report.accessibility_flags)
+
+
+def test_requesting_pdf_ua_explicitly_never_duplicates_the_always_on_flag():
+    report = build_report(
+        _doc(_good_chapter()), accessibility=AccessibilitySettings(extra_requirements=["pdf_ua"])
+    )
+    pdf_ua_flags = [f for f in report.accessibility_flags if "PDF/UA" in f.message]
+    assert len(pdf_ua_flags) == 1
+
+
+# --- Content Studio Phase 2: metadata tagging conventions & owner override -
+
+
+def test_no_metadata_settings_keeps_the_exact_pre_existing_metadata():
+    report = build_report(_doc(_good_chapter()))
+    assert report.metadata["Owner/requester"] == "not recorded"
+    assert report.metadata["Organisation tagging conventions"] == "not recorded"
+
+
+def test_tagging_conventions_and_owner_override_are_reflected():
+    report = build_report(
+        _doc(_good_chapter()),
+        owner="signed-in@example.com",
+        metadata_settings=MetadataSettings(tagging_conventions="internal-taxonomy-v2", owner_override="Jane Doe"),
+    )
+    assert report.metadata["Organisation tagging conventions"] == "internal-taxonomy-v2"
+    # An explicit override wins over whoever is signed in.
+    assert report.metadata["Owner/requester"] == "Jane Doe"
+
+
+def test_owner_falls_back_to_the_signed_in_user_without_an_override():
+    report = build_report(
+        _doc(_good_chapter()), owner="signed-in@example.com", metadata_settings=MetadataSettings()
+    )
+    assert report.metadata["Owner/requester"] == "signed-in@example.com"
 
 
 def test_the_endpoint_returns_a_report_for_a_generated_course(client):

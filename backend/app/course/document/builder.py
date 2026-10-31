@@ -269,6 +269,9 @@ def _collect_sources(
                     title=reference.title or url,
                     url=url,
                     note=reference.note,
+                    author=reference.author,
+                    source_type=reference.source_type,
+                    relevance=reference.relevance,
                     chapter_ids=[chapter.chapter_id],
                 )
                 order.append(url)
@@ -286,6 +289,32 @@ def _collect_sources(
 SOURCES_SECTION_KEY = "sources"
 
 
+def _source_text(source: SourceRecord) -> str:
+    """One source's full Sources-page text, as `\\n\\n`-joined lines -
+    `_paragraphs` (app.render.html_renderer) already splits exactly this
+    way into separate `<p>` tags, and the frontend's `whitespace-pre-wrap`
+    editor preserves the same breaks, so this needs no new rendering
+    machinery on either surface.
+
+    The headline (`title — url`) is byte-identical to this function's
+    pre-existing, already-tested output (course-sources follow-up: richer
+    metadata only ever ADDS lines below it, never replaces or duplicates
+    it) - every previously-generated course's source text still parses and
+    displays exactly as it always did, and the SAME url is never linked
+    twice on the page."""
+    label = source.title or source.url
+    headline = f"{label} — {source.url}" if source.url and source.url != label else label
+    lines = [headline]
+    if source.relevance.strip():
+        lines.append(f"Covers: {source.relevance.strip()}")
+    type_and_author = " — ".join(
+        part.strip() for part in (source.source_type, source.author) if part.strip()
+    )
+    if type_and_author:
+        lines.append(type_and_author)
+    return "\n\n".join(lines)
+
+
 def _source_blocks(sources: list[SourceRecord]) -> list[Block]:
     """Heading + one paragraph per source, laid out by the same `flow_blocks`
     every other page already uses - no bespoke renderer. When `sources` is
@@ -295,7 +324,11 @@ def _source_blocks(sources: list[SourceRecord]) -> list[Block]:
     the basis of the content")."""
     meta = BlockMeta(origin="system", section_key=SOURCES_SECTION_KEY)
     blocks: list[Block] = [
-        Block(type=BlockType.HEADING, content={"text": "Sources", "level": 1}, meta=meta.model_copy())
+        Block(
+            type=BlockType.HEADING,
+            content={"text": "Sources & Further Reading", "level": 1},
+            meta=meta.model_copy(),
+        )
     ]
     if not sources:
         blocks.append(
@@ -313,9 +346,9 @@ def _source_blocks(sources: list[SourceRecord]) -> list[Block]:
         )
         return blocks
     for source in sources:
-        label = source.title or source.url
-        text = f"{label} — {source.url}" if source.url and source.url != label else label
-        blocks.append(Block(type=BlockType.PARAGRAPH, content={"text": text}, meta=meta.model_copy()))
+        blocks.append(
+            Block(type=BlockType.PARAGRAPH, content={"text": _source_text(source)}, meta=meta.model_copy())
+        )
     return blocks
 
 

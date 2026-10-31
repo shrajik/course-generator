@@ -17,7 +17,7 @@ export function IconButton({
     <button
       type="button"
       className={cn(
-        "inline-flex h-7 w-7 items-center justify-center rounded-[7px] transition-colors",
+        "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-colors",
         "focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-brand-100",
         "disabled:cursor-not-allowed disabled:opacity-40",
         active

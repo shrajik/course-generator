@@ -207,6 +207,41 @@ async def test_transient_5xx_is_retried_then_succeeds():
     assert calls["count"] == 2
 
 
+async def test_malformed_2xx_body_is_retried_then_succeeds():
+    """A real, confirmed production case: Azure returned a 200 whose body
+    was missing the expected `data[0]` entry entirely - this must get the
+    same bounded retry treatment as a 502/503, not fail on the first
+    malformed response."""
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(200, json={"data": []})
+        return _b64_response()
+
+    result = await generate_image(
+        prompt="p", size="1024x1024", settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert result == _PNG_BYTES
+    assert calls["count"] == 2
+
+
+async def test_persistently_malformed_2xx_body_eventually_raises_clearly():
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(200, json={"data": []})
+
+    with pytest.raises(AIServiceError, match="data\\[0\\]"):
+        await generate_image(
+            prompt="p", size="1024x1024", settings=_settings(max_call_retries=3),
+            transport=httpx.MockTransport(handler),
+        )
+    assert calls["count"] == 3
+
+
 async def test_retries_are_bounded_by_max_call_retries():
     calls = {"count": 0}
 

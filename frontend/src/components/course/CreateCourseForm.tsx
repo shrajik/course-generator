@@ -6,10 +6,13 @@ import { ArrowRight, CheckCircle2, FileText, Layers3, Loader2, Save } from "luci
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { CoursePreviewArt } from "./CoursePreviewArt";
+import { AccessibilityPanel } from "./AccessibilityPanel";
+import { BriefDetailsPanel } from "./BriefDetailsPanel";
 import { DesignModelsPanel } from "./DesignModelsPanel";
 import { LearnerProfilePanel } from "./LearnerProfilePanel";
-import { SourcesPanel } from "./SourcesPanel";
+import { MetadataPanel } from "./MetadataPanel";
 import { StyleGuidePanel } from "./StyleGuidePanel";
+import { AlwaysOnStandardsCard } from "./AlwaysOnStandardsCard";
 import { RuleList } from "./RuleList";
 import { improveToc } from "@/lib/api/courses";
 import { classifyTemplateType } from "@/lib/api/course-templates";
@@ -175,30 +178,27 @@ export function CreateCourseForm() {
           </div>
 
           <div>
-            <label
-              htmlFor="target-audience"
-              className="mb-1.5 block text-[12.5px] font-medium text-ink-700"
-            >
-              Level
-            </label>
-            <select
-              id="target-audience"
-              className="field"
-              value={draft.targetAudience}
-              onChange={(event) => update({ targetAudience: event.target.value })}
-            >
+            <p className="mb-1.5 text-[12.5px] font-medium text-ink-700">Level</p>
+            <div className="grid gap-2.5 sm:grid-cols-3" role="radiogroup" aria-label="Level">
               {LEVEL_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={draft.targetAudience === option.value}
+                  onClick={() => update({ targetAudience: option.value })}
+                  className={
+                    "rounded-card border px-3.5 py-3 text-left transition " +
+                    (draft.targetAudience === option.value
+                      ? "border-brand-400 bg-brand-50"
+                      : "border-line bg-white hover:border-brand-200")
+                  }
+                >
+                  <p className="text-[12.5px] font-semibold text-ink-800">{option.label}</p>
+                </button>
               ))}
-            </select>
+            </div>
           </div>
-
-          <SourcesPanel
-            selected={draft.sourceIds ?? []}
-            onChange={(sourceIds) => update({ sourceIds })}
-          />
 
           <LearnerProfilePanel
             value={draft.learnerProfile}
@@ -284,6 +284,14 @@ export function CreateCourseForm() {
             </div>
           </div>
 
+          <BriefDetailsPanel
+            tasks={draft.tasks}
+            businessGoal={draft.businessGoal}
+            performanceGap={draft.performanceGap}
+            companions={draft.companions}
+            onChange={update}
+          />
+
           <DesignModelsPanel
             value={draft.designModels}
             onChange={(designModels) => update({ designModels })}
@@ -293,6 +301,18 @@ export function CreateCourseForm() {
             value={draft.styleGuide}
             onChange={(styleGuide) => update({ styleGuide })}
           />
+
+          <AccessibilityPanel
+            value={draft.accessibility}
+            onChange={(accessibility) => update({ accessibility })}
+          />
+
+          <MetadataPanel
+            value={draft.metadataSettings}
+            onChange={(metadataSettings) => update({ metadataSettings })}
+          />
+
+          <AlwaysOnStandardsCard />
 
           <div className="grid gap-4 sm:grid-cols-2">
             <RuleList

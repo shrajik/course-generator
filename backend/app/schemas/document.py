@@ -116,20 +116,28 @@ class Page(BaseModel):
 
 class SourceRecord(BaseModel):
     """One external source cited anywhere in the document - the structured
-    counterpart to the "Sources" page `document.document.builder` renders as
-    plain content blocks. Deduplicated by `url` across the whole course (see
-    `_collect_sources`); `chapter_ids` records every chapter that cited it,
-    so a reference used in two chapters appears once here, not twice.
+    counterpart to the "Sources & Further Reading" page
+    `document.document.builder` renders as plain content blocks. Deduplicated
+    by `url` across the whole course (see `_collect_sources`); `chapter_ids`
+    records every chapter that cited it, so a reference used in two chapters
+    appears once here, not twice.
 
     Sourced from `ChapterResearch.payload.references` (app.schemas.research),
     which itself only ever holds real API-returned citations or references
-    the model explicitly offered during research - never invented here."""
+    the model explicitly offered during research - never invented here.
+    `author`/`source_type`/`relevance` (course-sources follow-up) mirror
+    `Reference`'s own same-named fields 1:1 and carry the identical
+    "default blank, never fabricated" contract - a source collected before
+    these existed simply has them blank, same as `note` always has."""
 
     model_config = ConfigDict(extra="allow")
 
     title: str = ""
     url: str = ""
     note: str = ""
+    author: str = ""
+    source_type: str = ""
+    relevance: str = ""
     chapter_ids: list[str] = Field(default_factory=list)
 
 

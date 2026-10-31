@@ -12,6 +12,7 @@ import math
 import uuid
 from xml.sax.saxutils import escape
 
+from app.render.graph_math import nice_ticks, sample_function
 from app.render.textbook_palette import resolve_color_role, stroke_width_for
 from app.schemas.diagram import (
     SHAPE_TYPES,
@@ -2287,6 +2288,211 @@ def _layout_comparison(
     return elements, tallest
 
 
+# --- graph/chart (kind == "graph") -------------------------------------------
+
+# Fixed, not theme-derived - same "universal convention, not brand colour"
+# reasoning as _FLOW_ROLE_COLORS/_HIERARCHY_LEVEL_COLORS above. Cycles so any
+# count of functions/series still gets a distinct, readable colour.
+_GRAPH_SERIES_COLORS = ("#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2")
+
+_GRAPH_PLOT_HEIGHT = 320.0
+_GRAPH_AXIS_LABEL_SIZE = 13.0
+_GRAPH_TICK_LABEL_SIZE = 12.0
+_GRAPH_LEGEND_ROW_HEIGHT = 20.0
+
+
+def _fmt_tick(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text if text not in ("", "-0") else "0"
+
+
+def _layout_graph(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
+    """Mathematical function plots and categorical bar/line charts -
+    deterministic, never a raster image: axes, gridlines and labels are
+    drawn directly, and plotted content comes from real data (a function
+    safely sampled via app.render.graph_math, or the spec's own series
+    values) - never an invented scale or dataset."""
+    elements: list[str] = []
+    plot_left = MARGIN + 56.0
+    plot_right = CANVAS_WIDTH - MARGIN - 16.0
+    plot_width = plot_right - plot_left
+    plot_top = top + 8.0
+    plot_bottom = plot_top + _GRAPH_PLOT_HEIGHT
+
+    is_function = spec.graph_type == "function"
+    series_labels: list[str]
+    if is_function:
+        x_min = spec.x_min if spec.x_min is not None else -10.0
+        x_max = spec.x_max if spec.x_max is not None else 10.0
+        curves = [
+            (fn.label or fn.expression, sample_function(fn.expression, x_min, x_max))
+            for fn in spec.functions
+            if fn.expression.strip()
+        ]
+        curves = [(label, points) for label, points in curves if points]
+        series_labels = [label for label, _ in curves]
+        all_y = [y for _, points in curves for _, y in points]
+        y_lo, y_hi = (min(all_y), max(all_y)) if all_y else (-1.0, 1.0)
+        pad = (y_hi - y_lo) * 0.1 or 1.0
+        y_lo, y_hi = y_lo - pad, y_hi + pad
+
+        def scale_x(value: float) -> float:
+            return plot_left + (value - x_min) / (x_max - x_min) * plot_width
+
+    else:
+        categories = spec.categories
+        series_labels = [s.label or f"Series {i + 1}" for i, s in enumerate(spec.series)]
+        all_values = [v for s in spec.series for v in s.values]
+        y_lo, y_hi = (min(all_values), max(all_values)) if all_values else (0.0, 1.0)
+        if spec.graph_type == "bar":
+            # Bar height is a visual proportion of the value - starting
+            # anywhere but zero would misrepresent every bar's real size,
+            # the standard bar-chart convention. A line chart has no such
+            # convention, so it keeps the padded-around-the-data range below.
+            y_lo = min(0.0, y_lo)
+            y_hi = max(0.0, y_hi) + (y_hi - y_lo) * 0.1 or 1.0
+        else:
+            pad = (y_hi - y_lo) * 0.1 or 1.0
+            y_lo, y_hi = y_lo - pad, y_hi + pad
+        slot_width = plot_width / max(len(categories), 1)
+
+        def scale_x(index: float) -> float:  # noqa: ANN001 - index is a category position here
+            return plot_left + index * slot_width
+
+    # Snap the drawn axis extent to bracket the computed "nice" ticks (the
+    # same convention most charting libraries use) - without this, a padded
+    # range that doesn't land on a round number (e.g. 0..97) leaves the top
+    # of the plot with no gridline at all, which reads as unfinished rather
+    # than textbook-clean.
+    y_ticks = nice_ticks(y_lo, y_hi)
+    y_lo, y_hi = min(y_lo, y_ticks[0]), max(y_hi, y_ticks[-1])
+
+    def scale_y(value: float) -> float:
+        if y_hi <= y_lo:
+            return plot_bottom
+        return plot_bottom - (value - y_lo) / (y_hi - y_lo) * _GRAPH_PLOT_HEIGHT
+
+    # Plot area background + border, gridlines and y-axis ticks.
+    elements.append(
+        f'<rect x="{plot_left:.1f}" y="{plot_top:.1f}" width="{plot_width:.1f}" '
+        f'height="{_GRAPH_PLOT_HEIGHT:.1f}" fill="{theme.surface_color}" '
+        f'stroke="{theme.border_color}" stroke-width="1"/>'
+    )
+    for tick in y_ticks:
+        ty = scale_y(tick)
+        elements.append(
+            f'<line x1="{plot_left:.1f}" y1="{ty:.1f}" x2="{plot_right:.1f}" y2="{ty:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="1" stroke-dasharray="3,3"/>'
+        )
+        label_svg, _ = _text(
+            plot_left - 8, ty + _GRAPH_TICK_LABEL_SIZE / 3, [_fmt_tick(tick)],
+            font_size=_GRAPH_TICK_LABEL_SIZE, weight=400, color=theme.muted_color,
+            font_family=theme.font_family, anchor="end",
+        )
+        elements.append(label_svg)
+
+    if is_function:
+        for tick in nice_ticks(x_min, x_max):
+            tx = scale_x(tick)
+            label_svg, _ = _text(
+                tx, plot_bottom + _GRAPH_TICK_LABEL_SIZE + 4, [_fmt_tick(tick)],
+                font_size=_GRAPH_TICK_LABEL_SIZE, weight=400, color=theme.muted_color,
+                font_family=theme.font_family,
+            )
+            elements.append(label_svg)
+        # x and y axes themselves, where they cross zero (or the plot's
+        # own edge when zero is outside the visible range).
+        zero_y = scale_y(0.0) if y_lo <= 0.0 <= y_hi else plot_bottom
+        elements.append(
+            f'<line x1="{plot_left:.1f}" y1="{zero_y:.1f}" x2="{plot_right:.1f}" y2="{zero_y:.1f}" '
+            f'stroke="{theme.text_color}" stroke-width="1.5"/>'
+        )
+        zero_x = scale_x(0.0) if x_min <= 0.0 <= x_max else plot_left
+        elements.append(
+            f'<line x1="{zero_x:.1f}" y1="{plot_top:.1f}" x2="{zero_x:.1f}" y2="{plot_bottom:.1f}" '
+            f'stroke="{theme.text_color}" stroke-width="1.5"/>'
+        )
+        for index, (_, points) in enumerate(curves):
+            color = _GRAPH_SERIES_COLORS[index % len(_GRAPH_SERIES_COLORS)]
+            path = " ".join(
+                f"{'M' if i == 0 else 'L'}{scale_x(x):.1f},{scale_y(y):.1f}" for i, (x, y) in enumerate(points)
+            )
+            elements.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+    else:
+        for index, category in enumerate(categories):
+            cx = scale_x(index) + slot_width / 2
+            label_svg, _ = _text(
+                cx, plot_bottom + _GRAPH_TICK_LABEL_SIZE + 4,
+                _wrap(category, font_size=_GRAPH_TICK_LABEL_SIZE, width=slot_width),
+                font_size=_GRAPH_TICK_LABEL_SIZE, weight=400, color=theme.muted_color,
+                font_family=theme.font_family,
+            )
+            elements.append(label_svg)
+        zero_y = scale_y(0.0)
+        elements.append(
+            f'<line x1="{plot_left:.1f}" y1="{zero_y:.1f}" x2="{plot_right:.1f}" y2="{zero_y:.1f}" '
+            f'stroke="{theme.text_color}" stroke-width="1.5"/>'
+        )
+        if spec.graph_type == "bar":
+            series_count = max(len(spec.series), 1)
+            bar_gutter = slot_width * 0.15
+            group_width = slot_width - bar_gutter
+            bar_width = group_width / series_count
+            for s_index, s in enumerate(spec.series):
+                color = _GRAPH_SERIES_COLORS[s_index % len(_GRAPH_SERIES_COLORS)]
+                for c_index, value in enumerate(s.values):
+                    bx = scale_x(c_index) + bar_gutter / 2 + s_index * bar_width
+                    by = scale_y(max(value, 0.0))
+                    bh = abs(scale_y(value) - scale_y(0.0))
+                    elements.append(
+                        f'<rect x="{bx:.1f}" y="{by:.1f}" width="{(bar_width * 0.85):.1f}" '
+                        f'height="{bh:.1f}" fill="{color}" rx="2"/>'
+                    )
+        else:  # line
+            for s_index, s in enumerate(spec.series):
+                color = _GRAPH_SERIES_COLORS[s_index % len(_GRAPH_SERIES_COLORS)]
+                points = [(scale_x(i) + slot_width / 2, scale_y(v)) for i, v in enumerate(s.values)]
+                path = " ".join(f"{'M' if i == 0 else 'L'}{x:.1f},{y:.1f}" for i, (x, y) in enumerate(points))
+                elements.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5"/>')
+                for x, y in points:
+                    elements.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.5" fill="{color}"/>')
+
+    bottom = plot_bottom + _GRAPH_TICK_LABEL_SIZE + 18.0
+
+    if spec.x_label.strip():
+        label_svg, label_h = _text(
+            (plot_left + plot_right) / 2, bottom + _GRAPH_AXIS_LABEL_SIZE, [spec.x_label],
+            font_size=_GRAPH_AXIS_LABEL_SIZE, weight=600, color=theme.text_color, font_family=theme.font_family,
+        )
+        elements.append(label_svg)
+        bottom += label_h + 10.0
+
+    if spec.y_label.strip():
+        mid_y = (plot_top + plot_bottom) / 2
+        elements.append(
+            f'<text x="{(MARGIN + 14):.1f}" y="{mid_y:.1f}" font-size="{_GRAPH_AXIS_LABEL_SIZE:.1f}" '
+            f'font-weight="600" fill="{theme.text_color}" text-anchor="middle" '
+            f'font-family="{escape(theme.font_family)}" '
+            f'transform="rotate(-90 {(MARGIN + 14):.1f} {mid_y:.1f})">{escape(spec.y_label)}</text>'
+        )
+
+    if len(series_labels) > 1 or not is_function:
+        legend_y = bottom + _GRAPH_LEGEND_ROW_HEIGHT / 2
+        for index, label in enumerate(series_labels):
+            color = _GRAPH_SERIES_COLORS[index % len(_GRAPH_SERIES_COLORS)]
+            row_y = legend_y + index * _GRAPH_LEGEND_ROW_HEIGHT
+            elements.append(f'<rect x="{plot_left:.1f}" y="{row_y - 9:.1f}" width="14" height="14" fill="{color}" rx="2"/>')
+            label_svg, _ = _text(
+                plot_left + 20, row_y + 4, [label],
+                font_size=_GRAPH_TICK_LABEL_SIZE, weight=500, color=theme.text_color,
+                font_family=theme.font_family, anchor="start",
+            )
+            elements.append(label_svg)
+        bottom = legend_y + len(series_labels) * _GRAPH_LEGEND_ROW_HEIGHT
+
+    return elements, bottom - top
+
+
 # ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
@@ -2333,6 +2539,8 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
         elements, canvas_w, content_h = _layout_er(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "schematic":
         elements, content_h = _layout_schematic(spec, theme=theme, top=top)
+    elif kind == "graph":
+        elements, content_h = _layout_graph(spec, theme=theme, top=top)
     else:  # smart_art: numbered list, no connecting arrows
         elements, content_h = _layout_vertical(
             spec.nodes, spec.edges, theme=theme, connected=False, top=top

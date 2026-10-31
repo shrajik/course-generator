@@ -59,7 +59,7 @@ export function SamIterationButton() {
 
   return (
     <>
-      <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+      <Button variant="outline" size="sm" className="shrink-0" onClick={() => setOpen(true)}>
         <Repeat size={13} />
         Next iteration ({progress.built + 1} of {progress.total})
       </Button>

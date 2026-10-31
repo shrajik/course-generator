@@ -23,6 +23,7 @@ from app.core.errors import (
     ValidationFailedError,
 )
 from app.schemas.audit import AuditFinding, AuditReport
+from app.schemas.blocks import BlockType
 from app.schemas.course import GenerateRequest
 from app.services.audit_service import get_audit_service
 
@@ -339,6 +340,59 @@ async def test_the_four_override_actions_are_genuinely_distinct_values():
         "override_approved_incomplete_chapters",
     }
     assert len(actions) == 4  # sanity: no accidental collision in this test file's own usage
+
+
+# --- release-readiness audit: a confirmed-wrong formula must actually block
+# approve_course, not just appear as an easy-to-miss advisory warning --------
+
+
+async def test_a_confirmed_wrong_formula_actually_blocks_approve_course(service, technical_input):
+    """End-to-end proof that app.services.quality_framework's severity fix
+    works through the REAL approve_course path, not just in isolation (see
+    the matching report-level test in test_quality_verification.py). This
+    is exactly the "can a critical QA failure silently publish" risk a
+    release-readiness audit must rule out: before this fix, a formula_qa
+    mismatch/malformed finding was severity="major", which QualityReport.
+    hard_failures/approval_blocking_findings ignore entirely (severity ==
+    "blocker" only) - so a confirmed-wrong equation could reach a learner
+    with nothing but an easy-to-miss warning, never actually blocking
+    approval the way a structural quality blocker already does."""
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    document = service.storage.load_document(record.course_id)
+    image_block = next(block for _, block in document.iter_blocks() if block.type is BlockType.IMAGE)
+    image_block.content = {
+        **image_block.content,
+        "generated": True,
+        "error": None,
+        "formula_expression": "F = m / a",
+        "visual_qa_findings": [
+            {
+                "type": "formula_mismatch",
+                "detail": "uses the same symbols as Newton's second law but divides instead of multiplying",
+                "resolution": "formula_verification_failed",
+                "deterministic": True,
+            }
+        ],
+    }
+    service.storage.save_document(document)
+
+    with pytest.raises(QualityApprovalBlockedError) as excinfo:
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    findings = excinfo.value.details["findings"]
+    assert any(f["reason"] == "visual_qa_formula_mismatch" for f in findings)
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"  # never silently approved
+
+    # The existing, already-tested override mechanism picks this up
+    # automatically - no new override category needed, same as any other
+    # confirmed, independently-verified blocker.
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Formula corrected manually; verified against the textbook."
+    )
+    assert approved.review_status == "approved"
 
 
 # --- interaction with the source/fact-check audit gate ----------------------

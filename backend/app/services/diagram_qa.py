@@ -22,6 +22,7 @@ here turns into one targeted retry.
 from __future__ import annotations
 
 import math
+import unicodedata
 from dataclasses import dataclass, field
 
 from app.render.schematic_layout import _parse_anchor
@@ -53,6 +54,7 @@ DANGLING_RELATIONSHIP = "dangling_relationship"
 DUPLICATE_CRITICAL_COMPONENT = "duplicate_critical_component"
 MISSING_PRIMARY_OBJECT = "missing_primary_object"
 INVALID_COLOR_ROLE = "invalid_color_role"
+GARBLED_TEXT = "garbled_text"
 
 # Shape types that annotate/connect rather than occupy their own "object"
 # footprint the way block/circle/coil/gauge do - excluded from density,
@@ -349,6 +351,45 @@ def _segments_cross(
     return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
 
 
+# A real, observed failure mode (quality-governance follow-up): the model
+# that plans a diagram's text occasionally emits a short label/annotation
+# where several Latin letters have been swapped for similar-looking
+# Cyrillic/Greek glyphs mid-word - plain mojibake, not a real spelling (a
+# confirmed example: "confirm" rendered as "Conɪoтй", "language" as "ηµoge").
+# Traced this to the LLM-generated spec content itself, not the renderer -
+# both `diagram_renderer.py` and `concept_experience_renderer.py` wrap/slice
+# text by Python string (codepoint-safe) and rasterize via real Chromium
+# with standard web fonts, so nothing in either renderer's own code can
+# produce this. This never happens in genuine English technical content,
+# unlike ordinary non-ASCII symbols a real label CAN legitimately use (°, µ,
+# →, ≈, Ω, π, em dashes, curly quotes) - `_looks_garbled` deliberately
+# leaves a short, single scientific symbol alone (the word-length floor
+# below) and only flags a WORD that mixes Latin letters with Cyrillic/Greek
+# letters together, which no genuine English label ever needs.
+_MIN_GARBLED_WORD_LEN = 4
+
+
+def _script_of(ch: str) -> str:
+    name = unicodedata.name(ch, "")
+    for script in ("LATIN", "CYRILLIC", "GREEK"):
+        if name.startswith(script):
+            return script
+    return ""
+
+
+def _looks_garbled(text: str) -> bool:
+    if "�" in text:  # the Unicode replacement character - always a decode failure
+        return True
+    for word in text.split():
+        letters = [ch for ch in word if ch.isalpha()]
+        if len(letters) < _MIN_GARBLED_WORD_LEN:
+            continue
+        scripts = {_script_of(ch) for ch in letters}
+        if "LATIN" in scripts and scripts & {"CYRILLIC", "GREEK"}:
+            return True
+    return False
+
+
 def evaluate_schematic(spec: DiagramSpec) -> DiagramQAResult:
     """Run every check against an already-laid-out schematic spec (call
     after `resolve_schematic_layout`, before `render_diagram_svg`). A
@@ -388,8 +429,11 @@ def evaluate_blueprint(spec: DiagramSpec) -> DiagramQAResult:
 
     1. Universal checks (always run, no blueprint needed): duplicate shape
        ids, a declared relationship using an unrecognised type or pointing
-       at a shape that doesn't exist, and a `color_role` that isn't in the
-       centralized palette. These catch real mistakes regardless of whether
+       at a shape that doesn't exist, a `color_role` that isn't in the
+       centralized palette, and corrupted/garbled label text (see
+       `_looks_garbled` - a real, observed failure mode where the planner
+       model swaps Latin letters for similar-looking Cyrillic/Greek glyphs
+       mid-word). These catch real mistakes regardless of whether
        `visual_type` names anything this codebase has a canonical blueprint
        for.
     2. Blueprint checks (only when `visual_type` resolves via
@@ -448,6 +492,19 @@ def evaluate_blueprint(spec: DiagramSpec) -> DiagramQAResult:
             INVALID_COLOR_ROLE,
             f"These color roles aren't recognised: {', '.join(bad_colors[:3])}. Use one of the "
             f"centralized textbook color roles: {', '.join(COLOR_ROLES)}.",
+        ))
+
+    # --- universal: garbled/corrupted text -------------------------------------
+    garbled = sorted({
+        value for shape in all_shapes for value in (shape.label, shape.sublabel)
+        if value and _looks_garbled(value)
+    })
+    if garbled:
+        issues.append(DiagramQAIssue(
+            GARBLED_TEXT,
+            "These labels contain corrupted, garbled text rather than real words: "
+            f"{', '.join(repr(g) for g in garbled[:3])}. Rewrite them as plain, correctly "
+            "spelled English text.",
         ))
 
     # --- universal: declared relationships -------------------------------------

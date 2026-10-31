@@ -9,9 +9,26 @@ way a diffusion image model garbles text.
 
 from __future__ import annotations
 
+import ast
+
 from pydantic import BaseModel, ConfigDict, Field
 
 _AI = ConfigDict(extra="ignore")
+
+
+def _parses(expression: str) -> bool:
+    """Cheap, dependency-free syntax check (stdlib `ast` only - this module
+    stays free of any app.render/app.services import, same as every other
+    schema module) used only to reject an obviously-malformed function
+    expression at is_usable() time, before the raster-illustration fallback
+    would otherwise be reached. The actual safe, whitelisted evaluation at
+    render time is app.render.graph_math.safe_eval - this check is a cheaper
+    pre-filter, not a substitute for it."""
+    try:
+        ast.parse(expression, mode="eval")
+        return True
+    except (SyntaxError, ValueError):
+        return False
 
 DIAGRAM_KINDS = (
     "flow_chart",
@@ -27,7 +44,14 @@ DIAGRAM_KINDS = (
     "data_flow_diagram",
     "er_diagram",
     "swimlane",
+    "graph",
 )
+
+# "graph" is its own, third family - neither a sequence nor a labelled-box
+# relationship, so it deliberately joins neither SEQUENTIAL_KINDS nor
+# RELATIONSHIP_KINDS below. _kind_conflicts (app.services.diagram_service)
+# only ever flags a conflict for a hint that IS in one of those two tuples,
+# so leaving "graph" out of both is what keeps it safely inert there.
 
 # Kinds that show a SEQUENCE (steps happen in this order) - as opposed to
 # concept_map, which shows a STRUCTURE (things and how they relate, with no
@@ -120,6 +144,32 @@ class DiagramEdge(BaseModel):
     source: str = ""
     target: str = ""
     label: str = ""
+
+
+# --- graph/chart (kind == "graph") -------------------------------------------
+
+
+class GraphFunction(BaseModel):
+    """One plotted curve, only meaningful when DiagramSpec.graph_type ==
+    "function". `expression` is a Python-style expression of `x` (e.g.
+    "x**2", "sin(x)") evaluated safely by app.render.graph_math.safe_eval -
+    never passed to eval()/exec()."""
+
+    model_config = _AI
+
+    expression: str = ""
+    label: str = ""
+
+
+class GraphSeries(BaseModel):
+    """One bar/line series, only meaningful when DiagramSpec.graph_type is
+    "bar" or "line". `values` must have exactly one entry per
+    DiagramSpec.categories, in the same order."""
+
+    model_config = _AI
+
+    label: str = ""
+    values: list[float] = Field(default_factory=list)
 
 
 # The semantic-relationship vocabulary a schematic's `DiagramSpec.relationships`
@@ -534,6 +584,22 @@ class DiagramSpec(BaseModel):
     # declarative-only content, never layout).
     validation_criteria: list[str] = Field(default_factory=list)
 
+    # --- graph/chart fields (only meaningful for kind == "graph") -----------
+    graph_type: str = ""  # "function" | "bar" | "line"
+    x_label: str = ""
+    y_label: str = ""
+    # Domain for graph_type == "function". A rendering-range default
+    # (-10..10) applies when unset - see is_usable() - never an invented
+    # data value, the same category as DEFAULT_IMAGE_ASPECT elsewhere in
+    # this codebase.
+    x_min: float | None = None
+    x_max: float | None = None
+    functions: list[GraphFunction] = Field(default_factory=list)
+    # Shared by graph_type "bar"/"line": the x-axis groups, and one or more
+    # named series with exactly one value per category.
+    categories: list[str] = Field(default_factory=list)
+    series: list[GraphSeries] = Field(default_factory=list)
+
     def normalised_kind(self) -> str:
         value = (self.kind or "").strip().lower().replace(" ", "_")
         return value if value in DIAGRAM_KINDS else "smart_art"
@@ -570,6 +636,20 @@ class DiagramSpec(BaseModel):
             return bool(self.concept.strip()) and (
                 len(self.entities) + len(self.steps) + len(self.concept_states) >= 1
             )
+
+        if kind == "graph":
+            if self.graph_type == "function":
+                valid_functions = [f for f in self.functions if f.expression.strip() and _parses(f.expression)]
+                if not valid_functions:
+                    return False
+                x_min = self.x_min if self.x_min is not None else -10.0
+                x_max = self.x_max if self.x_max is not None else 10.0
+                return x_min < x_max
+            if self.graph_type in ("bar", "line"):
+                if not self.categories or not self.series:
+                    return False
+                return all(len(s.values) == len(self.categories) for s in self.series)
+            return False
 
         labelled = [n for n in self.nodes if n.label.strip()]
         # See max_nodes_for: er_diagram's node count includes attributes,

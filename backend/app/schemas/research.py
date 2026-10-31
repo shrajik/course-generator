@@ -13,6 +13,16 @@ class Reference(BaseModel):
     title: str = ""
     url: str = ""
     note: str = ""
+    # Additive (course-sources follow-up) - all three default "" so a
+    # reference built before these fields existed (or merged from a real
+    # web-search citation via ResearchAgent._merge_citations, which only
+    # ever sets title/url) stays perfectly valid. Populated by the research-
+    # structuring call ONLY when evident in the actual research notes - see
+    # RESEARCH_STRUCTURE_SYSTEM's own "never add a new fact" rule, which
+    # applies to these exactly as it already does to every other field here.
+    author: str = ""  # the resource's named author/organization, if stated
+    source_type: str = ""  # e.g. "official documentation", "textbook", "research paper"
+    relevance: str = ""  # one short sentence: what a learner gets from this resource
 
 
 class Definition(BaseModel):

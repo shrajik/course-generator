@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from app.api.course_authorization import check_document_owner
 from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.ids import slugify
+from app.course.companions import companion_deliverables
 from app.course.compliance import build_report
 from app.course.design_models import design_outputs
 from app.db.models import User
@@ -161,7 +162,10 @@ async def repair_visual_coverage(
 @router.get("/{document_id}/compliance")
 async def compliance_report(
     document_id: str,
-    schema: str = Query(default="lom", pattern="^(lom|dublin_core)$"),
+    # None (the default) falls back to the course's own stored schema
+    # preference (CourseInput.metadata.schema_preference), then "lom" - an
+    # explicit query param still overrides either, unchanged.
+    schema: str | None = Query(default=None, pattern="^(lom|dublin_core)$"),
     service: DocumentService = Depends(_service),
     course_service: CourseService = Depends(_course_service),
     current_user: User | None = Depends(get_current_user_if_db_enabled),
@@ -172,12 +176,17 @@ async def compliance_report(
     course_id = await check_document_owner(document_id, current_user, course_service, service)
     document = await service.load(document_id)
     record = await course_service.get_course_record(course_id)
+    metadata_settings = record.input.metadata
+    resolved_schema = schema or (metadata_settings.schema_preference if metadata_settings else None) or "lom"
     report = build_report(
         document,
-        schema=schema,  # type: ignore[arg-type]
+        schema=resolved_schema,  # type: ignore[arg-type]
         owner=current_user.email if current_user is not None else None,
         language=record.input.language,
         profile=record.input.learner_profile,
+        packaging=record.input.packaging,
+        accessibility=record.input.accessibility,
+        metadata_settings=metadata_settings,
     )
     return report.to_dict()
 
@@ -196,6 +205,21 @@ async def design_model_outputs(
     document = await service.load(document_id)
     record = await course_service.get_course_record(course_id)
     return design_outputs(document, record.input)
+
+
+@router.get("/{document_id}/companions")
+async def companion_outputs(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """Job-aid / quick-reference / manager-guide content for whichever companion
+    deliverables the brief requested. Built with no AI call; {} when none were requested."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    document = await service.load(document_id)
+    record = await course_service.get_course_record(course_id)
+    return companion_deliverables(document, record.input)
 
 
 @router.post("/{document_id}/export/pdf")

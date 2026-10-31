@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markupsafe import Markup, escape
 
+from app.course.document.builder import SOURCES_SECTION_KEY
 from app.course.document.layout import image_box_height
 from app.schemas.blocks import BlockType
 from app.course.document.code_cell import (
@@ -34,6 +36,16 @@ _environment = Environment(
 )
 
 _PARAGRAPH_SPLIT = re.compile(r"\n{2,}")
+
+# Matches the exact URL shape `app.course.document.builder._source_blocks`
+# writes into a Sources paragraph's text ("{title} — {url}") - deliberately
+# scheme-required (http/https only), so this never mistakes an ordinary
+# word or a bare domain-looking string elsewhere in course prose for a link.
+_LINK_URL_PATTERN = re.compile(r'https?://[^\s<>"\')\]]+')
+# Trailing characters that read as sentence punctuation rather than part of
+# the URL itself (a period ending the sentence, a comma before the next
+# clause) - stripped from the link and re-appended as plain escaped text.
+_LINK_TRAILING_PUNCTUATION = ".,;:!?"
 
 # Blocks whose box should render its background/border chrome.
 _PANEL_TYPES = {
@@ -218,6 +230,55 @@ def _paragraphs(block: Block) -> list[str]:
     return [part.strip() for part in _PARAGRAPH_SPLIT.split(text) if part.strip()]
 
 
+def _linkify(text: str) -> Markup:
+    """Turn `http(s)://` URLs embedded in plain text into real, clickable
+    `<a>` tags - scoped to the Sources page only (see its one call site
+    below), never applied to ordinary chapter prose, matching the feature's
+    own "inspect the existing Sources section" scope.
+
+    Every non-URL run is escaped exactly as Jinja's autoescape already
+    would (this function is the one place that escaping happens for a
+    Sources paragraph, since returning `Markup` opts the whole string out
+    of the template's own autoescape) - only the recognised URL substring
+    itself becomes a real anchor tag. `target="_blank" rel="noreferrer"`
+    matches the same external-link contract already used elsewhere in this
+    app's frontend (see frontend/src/components/editor/QualityPanel.tsx)
+    and the parallel frontend/src/lib/content/links.ts parser, so a source
+    link behaves identically whether read as an editor/PDF export or the
+    live preview."""
+    pieces: list[str] = []
+    cursor = 0
+    for match in _LINK_URL_PATTERN.finditer(text):
+        start, end = match.span()
+        if start > cursor:
+            pieces.append(str(escape(text[cursor:start])))
+        url = match.group(0)
+        trail = ""
+        while url and url[-1] in _LINK_TRAILING_PUNCTUATION:
+            trail = url[-1] + trail
+            url = url[:-1]
+        if not url:  # the "URL" was pure punctuation - nothing left to link
+            pieces.append(str(escape(trail)))
+            cursor = end
+            continue
+        safe_url = escape(url)
+        pieces.append(f'<a href="{safe_url}" target="_blank" rel="noreferrer">{safe_url}</a>')
+        if trail:
+            pieces.append(str(escape(trail)))
+        cursor = end
+    if cursor < len(text):
+        pieces.append(str(escape(text[cursor:])))
+    return Markup("".join(pieces))
+
+
+def _source_paragraphs(block: Block) -> list[str | Markup]:
+    """Like `_paragraphs`, but for a Sources-section block specifically -
+    each paragraph's URL (if any) renders as a real link. Only ever called
+    for `block.meta.section_key == SOURCES_SECTION_KEY` (see its call site),
+    so this never changes how an ordinary chapter paragraph renders."""
+    return [_linkify(strip_jargon(part)) for part in _paragraphs(block)]
+
+
 def _image_src(block: Block, asset_prefix: str) -> str | None:
     path = block.content.get("path")
     if not path:
@@ -332,7 +393,11 @@ def render_document_html(
                     # without touching each branch of the Jinja template.
                     "content": strip_jargon(block.content),
                     "css": _css(block, theme),
-                    "paragraphs": strip_jargon(_paragraphs(block)),
+                    "paragraphs": (
+                        _source_paragraphs(block)
+                        if block.meta.section_key == SOURCES_SECTION_KEY
+                        else strip_jargon(_paragraphs(block))
+                    ),
                     "image_src": _image_src(block, asset_prefix),
                     "inline_html": inline_html,
                     "image_box": round(image_box_height(block), 2),

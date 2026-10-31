@@ -198,7 +198,7 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
   return (
     <div className="flex flex-col gap-6">
       <StepHeader
-        step={3}
+        step={4}
         title="Generating Your Course"
         subtitle="This may take a few minutes. You can leave this page."
       />

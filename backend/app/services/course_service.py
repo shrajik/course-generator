@@ -58,6 +58,8 @@ from app.course.templates.registry import load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import (
     ChapterProgress,
+    CoursePhase,
+    CoursePhases,
     CourseActivityEntry,
     CourseInput,
     CourseRecord,
@@ -66,6 +68,7 @@ from app.schemas.course import (
     ImproveTocRequest,
     ImproveTocResponse,
     OverrideEvidence,
+    PhaseApproval,
     ReviewHistoryEntry,
     RunInfo,
     WorkspaceActivityEntry,
@@ -234,6 +237,11 @@ class CourseService:
         self, course_input: CourseInput, *, run_planner: bool = True, owner_id: str | None = None
     ) -> CourseRecord:
         course_id = new_course_id()
+        design = course_input.design_models
+        # Content Studio Phase 3 - phase-gated approval is an ADDIE concept;
+        # SAM already has its own, different iteration-gating mechanism
+        # (_sam_iteration_targets) that this never touches or competes with.
+        phases = CoursePhases() if design is not None and design.has("addie") and not design.has("sam") else None
         record = CourseRecord(
             course_id=course_id,
             document_id=document_id_for_course(course_id),
@@ -242,6 +250,7 @@ class CourseService:
             template_id=course_input.template_id,
             owner_id=owner_id,
             outline_approved=False,
+            phases=phases,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
         )
@@ -276,9 +285,53 @@ class CourseService:
         record.outline_approved = True
         record.outline_approved_at = now
         record.outline_approved_by = actor_id
+        # Content Studio Phase 3 - approving the outline already *is*
+        # approving Analysis + Design (the blueprint carries both); this
+        # reuses this one existing action rather than a parallel endpoint.
+        if record.phases is not None and record.phases.analysis_design.status != "approved":
+            record.phases.analysis_design = PhaseApproval(status="approved", approved_at=now, approved_by=actor_id)
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Outline approved for %s by %s", course_id, actor_id)
+        return record
+
+    # --- Content Studio Phase 3: ADDIE phase-gated approval -----------------
+    async def approve_phase(self, course_id: str, phase: CoursePhase, actor_id: str | None) -> CourseRecord:
+        """Sign off one ADDIE phase so the next may proceed. See CoursePhases'
+        own docstring for why there are 3 real phases, not 5: `analysis_design`
+        is approved via `approve_outline` instead (the blueprint already
+        carries both, so that's the single source of truth for it, not this
+        method) - calling this with that phase is a client error."""
+        record = await self._load_course(course_id)
+        if record.phases is None:
+            raise ConflictError(f"Course '{course_id}' does not have phase-gated approval active")
+        if phase == "analysis_design":
+            raise ConflictError("Analysis & Design is approved via approve_outline, not approve_phase")
+
+        current = getattr(record.phases, phase)
+        if current.status == "approved":
+            return record  # idempotent: approving twice changes nothing
+
+        if phase == "development":
+            if record.phases.analysis_design.status != "approved":
+                raise ConflictError("Analysis & Design must be approved before Development")
+            if current.status != "in_review":
+                raise ConflictError("Development has not finished generating yet")
+        elif phase == "implementation_evaluation":
+            if record.phases.development.status != "approved":
+                raise ConflictError("Development must be approved before Implementation & Evaluation")
+
+        now = utc_now_iso()
+        setattr(record.phases, phase, PhaseApproval(status="approved", approved_at=now, approved_by=actor_id))
+        if phase == "development" and record.phases.implementation_evaluation.status == "pending":
+            # Free to compute (app.course.design_models.design_outputs is an
+            # instant derived summary, no AI call) - no separate "generate"
+            # trigger needed, so it's ready to review the moment Development
+            # is approved.
+            record.phases.implementation_evaluation.status = "in_review"
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Phase %s approved for %s by %s", phase, course_id, actor_id)
         return record
 
     def _require_outline_approved(self, record: CourseRecord) -> None:
@@ -317,6 +370,14 @@ class CourseService:
                 f"Course '{course_id}' cannot be submitted for review: "
                 f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
                 details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
+        # Content Studio Phase 3 - for an ADDIE course with phase-gating
+        # active, every phase must be stepped through in order before the
+        # whole-course review workflow (unchanged otherwise) can start.
+        if record.phases is not None and record.phases.implementation_evaluation.status != "approved":
+            raise ConflictError(
+                f"Course '{course_id}' cannot be submitted for review: Implementation & Evaluation "
+                "has not been approved yet"
             )
         now = utc_now_iso()
         record.review_status = "in_review"
@@ -775,6 +836,12 @@ class CourseService:
             ChapterProgress(chapter_id=chapter.id, title=chapter.title)
             for chapter in blueprint.chapters
         ]
+        # Content Studio Phase 3 - the blueprint (Analysis + Design content)
+        # now exists and is ready to approve. Never regresses an already-
+        # approved phase (a later re-plan, if ever called, must not silently
+        # unapprove it).
+        if record.phases is not None and record.phases.analysis_design.status == "pending":
+            record.phases.analysis_design.status = "in_review"
         await self._save_course(record)
         return blueprint
 
@@ -1376,6 +1443,20 @@ class CourseService:
         record.status = "failed" if failed and not generated else "ready"
         record.last_error = f"chapters failed: {', '.join(failed)}" if failed else None
         record.warnings = warnings
+        # Content Studio Phase 3 - `development` only advances once the REAL
+        # chapter inventory is complete, never just because this particular
+        # generate() call reports "ready" - a targeted/partial run can set
+        # that status without every blueprint-planned chapter existing (see
+        # submit_for_review's own identical caution). Never regresses an
+        # already-approved phase.
+        if (
+            record.phases is not None
+            and record.status == "ready"
+            and record.phases.development.status == "pending"
+        ):
+            inventory_issues = await self._verify_inventory(record)
+            if not inventory_issues:
+                record.phases.development.status = "in_review"
         if record.status == "ready":
             await self._tell_author(
                 record, "generation_done", f"\u201c{record.input.course_title}\u201d is ready",

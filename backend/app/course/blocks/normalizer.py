@@ -43,6 +43,7 @@ def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
             "diagram_kind": draft.diagram_kind.strip().lower().replace(" ", "_"),
             "illustration_style": draft.illustration_style.strip().lower(),
             "expected_labels": [label.strip() for label in draft.image_expected_labels if label.strip()],
+            "formula_expression": draft.image_formula_expression.strip(),
         }
 
     if t is BlockType.QUOTE:

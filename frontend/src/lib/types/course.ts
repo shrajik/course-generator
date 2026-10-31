@@ -132,6 +132,10 @@ export interface StyleGuide {
   citation_system: "author_date" | "notes_bibliography";
   brand_terms: string[];
   banned_words: string[];
+  /** Content Studio Phase 2 - whether the writer is asked to narrate a
+   * conflict between a client override and the base guide. Defaults true
+   * server-side, matching the pre-existing (only-ever) behaviour. */
+  flag_voice_conflicts: boolean;
 }
 
 export type DesignModelId = "addie" | "bloom" | "sam" | "gagne" | "kirkpatrick";
@@ -147,6 +151,39 @@ export interface DesignModels {
   business_goal: string;
   data_sources: "lms_only" | "lms_and_kpis";
 }
+
+export type PackagingStandard = "scorm_1_2" | "scorm_2004" | "xapi" | "cmi5" | "aicc" | "lti";
+export type AuthoringTool = "articulate_storyline" | "rise_360" | "captivate" | "custom_html5";
+
+/** Mirrors backend app/schemas/standards.py. */
+export interface PackagingSettings {
+  standard: PackagingStandard | null;
+  target_lms: string;
+  authoring_tool: AuthoringTool | null;
+  track_beyond_lms: boolean;
+  lrs_confirmed: boolean;
+}
+
+export type AccessibilityTarget = "wcag21_aa" | "wcag22_aa";
+export type ExtraAccessibilityRequirement = "section_508" | "en_301_549" | "pdf_ua";
+
+/** Mirrors backend app/schemas/standards.py. */
+export interface AccessibilitySettings {
+  compliance_target: AccessibilityTarget;
+  extra_requirements: ExtraAccessibilityRequirement[];
+  brand_colors: string[];
+}
+
+export type MetadataSchema = "lom" | "dublin_core";
+
+/** Mirrors backend app/schemas/standards.py. */
+export interface MetadataSettings {
+  schema_preference: MetadataSchema | null;
+  tagging_conventions: string;
+  owner_override: string;
+}
+
+export type CompanionDeliverable = "job_aid" | "quick_ref" | "manager_guide";
 
 export interface CourseInput {
   course_title: string;
@@ -173,6 +210,25 @@ export interface CourseInput {
   content_level?: ContentLevel;
   /** Defaults to [] server-side when omitted - see LearningApproach above. */
   learning_approaches?: LearningApproach[];
+  /** Content Studio Phase 2 - optional packaging/delivery-tracking standard. */
+  packaging?: PackagingSettings | null;
+  /** Content Studio Phase 2 - optional accessibility target/extras/brand colours. */
+  accessibility?: AccessibilitySettings | null;
+  /** Content Studio Phase 2 - optional metadata schema preference/org tagging/owner. */
+  metadata?: MetadataSettings | null;
+  /** Content Studio Phase 1/4 - tasks the learner must be able to do; each
+   * becomes at least one learning objective. Defaults to [] server-side. */
+  tasks?: string[];
+  /** Content Studio Phase 1/4 - the business/performance goal this course
+   * exists to move. Independent of DesignModels.business_goal (Kirkpatrick-
+   * specific). Defaults to "" server-side. */
+  business_goal?: string;
+  /** Content Studio Phase 1/4 - optional; left blank, the Analysis phase
+   * drafts one (explicitly flagged as drafted, never stated as fact). */
+  performance_gap?: string;
+  /** Content Studio Phase 1/4 - schema only, selecting one does not yet
+   * generate the actual document. Defaults to [] server-side. */
+  companions?: CompanionDeliverable[];
 }
 
 export interface CreateCourseRequest extends CourseInput {
@@ -278,6 +334,24 @@ export interface WorkspaceActivityListResponse {
   activities: WorkspaceActivityEntry[];
 }
 
+/** Content Studio Phase 3/5 - ADDIE phase-gated approval. Analysis+Design
+ * and Implementation+Evaluation are each one approvable unit - see the
+ * backend's CoursePhases docstring for why. */
+export type CoursePhase = "analysis_design" | "development" | "implementation_evaluation";
+export type PhaseStatus = "pending" | "in_review" | "approved";
+
+export interface PhaseApproval {
+  status: PhaseStatus;
+  approved_at: string | null;
+  approved_by: string | null;
+}
+
+export interface CoursePhases {
+  analysis_design: PhaseApproval;
+  development: PhaseApproval;
+  implementation_evaluation: PhaseApproval;
+}
+
 export interface CourseRecord {
   course_id: string;
   document_id: string;
@@ -294,6 +368,8 @@ export interface CourseRecord {
   /** Gate 1. null = created before the gate existed; false = awaiting sign-off. */
   outline_approved?: boolean | null;
   outline_approved_at?: string | null;
+  /** Content Studio Phase 3 - null for every course except ADDIE-without-SAM. */
+  phases?: CoursePhases | null;
   created_at: string;
   updated_at: string;
   chapters: ChapterProgress[];

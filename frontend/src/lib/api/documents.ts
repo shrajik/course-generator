@@ -68,6 +68,22 @@ export function getDesignOutputs(documentId: string): Promise<DesignOutputs> {
   return request<DesignOutputs>(`/api/documents/${documentId}/design-outputs`);
 }
 
+/** Companion-deliverable content (job aid, quick-reference card, manager
+ * guide) for whichever were requested in the brief. */
+export type CompanionDeliverables = {
+  job_aid?: { title: string; sections: { chapter: string; checklist: string[]; watch_outs: string[] }[] };
+  quick_ref?: { title: string; sections: { chapter: string; key_points: string[] }[] };
+  manager_guide?: {
+    title: string;
+    note: string;
+    sections: { chapter: string; coaching_prompts: string[]; scenario_notes: string[] }[];
+  };
+};
+
+export function getCompanionDeliverables(documentId: string): Promise<CompanionDeliverables> {
+  return request<CompanionDeliverables>(`/api/documents/${documentId}/companions`);
+}
+
 export function getCourseDocument(courseId: string): Promise<CourseDocument> {
   return request<CourseDocument>(`/api/courses/${courseId}/document`);
 }

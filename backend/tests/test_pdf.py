@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from app.render.html_renderer import render_document_html
+from app.course.document.builder import SOURCES_SECTION_KEY
+from app.render.html_renderer import _linkify, render_document_html
 from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
 from app.schemas.course import GenerateRequest
-from app.schemas.document import Block, CourseDocument, Page
+from app.schemas.document import Block, BlockMeta, CourseDocument, Page
 
 
 def _playwright_available() -> bool:
@@ -83,6 +84,85 @@ def test_html_renderer_handles_every_block_type():
         "Why?",
     ]:
         assert needle in html, needle
+
+
+# --- course-sources follow-up: clickable Sources-page links -----------------
+
+
+def test_linkify_wraps_a_url_in_an_anchor_tag():
+    result = _linkify("Official Python Docs — https://docs.python.org/3/")
+    assert '<a href="https://docs.python.org/3/" target="_blank" rel="noreferrer">' in result
+    assert result.count("<a ") == 1
+
+
+def test_linkify_escapes_surrounding_text_safely():
+    result = _linkify('A <script>alert(1)</script> & "quoted" note')
+    assert "<script>" not in result
+    assert "&lt;script&gt;" in result
+    assert "&amp;" in result
+
+
+def test_linkify_strips_trailing_sentence_punctuation_from_the_link():
+    result = _linkify("See https://example.test/a.")
+    assert 'href="https://example.test/a"' in result
+    assert result.endswith("</a>.")
+
+
+def test_linkify_handles_multiple_urls_and_plain_text():
+    result = _linkify("No link here, just text.")
+    assert "<a " not in result
+    assert result == "No link here, just text."
+
+
+def _sources_document(text: str) -> CourseDocument:
+    meta = BlockMeta(origin="system", section_key=SOURCES_SECTION_KEY)
+    blocks = [
+        Block(type=BlockType.HEADING, content={"text": "Sources & Further Reading", "level": 1}, meta=meta),
+        Block(type=BlockType.PARAGRAPH, content={"text": text}, meta=meta),
+    ]
+    return CourseDocument(
+        document_id="doc_sources_render",
+        course_id="crs_sources_render",
+        course_title="Sources Render Test",
+        template_id="technical_v1",
+        pages=[Page(id="page_1", page_number=1, kind="content", blocks=blocks)],
+    )
+
+
+def test_sources_page_url_renders_as_a_real_link_in_html():
+    document = _sources_document("Official Python Docs — https://docs.python.org/3/")
+    html = render_document_html(document, load_template("technical_v1"))
+    assert '<a href="https://docs.python.org/3/" target="_blank" rel="noreferrer">' in html
+    assert "https://docs.python.org/3/</a>" in html
+
+
+@needs_browser
+async def test_sources_page_url_is_a_real_clickable_link_in_the_exported_pdf(documents, storage):
+    """The HTML-level `<a href>` assertion above proves the markup is
+    correct; this proves Chromium's print-to-PDF actually carries it
+    through as a real PDF link annotation (`/URI`), not just blue
+    underlined text with nothing behind it."""
+    document = _sources_document("Official Python Docs — https://docs.python.org/3/")
+    storage.ensure_course_dirs(document.course_id)
+    path = await documents.pdf.export_pdf(document)
+    data = path.read_bytes()
+    assert b"/URI" in data
+    assert b"docs.python.org" in data
+
+
+def test_an_ordinary_chapter_paragraph_url_is_never_linked():
+    """The linkify transform is scoped to the Sources section only (see its
+    one call site in html_renderer.py) - an ordinary chapter paragraph that
+    happens to mention a URL must render exactly as before, unlinked."""
+    template = load_template("technical_v1")
+    block = Block(type=BlockType.PARAGRAPH, content={"text": "See https://example.test/a for details."})
+    document = CourseDocument(
+        document_id="doc_plain", course_id="crs_plain", course_title="Plain",
+        template_id="technical_v1", pages=[Page(id="page_1", page_number=1, kind="content", blocks=[block])],
+    )
+    html = render_document_html(document, template)
+    assert "<a " not in html
+    assert "https://example.test/a" in html
 
 
 def test_html_renderer_escapes_content():

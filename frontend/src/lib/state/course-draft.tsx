@@ -17,10 +17,14 @@ import {
 } from "react";
 import {
   LEVEL_OPTIONS,
+  type AccessibilitySettings,
+  type CompanionDeliverable,
   type ContentLevel,
   type DesignModels,
   type LearnerProfile,
   type LearningApproach,
+  type MetadataSettings,
+  type PackagingSettings,
   type StyleGuide,
   type TemplateKind,
   type TocItem,
@@ -83,6 +87,23 @@ export interface CourseDraft {
   designModels: DesignModels | null;
   /** Writing style guide and client overrides. Null = not chosen. */
   styleGuide: StyleGuide | null;
+  /** Content Studio Phase 2 - packaging/delivery-tracking standard. Null = not chosen. */
+  packaging: PackagingSettings | null;
+  /** Content Studio Phase 2 - accessibility target/extras/brand colours. Null = not chosen. */
+  accessibility: AccessibilitySettings | null;
+  /** Content Studio Phase 2 - metadata schema preference/org tagging/owner. Null = not chosen. */
+  metadataSettings: MetadataSettings | null;
+  /** Content Studio Phase 1/4 - tasks the learner must be able to do; each
+   * becomes at least one learning objective. */
+  tasks: string[];
+  /** Content Studio Phase 1/4 - the business/performance goal this course
+   * exists to move (independent of DesignModels.business_goal). */
+  businessGoal: string;
+  /** Content Studio Phase 1/4 - optional; left blank, the Analysis phase drafts one. */
+  performanceGap: string;
+  /** Content Studio Phase 1/4 - companion deliverables requested alongside
+   * the course (schema only - does not yet generate the document). */
+  companions: CompanionDeliverable[];
   /** Uploaded source documents to ground the course in. */
   sourceIds: string[];
   toc: TocItem[];
@@ -120,6 +141,13 @@ export const EMPTY_DRAFT: CourseDraft = {
   learningApproaches: [],
   designModels: null,
   styleGuide: null,
+  packaging: null,
+  accessibility: null,
+  metadataSettings: null,
+  tasks: [],
+  businessGoal: "",
+  performanceGap: "",
+  companions: [],
   sourceIds: [],
   toc: [],
   tocDraftedFor: null,

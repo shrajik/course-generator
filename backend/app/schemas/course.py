@@ -8,7 +8,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.learner import LearnerProfile
 from app.schemas.design import DesignModels
+from app.schemas.standards import AccessibilitySettings, MetadataSettings, PackagingSettings
 from app.schemas.style import StyleGuide
+
+# Content Studio Phase 1 - companion deliverables a course can request
+# alongside the course itself (schema only for now: selecting one of these
+# does not yet produce a job-aid/quick-reference/manager-guide document -
+# that generation step is deliberately a separate, later phase. See
+# CourseInput.companions below.
+CompanionDeliverable = Literal["job_aid", "quick_ref", "manager_guide"]
 
 TemplateKind = Literal["technical", "non_technical"]
 
@@ -111,6 +119,40 @@ class CourseInput(BaseModel):
     # Uploaded source documents (see app/services/source_service.py) whose text
     # is the ground truth for this course. Ids of sources the creator owns.
     source_ids: list[str] = Field(default_factory=list, max_length=50)
+    # --- Content Studio Phase 1 (backend data-model foundation) -------------
+    # [] (the pre-existing default) keeps every pre-existing course's prompts
+    # byte-identical - see _brief_details_brief in app/agents/prompts.py for
+    # the "" it returns when none of these three fields are set. One task per
+    # line, in the UI's own words: "each task becomes at least one learning
+    # objective" - never validated against the toc/chapters shape, since a
+    # task is a learner outcome, not a content-structure constraint.
+    tasks: list[str] = Field(default_factory=list, max_length=20)
+    # The business/performance goal the course exists to move - independent
+    # of `DesignModels.business_goal` (that field is Kirkpatrick-specific and
+    # required only when Kirkpatrick is selected; this one is general-purpose
+    # and always optional, left untouched here to avoid any risk to that
+    # already-tested validator).
+    business_goal: str = Field(default="", max_length=500)
+    # Optional: the UI's own placeholder is "left blank, the Analysis phase
+    # drafts one" - see _brief_details_brief, which tells the model to draft
+    # a gap statement (explicitly flagged as drafted, never stated as fact)
+    # only when this is blank.
+    performance_gap: str = Field(default="", max_length=1000)
+    # Schema only this phase - selecting one does not yet generate the actual
+    # companion document (see CompanionDeliverable's own docstring above).
+    companions: list[CompanionDeliverable] = Field(default_factory=list)
+    # Packaging/delivery-tracking standard (app/schemas/standards.py) - None
+    # keeps app.course.compliance's existing "no packaging standard selected"
+    # behaviour exactly.
+    packaging: PackagingSettings | None = None
+    # --- Content Studio Phase 2 (standards & compliance step) ---------------
+    # Accessibility target/extra-requirements/brand-colors - None keeps
+    # app.course.compliance's existing fixed-target, theme-colors-only
+    # behaviour exactly.
+    accessibility: AccessibilitySettings | None = None
+    # Metadata schema preference/org-tagging/owner override - None keeps the
+    # existing "lom" default and no org-tagging/owner-override behaviour.
+    metadata: MetadataSettings | None = None
 
     @field_validator("toc", mode="before")
     @classmethod
@@ -263,6 +305,44 @@ class QualitySnapshot(BaseModel):
     warning_count: int
 
 
+# --- phase-gated approval (Content Studio Phase 3, ADDIE only) --------------
+# 3 real phases, not a literal 5-tab split - Analysis and Design are both
+# produced by the existing blueprint/outline step; Implementation and
+# Evaluation are both computed instantly as a derived summary once the
+# document is built (app.course.design_models.design_outputs, no separate
+# generation call). See CoursePhases' own docstring for the full reasoning.
+CoursePhase = Literal["analysis_design", "development", "implementation_evaluation"]
+PhaseStatus = Literal["pending", "in_review", "approved"]
+
+
+class PhaseApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: PhaseStatus = "pending"
+    approved_at: str | None = None
+    approved_by: str | None = None
+
+
+class CoursePhases(BaseModel):
+    """ADDIE phase-gated approval state (Content Studio Phase 3) - 3 real
+    phases: `analysis_design` is approved via the EXISTING `approve_outline`
+    Gate 1 (the blueprint already carries both); `development` is approved
+    once chapter generation genuinely completes (the real inventory, not
+    just `status == "ready"` - see CourseService._finalise); approving
+    `development` cascades `implementation_evaluation` straight to
+    "in_review", since computing it costs nothing. Only ever set (non-None)
+    for a course whose design_models selects "addie" and not "sam" at
+    creation time - every other course has `phases is None` and generates/
+    approves exactly as it always has, the same backward-compatible
+    contract as `outline_approved`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_design: PhaseApproval = Field(default_factory=PhaseApproval)
+    development: PhaseApproval = Field(default_factory=PhaseApproval)
+    implementation_evaluation: PhaseApproval = Field(default_factory=PhaseApproval)
+
+
 class CourseRecord(BaseModel):
     """Everything we persist about a course besides blueprint/research/chapters."""
 
@@ -290,6 +370,9 @@ class CourseRecord(BaseModel):
     outline_approved: bool | None = None
     outline_approved_at: str | None = None
     outline_approved_by: str | None = None
+    # ADDIE phase-gated approval state (Content Studio Phase 3) - None for
+    # every course that doesn't select ADDIE-without-SAM at creation time.
+    phases: CoursePhases | None = None
     created_at: str
     updated_at: str
     chapters: list[ChapterProgress] = Field(default_factory=list)

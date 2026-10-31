@@ -40,6 +40,7 @@ from app.schemas.course import (
     ApproveCourseRequest,
     CourseActivityListResponse,
     CourseInput,
+    CoursePhase,
     CourseRecord,
     CourseReviewResponse,
     CreateCourseRequest,
@@ -350,8 +351,15 @@ async def review_brief(
     where the open findings are. Built from the saved course, with no AI call."""
     record = await get_owned_course(course_id, current_user, service)
     document = await documents.load(record.document_id)
+    metadata_settings = record.input.metadata
     compliance = build_report(
-        document, language=record.input.language, profile=record.input.learner_profile
+        document,
+        schema=(metadata_settings.schema_preference if metadata_settings else None) or "lom",  # type: ignore[arg-type]
+        language=record.input.language,
+        profile=record.input.learner_profile,
+        packaging=record.input.packaging,
+        accessibility=record.input.accessibility,
+        metadata_settings=metadata_settings,
     )
     return build_review_brief(
         document=document,
@@ -375,6 +383,25 @@ async def approve_outline(
     record = await service.approve_outline(course_id, actor)
     if current_user is not None:
         await service.record_activity(course_id, actor, current_user.email, "outline_approved")
+    return record
+
+
+@router.post("/{course_id}/phases/{phase}/approve", response_model=CourseRecord)
+async def approve_phase(
+    course_id: str,
+    phase: CoursePhase,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> CourseRecord:
+    """Content Studio Phase 3: sign off one ADDIE phase so the next may
+    proceed - only active for a course whose design_models selected
+    "addie" without "sam" at creation time. Author (or admin) only, same
+    authorization as `approve-outline`."""
+    await get_course_for_author_action(course_id, current_user, service)
+    actor = str(current_user.id) if current_user is not None else None
+    record = await service.approve_phase(course_id, phase, actor)
+    if current_user is not None:
+        await service.record_activity(course_id, actor, current_user.email, f"phase_approved:{phase}")
     return record
 
 

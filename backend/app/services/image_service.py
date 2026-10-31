@@ -27,8 +27,10 @@ from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
 from app.services.concept_visual_service import ConceptVisualService
 from app.services.diagram_service import DiagramService
+from app.services.formula_qa import evaluate_formula
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.quality_framework import visual_qa_finding_entries
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
@@ -118,6 +120,23 @@ _NO_TEXT_SUFFIX = (
     "writing anywhere in the image - a completely text-free illustration."
 )
 
+# Substrings that show up in the provider's own error body for a content-
+# policy rejection (confirmed real case: Azure FLUX.2-flex returning
+# `{"error":{"code":"content_safety_violation","message":"Content violated
+# RAI policy blocking criteria (DallEBlockList_Prompt)."}}`, wrapped into
+# AIServiceError's message by azure_image_provider.py/azure_mai_image_
+# provider.py's `f"...request failed with status {code}: {body}"`). Checked
+# as a plain substring match (not a dedicated exception type) so this works
+# the same for either provider without either one needing to know about a
+# safety-specific exception class - the raw body text already carries the
+# signal, consistently, across both.
+_CONTENT_SAFETY_MARKERS = ("content_safety_violation", "content safety", "rai policy")
+
+
+def _is_content_safety_violation(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _CONTENT_SAFETY_MARKERS)
+
 
 class ImageTextCheck(BaseModel):
     """What a vision-capable model reports actually seeing rendered in a
@@ -128,6 +147,28 @@ class ImageTextCheck(BaseModel):
     about the topic."""
 
     detected_text: list[str] = Field(default_factory=list)
+
+
+class ImageRelevanceCheck(BaseModel):
+    """A vision-capable model's judgment on whether a generated image
+    actually depicts its own brief - see ImageService._verify_image_relevance.
+    A model-based judgment call (never deterministic, unlike formula_qa's
+    AST comparison or diagram_content_qa's structural checks): there is no
+    pixel-level ground truth for "is this about photosynthesis" without
+    real object recognition, which this codebase doesn't have. `on_topic`/
+    `genuinely_educational` default to True so a vision-call FAILURE never
+    masquerades as a CONFIRMED relevance problem (a false "off-topic" claim
+    the image never earned) - but `errored` (production risk follow-up)
+    separately, explicitly records that the check could not actually run,
+    so a caller can still tell "genuinely verified clean" from "never
+    verified at all" instead of conflating the two into one confident-
+    looking default."""
+
+    on_topic: bool = True
+    on_topic_detail: str = ""
+    genuinely_educational: bool = True
+    educational_detail: str = ""
+    errored: bool = False
 
 # Fixed, universal guidance for the DEFAULT ("" / decorative) illustration
 # style - see ImageContent.illustration_style. Replaces the old per-template
@@ -480,16 +521,22 @@ class ImageService:
             return data
 
     # --- text accuracy ------------------------------------------------------
-    async def _verify_generated_text(self, image: bytes, expected_labels: list[str]) -> list[str]:
+    async def _verify_generated_text(self, image: bytes, expected_labels: list[str]) -> list[str] | None:
         """Asks a vision-capable model to read back every piece of text it
         can actually see in `image`, then reports which of `expected_labels`
         never showed up verbatim (case/whitespace-insensitive) - a missing
         label means either it's absent or - just as likely, since image
         models garble baked-in text - misspelled into something that no
         longer matches. Returns the empty list when everything expected was
-        found; never raises (a vision-check failure isn't treated as a text
-        error - a genuinely garbled image gets a real chance to be flagged
-        the NEXT time this runs, not silently blocked on this call alone).
+        genuinely confirmed found; never raises (a vision-check failure is
+        never treated as "confirmed wrong" either - a genuinely garbled
+        image gets a real chance to be flagged the NEXT time this runs).
+        Returns `None` - never `[]` - when the check itself could not
+        complete (the vision call raised): production risk follow-up, a
+        real, confirmed prior bug - `None` collapsing to the SAME falsy
+        value as `[]` let an operational vision-check failure be silently
+        treated as "every label verified correct." Every caller must check
+        `missing == []` for a genuine pass, never a bare `not missing`.
 
         Deliberately never shows `expected_labels` to the model doing the
         transcribing - a confirmed real failure (a "Chlo-rlorphyit" render
@@ -523,12 +570,12 @@ class ImageService:
                 image=image,
             )
         except Exception as exc:  # noqa: BLE001 - never block on a QA-step failure
-            log.warning("Image text check failed: %s", exc)
-            return []
+            log.warning("Image text check failed (inconclusive, never treated as a pass): %s", exc)
+            return None
         detected = {normalize(text) for text in result.detected_text}
         return [label for label in expected_labels if normalize(label) not in detected]
 
-    async def _verify_image_has_no_text(self, image: bytes) -> list[str]:
+    async def _verify_image_has_no_text(self, image: bytes) -> list[str] | None:
         """For a force-text-free image (see `_generate_text_free_illustration`)
         - the same vision-model transcription technique `_verify_generated_text`
         uses, inverted: there's no specific label to check against here, the
@@ -539,10 +586,13 @@ class ImageService:
         `structured_fallback`) - so any text that does show up is
         presumptively more of that same garbled, unreliable lettering, not a
         message worth keeping. Returns whatever text was actually detected
-        (empty list = genuinely text-free); never raises (a vision-check
-        failure isn't treated as "it has text" - that would needlessly burn
-        through the caller's own bounded retry budget on a QA-step problem,
-        not an image problem)."""
+        (empty list = genuinely confirmed text-free); never raises. Returns
+        `None` - never `[]` - when the check itself could not complete
+        (production risk follow-up: a vision-call exception must never be
+        silently treated as "confirmed genuinely text-free," the same
+        ERROR-vs-PASS conflation fixed in `_verify_generated_text`). Callers
+        must check `found == []` for a genuine pass, never a bare `not
+        found`."""
         try:
             result = await self.ai.structured(
                 schema=ImageTextCheck,
@@ -561,9 +611,50 @@ class ImageService:
                 image=image,
             )
         except Exception as exc:  # noqa: BLE001 - never block on a QA-step failure
-            log.warning("Image no-text check failed: %s", exc)
-            return []
+            log.warning("Image no-text check failed (inconclusive, never treated as confirmed clean): %s", exc)
+            return None
         return [text for text in result.detected_text if text.strip()]
+
+    async def _verify_image_relevance(
+        self, image: bytes, *, brief: str, course_title: str
+    ) -> ImageRelevanceCheck:
+        """Does this generated image actually depict its own brief, and does
+        it read as genuinely educational rather than purely decorative or
+        unrelated? Unlike `_verify_generated_text` (a plain string-match
+        against a transcription), there is no deterministic ground truth
+        for this - it is necessarily a vision-model judgment call, the
+        image-pipeline counterpart to `diagram_content_qa.evaluate_content`'s
+        LLM-judged semantic check for diagrams. Never raises (a vision-check
+        failure returns `errored=True`, never a confirmed "off-topic" claim
+        the image never earned - but also never silently indistinguishable
+        from a genuine pass; see `ImageRelevanceCheck.errored`'s own
+        docstring, production risk follow-up)."""
+        if not brief.strip():
+            return ImageRelevanceCheck()
+        try:
+            return await self.ai.structured(
+                schema=ImageRelevanceCheck,
+                system=(
+                    "You are a strict reviewer judging whether a generated educational image "
+                    "actually depicts what it was asked to depict. Look at the attached image "
+                    "and judge two things: (1) `on_topic` - does the image's actual visual "
+                    "content genuinely, specifically depict the stated brief, not a generic, "
+                    "unrelated, or merely thematically-adjacent picture? (2) `genuinely_"
+                    "educational` - does this read as a real teaching aid for the brief, not a "
+                    "purely decorative/stock-photo-style image that happens not to contradict "
+                    "it? Be concrete in every detail field: name exactly what the image actually "
+                    "shows and why that does or doesn't match, never a bare \"could be better\"."
+                ),
+                user=f"COURSE: {course_title}\n\nBRIEF (what this image is supposed to depict):\n{brief}\n\n"
+                "Judge the attached image against this brief.",
+                model=self.settings.diagram_model,
+                purpose="image_relevance_check",
+                phase="image",
+                image=image,
+            )
+        except Exception as exc:  # noqa: BLE001 - never block on a QA-step failure
+            log.warning("Image relevance check failed (inconclusive, never treated as a pass): %s", exc)
+            return ImageRelevanceCheck(errored=True)
 
     async def _generate_text_free_illustration(
         self, prompt: str, *, block_id: str, provider: str | None = None, size: str | None = None
@@ -592,12 +683,12 @@ class ImageService:
         size = size or self.settings.image_size
         data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=size, provider=provider)
         found = await self._verify_image_has_no_text(data)
-        if not found:
+        if found == []:
             return data, True
 
         log.info(
-            "Text-free image for %s still rendered text (%s) - one final, more emphatic attempt",
-            block_id, found,
+            "Text-free image for %s still unresolved (%s) - one final, more emphatic attempt",
+            block_id, found if found is not None else "vision check inconclusive",
         )
         final_prompt = (
             f"{prompt}\n\nABSOLUTELY CRITICAL: this image must contain ZERO text of any kind - "
@@ -607,12 +698,22 @@ class ImageService:
         )
         data = await self.ai.image(prompt=final_prompt, size=size, provider=provider)
         found = await self._verify_image_has_no_text(data)
-        if found:
+        if found == []:
+            return data, True
+        if found is None:
+            log.warning(
+                "Text-free image for %s could not be verified (vision check inconclusive) after every "
+                "bounded attempt - never treated as confirmed clean", block_id,
+            )
+        else:
             log.warning(
                 "Text-free image for %s still has text after every bounded attempt (%s) - "
                 "flagged, not silently accepted as correct", block_id, found,
             )
-        return data, not found
+        # Deliberately `found == []`, not `not found` - see `_generate_with_
+        # text_check`'s identical final line for why `None` must never
+        # collapse into the same "falsy -> verified" outcome as `[]`.
+        return data, found == []
 
     # --- generation -------------------------------------------------------
     async def generate_for_block(
@@ -701,28 +802,38 @@ class ImageService:
         alongside whether it actually passed verification, so a caller can
         never mistake "we stopped retrying" for "this was confirmed
         correct" (see `_generate_illustration`'s `text_verified` field).
-        Returns (image bytes, text_verified)."""
+        Returns (image bytes, text_verified). `text_verified` is True only
+        when some attempt's check GENUINELY completed and found every label
+        correct (`missing == []`) - a vision-check exception (`missing is
+        None`, see `_verify_generated_text`) is never treated the same as a
+        genuine pass, at any of the four bounded attempts below; it falls
+        through to the next attempt exactly like a confirmed wrong answer
+        would, and the final, honest `text_verified` is False either way."""
         size = size or self.settings.image_size
         data = await self.ai.image(prompt=prompt, size=size, provider=provider)
         missing = await self._verify_generated_text(data, expected_labels)
-        if not missing:
+        if missing == []:
             return data, True
 
-        log.info("Image text check failed for %s (missing/misspelled: %s) - retrying", block_id, missing)
+        log.info(
+            "Image text check failed for %s (missing/misspelled: %s) - retrying", block_id,
+            missing if missing is not None else "vision check inconclusive",
+        )
         retry_prompt = (
             f"{prompt}\n\nThe previous attempt got this text wrong or left it out: "
-            f"{', '.join(missing)}. This exact text must appear, spelled correctly, "
+            f"{', '.join(missing or expected_labels)}. This exact text must appear, spelled correctly, "
             "letter by letter, in large clearly legible lettering: "
             f"{', '.join(expected_labels)}. Double-check every letter before finalizing - "
             "a near-miss spelling (an extra, missing, or swapped letter) is still wrong."
         )
         data = await self.ai.image(prompt=retry_prompt, size=size, provider=provider)
         missing = await self._verify_generated_text(data, expected_labels)
-        if not missing:
+        if missing == []:
             return data, True
 
         log.info(
-            "Image text check failed again for %s (%s) - attempting a text-free image", block_id, missing
+            "Image text check failed again for %s (%s) - attempting a text-free image", block_id,
+            missing if missing is not None else "vision check inconclusive",
         )
         data = await self.ai.image(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=size, provider=provider)
         # Trust nothing on faith: a "text-free" request can still come back
@@ -730,12 +841,12 @@ class ImageService:
         # against the exact same expected labels, since any of them
         # appearing wrong is exactly as bad as it was on a labelled attempt.
         missing = await self._verify_generated_text(data, expected_labels)
-        if not missing:
+        if missing == []:
             return data, True
 
         log.info(
-            "Text-free attempt for %s still rendered incorrect text (%s) - one final, more "
-            "emphatic attempt", block_id, missing,
+            "Text-free attempt for %s still unresolved (%s) - one final, more emphatic attempt",
+            block_id, missing if missing is not None else "vision check inconclusive",
         )
         final_prompt = (
             f"{prompt}\n\nABSOLUTELY CRITICAL: this image must contain ZERO text of any kind - "
@@ -748,7 +859,56 @@ class ImageService:
         missing = await self._verify_generated_text(data, expected_labels)
         # Whatever this final, bounded attempt produced is what ships - but
         # the caller is told the honest truth about whether it's clean.
-        return data, not missing
+        # `missing == []` is deliberately NOT `not missing`: that would also
+        # be True for `None` (a vision-check exception, Python's own
+        # falsiness rule for None), silently treating "could not verify" as
+        # "verified correct" - the exact conflation this fix exists to close.
+        return data, missing == []
+
+    @staticmethod
+    def _safety_fallback_prompt(
+        *,
+        course_title: str,
+        chapter_title: str,
+        section_title: str,
+        key_concept: str,
+        expected_labels: list[str] | None = None,
+    ) -> str:
+        """A generic, policy-conscious prompt for the ONE bounded retry after
+        a content-safety rejection (see `_is_content_safety_violation`'s own
+        docstring on why this drops the writer's free-text prompt entirely).
+        Deliberately abstract/symbolic rather than depicting anything
+        specific enough to risk the same or a different policy rule.
+
+        `expected_labels` (a textbook illustration's essential part-labels,
+        e.g. "Nucleus", "Cell wall") are preserved here rather than silently
+        dropped like the rest of the rejected request - a real, confirmed
+        gap: the first version of this fallback always forced a text-free
+        image, which meant a content-safety rejection on a LABELLED
+        illustration shipped a generic, unlabelled placeholder instead,
+        quietly losing essential educational content the course still
+        needed. Labels are not what a safety filter rejects (the depicted
+        scene/subject is), so asking for them on an otherwise generic,
+        abstract depiction is safe; the caller still verifies them with the
+        same `_verify_generated_text` mechanism as every other labelled
+        path, never trusted on faith."""
+        topic = key_concept.strip() or section_title.strip() or chapter_title.strip() or course_title.strip()
+        base = (
+            f"A clean, abstract, symbolic educational illustration representing the general "
+            f"theme of \"{topic}\" for a course titled \"{course_title}\". Use simple geometric "
+            "shapes, soft colors and generic iconography (e.g. gears, books, charts, arrows, "
+            "lightbulbs) rather than depicting any specific person, scene, brand, weapon, or "
+            "sensitive subject matter. Nothing graphic, violent, political, or controversial - "
+            "purely decorative and safe for an educational audience of any age."
+        )
+        labels = [label.strip() for label in (expected_labels or []) if label.strip()]
+        if not labels:
+            return f"{base}{_NO_TEXT_SUFFIX}"
+        return (
+            f"{base}\n\nThis illustration must still clearly label these exact parts, spelled "
+            f"correctly, in large legible lettering, even though the overall scene is generic/"
+            f"abstract: {', '.join(labels)}."
+        )
 
     async def _generate_illustration(
         self,
@@ -835,6 +995,13 @@ class ImageService:
         # whole point of forcing text-free is a real promise ("no text")
         # that's just as checkable as a labelled one.
         text_verified: bool | None = None
+        # Set True only inside the content-safety except-block below - skips
+        # the topic-relevance check for that one, deliberately-generic/
+        # abstract emergency image (see `_safety_fallback_prompt`'s own
+        # docstring): checking "is this on-topic" against a picture built
+        # NOT to be specific, by design, would always fail and waste a
+        # retry on something that can never pass.
+        is_safety_fallback = False
         try:
             if force_text_free or not is_textbook:
                 # Every style that isn't "textbook" (the default/blank style,
@@ -863,18 +1030,298 @@ class ImageService:
                     prompt=prompt, size=image_size or self.settings.image_size, provider=provider
                 )
         except Exception as exc:  # noqa: BLE001 - a failed image must not fail the course
-            log.warning("Image generation failed for %s: %s", block.id, exc)
-            block.content = merge_content(
-                block.type, block.content, {"error": str(exc)[:300], "generated": False}
+            if not _is_content_safety_violation(exc):
+                log.warning("Image generation failed for %s: %s", block.id, exc)
+                block.content = merge_content(
+                    block.type, block.content,
+                    # `omitted_after_qa_failure` explicitly cleared: this is
+                    # a genuine technical failure (`error` is set, which
+                    # already independently makes layout.image_generation_
+                    # failed() treat it as a compact placeholder) - a stale
+                    # True from an earlier, DIFFERENT (QA) failure on this
+                    # same block must not linger with the wrong meaning.
+                    {"error": str(exc)[:300], "generated": False, "omitted_after_qa_failure": False},
+                )
+                return False
+            # A content-policy rejection is never retried with the SAME
+            # prompt (the provider will reject it again, identically) - the
+            # writer's own free-text prompt/purpose/caption is the one part
+            # of the request that is both block-specific and outside this
+            # codebase's control, so it's the most likely trigger and is
+            # dropped entirely for this one bounded retry, in favour of a
+            # generic, explicitly policy-conscious depiction of the same
+            # topic built only from the course/chapter/section grounding
+            # context. A real, confirmed case this fixes: a capstone-project
+            # illustration request rejected by Azure's DallEBlockList_Prompt
+            # filter, which previously left the block with no image at all
+            # (`generated: False`) for the rest of that course's lifetime -
+            # see this module's own `_safety_fallback_prompt`.
+            safe_prompt = self._safety_fallback_prompt(
+                course_title=course_title,
+                chapter_title=chapter_title,
+                section_title=section_title,
+                key_concept=key_concept,
+                expected_labels=expected_labels,
             )
-            return False
+            log.warning(
+                "Image generation for %s was rejected by the provider's content-safety filter "
+                "(%s) - retrying once with a generic, topic-only safe-fallback prompt", block.id, exc,
+            )
+            try:
+                data = await self.ai.image(
+                    prompt=safe_prompt, size=image_size or self.settings.image_size, provider=provider
+                )
+            except Exception as retry_exc:  # noqa: BLE001 - same reasoning as the outer handler
+                log.warning(
+                    "Safety-fallback image generation also failed for %s: %s", block.id, retry_exc
+                )
+                block.content = merge_content(
+                    block.type, block.content,
+                    {"error": str(retry_exc)[:300], "generated": False, "omitted_after_qa_failure": False},
+                )
+                return False
+            prompt = safe_prompt  # the persisted `prompt` must reflect what was actually sent
+            is_safety_fallback = True
+            # Essential labels, if any, are checked exactly like every other
+            # labelled path - never trusted on faith just because this is an
+            # emergency fallback. None (not False) when nothing was promised
+            # in the first place, same contract `_generate_illustration`
+            # already keeps for the non-fallback paths.
+            if expected_labels:
+                missing = await self._verify_generated_text(data, expected_labels)
+                # `missing == []`, not `not missing` - a vision-check
+                # exception (`None`) must never collapse into "verified
+                # correct" (production risk follow-up).
+                text_verified = missing == []
+            else:
+                text_verified = None
         if text_verified is False:
             log.warning(
-                "Image for %s shipped with unverified/incorrect text after every bounded "
-                "attempt - flagged, not silently accepted as correct", block.id,
+                "Image for %s has confirmed-incorrect text after every bounded attempt - "
+                "will be omitted rather than published, not silently accepted as correct", block.id,
             )
+        # Topic/educational relevance - the gap behind "a visually
+        # attractive but irrelevant image must not pass merely because a
+        # file exists": nothing before this checked whether a successfully-
+        # generated raster image actually depicts its own brief, only
+        # whether its (optional) baked-in TEXT was spelled right. One vision
+        # call, one bounded retry with the brief re-emphasised if it fails -
+        # safe to retry (unlike a formula mismatch, there's no risk of
+        # replacing legitimately-correct content with a wrong "correction":
+        # regenerating with a more specific prompt can only make the result
+        # more on-topic or leave it equally generic, never introduce a new
+        # kind of error). Skipped for the deliberately-generic safety
+        # fallback (see `is_safety_fallback`'s own comment above).
+        relevance_findings: list[dict] = []
+        if not is_safety_fallback:
+            brief = "\n".join(
+                part for part in (
+                    str(block.content.get("purpose") or ""),
+                    str(block.content.get("prompt") or ""),
+                    str(block.content.get("caption") or ""),
+                ) if part
+            )[:MAX_PROMPT_CHARS]
+            relevance = await self._verify_image_relevance(data, brief=brief, course_title=course_title)
+            # `relevance.errored` is checked explicitly, alongside on_topic/
+            # genuinely_educational - a vision-call exception leaves BOTH of
+            # those at their safe default (True), so without this check an
+            # errored (never actually verified) attempt would silently fall
+            # straight through as if it had genuinely passed (production
+            # risk follow-up: the same ERROR-vs-PASS conflation fixed for
+            # the text-legibility checks above).
+            if relevance.errored or not (relevance.on_topic and relevance.genuinely_educational):
+                log.info(
+                    "Image relevance check failed for %s (on_topic=%s, genuinely_educational=%s, "
+                    "errored=%s) - retrying once with the brief re-emphasised",
+                    block.id, relevance.on_topic, relevance.genuinely_educational, relevance.errored,
+                )
+                retry_prompt = (
+                    f"{prompt}\n\nIMPORTANT: the previous attempt did not clearly depict the actual "
+                    f"subject. This image MUST specifically, unmistakably depict: {brief or course_title}. "
+                    "Do not produce a generic or decorative image unrelated to this exact subject."
+                )
+                try:
+                    retried_data = await self.ai.image(
+                        prompt=retry_prompt, size=image_size or self.settings.image_size, provider=provider
+                    )
+                    retried_relevance = await self._verify_image_relevance(
+                        retried_data, brief=brief, course_title=course_title
+                    )
+                    if (
+                        not retried_relevance.errored
+                        and retried_relevance.on_topic
+                        and retried_relevance.genuinely_educational
+                    ):
+                        data, relevance, prompt = retried_data, retried_relevance, retry_prompt
+                except Exception as exc:  # noqa: BLE001 - keep the first image, don't fail the block
+                    log.warning("Image relevance retry failed for %s: %s", block.id, exc)
+                if relevance.errored or not (relevance.on_topic and relevance.genuinely_educational):
+                    log.warning(
+                        "Image for %s still failed relevance check after retry - will be omitted "
+                        "rather than published, not silently accepted as correct", block.id,
+                    )
+                    issues: list[tuple[str, str, bool]] = []
+                    if relevance.errored:
+                        issues.append((
+                            "image_relevance_check_error",
+                            "The image relevance check could not be completed (vision call failed) "
+                            "after every bounded attempt - never treated as a confirmed pass.",
+                            False,
+                        ))
+                    if not relevance.on_topic:
+                        issues.append(("off_topic_image", relevance.on_topic_detail or "Image does not depict the requested topic.", False))
+                    if not relevance.genuinely_educational:
+                        issues.append(("decorative_not_educational", relevance.educational_detail or "Image reads as decorative, not educational.", False))
+                    relevance_findings = visual_qa_finding_entries(issues, resolution="image_relevance_unverified")
         if (block.content.get("illustration_style") or "").strip().lower() == "section_intro":
             data = self._resize_section_intro(data)
+        # Mathematical/scientific correctness of a depicted governing
+        # equation - deterministic, AST-based, never an OCR read or the
+        # generating model's own self-certification (see formula_qa's own
+        # docstring on why). `formula_expression` is blank for every
+        # illustration that isn't a formula block (the overwhelming
+        # majority), so this is a no-op then - `formula_verified` stays
+        # `None`, never a false claim of having checked something that
+        # wasn't there to check. Computed BEFORE the publication-eligibility
+        # decision below (moved up from its previous position, after the now-
+        # conditional `save_asset`) so both branches below can record it.
+        formula_expression = str(block.content.get("formula_expression") or "").strip()
+        formula_verified: bool | None = None
+        formula_findings: list[dict] = []
+        if formula_expression:
+            formula_result = evaluate_formula(formula_expression)
+            formula_verified = formula_result.verifiable and formula_result.passed
+            if not formula_result.passed:
+                log.warning(
+                    "Formula verification failed for %s (%s) - flagged, not silently shipped as correct",
+                    block.id, [issue.reason for issue in formula_result.issues],
+                )
+                formula_findings = visual_qa_finding_entries(
+                    [(issue.reason, issue.detail, True) for issue in formula_result.issues],
+                    resolution="formula_verification_failed",
+                )
+        # merge_content is a shallow merge - `visual_qa_findings` would
+        # otherwise be REPLACED wholesale, silently erasing a finding
+        # app.services.diagram_service just persisted on this exact block a
+        # moment earlier (a real, confirmed risk: a failed diagram falls
+        # back to THIS SAME illustration call with its "fell_back_to_
+        # illustration" finding already sitting in block.content). Keep
+        # every existing entry except a STALE formula/relevance one from an
+        # earlier attempt on this same block (never double-stack across
+        # re-renders), then add this attempt's own findings, if any.
+        _stale_resolutions = {"formula_verification_failed", "image_relevance_unverified"}
+        existing_findings = [
+            entry for entry in (block.content.get("visual_qa_findings") or [])
+            if isinstance(entry, dict) and entry.get("resolution") not in _stale_resolutions
+        ]
+        # Fail-closed publication gate (production risk follow-up): a
+        # CONFIRMED raster defect - required/attempted text that still reads
+        # wrong after EVERY bounded attempt (`text_verified is False`, never
+        # `None` - "nothing was promised" never reaches here), or an image
+        # confirmed off-topic/non-educational after its own bounded retry
+        # (`relevance_findings` non-empty) - must never be persisted as a
+        # successful, publishable asset merely because the provider call
+        # itself returned bytes. Reuses the exact same "not yet generated"
+        # state `document/layout.py.image_generation_failed` and this same
+        # method's own content-safety except-handler already use for a real
+        # generation failure (`path=None`, `generated=False`) - deliberately
+        # `error=None` here (NOT a technical failure, and must NOT trip
+        # quality_framework's separate, always-"blocker" `image_generation_
+        # failed` finding; the real reason is already recorded, at its own
+        # already-established severity, via `text_verified`/
+        # `visual_qa_findings` below - unchanged by this branch). Formula
+        # correctness is deliberately NOT included here - see formula_qa's
+        # own module docstring on why a wrong equation is never silently
+        # "fixed" or withdrawn, only ever flagged; this is a materially
+        # different defect class (bad raster text/relevance has no
+        # "could silently replace correct content with a NEW wrong one"
+        # risk the way an auto-corrected formula would).
+        confirmed_text_failure = text_verified is False
+        confirmed_relevance_failure = bool(relevance_findings)
+        if confirmed_text_failure or confirmed_relevance_failure:
+            # Every real attempt at the actual brief failed its own QA - but
+            # a blank "Image not generated yet" placeholder is a worse
+            # outcome for every page than a clean, generic, still
+            # chapter-themed illustration, so this is never the end of the
+            # road: one final attempt drops exactly what broke the last few
+            # tries - any specific labels (the source of every confirmed
+            # text failure above) and any claim of depicting the precise
+            # brief (the source of every confirmed relevance failure) -
+            # reusing the same generic/abstract/policy-safe prompt builder
+            # the content-safety path already trusts enough to ship
+            # unverified (see `is_safety_fallback` below). This can only
+            # ever be reached after a genuine, confirmed QA failure, never
+            # in place of a normal successful generation.
+            log.warning(
+                "Image for %s failed confirmed QA after every bounded attempt (text_failed=%s, "
+                "relevance_failed=%s) - trying one generic, label-free fallback before giving up "
+                "on this block entirely", block.id, confirmed_text_failure, confirmed_relevance_failure,
+            )
+            fallback_prompt = self._safety_fallback_prompt(
+                course_title=course_title,
+                chapter_title=chapter_title,
+                section_title=section_title,
+                key_concept=key_concept,
+                expected_labels=None,
+            )
+            try:
+                data = await self.ai.image(
+                    prompt=fallback_prompt, size=self.settings.image_size, provider=provider
+                )
+            except Exception as exc:  # noqa: BLE001 - genuinely nothing left to try
+                log.warning(
+                    "Generic last-resort fallback also failed for %s: %s - omitting the image "
+                    "rather than publishing a known-bad visual; the course's text content is "
+                    "unaffected", block.id, exc,
+                )
+                block.content = merge_content(
+                    block.type,
+                    block.content,
+                    {
+                        "path": None,
+                        "asset_id": None,
+                        "generated": False,
+                        "error": None,
+                        # Narrow, explicit state (layout-defect follow-up) -
+                        # see ImageContent.omitted_after_qa_failure's own
+                        # docstring. This is what lets app.course.document.
+                        # layout.image_generation_failed tell this apart from
+                        # "simply not generated yet" and give it the same
+                        # compact placeholder a technical failure gets,
+                        # WITHOUT setting `error` (which would incorrectly
+                        # trip quality_framework's separate, always-"blocker"
+                        # `image_generation_failed` finding - unchanged by
+                        # this field, which that function never reads).
+                        "omitted_after_qa_failure": True,
+                        "prompt": prompt,
+                        "width": None,
+                        "height": None,
+                        "text_verified": text_verified,
+                        "formula_verified": formula_verified,
+                        "visual_qa_findings": existing_findings + formula_findings + relevance_findings,
+                        "generation_mode": "mock" if self.ai.is_mock else "real",
+                    },
+                )
+                return False
+            prompt = fallback_prompt
+            text_verified = None
+            # The ORIGINAL image's relevance findings described a picture
+            # that is no longer what's being shipped - keeping them would
+            # misreport a defect on an image nobody will ever see. The
+            # generic fallback is deliberately NOT topic-specific (same
+            # reasoning `is_safety_fallback` already uses to skip this same
+            # check above), so it never makes sense to re-run the relevance
+            # check against it either.
+            relevance_findings = visual_qa_finding_entries(
+                [(
+                    "generic_fallback_used",
+                    "Every attempt at the actual brief failed quality checks (garbled text or "
+                    "off-topic/decorative) - a clean, generic, chapter-themed illustration was "
+                    "published instead so this page is never left without an image.",
+                    False,
+                )],
+                resolution="generic_fallback_published",
+            )
         relative = self.storage.save_asset(course_id, data, extension=self._detect_extension(data))
         width, height = self._dimensions(data)
         block.content = merge_content(
@@ -885,10 +1332,17 @@ class ImageService:
                 "asset_id": relative.rsplit("/", 1)[-1],
                 "generated": True,
                 "error": None,
+                # A genuinely successful ship - any earlier QA-omission flag
+                # from a previous, now-superseded render of this same block
+                # must not linger and wrongly shrink THIS valid image's
+                # reserved layout space.
+                "omitted_after_qa_failure": False,
                 "prompt": prompt,
                 "width": width,
                 "height": height,
                 "text_verified": text_verified,
+                "formula_verified": formula_verified,
+                "visual_qa_findings": existing_findings + formula_findings + relevance_findings,
                 "generation_mode": "mock" if self.ai.is_mock else "real",
             },
         )

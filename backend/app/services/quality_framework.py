@@ -416,6 +416,47 @@ def visual_findings(document: CourseDocument) -> list[QualityFinding]:
     return findings
 
 
+# Which subsystem actually produces each `visual_qa_findings` entry type -
+# `source` must be derived from this, never guessed from `resolution` alone
+# (a real, confirmed case: `resolution == "rendered_with_unresolved_issues"`
+# used to mean "this came from concept_visual_service's concept_qa layer",
+# until app.services.diagram_service's own flow_chart-connectivity check
+# started using that exact same resolution string too - two genuinely
+# different checks legitimately sharing one resolution value). Checked
+# before the resolution-based legacy fallback below, which still covers
+# every entry type neither of these new checks ever produces (concept_qa's
+# own reason codes, and diagram_render_qa's pre-existing geometry kinds).
+_CONNECTIVITY_FINDING_TYPES = frozenset({"flow_chart_connectivity"})
+# "structurally_garbled_text"/"misspelled_or_garbled_text" (diagram_content_qa,
+# release-readiness audit follow-up) are deliberately NOT named "garbled_text"
+# - that exact string is concept_qa's own pre-existing reason code (via
+# diagram_qa's shared `_looks_garbled` helper), persisted under a DIFFERENT
+# resolution ("rendered_with_unresolved_issues"). Reusing the same string here
+# (persisted under "fell_back_to_illustration") would be exactly the
+# ambiguous-type case this dispatch exists to avoid, per the comment above.
+_CONTENT_QA_FINDING_TYPES = frozenset(
+    {"off_topic", "generic_content", "missing_key_concept", "structurally_garbled_text", "misspelled_or_garbled_text"}
+)
+_FORMULA_QA_FINDING_TYPES = frozenset({"malformed_expression", "formula_mismatch"})
+_IMAGE_RELEVANCE_FINDING_TYPES = frozenset({"off_topic_image", "decorative_not_educational"})
+
+
+def _visual_qa_source(entry_type: str, resolution: str) -> str:
+    if entry_type in _CONNECTIVITY_FINDING_TYPES:
+        return "diagram_service"
+    if entry_type in _CONTENT_QA_FINDING_TYPES:
+        return "diagram_content_qa"
+    if entry_type in _FORMULA_QA_FINDING_TYPES:
+        return "formula_qa"
+    if entry_type in _IMAGE_RELEVANCE_FINDING_TYPES:
+        return "image_relevance_qa"
+    # Legacy inference, unchanged for every entry type this already covered
+    # correctly: diagram_render_qa's geometry kinds ("fell_back_to_
+    # illustration") and concept_qa's own reason codes ("rendered_with_
+    # unresolved_issues").
+    return "diagram_qa" if resolution == "fell_back_to_illustration" else "concept_qa"
+
+
 def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFinding]:
     findings: list[QualityFinding] = []
     error = content.get("error")
@@ -464,12 +505,64 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
             continue
         resolution = str(entry.get("resolution") or "")
         # "Fell back to illustration" means a SAFE replacement already
-        # shipped (see diagram_service.py) - informational, not a
-        # current defect. "Rendered with unresolved issues" means the
-        # flawed structure shipped anyway (concept_visual_service.py has
-        # no fallback) - a real, visible quality problem.
-        severity = "major" if resolution == "rendered_with_unresolved_issues" else "minor"
-        source = "diagram_qa" if resolution == "fell_back_to_illustration" else "concept_qa"
+        # shipped (diagram_render_qa's geometry checks, diagram_content_qa's
+        # content-relevance check - both in diagram_service.py) -
+        # informational, not a current defect. "Rendered with unresolved
+        # issues" means a STRUCTURAL/layout flaw shipped anyway - either
+        # concept_visual_service.py (which has no fallback at all) or
+        # diagram_service.py's flow_chart-connectivity check specifically
+        # (which deliberately renders anyway even on failure - the
+        # renderer's own edge guarantees make that safe, see
+        # _flow_chart_connectivity_issues' own docstring) - real and visible,
+        # but a presentation imperfection (a flowchart with an extra dead
+        # end), never a claim that the shown INFORMATION is wrong - "major"
+        # (a human-reviewable warning), not a hard approval gate.
+        #
+        # "Formula verification failed" (app.services.formula_qa, via
+        # ImageService) splits into two severities by its own `type`, NOT
+        # a single resolution-wide "blocker" - release-readiness audit
+        # correction: `formula_mismatch` means the expression DID parse as
+        # valid algebra AND its symbol set exactly matched a known
+        # reference AND it is provably the wrong equation - a genuine,
+        # high-confidence factual-correctness defect, "blocker". But
+        # `malformed_expression` fires for TWO different things formula_qa
+        # cannot tell apart: genuinely broken input (stray operators, plain
+        # prose), AND a legitimate equation in a notation this module's
+        # narrow algebraic grammar was never built to parse (a chemical
+        # reaction equation, a derivative/integral, probability notation -
+        # see formula_qa's own docstring on scope). Confirmed via direct
+        # testing: "2 H2 + O2 -> 2 H2O" (a textbook-correct chemical
+        # equation) reports `malformed_expression` exactly like genuine
+        # prose does - asserting "blocker" there would FALSELY tell a
+        # reviewer a correct chemistry formula is defective, purely
+        # because this tool doesn't understand chemistry notation. Since
+        # formula_qa cannot distinguish the two cases, treating
+        # `malformed_expression` as a confident, approval-blocking claim
+        # is the actual over-claim the "do not claim an unchecked formula
+        # is correct - or confidently wrong - without real evidence"
+        # principle rules out: it stays "major" (prominently flagged, not
+        # silently "minor" - still real and visible), never an automatic
+        # approval block based on a classification this module admits it
+        # cannot make reliably.
+        #
+        # "Image relevance unverified" stays "major" too: it is an LLM
+        # judgment call (deterministic=False, set below), and per this
+        # module's own established contract (see `text_verified is False`'s
+        # identical reasoning above, and concept_qa's Layer 2), an
+        # unverified AI opinion - however severe it claims to be - must
+        # never autonomously block a human reviewer's course; it still
+        # needs to be visibly flagged for them, which "major" (not
+        # silently "minor") already ensures.
+        entry_type = str(entry.get("type") or "")
+        if resolution == "formula_verification_failed" and entry_type == "formula_mismatch":
+            severity = "blocker"
+        elif resolution in (
+            "rendered_with_unresolved_issues", "image_relevance_unverified", "formula_verification_failed",
+        ):
+            severity = "major"
+        else:
+            severity = "minor"
+        source = _visual_qa_source(entry_type, resolution)
         # Provenance (quality-governance follow-up, Phase 3.7): `deterministic`
         # is explicit metadata set at issue-construction time (see
         # DiagramQAIssue.deterministic / visual_qa_finding_entries) - never

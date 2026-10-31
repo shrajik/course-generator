@@ -31,6 +31,7 @@ from app.schemas.blocks import merge_content
 from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
+from app.services.diagram_content_qa import evaluate_content
 from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
 from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
@@ -86,7 +87,7 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   rejects a `schematic` answer unconditionally and falls back to that
   illustration path anyway - so treat this prompt's remaining kinds
   (concept_map, hierarchy, comparison, flow_chart/process/cycle,
-  data_flow_diagram, er_diagram, swimlane, smart_art) as the complete list;
+  data_flow_diagram, er_diagram, swimlane, smart_art, graph) as the complete list;
   none of them is "physical shape and arrangement," and that's fine - this
   call was reached in error for that brief.
 - The brief describes a strict parent/child breakdown (an org chart, a
@@ -130,6 +131,27 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   each step is itself part of what the brief needs to teach.
 - Anything else - a short list of steps, pillars, principles or ideas with
   no real relationships between them -> smart_art. Leave `edges` empty.
+- The brief is specifically about a mathematical function, a quantitative
+  trend, or a comparison of real numeric values across categories -> graph.
+  This kind does NOT use `nodes`/`edges` at all - leave both empty. Set
+  `graph_type` to exactly one of:
+  * `"function"` - plot one or more curves. Each entry in `functions` is a
+    Python-style expression of `x` (e.g. `"x**2"`, `"sin(x)"`, `"2*x + 1"`)
+    with a short `label` (e.g. "y = x^2"); set `x_min`/`x_max` to a sensible
+    domain for the concept.
+  * `"bar"` or `"line"` - set `categories` (the x-axis groups, e.g. a list
+    of approaches, time periods or options) and one or more `series`, each
+    a `label` and exactly one numeric value per category, in the same order
+    as `categories`. Use `"bar"` to compare discrete categories, `"line"`
+    for a trend over an ordered sequence (time, steps).
+  Always set `x_label`/`y_label` to what each axis actually represents.
+  Base every function/value only on the brief - a genuine illustrative or
+  pedagogical example (e.g. "plot y = x^2 to show a parabola", "three
+  example speed/risk scores to illustrate a tradeoff") is fine; a fabricated
+  real-world statistic, measurement or dataset presented as fact is not -
+  when the brief gives no real numbers and none would be honestly
+  illustrative, choose a different kind instead (or `image_kind:
+  illustration`, decided by the writer before this call).
 
 For `flow_chart`/`process` specifically: if the sequence has a genuine
 bounded start and end (a bounded procedure, not an ongoing pipeline), add
@@ -513,6 +535,12 @@ class DiagramService:
         # fix the spec, so a persistent issue is logged and rendered
         # anyway rather than discarded for the unreliable raster fallback.
         connectivity_issues = _flow_chart_connectivity_issues(spec)
+        # Carries over into the final, successful save below (see its own
+        # merge_content call) ONLY if the retry fails to resolve them -
+        # starts at whatever the first attempt found; replaced with [] the
+        # moment a clean `reconnected` spec is accepted, so a since-resolved
+        # problem is never persisted as if it still shipped.
+        unresolved_connectivity_issues = connectivity_issues
         if connectivity_issues:
             log.info(
                 "Diagram for %s has connectivity problems (%s) - retrying with targeted feedback",
@@ -533,6 +561,7 @@ class DiagramService:
                 reconnected = self._normalise(reconnected)
                 if reconnected.normalised_kind() == "flow_chart" and not _flow_chart_connectivity_issues(reconnected):
                     spec = reconnected
+                    unresolved_connectivity_issues = []
                 else:
                     log.warning(
                         "Diagram for %s still has connectivity problems after retry (%s) - rendering anyway; "
@@ -548,6 +577,59 @@ class DiagramService:
                 block.id, spec.normalised_kind(), len(spec.nodes), len(spec.edges),
             )
             return False
+
+        # Structural usability (right number of labelled nodes/edges) says
+        # nothing about whether the content is actually ABOUT the brief -
+        # the gap behind "a flowchart with boxes but no meaningful
+        # information". One bounded content-relevance retry, same shape as
+        # every other QA step here; unlike the connectivity check above,
+        # there's no renderer-level safety net for wrong CONTENT, so a
+        # persistent failure falls back to the raster illustration path
+        # rather than shipping it, same as a persistent render-QA failure.
+        brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
+        content_result = await evaluate_content(spec, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings)
+        if not content_result.passed:
+            log.info(
+                "Diagram content QA failed for %s (%s) - retrying with targeted feedback",
+                block.id, [issue.reason for issue in content_result.issues],
+            )
+            try:
+                retried = await self._request_spec(
+                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
+                    memory=memory_text, kind_hint=spec.normalised_kind(), pin_kind=True, block_id=block.id,
+                    qa_feedback=(
+                        "The previous attempt's content was rejected for these reasons: "
+                        + "; ".join(issue.detail for issue in content_result.issues)
+                        + ". Make every label specific and genuinely about this exact brief - "
+                        "never a generic placeholder - and cover every concept the brief named."
+                    ),
+                )
+                retried = self._normalise(retried)
+                if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
+                    retried_result = await evaluate_content(
+                        retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
+                    )
+                    if retried_result.passed or len(retried_result.issues) < len(content_result.issues):
+                        spec, content_result = retried, retried_result
+            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
+                log.warning("Diagram content-QA retry failed for %s: %s", block.id, exc)
+
+            if not content_result.passed:
+                log.info(
+                    "Diagram for %s still has content issues after retry - falling back to illustration",
+                    block.id,
+                )
+                block.content = merge_content(
+                    block.type,
+                    block.content,
+                    {
+                        "visual_qa_findings": visual_qa_finding_entries(
+                            [(issue.reason, issue.detail, issue.deterministic) for issue in content_result.issues],
+                            resolution="fell_back_to_illustration",
+                        )
+                    },
+                )
+                return False
 
         if spec.normalised_kind() == "schematic":
             spec = await self._resolve_and_check_schematic(
@@ -580,7 +662,18 @@ class DiagramService:
         # assumes. Running it on schematic produced real false positives
         # (confirmed: several passing electric-motor/pulley tests started
         # failing) rather than catching anything real.
-        issues = [] if spec.normalised_kind() == "schematic" else validate_rendered_svg(svg_bytes, kind=spec.normalised_kind())
+        #
+        # Graph is exempt too: this check's overlap/clipping/"shared edge
+        # segment" heuristics are built around discrete node boxes and the
+        # arrows connecting them - a plotted axis/curve/bar has none of
+        # those, and a confirmed real case showed it flagging a plotted
+        # function's own curve as a "shared edge segment" with the x-axis
+        # line, falling the graph back to an unreliable raster illustration
+        # for no real defect. Graph gets its own geometry discipline
+        # instead (real auto-computed axis ranges, nice_ticks spacing) - see
+        # app.render.diagram_renderer._layout_graph.
+        _exempt_kinds = ("schematic", "graph")
+        issues = [] if spec.normalised_kind() in _exempt_kinds else validate_rendered_svg(svg_bytes, kind=spec.normalised_kind())
         if issues:
             log.info(
                 "Rendered diagram QA failed for %s (%s) - retrying with targeted feedback",
@@ -648,6 +741,23 @@ class DiagramService:
                 "error": None,
                 "width": width,
                 "height": height,
+                # Quality-governance follow-up: previously this state (retry
+                # exhausted, shipping anyway) was visible only in the log
+                # warning above - a real reviewer or the quality report had
+                # no way to see it. Set explicitly on every successful save
+                # (including the clean "[]" case), same reasoning as
+                # concept_visual_service.py's identical comment: a re-render
+                # that resolves the problem must never leave a STALE finding
+                # from an earlier, worse attempt (merge_content is a shallow
+                # merge - an omitted key here would silently keep whatever
+                # was already on the block). Same resolution string as that
+                # module's own "rendered anyway, unresolved" case;
+                # `deterministic=True` because `_flow_chart_connectivity_
+                # issues` is pure in/out-degree counting, no AI judgment call.
+                "visual_qa_findings": visual_qa_finding_entries(
+                    [("flow_chart_connectivity", detail, True) for detail in unresolved_connectivity_issues],
+                    resolution="rendered_with_unresolved_issues",
+                ) if unresolved_connectivity_issues else [],
             },
         )
         log.info(

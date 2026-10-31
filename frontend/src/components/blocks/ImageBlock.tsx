@@ -37,7 +37,20 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
         <div
           className={
             isFlexibleHeightHtml
-              ? "flex items-center justify-center"
+              ? // A concept_experience/toc fragment's own width is computed
+                // server-side from its content (entity/satellite count - see
+                // app/render/concept_experience_renderer.py), never from the
+                // viewport, so it can legitimately be wider than a narrow
+                // screen's own column - confirmed via a real Chromium
+                // measurement (see tests/test_concept_visuals.py's
+                // TestConceptMapRealBrowserGeometry narrow-viewport test:
+                // a dense concept map renders ~612px wide regardless of a
+                // 375px viewport). `overflow-x-auto` turns that into a
+                // horizontal scroll on narrow screens instead of an
+                // unbounded bleed past this block's own column - a minimal,
+                // backward-compatible fix (a desktop-width container that
+                // already fits never shows a scrollbar).
+                "flex items-center justify-center overflow-x-auto"
               : "flex items-center justify-center overflow-hidden"
           }
           // imageBoxHeight caps at a fixed picture-sized box - fine for a

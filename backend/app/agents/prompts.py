@@ -139,6 +139,37 @@ def source_grounding_guidance(course_input: CourseInput) -> str:
     )
 
 
+def _brief_details_brief(course_input: CourseInput) -> str:
+    """Content Studio Phase 1 - the brief's own task list / business goal /
+    performance gap. "" when none of the three is set, so a course that
+    never used this feature gets a byte-identical prompt to before it
+    existed - same contract as every other optional brief in this module."""
+    has_tasks = bool(course_input.tasks)
+    has_goal = bool(course_input.business_goal.strip())
+    has_gap = bool(course_input.performance_gap.strip())
+    if not (has_tasks or has_goal or has_gap):
+        return ""
+    lines = ["BRIEF DETAILS:"]
+    if has_tasks:
+        lines.append(
+            "Tasks the learner must be able to do after this course (each is at least one "
+            "learning objective):"
+        )
+        lines.append(_bullets(course_input.tasks))
+    if has_goal:
+        lines.append(f"Business/performance goal: {course_input.business_goal.strip()}")
+    if has_gap:
+        lines.append(f"Performance gap: {course_input.performance_gap.strip()}")
+    else:
+        lines.append(
+            "Performance gap: not stated by the creator - draft a short, plausible gap "
+            "statement from the brief and tasks above for the Analysis summary, and say "
+            "plainly that it is drafted/inferred, never presented as a fact the creator "
+            "confirmed."
+        )
+    return "\n".join(lines)
+
+
 def _design_brief(course_input: CourseInput) -> str:
     """Rules for the selected instructional-design models ("" when none is)."""
     return design_model_brief(
@@ -386,7 +417,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(content_level_brief(course_input.content_level))}{_appended(learning_approaches_brief(course_input.learning_approaches))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}"""
+{_appended(learner_brief(course_input.learner_profile))}{_appended(content_level_brief(course_input.content_level))}{_appended(learning_approaches_brief(course_input.learning_approaches))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}{_appended(_brief_details_brief(course_input))}"""
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +559,13 @@ Rules:
 - Use only what is present in the notes. Do not add new facts.
 - Copy source URLs exactly as they appear in the notes. Never guess a URL.
 - Leave a list empty rather than padding it with generic filler.
+- For each reference, fill `author`, `source_type` (e.g. "official
+  documentation", "textbook", "research paper", "university resource",
+  "educational platform") and `relevance` (one short sentence: what a
+  learner gets from this specific resource) ONLY when the notes actually
+  say so - leave any of them blank rather than inferring or guessing. Never
+  invent an author, a publication, or a relevance claim the notes don't
+  support.
 """
 
 
@@ -661,7 +699,14 @@ How to produce blocks:
     formula block with "electromotive force" garbled into "electromotivie
     oforce" because only the diagram's own component labels were listed,
     leaving the formula's own text completely unverified even though it's
-    exactly as checkable.
+    exactly as checkable. Also set `image_formula_expression` to the exact
+    equation in plain ASCII (letters/digits/Greek-as-words only - `*` for
+    multiply, `/` for divide, `^` for exponent, `_` for subscript,
+    parentheses as needed, exactly one `=`; e.g. "F = m * a", never "F=ma"
+    baked only into prose) - a real automated check compares this against
+    known reference formulas for mathematical correctness, something
+    `image_expected_labels` alone (spelling only) can never catch. Leave it
+    blank when the picture has no governing equation at all.
   * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
     the relationships is enough (an abstract system, an organisation, a
     reaction pathway) and there's no real physical arrangement to draw.
@@ -673,12 +718,16 @@ How to produce blocks:
     relationship with axes. That family is rendered from labelled boxes and
     connector lines; it has no notion of an axis or a curve, so forcing a
     graph into it produces boxes labelled "Axes: P (vertical), Q
-    (horizontal)" with crossing lines behind them - never draw one. A
-    coordinate-axis graph is a photographic/artistic scene as far as this
-    renderer is concerned: use `image_kind: illustration` and describe the
-    exact axes, labels, curves and any shift/movement in `image_prompt` so
-    the image model draws the graph directly, the same way it would draw
-    any other picture.
+    (horizontal)" with crossing lines behind them - never draw one. Use
+    `diagram_kind: graph` instead - a real, deterministically-rendered
+    axis/gridline/curve plot (never a raster image for this: an image model
+    routinely garbles axis numbers and tick labels, which a graph is
+    entirely made of). Set `image_prompt` to describe the function or
+    comparison in plain language (e.g. "plot y = x^2 for -10 to 10" or
+    "compare approach speed and risk across three options") - the diagram
+    service turns that into the real plotted function/data, not this call.
+    A bar/line chart of real categorical values also belongs here, same
+    `diagram_kind: graph` - never as an illustration either.
   * A chronological/historical timeline (a sequence of dated events, eras or
     milestones - a country's history, a technology's evolution, a person's
     life) is a SEQUENCE, not a relationship - use `diagram_kind: flow_chart`

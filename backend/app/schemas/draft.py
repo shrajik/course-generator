@@ -100,6 +100,10 @@ class DraftBlock(BaseModel):
     # See ImageContent.expected_labels. Only meaningful when
     # illustration_style == "textbook".
     image_expected_labels: list[str] = Field(default_factory=list)
+    # See ImageContent.formula_expression. Only meaningful when the block
+    # depicts one key governing equation - see WRITER_SYSTEM's instruction to
+    # set this alongside image_expected_labels.
+    image_formula_expression: str = ""
 
 
 class BlockReplacement(BaseModel):

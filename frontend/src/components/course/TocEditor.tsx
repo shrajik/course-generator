@@ -2,13 +2,13 @@
 
 import { useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Loader2, Plus, Sparkles } from "lucide-react";
+import { ArrowLeft, ArrowRight, Plus, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { ChapterItem, type DragState } from "./ChapterItem";
 import { ImproveTocDialog } from "./ImproveTocDialog";
 import { TocSummary } from "./TocSummary";
-import { approveOutline, createCourse, improveToc } from "@/lib/api/courses";
+import { improveToc } from "@/lib/api/courses";
 import { ApiError } from "@/lib/api/client";
 import { useCourseDraft } from "@/lib/state/course-draft";
 import type { ImproveTocResponse, TocItem } from "@/lib/types/course";
@@ -33,9 +33,6 @@ export function TocEditor() {
   const [suggestion, setSuggestion] = useState<ImproveTocResponse | null>(null);
   const [improving, setImproving] = useState(false);
   const [improveError, setImproveError] = useState<string | null>(null);
-
-  const [generating, setGenerating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const toc = draft.toc;
   const estimate = useMemo(() => estimateFromToc(toc), [toc]);
@@ -154,50 +151,16 @@ export function TocEditor() {
     setSuggestion(null);
   };
 
-  // --- Generate ------------------------------------------------------------
+  // --- Continue to Review & Generate ---------------------------------------
   /**
-   * The course is created here, with the TOC the user actually approved, and the
-   * generation screen kicks off the backend pipeline.
+   * The course itself isn't created yet - that happens on the Review &
+   * Generate screen, once the person has had a chance to see a recap of
+   * everything they've set up. `draft` is already persisted to
+   * sessionStorage, so the next screen picks it up as-is.
    */
-  const handleGenerate = async () => {
-    if (generating || toc.length === 0) return;
-    setGenerating(true);
-    setError(null);
-    try {
-      const record = await createCourse(
-        {
-          course_title: draft.courseTitle.trim(),
-          toc,
-          target_audience: draft.targetAudience.trim(),
-          dos: draft.dos.filter((item) => item.trim()),
-          donts: draft.donts.filter((item) => item.trim()),
-          template: draft.template,
-          language: "en",
-          tone: "",
-          learner_profile: draft.learnerProfile,
-          style_guide: draft.styleGuide,
-          source_ids: draft.sourceIds ?? [],
-          design_models:
-            draft.designModels && draft.designModels.models.length > 0 ? draft.designModels : null,
-          // Only an uploaded template sets this; the built-in pair is
-          // resolved from `template` server-side exactly as before.
-          template_id_override: draft.selectedTemplate?.templateId ?? null,
-          content_level: draft.contentLevel,
-          learning_approaches: draft.learningApproaches,
-        },
-        { runPlanner: false },
-      );
-      // Clicking "Generate Course" on this screen is the person signing off the
-      // outline (Gate 1); the server refuses to generate until it is recorded.
-      await approveOutline(record.course_id);
-      update({ courseId: record.course_id, documentId: record.document_id });
-      router.push(`/generate/${record.course_id}`);
-    } catch (caught) {
-      setError(
-        caught instanceof ApiError ? caught.message : "The course could not be created.",
-      );
-      setGenerating(false);
-    }
+  const handleContinue = () => {
+    if (toc.length === 0) return;
+    router.push("/review-generate");
   };
 
   if (!hydrated) return null;
@@ -269,29 +232,14 @@ export function TocEditor() {
             </div>
           )}
 
-          {error ? (
-            <p className="mt-4 rounded-[10px] border border-red-200 bg-red-50 px-3 py-2.5 text-[12.5px] text-red-800">
-              {error}
-            </p>
-          ) : null}
-
           <div className="mt-6 flex items-center justify-between">
             <Button variant="outline" onClick={() => router.push("/")}>
               <ArrowLeft size={14} />
               Back
             </Button>
-            <Button onClick={handleGenerate} disabled={generating || toc.length === 0}>
-              {generating ? (
-                <>
-                  <Loader2 size={14} className="animate-spin" />
-                  Starting…
-                </>
-              ) : (
-                <>
-                  <Sparkles size={14} />
-                  Generate Course
-                </>
-              )}
+            <Button onClick={handleContinue} disabled={toc.length === 0}>
+              <ArrowRight size={14} />
+              Next: Review
             </Button>
           </div>
         </div>

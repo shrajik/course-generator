@@ -7,9 +7,11 @@ import pytest
 from app.course.document.layout import (
     MAX_DIAGRAM_IMAGE_HEIGHT,
     MAX_IMAGE_HEIGHT,
+    MISSING_IMAGE_BOX_HEIGHT,
     estimate_height,
     flow_blocks,
     image_box_height,
+    image_generation_failed,
     page_visual_fraction,
     split_block,
     text_height,
@@ -466,6 +468,41 @@ def test_a_failed_image_does_not_leave_a_blank_box_between_blocks():
     pages = flow_blocks([_paragraph(10), _image(error="x"), _paragraph(10)])
     blocks = pages[0]
     assert blocks[2].layout.y - (blocks[1].layout.y + blocks[1].layout.height) < 30
+
+
+def test_a_qa_omitted_image_reserves_only_a_strip():
+    """Layout-defect follow-up: a CONFIRMED QA failure (text/relevance),
+    omitted by ImageService rather than published, must get the same
+    compact placeholder a technical failure gets - not the full image-sized
+    box reserved for "simply not generated yet". Real, confirmed defect
+    this guards against: before `omitted_after_qa_failure` existed, this
+    case measured ~382pt (same as a normal image) instead of ~36-44pt."""
+    omitted = estimate_height(_image(error=None, generated=False, omitted_after_qa_failure=True))
+    pending = estimate_height(_image())
+    done = estimate_height(_image(path="a.png", width=1024, height=1024))
+    assert omitted < 80 < pending < done
+
+
+def test_a_qa_omitted_image_does_not_leave_a_blank_box_between_blocks():
+    pages = flow_blocks([_paragraph(10), _image(error=None, omitted_after_qa_failure=True), _paragraph(10)])
+    blocks = pages[0]
+    assert blocks[2].layout.y - (blocks[1].layout.y + blocks[1].layout.height) < 30
+
+
+def test_image_generation_failed_is_true_for_a_qa_omission_not_just_a_technical_failure():
+    technical_failure = _image(error="Azure 429", generated=False)
+    qa_omission = _image(error=None, generated=False, omitted_after_qa_failure=True)
+    pending = _image()  # neither error nor omitted_after_qa_failure set
+    successful = _image(path="a.png", width=1024, height=1024)
+    assert image_generation_failed(technical_failure) is True
+    assert image_generation_failed(qa_omission) is True
+    assert image_generation_failed(pending) is False
+    assert image_generation_failed(successful) is False
+
+
+def test_image_box_height_gives_the_qa_omitted_strip_not_a_full_box():
+    qa_omission = _image(error=None, generated=False, omitted_after_qa_failure=True)
+    assert image_box_height(qa_omission) == MISSING_IMAGE_BOX_HEIGHT
 
 
 def test_a_section_intro_picture_with_no_paragraph_beside_it_stays_small():

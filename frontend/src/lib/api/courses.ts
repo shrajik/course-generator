@@ -6,6 +6,7 @@ import type {
   CourseBlueprint,
   CourseDetail,
   CourseInput,
+  CoursePhase,
   CourseRecord,
   CourseReview,
   ImproveTocRequest,
@@ -51,6 +52,13 @@ export function createCourse(
 /** Gate 1: sign off the outline. Generation is refused until this is done. */
 export function approveOutline(courseId: string): Promise<CourseRecord> {
   return request<CourseRecord>(`/api/courses/${courseId}/approve-outline`, { method: "POST" });
+}
+
+/** Content Studio Phase 3/5 - approve one ADDIE phase. */
+export function approvePhase(courseId: string, phase: CoursePhase): Promise<CourseRecord> {
+  return request<CourseRecord>(`/api/courses/${courseId}/phases/${phase}/approve`, {
+    method: "POST",
+  });
 }
 
 export function listCourses(): Promise<CourseListResponse> {

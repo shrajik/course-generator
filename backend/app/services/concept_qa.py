@@ -10,9 +10,11 @@ C:\\Users\\Dell\\.claude\\plans\\linear-wobbling-puppy.md for the full design):
    (see `_representation_plausible` - never blindly trusts the planner's
    representation choice), instance-value distinctness, a single-line
    `technical_signature`, non-empty `learning_objectives`/`core_message`/
-   `validation_criteria`, label length caps, and the "default state is
-   already complete" check that structurally guarantees no-click-required
-   rendering. `representation`-aware throughout: every check names which of
+   `validation_criteria`, label/description length caps, corrupted-text
+   detection (see `_looks_garbled`, reused from `diagram_qa`), and the
+   "default state is already complete" check that structurally guarantees
+   no-click-required rendering. `representation`-aware throughout: every
+   check names which of
    the 11 REPRESENTATION_TYPES families it applies to, never hardcoded to
    Java or any other single subject.
 2. Semantic QA (one GPT-5-mini structured call, only runs once layer 1
@@ -33,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import Settings, get_settings
 from app.schemas.diagram import DiagramSpec, VisualEntity
-from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult
+from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult, GARBLED_TEXT, _looks_garbled
 from app.services.openai_service import AIClient, get_ai_client
 
 # --- structural (layer 1) failure reasons -----------------------------------
@@ -64,6 +66,15 @@ _LABEL_LENGTH_CAP = 40  # characters - "short, a few words", not a sentence
 # literal "key : value" text dumped into a plain card.
 _PROPERTY_KEY_LENGTH_CAP = 30
 _PROPERTY_VALUE_LENGTH_CAP = 60
+# `VisualStep.description`/`VisualState.description` are deliberately allowed
+# to run a full sentence longer than a label (the renderer's own
+# `estimate_pixel_size` auto-scales a visual down to fit exactly this case -
+# see test_height_is_capped_even_for_many_steps_with_long_descriptions, which
+# treats a ~113-character sentence as "the kind a real chapter would actually
+# write"), so this cap sits well above that already-accepted length and only
+# catches a description that has grown into multiple sentences / near-
+# paragraph length, not an ordinary one-sentence caption.
+_DESCRIPTION_LENGTH_CAP = 220
 # Representations where a learner comparing concrete instances is central to
 # the whole point - the only ones instance-count/variation checks apply to.
 _INSTANCE_DRIVEN_REPRESENTATIONS = ("object", "comparison", "data_structure", "before_after")
@@ -183,6 +194,38 @@ def _structural_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
             "short fact (\"color: Red\"), never a full description. If this content doesn't "
             "reduce to short facts, it likely isn't a fit for this representation at all - "
             "reconsider the entity/property breakdown or the representation choice.",
+        ))
+
+    long_descriptions = [
+        s.description for s in spec.steps if len(s.description) > _DESCRIPTION_LENGTH_CAP
+    ] + [
+        st.description for st in spec.concept_states if len(st.description) > _DESCRIPTION_LENGTH_CAP
+    ]
+    if long_descriptions:
+        issues.append(DiagramQAIssue(
+            TOO_DENSE,
+            f"Some step/state descriptions are too long (over {_DESCRIPTION_LENGTH_CAP} "
+            f"characters, e.g. '{long_descriptions[0][:60]}...') - a description is a short "
+            "caption, not a multi-sentence passage; move longer explanation into the "
+            "surrounding course text instead.",
+        ))
+
+    garbled_texts = sorted({
+        value for e in spec.entities
+        for value in (e.label, *e.properties.keys(), *(str(v) for v in e.properties.values()))
+        if value and _looks_garbled(value)
+    } | {
+        value for s in spec.steps for value in (s.label, s.description) if value and _looks_garbled(value)
+    } | {
+        value for st in spec.concept_states for value in (st.label, st.description)
+        if value and _looks_garbled(value)
+    })
+    if garbled_texts:
+        issues.append(DiagramQAIssue(
+            GARBLED_TEXT,
+            "These contain corrupted, garbled text rather than real words: "
+            f"{', '.join(repr(g) for g in garbled_texts[:3])}. Rewrite them as plain, "
+            "correctly spelled English text.",
         ))
 
     return issues

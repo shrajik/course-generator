@@ -8,6 +8,7 @@ from xml.sax.saxutils import escape
 
 import pytest
 
+import app.services.mock_ai as mock_ai_module
 from app.agents.writer import WriterAgent
 from app.core.errors import AIServiceError
 from app.course.templates.registry import load_template
@@ -29,6 +30,8 @@ from app.schemas.diagram import (
     DiagramEdge,
     DiagramNode,
     DiagramSpec,
+    GraphFunction,
+    GraphSeries,
     SchematicRelationship,
     SchematicShape,
     SchematicState,
@@ -40,6 +43,7 @@ from app.services.diagram_qa import (
     CANVAS_CLIPPING,
     DANGLING_RELATIONSHIP,
     DUPLICATE_CRITICAL_COMPONENT,
+    GARBLED_TEXT,
     INVALID_COLOR_ROLE,
     INVALID_RELATIONSHIP,
     MISSING_PRIMARY_OBJECT,
@@ -47,6 +51,7 @@ from app.services.diagram_qa import (
     MISSING_REQUIRED_COMPONENT,
     OBJECT_COLLISION,
     WEAK_FOCAL_HIERARCHY,
+    _looks_garbled,
     evaluate_blueprint,
     evaluate_schematic,
 )
@@ -563,6 +568,383 @@ async def test_diagram_service_retries_once_on_disconnected_ends_then_renders_an
     assert ok is True  # still rendered - real edges are guaranteed regardless
     assert len(calls) == 2  # exactly one retry, never unbounded
     assert "outgoing edge" in calls[1]
+    # Quality-governance follow-up: this "retry exhausted, shipped anyway"
+    # state must be visible to the quality report, not only this test's own
+    # log-capture - a real, confirmed gap this closes (previously only a
+    # log.warning, no persisted finding at all).
+    findings = block.content.get("visual_qa_findings")
+    assert findings and findings[0]["type"] == "flow_chart_connectivity"
+    assert findings[0]["resolution"] == "rendered_with_unresolved_issues"
+    assert findings[0]["deterministic"] is True
+
+
+async def test_a_resolved_connectivity_retry_leaves_no_finding_behind(service, monkeypatch):
+    """The mirror case: when the retry DOES produce a clean spec, nothing
+    should be persisted - and a re-render of a block that previously carried
+    a connectivity finding must not leave a STALE one behind now that it's
+    fixed (merge_content is a shallow merge, so this must be set explicitly
+    to [], never just omitted)."""
+    template = load_template("technical")
+    block = _diagram_block(diagram_kind="flow_chart")
+    block.content["visual_qa_findings"] = [
+        {"type": "flow_chart_connectivity", "detail": "stale from an earlier attempt",
+         "resolution": "rendered_with_unresolved_issues", "deterministic": True}
+    ]
+
+    def _disconnected_spec() -> DiagramSpec:
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[
+                DiagramNode(id="start", label="Start"),
+                DiagramNode(id="decide", label="Route"),
+                DiagramNode(id="close", label="Close"),
+                DiagramNode(id="escalate", label="Escalate"),
+            ],
+            edges=[
+                DiagramEdge(source="start", target="decide"),
+                DiagramEdge(source="decide", target="close", label="A"),
+                DiagramEdge(source="decide", target="escalate", label="B"),
+            ],
+        )
+
+    def _reconnected_spec() -> DiagramSpec:
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[
+                DiagramNode(id="start", label="Start"),
+                DiagramNode(id="decide", label="Route"),
+                DiagramNode(id="close", label="Close"),
+                DiagramNode(id="escalate", label="Escalate"),
+                DiagramNode(id="end", label="End"),
+            ],
+            edges=[
+                DiagramEdge(source="start", target="decide"),
+                DiagramEdge(source="decide", target="close", label="A"),
+                DiagramEdge(source="decide", target="escalate", label="B"),
+                DiagramEdge(source="close", target="end"),
+                DiagramEdge(source="escalate", target="end"),
+            ],
+        )
+
+    calls = {"n": 0}
+
+    async def fake_request_spec(self, **kwargs):
+        calls["n"] += 1
+        return _disconnected_spec() if calls["n"] == 1 else _reconnected_spec()
+
+    monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_resolved_connectivity", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert block.content.get("visual_qa_findings") == []
+
+
+# ---------------------------------------------------------------------------
+# diagram_content_qa: semantic/content-relevance (the "meaningless flowchart" gap)
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluate_content_is_a_noop_for_schematic_and_concept_experience():
+    """Each already has its own dedicated semantic check elsewhere - never a
+    silent double-charge of two LLM calls for the same spec."""
+    from app.services.diagram_content_qa import evaluate_content
+
+    assert (await evaluate_content(
+        DiagramSpec(kind="schematic"), brief="anything", course_title="Course"
+    )).passed
+    assert (await evaluate_content(
+        DiagramSpec(kind="concept_experience"), brief="anything", course_title="Course"
+    )).passed
+
+
+async def test_evaluate_content_is_a_noop_with_a_blank_brief():
+    """Nothing to grade the content against - never fabricate a judgement."""
+    from app.services.diagram_content_qa import evaluate_content
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    assert (await evaluate_content(spec, brief="   ", course_title="Course")).passed
+
+
+async def test_evaluate_content_catches_off_topic_and_generic_labels(monkeypatch):
+    from app.services.diagram_content_qa import GENERIC_CONTENT, OFF_TOPIC, evaluate_content
+
+    def failing_critique(user: str) -> dict:
+        return {
+            "on_topic": False, "on_topic_detail": "labels describe an unrelated topic",
+            "specific_enough": False, "specific_detail": "every label is a generic placeholder",
+            "missing_concepts": [],
+        }
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", failing_critique)
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="Step 1"), DiagramNode(id="b", label="Step 2")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    result = await evaluate_content(spec, brief="Explain the water cycle", course_title="Course")
+
+    assert not result.passed
+    reasons = {issue.reason for issue in result.issues}
+    assert reasons == {OFF_TOPIC, GENERIC_CONTENT}
+    assert all(issue.deterministic is False for issue in result.issues)  # an LLM judgment, never a proven fact
+
+
+async def test_evaluate_content_reports_missing_key_concepts(monkeypatch):
+    from app.services.diagram_content_qa import MISSING_KEY_CONCEPT, evaluate_content
+
+    def failing_critique(user: str) -> dict:
+        return {
+            "on_topic": True, "specific_enough": True,
+            "missing_concepts": ["condensation", "precipitation"],
+        }
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", failing_critique)
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="Evaporation"), DiagramNode(id="b", label="Collection")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    result = await evaluate_content(spec, brief="Explain the water cycle", course_title="Course")
+
+    assert not result.passed
+    assert result.issues[0].reason == MISSING_KEY_CONCEPT
+    assert "condensation" in result.issues[0].detail and "precipitation" in result.issues[0].detail
+
+
+async def test_evaluate_content_catches_structurally_garbled_labels_without_an_llm_call(monkeypatch):
+    """Layer 0 (release-readiness audit follow-up): a node label mixing Latin
+    with Cyrillic/Greek homoglyphs is caught by the same deterministic,
+    free `_looks_garbled` check `concept_qa`/`evaluate_schematic` already
+    use - BEFORE any LLM call is made. Monkeypatching ContentCritique to
+    raise proves the short-circuit: if the LLM path were reached, this test
+    would fail with that exception instead of the assertion below."""
+    from app.services.diagram_content_qa import STRUCTURALLY_GARBLED_TEXT, evaluate_content
+
+    def must_not_be_called(user: str) -> dict:
+        raise AssertionError("evaluate_content must short-circuit before any LLM call")
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", must_not_be_called)
+
+    # "Тriggered" - the T is Cyrillic У+0422, every other letter is Latin;
+    # visually near-identical to "Triggered", exactly the homoglyph-swap
+    # class _looks_garbled exists to catch.
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="Тriggered probe"), DiagramNode(id="b", label="Done")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+
+    result = await evaluate_content(spec, brief="Explain the probe workflow", course_title="Course")
+
+    assert not result.passed
+    assert result.issues[0].reason == STRUCTURALLY_GARBLED_TEXT
+    assert result.issues[0].deterministic is True
+
+
+async def test_evaluate_content_catches_misspelled_and_scrambled_labels_via_the_llm_critique(monkeypatch):
+    """Layer 1 (release-readiness audit follow-up): the real, confirmed
+    defect class from a live production preview - plain-Latin misspellings
+    ("Triggerted" for "Triggered", "Ambigeous" for "Ambiguous") and fully
+    scrambled sentences, neither of which _looks_garbled can detect (no
+    homoglyphs involved) - caught via the existing ContentCritique call's
+    new `text_legible` judgment, not a new API call."""
+    from app.services.diagram_content_qa import MISSPELLED_OR_GARBLED_TEXT, evaluate_content
+
+    def illegible_critique(user: str) -> dict:
+        return {
+            "on_topic": True, "specific_enough": True, "missing_concepts": [],
+            "text_legible": False,
+            "text_legible_detail": "'Triggerted probe' and 'Ambigeous or missing signal' are misspelled.",
+        }
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", illegible_critique)
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[
+            DiagramNode(id="a", label="Triggerted probe (often a sanitizer)"),
+            DiagramNode(id="b", label="Ambigeous or missing signal"),
+        ],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    result = await evaluate_content(spec, brief="Explain the triage workflow", course_title="Course")
+
+    assert not result.passed
+    assert result.issues[0].reason == MISSPELLED_OR_GARBLED_TEXT
+    assert "Triggerted" in result.issues[0].detail
+    assert result.issues[0].deterministic is False  # an LLM judgment, never a proven fact
+
+
+async def test_evaluate_content_does_not_false_flag_correctly_spelled_labels_as_illegible(monkeypatch):
+    """A real short/technical label (an abbreviation, a symbol-heavy term)
+    must not be mistaken for garbled text - valid content is never
+    unnecessarily rejected."""
+    from app.services.diagram_content_qa import evaluate_content
+
+    def clean_critique(user: str) -> dict:
+        return {"on_topic": True, "specific_enough": True, "missing_concepts": [], "text_legible": True}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", clean_critique)
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="Read crash log"), DiagramNode(id="b", label="Triggered probe")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    result = await evaluate_content(spec, brief="Explain the triage workflow", course_title="Course")
+
+    assert result.passed
+
+
+async def test_diagram_content_qa_retries_once_then_succeeds(service, monkeypatch):
+    """Full production path: a content-QA failure triggers exactly one
+    retry with targeted feedback; a spec that passes on the retry ships
+    normally, with no stale finding left behind."""
+    template = load_template("technical")
+    block = _diagram_block()
+    calls = {"n": 0}
+
+    def sometimes_failing_critique(user: str) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"on_topic": False, "on_topic_detail": "off topic", "specific_enough": True, "missing_concepts": []}
+        return {"on_topic": True, "specific_enough": True, "missing_concepts": []}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", sometimes_failing_critique)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_content_qa_retry", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert calls["n"] == 2  # exactly one retry, never unbounded
+    assert block.content.get("path", "").endswith(".svg")
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_diagram_garbled_text_retries_once_with_the_specific_bad_labels_fed_back(service, monkeypatch):
+    """Follow-up to the two Layer-0/Layer-1 unit tests above: this is the
+    REAL production path (diagram_service.py's retry loop, not evaluate_content
+    called directly) - proves retry feedback for the new reason code actually
+    reaches the next generation attempt, the same contract already proven for
+    off_topic/generic_content."""
+    template = load_template("technical")
+    block = _diagram_block()
+    calls = {"n": 0}
+    feedback_seen: list[str] = []
+
+    def sometimes_illegible_critique(user: str) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "on_topic": True, "specific_enough": True, "missing_concepts": [],
+                "text_legible": False, "text_legible_detail": "'Triggerted' is misspelled",
+            }
+        return {"on_topic": True, "specific_enough": True, "missing_concepts": [], "text_legible": True}
+
+    original_request_spec = service.images.diagrams._request_spec
+
+    async def spying_request_spec(*args, **kwargs):
+        if kwargs.get("qa_feedback"):
+            feedback_seen.append(kwargs["qa_feedback"])
+        return await original_request_spec(*args, **kwargs)
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", sometimes_illegible_critique)
+    monkeypatch.setattr(service.images.diagrams, "_request_spec", spying_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_garbled_text_retry", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert calls["n"] == 2  # exactly one retry, never unbounded
+    assert block.content.get("path", "").endswith(".svg")
+    assert block.content.get("visual_qa_findings") == []  # resolved - no stale finding left behind
+    assert feedback_seen and "Triggerted" in feedback_seen[0]
+
+
+async def test_diagram_garbled_text_falls_back_to_a_verified_text_free_illustration(service, monkeypatch):
+    """The full production path (release-readiness audit follow-up, Priority
+    1/2): a diagram whose labels are confirmed misspelled/garbled, after an
+    exhausted retry, falls back to the raster illustration path - and that
+    fallback is NOT trusted on faith. It goes through the pre-existing
+    `force_text_free`/`_generate_text_free_illustration` machinery, which
+    genuinely re-verifies (via a real, if mocked, vision call) whether any
+    text survived. Overriding ImageTextCheck to report leftover text here
+    (rather than relying on the default empty mock) proves that check is
+    actually invoked for this new reason code too, not silently skipped. A
+    confirmed `text_verified=False` on this raster fallback is never shipped
+    AS a verified image, but a further, deliberately generic/label-free
+    illustration still publishes rather than leaving the page blank - the
+    diagram's own finding about its labels still coexists with that final
+    generic-fallback finding, never silently erased."""
+    template = load_template("technical")
+    block = _diagram_block()
+
+    def always_illegible_critique(user: str) -> dict:
+        return {
+            "on_topic": True, "specific_enough": True, "missing_concepts": [],
+            "text_legible": False, "text_legible_detail": "'Ambigeous' is misspelled",
+        }
+
+    def leftover_text_found(user: str) -> dict:
+        return {"detected_text": ["Ambigeous"]}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", always_illegible_critique)
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ImageTextCheck", leftover_text_found)
+
+    ok = await service.images.generate_for_block(
+        course_id="course_garbled_text_fallback", block=block, template=template, course_title="Test Course"
+    )
+
+    # The fallback illustration's OWN labelled/text-free attempts are both
+    # confirmed wrong - but a further, generic/label-free attempt ships
+    # rather than leaving the page with no image at all.
+    assert ok is True
+    assert block.content.get("generated") is True
+    assert block.content.get("path", "").endswith(".png")
+    assert block.content.get("error") is None  # a confirmed QA failure, not a technical/provider failure
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["type"] == "misspelled_or_garbled_text" for f in findings)
+    assert any(f["resolution"] == "fell_back_to_illustration" for f in findings)
+    assert any(f["type"] == "generic_fallback_used" for f in findings)
+    # The FINAL published image makes no claim about any text at all -
+    # text_verified resets to None, not a false "verified correct".
+    assert block.content.get("text_verified") is None
+
+
+async def test_diagram_content_qa_falls_back_to_illustration_after_exhausted_retry(service, monkeypatch):
+    """Unlike the connectivity check, there is no renderer-level safety net
+    for wrong CONTENT - a persistent failure must fall back to the raster
+    illustration path, same as a persistent render-QA failure, and the real
+    reasons must be persisted (not just logged)."""
+    template = load_template("technical")
+    block = _diagram_block()
+
+    def always_failing_critique(user: str) -> dict:
+        return {"on_topic": False, "on_topic_detail": "still off topic", "specific_enough": True, "missing_concepts": []}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", always_failing_critique)
+
+    ok = await service.images.generate_for_block(
+        course_id="course_content_qa_fallback", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True  # the raster illustration fallback still succeeds
+    assert block.content.get("path", "").endswith(".png")
+    findings = block.content.get("visual_qa_findings")
+    assert findings and findings[0]["type"] == "off_topic"
+    assert findings[0]["resolution"] == "fell_back_to_illustration"
+    assert findings[0]["deterministic"] is False
 
 
 def test_flow_chart_a_deep_branch_still_gets_real_branch_geometry_not_a_fallback():
@@ -2128,6 +2510,65 @@ class TestBlueprintValidation:
         result = evaluate_blueprint(DiagramSpec(kind="schematic", shapes=shapes))
         assert INVALID_COLOR_ROLE in {i.reason for i in result.issues}
 
+    def test_garbled_label_text_is_detected(self):
+        """Reproduces a real, reported bug: an annotation's text arrived
+        mojibake-corrupted - Latin letters swapped for similar-looking
+        Cyrillic/Greek glyphs mid-word ("confirm" -> "Conɪoтй") - and shipped
+        straight into a rendered diagram with nothing catching it."""
+        shapes = [
+            SchematicShape(type="block", id="a", label="Build system", role="primary"),
+            SchematicShape(
+                type="label", id="note", label="Check _cplumlous macro tr Conɪoтй ηµoge konges mode",
+            ),
+        ]
+        result = evaluate_blueprint(DiagramSpec(kind="schematic", shapes=shapes))
+        assert GARBLED_TEXT in {i.reason for i in result.issues}
+
+    def test_clean_label_text_is_not_flagged_as_garbled(self):
+        shapes = [
+            SchematicShape(type="block", id="a", label="Build system", role="primary"),
+            SchematicShape(
+                type="label", id="note", label="Check the __cplusplus macro to confirm language mode",
+            ),
+        ]
+        result = evaluate_blueprint(DiagramSpec(kind="schematic", shapes=shapes))
+        assert GARBLED_TEXT not in {i.reason for i in result.issues}
+
+    def test_legitimate_scientific_symbols_are_not_flagged_as_garbled(self):
+        """Real Greek-letter unit prefixes/symbols (µ, Ω, π, ...) mixed with
+        Latin unit letters are common and legitimate - this check must only
+        flag an implausible mid-word Latin/Cyrillic-or-Greek letter mixture,
+        never a short, ordinary scientific symbol."""
+        shapes = [SchematicShape(
+            type="label", id="note", label="Resistance measured in Ω, capacitance in µF",
+        )]
+        result = evaluate_blueprint(DiagramSpec(kind="schematic", shapes=shapes))
+        assert GARBLED_TEXT not in {i.reason for i in result.issues}
+
+
+class TestLooksGarbled:
+    """Unit tests for `_looks_garbled` directly - the shared detector reused
+    by both diagram_qa.py (schematic) and concept_qa.py (concept_experience)."""
+
+    def test_detects_the_real_reported_corruption(self):
+        assert _looks_garbled("Check _cplumlous macro tr Conɪoтй ηµoge konges mode")
+
+    def test_does_not_flag_the_clean_equivalent_sentence(self):
+        assert not _looks_garbled("Check the __cplusplus macro to confirm language mode")
+
+    def test_detects_the_unicode_replacement_character(self):
+        assert _looks_garbled("Corrupted�text")
+
+    def test_does_not_flag_long_ordinary_english_words(self):
+        assert not _looks_garbled("antiferromagnetic coupling strength")
+
+    def test_does_not_flag_short_scientific_symbols_mixed_with_latin(self):
+        assert not _looks_garbled("5 μm diameter, 10 μF capacitor, 2 Ω resistance")
+
+    def test_does_not_flag_empty_or_blank_text(self):
+        assert not _looks_garbled("")
+        assert not _looks_garbled("   ")
+
     def test_unknown_visual_type_skips_blueprint_checks_but_still_validates_universals(self):
         """An unrecognised visual_type must never fail generation - but a
         genuinely invalid relationship/color role is still caught, since
@@ -2838,3 +3279,124 @@ def test_flow_chart_rendered_font_size_attributes_match_the_source_constants():
     text = svg_bytes.decode("utf-8")
     assert f'font-size="{LABEL_SIZE:.1f}"' in text
     assert f'font-size="{EDGE_LABEL_FONT_SIZE:.1f}"' in text
+
+
+# ---------------------------------------------------------------------------
+# graph/chart (kind == "graph") - native, deterministic function plots and
+# categorical bar/line charts; see app.render.graph_math for the underlying
+# safe-eval/tick math and its own dedicated test file.
+# ---------------------------------------------------------------------------
+
+
+def test_graph_is_usable_requires_a_parseable_function_with_a_real_domain():
+    assert not DiagramSpec(kind="graph", graph_type="function").is_usable()
+    assert not DiagramSpec(
+        kind="graph", graph_type="function", functions=[GraphFunction(expression="")]
+    ).is_usable()
+    assert not DiagramSpec(
+        kind="graph", graph_type="function", functions=[GraphFunction(expression="not valid ((( python")]
+    ).is_usable()
+    assert DiagramSpec(
+        kind="graph", graph_type="function", functions=[GraphFunction(expression="x**2")]
+    ).is_usable()
+    # x_min/x_max default to -10/10 when unset - a rendering default, not a
+    # hard requirement the writer must always supply.
+    assert DiagramSpec(
+        kind="graph", graph_type="function",
+        functions=[GraphFunction(expression="x")], x_min=5, x_max=5,
+    ).is_usable() is False
+
+
+def test_graph_is_usable_requires_matching_series_and_category_lengths():
+    assert not DiagramSpec(kind="graph", graph_type="bar").is_usable()
+    assert not DiagramSpec(
+        kind="graph", graph_type="bar", categories=["A", "B"], series=[GraphSeries(label="s", values=[1])]
+    ).is_usable()
+    assert DiagramSpec(
+        kind="graph", graph_type="bar", categories=["A", "B"], series=[GraphSeries(label="s", values=[1, 2])]
+    ).is_usable()
+    assert DiagramSpec(
+        kind="graph", graph_type="line", categories=["A", "B"], series=[GraphSeries(label="s", values=[1, 2])]
+    ).is_usable()
+
+
+def test_graph_is_usable_rejects_an_unknown_graph_type():
+    assert not DiagramSpec(
+        kind="graph", graph_type="scatter", categories=["A"], series=[GraphSeries(label="s", values=[1])]
+    ).is_usable()
+
+
+@pytest.mark.parametrize("graph_type", ["function", "bar", "line"])
+def test_render_graph_svg_is_well_formed(graph_type):
+    if graph_type == "function":
+        spec = DiagramSpec(
+            kind="graph", title="A parabola", graph_type="function", x_label="x", y_label="y",
+            functions=[GraphFunction(expression="x**2", label="y = x^2")],
+        )
+    else:
+        spec = DiagramSpec(
+            kind="graph", title="Comparison", graph_type=graph_type, x_label="Option", y_label="Score",
+            categories=["A", "B", "C"],
+            series=[GraphSeries(label="Speed", values=[7, 3, 5]), GraphSeries(label="Risk", values=[2, 9, 5])],
+        )
+    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)  # raises if malformed
+    assert root.tag.endswith("svg")
+    assert width > 0 and height > 0
+    text = svg_bytes.decode("utf-8")
+    assert spec.x_label in text and spec.y_label in text
+
+
+def test_render_graph_svg_plots_the_real_function_values_not_a_placeholder():
+    """The rendered path must trace the function's own real output, not a
+    generic placeholder shape - spot-check two known points of y = x."""
+    spec = DiagramSpec(
+        kind="graph", title="Identity", graph_type="function", x_label="x", y_label="y",
+        x_min=0, x_max=10, functions=[GraphFunction(expression="x", label="y = x")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    # A straight diagonal line's path has monotonically increasing x and y
+    # pixel coordinates together (never a flat or inverted line) - extract
+    # the <path> element's d attribute and confirm its first/last points
+    # move in the same direction on both axes.
+    match = re.search(r'<path d="([^"]+)" fill="none" stroke="#2563eb"', text)
+    assert match, "expected a plotted path in the rendered SVG"
+    coords = re.findall(r"[ML]([\d.]+),([\d.]+)", match.group(1))
+    assert len(coords) > 10
+    first_x, first_y = map(float, coords[0])
+    last_x, last_y = map(float, coords[-1])
+    assert last_x > first_x  # x increases left to right
+    assert last_y < first_y  # SVG y is inverted - y = x increasing means pixel-y decreases
+
+
+def test_render_graph_svg_bar_chart_bar_heights_reflect_real_values():
+    """A taller real value must render as a visually taller bar."""
+    spec = DiagramSpec(
+        kind="graph", title="t", graph_type="bar", x_label="x", y_label="y",
+        categories=["Low", "High"], series=[GraphSeries(label="s", values=[1, 99])],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    # Bar rects (not the 14x14 legend swatch, which shares the same fill
+    # colour) are the ones whose width is the computed bar width, not "14".
+    heights = [
+        float(h)
+        for w, h in re.findall(r'<rect x="[\d.]+" y="[\d.]+" width="([\d.]+)" height="([\d.]+)" fill="#2563eb"', text)
+        if w != "14"
+    ]
+    assert len(heights) == 2
+    assert heights[1] > heights[0] * 5  # the 99-value bar is dramatically taller than the 1-value bar
+
+
+def test_render_graph_svg_never_evaluates_an_unsafe_expression():
+    """is_usable() rejects an unparseable expression before rendering, but
+    confirm the renderer itself never raises or executes anything unsafe
+    even if a spec slips through with a hostile expression (e.g. built by
+    hand, bypassing is_usable())."""
+    spec = DiagramSpec(
+        kind="graph", title="t", graph_type="function", x_label="x", y_label="y",
+        functions=[GraphFunction(expression="__import__('os').system('echo pwned')", label="bad")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())  # must not raise
+    ET.fromstring(svg_bytes)  # still well-formed, even with zero plotted points

@@ -194,14 +194,21 @@ MISSING_IMAGE_BOX_HEIGHT = 36.0
 
 
 def image_generation_failed(block: Block) -> bool:
-    """An image with no file because generating it failed. (An image that has
-    simply not been generated yet has no `error`, and keeps its full slot.)"""
+    """An image with no file for a REASON worth showing the compact
+    "Visual unavailable" placeholder for - either a genuine technical/
+    provider failure (`error` is set), or a confirmed QA rejection
+    (`omitted_after_qa_failure` is set - see ImageContent's own docstring on
+    that field; production risk follow-up, a real, confirmed defect: before
+    this field existed, a QA-omitted image fell through to the "simply not
+    generated yet" case below and reserved a full ~382pt image-sized blank
+    region instead of this 36pt strip). An image that has simply not been
+    generated yet has NEITHER of those set, and keeps its full slot."""
     content = block.content
     return (
         block.type is BlockType.IMAGE
         and content.get("kind") != "toc"
         and not content.get("path")
-        and bool(content.get("error"))
+        and bool(content.get("error") or content.get("omitted_after_qa_failure"))
     )
 
 

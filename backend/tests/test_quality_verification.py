@@ -353,6 +353,213 @@ def test_visual_qa_findings_without_a_deterministic_flag_default_to_unverified()
     assert findings[0].verifier is None
 
 
+def test_a_flow_chart_connectivity_finding_is_attributed_to_diagram_service_not_concept_qa():
+    """Real, confirmed mislabeling this fixes: `source` used to be guessed
+    purely from `resolution`, which assumed "rendered_with_unresolved_issues"
+    could only ever come from concept_visual_service's concept_qa layer -
+    until app.services.diagram_service's own flow_chart-connectivity-
+    exhausted-retry path started persisting a finding at that exact same
+    resolution too. Its `type` ("flow_chart_connectivity") must route to
+    its real producer, never the wrong subsystem."""
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "flow_chart_connectivity",
+                        "detail": "2 different nodes have no outgoing edge",
+                        "resolution": "rendered_with_unresolved_issues",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "diagram_service"
+    assert findings[0].verifier == "diagram_service:flow_chart_connectivity"
+    assert findings[0].verification_status == "independently_verified"
+    assert findings[0].severity == "major"  # "rendered_with_unresolved_issues" always ships the flaw
+
+
+def test_a_diagram_content_qa_finding_is_attributed_to_diagram_content_qa_not_diagram_render_qa():
+    """The mirror case on the "fell_back_to_illustration" side: that
+    resolution used to mean, unambiguously, a diagram_render_qa geometry
+    finding - now app.services.diagram_content_qa's semantic/content-
+    relevance check ALSO falls back to illustration and persists a finding
+    at that same resolution. Its `type` ("off_topic"/"generic_content"/
+    "missing_key_concept") must route to its real producer, and must stay
+    `unverified` (an LLM judgment call, never independently verified)."""
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "off_topic",
+                        "detail": "labels describe an unrelated topic",
+                        "resolution": "fell_back_to_illustration",
+                        "deterministic": False,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "diagram_content_qa"
+    assert findings[0].verification_status == "unverified"
+    assert findings[0].verifier is None
+    assert findings[0].severity == "minor"  # a safe replacement already shipped
+
+
+def test_a_garbled_diagram_text_finding_is_attributed_to_diagram_content_qa_not_concept_qa():
+    """Release-readiness audit follow-up: diagram_content_qa's own two new
+    reason codes ("structurally_garbled_text" via the deterministic
+    _looks_garbled reuse, "misspelled_or_garbled_text" via the LLM critique)
+    must route to diagram_content_qa - NOT to concept_qa, which already uses
+    the similarly-named "garbled_text" string (deliberately different, see
+    diagram_content_qa.py's own module docstring on why the string had to
+    be distinct rather than reused)."""
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "structurally_garbled_text",
+                        "detail": "'Тriggered probe' mixes Latin and Cyrillic letters",
+                        "resolution": "fell_back_to_illustration",
+                        "deterministic": True,
+                    },
+                    {
+                        "type": "misspelled_or_garbled_text",
+                        "detail": "'Triggerted probe' and 'Ambigeous' are misspelled",
+                        "resolution": "fell_back_to_illustration",
+                        "deterministic": False,
+                    },
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert len(findings) == 2
+    assert all(f.source == "diagram_content_qa" for f in findings)
+    assert findings[0].verification_status == "independently_verified"
+    assert findings[0].verifier == "diagram_content_qa:structurally_garbled_text"
+    assert findings[1].verification_status == "unverified"
+    assert findings[1].verifier is None
+    assert all(f.severity == "minor" for f in findings)  # a safe replacement already shipped
+
+
+def test_a_formula_verification_failure_is_attributed_to_formula_qa_and_is_a_blocker():
+    """app.services.formula_qa's own findings route through the same
+    `visual_qa_findings` mechanism - `source` must name its real producer.
+    Release-readiness audit fix: a confirmed-wrong/malformed EQUATION is a
+    factual-correctness defect (not a layout one, unlike "rendered anyway"),
+    and formula_qa is 100% deterministic - this must be severity="blocker",
+    not "major", or it can never actually block course approval (see
+    QualityReport.hard_failures/approval_blocking_findings, both severity
+    == "blocker" only) - a real, confirmed gap this fixes (see the matching
+    end-to-end test in test_quality_overrides.py proving it actually gates
+    approve_course, not just this report-building function in isolation)."""
+    document = _document(
+        [
+            _image_block(
+                kind="illustration",
+                generated=True,
+                error=None,
+                formula_expression="F = m / a",
+                visual_qa_findings=[
+                    {
+                        "type": "formula_mismatch",
+                        "detail": "uses the same symbols as Newton's second law but divides instead of multiplying",
+                        "resolution": "formula_verification_failed",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "formula_qa"
+    assert findings[0].severity == "blocker"
+    assert findings[0].verification_status == "independently_verified"
+    assert findings[0].verifier == "formula_qa:formula_mismatch"
+
+
+def test_a_malformed_formula_finding_is_major_not_a_blocker():
+    """Release-readiness audit correction: `malformed_expression` must NOT
+    get the same "blocker" treatment as a confirmed `formula_mismatch` -
+    formula_qa cannot tell a genuinely broken formula apart from a
+    legitimate equation in a notation outside its narrow algebraic grammar
+    (confirmed via direct testing: a textbook-correct chemical equation,
+    "2 H2 + O2 -> 2 H2O", reports `malformed_expression` exactly like plain
+    prose does). Asserting "blocker" here would falsely tell a reviewer a
+    possibly-correct chemistry/calculus formula is a confirmed defect,
+    purely because this tool doesn't understand that notation - still
+    real and visible ("major", never silently "minor"), never an
+    automatic approval block based on a classification formula_qa itself
+    admits it cannot make reliably."""
+    document = _document(
+        [
+            _image_block(
+                kind="illustration",
+                generated=True,
+                error=None,
+                formula_expression="2 H2 + O2 -> 2 H2O",
+                visual_qa_findings=[
+                    {
+                        "type": "malformed_expression",
+                        "detail": "must be exactly one equation (one '=' with a non-empty expression on each side)",
+                        "resolution": "formula_verification_failed",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "formula_qa"
+    assert findings[0].severity == "major"  # NOT "blocker" - see this test's own docstring
+    assert findings[0].verification_status == "independently_verified"
+
+
+def test_an_image_relevance_failure_is_attributed_to_image_relevance_qa_and_is_major():
+    """app.services.image_service's own relevance-check findings route
+    through the same `visual_qa_findings` mechanism - `source` must name
+    its real producer, distinct from every other subsystem that already
+    writes to this list."""
+    document = _document(
+        [
+            _image_block(
+                kind="illustration",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "off_topic_image",
+                        "detail": "depicts an unrelated generic office scene",
+                        "resolution": "image_relevance_unverified",
+                        "deterministic": False,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "image_relevance_qa"
+    assert findings[0].severity == "major"
+    assert findings[0].verification_status == "unverified"  # an LLM judgment, never independently verified
+    assert findings[0].verifier is None
+
+
 def test_visual_finding_derivation_failure_is_isolated_to_that_block(monkeypatch):
     def _boom(artifact, content):
         raise RuntimeError("malformed image content")

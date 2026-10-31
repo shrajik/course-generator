@@ -124,6 +124,25 @@ class ImageContent(_Content):
     # ImageService._verify_generated_text). Leave empty for an illustration
     # that isn't meant to have any text in it at all.
     expected_labels: list[str] = Field(default_factory=list)
+    # The exact plain-text governing equation this illustration depicts (see
+    # app.agents.prompts' "FORMULA BLOCK" guidance), e.g. "F = m * a" or
+    # "E = m * c^2" - ASCII operators only (`*`, `/`, `^` for exponent, `_`
+    # for subscript), never LaTeX/Unicode, so app.services.formula_qa can
+    # parse it deterministically. Distinct from `expected_labels` (which
+    # covers each symbol's DEFINITION text, e.g. "F = force") - this is the
+    # equation ITSELF, the one thing nothing in this pipeline previously
+    # checked for mathematical correctness (only the rendered glyphs'
+    # spelling, via `text_verified` above). "" means no formula is depicted
+    # - every existing illustration is unaffected by this field's presence.
+    formula_expression: str = ""
+    # The honest, final word on whether `formula_expression` was confirmed
+    # correct against a known reference - see formula_qa.evaluate_formula's
+    # own docstring for the full contract. `None` means nothing was
+    # checkable (no `formula_expression`, or no reference to check it
+    # against - genuinely different from `False`, which means a check RAN
+    # and found a real mismatch). Never silently treated as "correct" just
+    # because an image was generated.
+    formula_verified: bool | None = None
     # The honest, final word on whether the delivered image's text passed
     # `_verify_generated_text` - `None` means nothing was promised to check
     # (no expected_labels, or a non-illustration kind), `True` means it
@@ -145,6 +164,27 @@ class ImageContent(_Content):
     # description>, "resolution": <what ultimately happened to this block>}.
     # Empty list (not None) when nothing was ever flagged - the common case.
     visual_qa_findings: list[dict] = Field(default_factory=list)
+    # Production risk follow-up (fail-closed publication gate): True only
+    # when `path is None` because ImageService deliberately OMITTED a
+    # CONFIRMED-bad image (text/relevance failed every bounded retry
+    # attempt) - never because nothing has been generated yet (that case
+    # leaves this False, same as before this field existed) and never
+    # because of a genuine technical/provider failure (that case sets
+    # `error` instead - see ImageService's own fail-closed publication gate
+    # docstring for why the two must stay separate: `error` is what
+    # quality_framework's unrelated, always-"blocker" `image_generation_
+    # failed` finding keys off, and a QA omission must never trip that).
+    # Exists solely so app.course.document.layout.image_generation_failed
+    # can give a QA omission the same compact "Visual unavailable"
+    # placeholder a technical failure gets, instead of silently falling
+    # into the "simply not generated yet, reserve its full slot" case - a
+    # real, confirmed defect (a QA-omitted image reserved ~382pt, the same
+    # as a normal image, instead of the intended 36pt strip) this field
+    # exists to fix. ImageService resets this to False on every attempt
+    # that does NOT end in a QA omission (a genuine failure, or a
+    # successful ship), so a stale True from an earlier failed render of
+    # the same block never survives a later, different outcome.
+    omitted_after_qa_failure: bool = False
 
 
 class QuoteContent(_Content):
