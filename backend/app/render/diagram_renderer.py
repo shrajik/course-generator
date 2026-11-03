@@ -9,6 +9,7 @@ diagram always renders crisp labels and never drifts from the brand.
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from xml.sax.saxutils import escape
 
@@ -72,6 +73,32 @@ _FLOW_ROLE_COLORS = {
     "decision": ("#e9d5ff", "#7e22ce"),  # purple
     "process": ("#bfdbfe", "#1d4ed8"),  # blue
 }
+
+_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def _tint(hex_color: str, *, toward_white: float = 0.82) -> str:
+    """A light fill tone for a bold `hex_color` stroke - blends toward white
+    by `toward_white` (0..1), matching the existing palette's own light-fill/
+    dark-stroke convention (e.g. "#bbf7d0" is roughly "#16a34a" blended 85%
+    toward white)."""
+    text = hex_color.lstrip("#")
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    r, g, b = (int(text[i : i + 2], 16) for i in (0, 2, 4))
+    blend = lambda c: round(c + (255 - c) * toward_white)  # noqa: E731
+    return f"#{blend(r):02x}{blend(g):02x}{blend(b):02x}"
+
+
+def _node_colors(node: DiagramNode, role: str) -> tuple[str, str]:
+    """(fill, stroke) for drawing `node` - Edit Visuals (flowchart editor):
+    the node's own `color` override when it's a valid hex, else the role's
+    existing fixed _FLOW_ROLE_COLORS pair, byte-identical to before this
+    override existed."""
+    if _HEX_RE.match(node.color.strip()):
+        stroke = node.color.strip()
+        return (_tint(stroke), stroke)
+    return _FLOW_ROLE_COLORS.get(role, _FLOW_ROLE_COLORS["process"])
 
 # hierarchy: root = purple, its direct children = teal, everything deeper =
 # a plain neutral fill - same fixed, universal-convention colouring as
@@ -490,7 +517,20 @@ def _layout_flow_chart(
 
     def role_of(nid: str) -> str:
         # Decision is structural (2+ outgoing edges is unambiguous - anything
-        # with two paths forward IS a decision, whatever it's labelled).
+        # with two paths forward IS a decision, whatever it's labelled) and
+        # takes priority over any explicit override below: the branch-layout
+        # code that follows assumes a 2-out-edge node is drawn as a decision,
+        # so letting an override turn that off would silently break it.
+        if out_degree.get(nid, 0) >= 2:
+            return "decision"
+        # Edit Visuals (flowchart editor): an explicit per-node `role`
+        # override (set by a person in the editor, e.g. a node literally
+        # labelled "Done" that the auto-detection below wouldn't catch)
+        # takes the next priority, before falling back to the original
+        # structural/label-based auto-detection.
+        override = by_id[nid].role.strip().lower()
+        if override in ("start", "process", "end"):
+            return override
         # Start/end deliberately is NOT structural, unlike an earlier version
         # of this function: a node with no incoming edge isn't necessarily a
         # procedure's "Start" - it's just as often the first of two plain
@@ -499,8 +539,6 @@ def _layout_flow_chart(
         # can only show a short centred label. Matching the label itself
         # (as the reference flowcharts this mirrors always explicitly do)
         # only fires the pill styling when the content actually calls for it.
-        if out_degree.get(nid, 0) >= 2:
-            return "decision"
         label = by_id[nid].label.strip().lower()
         if label in _START_WORDS:
             return "start"
@@ -817,17 +855,17 @@ def _layout_flow_chart(
             elements.append(
                 _draw_diamond(
                     node, cx=x_center, cy=y + dh / 2, width=dw, height=dh, theme=theme,
-                    colors=_FLOW_ROLE_COLORS["decision"], base_size=_DIAMOND_LABEL_SIZE, min_size=_DIAMOND_LABEL_SIZE,
+                    colors=_node_colors(node, "decision"), base_size=_DIAMOND_LABEL_SIZE, min_size=_DIAMOND_LABEL_SIZE,
                 )
             )
             positions[nid] = (x_center, y, y + dh, dw)
             return dh
         if role in ("start", "end"):
-            elements.append(_draw_pill(node, cx=x_center, cy=y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[role]))
+            elements.append(_draw_pill(node, cx=x_center, cy=y + _PILL_H / 2, theme=theme, colors=_node_colors(node, role)))
             positions[nid] = (x_center, y, y + _PILL_H, _PILL_W)
             return _PILL_H
         svg, height = _node_block(
-            node, x=x_center - process_w / 2, y=y, width=process_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"]
+            node, x=x_center - process_w / 2, y=y, width=process_w, theme=theme, colors=_node_colors(node, "process")
         )
         elements.append(svg)
         positions[nid] = (x_center, y, y + height, process_w)
@@ -856,12 +894,12 @@ def _layout_flow_chart(
             visited.add(hop_id)
             if hop_role in ("start", "end"):
                 elements.append(
-                    _draw_pill(hop_node, cx=side_cx, cy=by_y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[hop_role])
+                    _draw_pill(hop_node, cx=side_cx, cy=by_y + _PILL_H / 2, theme=theme, colors=_node_colors(hop_node, hop_role))
                 )
                 hop_h, hop_w = _PILL_H, _PILL_W
             else:
                 svg, hop_h = _node_block(
-                    hop_node, x=side_left_x, y=by_y, width=side_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"]
+                    hop_node, x=side_left_x, y=by_y, width=side_w, theme=theme, colors=_node_colors(hop_node, "process")
                 )
                 elements.append(svg)
                 hop_w = side_w
@@ -1022,12 +1060,12 @@ def _layout_flow_chart(
             col_w = process_w if on_spine else side_w
             if target_role in ("start", "end"):
                 elements.append(
-                    _draw_pill(target, cx=col_cx, cy=branch_y + _PILL_H / 2, theme=theme, colors=_FLOW_ROLE_COLORS[target_role])
+                    _draw_pill(target, cx=col_cx, cy=branch_y + _PILL_H / 2, theme=theme, colors=_node_colors(target, target_role))
                 )
                 target_h, target_w = _PILL_H, _PILL_W
             else:
                 svg, target_h = _node_block(
-                    target, x=col_x, y=branch_y, width=col_w, theme=theme, colors=_FLOW_ROLE_COLORS["process"]
+                    target, x=col_x, y=branch_y, width=col_w, theme=theme, colors=_node_colors(target, "process")
                 )
                 elements.append(svg)
                 target_w = col_w

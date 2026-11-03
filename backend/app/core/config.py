@@ -254,6 +254,13 @@ class Settings(BaseSettings):
     #  planning asks for structure (concept/entities/interactions), not
     #  pixels.
     concept_visual_model: str = "gpt-5-mini"
+    #  Edit Visuals Part 2 - one extra vision call per successfully-generated
+    #  default/textbook illustration, suggesting default overlay-label
+    #  positions (see ImageService._suggest_overlay_labels). Purely additive
+    #  and best-effort: disabling this never blocks or changes the image
+    #  itself, it only means a course ships with no pre-suggested labels
+    #  (a person can still add one by hand in the editor).
+    enable_image_overlay_suggestions: bool = True
     #  AI memory layer (templates/visual knowledge/course samples/generation
     #  history retrieval - see app.services.memory_service). Retrieval always
     #  fails soft regardless of this flag; the flag exists to disable the

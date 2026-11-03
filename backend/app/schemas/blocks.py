@@ -185,6 +185,35 @@ class ImageContent(_Content):
     # successful ship), so a stale True from an earlier failed render of
     # the same block never survives a later, different outcome.
     omitted_after_qa_failure: bool = False
+    # Edit Visuals Part 2 (text-overlay editor) - a separate, client-
+    # rendered layer of positioned labels over a text-free raster
+    # illustration; never baked into the picture itself, never requires
+    # regenerating the image to edit. Empty by default - every existing
+    # block/course is unaffected. Only meaningful for kind == "illustration";
+    # diagram/concept_experience/toc already have their own labelling.
+    overlay_labels: list["OverlayLabel"] = Field(default_factory=list)
+
+
+class OverlayLabel(BaseModel):
+    """One positioned label drawn over a text-free illustration - see
+    ImageContent.overlay_labels. `x_pct`/`y_pct` (0-100) are percentages of
+    the image's own rendered rect, not the (possibly larger, letterboxed)
+    outer block box - both the editor and the exported PDF size an inner
+    wrapper to the image's real contain-fit rect via CSS `aspect-ratio`
+    (see app.render.templates.course.html.j2 and ImageBlock.tsx), so a
+    percentage here always lands on the same picture pixel in both."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = ""
+    text: str = ""
+    x_pct: float = 50.0
+    y_pct: float = 50.0
+    style: str = "label"  # "title" | "callout" | "label"
+    # "" (default) = the style's own default colour; any other value must be
+    # a real "#rgb"/"#rrggbb" hex to take effect (same validate-at-use
+    # convention as DiagramNode.color from the flowchart editor).
+    color: str = ""
 
 
 class QuoteContent(_Content):

@@ -136,6 +136,18 @@ class DiagramNode(BaseModel):
     # node needs one for a sensible layout; a blank lane groups with any
     # other blank-lane nodes into its own column.
     lane: str = ""
+    # Edit Visuals (flowchart editor) - flow_chart/process only. "" (default)
+    # keeps diagram_renderer.role_of()'s existing in/out-degree + label-text
+    # auto-detection exactly as it was before this field existed; one of
+    # "start"/"process"/"decision"/"end" overrides it explicitly, letting a
+    # person re-type a node's role from the editor without renaming it to a
+    # magic word like "Start"/"End".
+    role: str = ""
+    # Optional "#rrggbb"/"#rgb" hex override of the role's default fill/
+    # stroke pair - "" (default, or anything that doesn't parse as a real
+    # hex colour) keeps the existing fixed _FLOW_ROLE_COLORS palette exactly
+    # as it was before this field existed.
+    color: str = ""
 
 
 class DiagramEdge(BaseModel):

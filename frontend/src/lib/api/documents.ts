@@ -4,7 +4,9 @@ import type {
   AiEditResponse,
   ConceptVisualSpec,
   CourseDocument,
+  FlowchartSpec,
   UpdateConceptVisualSpecResponse,
+  VisualSpecPreviewResponse,
 } from "@/lib/types/document";
 
 export function getDocument(documentId: string, signal?: AbortSignal): Promise<CourseDocument> {
@@ -124,6 +126,46 @@ export function updateConceptVisualSpec(
   return request<UpdateConceptVisualSpecResponse>(
     `/api/documents/${documentId}/blocks/${blockId}/visual-spec`,
     { method: "PUT", body: { spec } },
+  );
+}
+
+/** Edit Visuals (flowchart editor) - fix a node/edge/label/color inside a
+ * flow_chart/process/etc. diagram and get back the re-rendered block. No AI
+ * call; same PUT endpoint `updateConceptVisualSpec` already hits, since the
+ * request/response shape was never kind-specific - this is the same call
+ * under the clearer name the flowchart editor uses. */
+export function updateDiagramSpec(
+  documentId: string,
+  blockId: string,
+  spec: FlowchartSpec,
+): Promise<UpdateConceptVisualSpecResponse> {
+  return request<UpdateConceptVisualSpecResponse>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec`,
+    { method: "PUT", body: { spec } },
+  );
+}
+
+/** Renders a draft spec exactly as Save would, without persisting anything -
+ * the live-preview call the flowchart/concept editor makes on every edit
+ * (debounce this client-side). */
+export function previewVisualSpec(
+  documentId: string,
+  blockId: string,
+  spec: FlowchartSpec | ConceptVisualSpec,
+): Promise<VisualSpecPreviewResponse> {
+  return request<VisualSpecPreviewResponse>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec/preview`,
+    { method: "POST", body: { spec } },
+  );
+}
+
+/** For a diagram block generated before spec persistence existed: one AI
+ * call reconstructing a real, editable spec from the block's own stored
+ * brief - never auto-saved, the editor seeds itself from the result. */
+export function reconstructDiagramSpec(documentId: string, blockId: string): Promise<FlowchartSpec> {
+  return request<FlowchartSpec>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec/reconstruct`,
+    { method: "POST" },
   );
 }
 

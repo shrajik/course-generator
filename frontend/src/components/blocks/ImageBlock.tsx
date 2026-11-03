@@ -1,12 +1,92 @@
 "use client";
 
+import { useRef, useState } from "react";
 import { ImageOff } from "lucide-react";
 import { Caption, readText } from "./parts";
 import { assetUrl } from "@/lib/api/documents";
 import { isSectionIntroImage } from "@/lib/editor/pairing";
+import { nextLabelId, pctFromPointer } from "@/lib/editor/overlayLabels";
 import { imageBoxHeight } from "@/lib/editor/style";
 import { isHtmlPath, isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
+import type { OverlayLabel } from "@/lib/types/document";
+import { cn } from "@/lib/utils/cn";
 import type { BlockViewProps } from "./types";
+
+const OVERLAY_STYLE_CLASS: Record<OverlayLabel["style"], string> = {
+  title: "text-[13px] font-bold px-2.5 py-1",
+  callout: "text-[11.5px] font-medium px-2 py-1",
+  label: "text-[11px] font-medium px-1.5 py-0.5",
+};
+
+/** Edit Visuals Part 2 - a text-free illustration's own rendered rect
+ * (contain-fit, via CSS `aspect-ratio` - never computed in JS, see
+ * OverlayLabel's own docstring for why), with the overlay labels drawn
+ * directly on top and, when `editable`, draggable to a new position. The
+ * exported PDF uses the identical CSS, in real Chromium (Playwright) -
+ * see course.html.j2's matching `.figure-frame`. */
+function IllustrationWithOverlay({
+  source,
+  alt,
+  width,
+  height,
+  labels,
+  editable,
+  onLabelsChange,
+}: {
+  source: string;
+  alt: string;
+  width: number;
+  height: number;
+  labels: OverlayLabel[];
+  editable: boolean;
+  onLabelsChange: (next: OverlayLabel[]) => void;
+}) {
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [dragId, setDragId] = useState<string | null>(null);
+
+  const movePointer = (event: React.PointerEvent) => {
+    if (!dragId || !frameRef.current) return;
+    const { x_pct, y_pct } = pctFromPointer(event.clientX, event.clientY, frameRef.current.getBoundingClientRect());
+    onLabelsChange(labels.map((label) => (label.id === dragId ? { ...label, x_pct, y_pct } : label)));
+  };
+
+  return (
+    <div
+      ref={frameRef}
+      className="relative block max-h-full max-w-full"
+      style={{ aspectRatio: `${width} / ${height}` }}
+      onPointerMove={movePointer}
+      onPointerUp={() => setDragId(null)}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={source} alt={alt} className="block h-full w-full" draggable={false} />
+      {labels.map((label) => (
+        <div
+          key={label.id}
+          onPointerDown={(event) => {
+            if (!editable) return;
+            event.stopPropagation();
+            (event.target as HTMLElement).setPointerCapture?.(event.pointerId);
+            setDragId(label.id);
+          }}
+          className={cn(
+            "absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded-full border bg-white/95 shadow-[0_1px_3px_rgba(0,0,0,0.15)]",
+            OVERLAY_STYLE_CLASS[label.style],
+            editable ? "cursor-move select-none" : "pointer-events-none",
+          )}
+          style={{
+            left: `${label.x_pct}%`,
+            top: `${label.y_pct}%`,
+            borderColor: label.color || "#e5e7eb",
+            color: label.color || undefined,
+          }}
+        >
+          {label.text}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 /** Diagrams are generated as SVG with built-in hover/focus tooltips (see
  * backend app/render/diagram_renderer.py) - but that only works once the
@@ -30,6 +110,12 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
   const isFlexibleHeightHtml = _FLEXIBLE_HEIGHT_KINDS.has(kind) && isHtmlPath(path);
   const wantsInline = (kind === "diagram" && isSvgPath(path)) || isFlexibleHeightHtml;
   const inlineMarkup = useInlineDiagramSvg(documentId, path, wantsInline);
+  const intrinsicWidth = typeof block.content.width === "number" ? block.content.width : null;
+  const intrinsicHeight = typeof block.content.height === "number" ? block.content.height : null;
+  const overlayLabels = Array.isArray(block.content.overlay_labels)
+    ? (block.content.overlay_labels as OverlayLabel[])
+    : [];
+  const wantsOverlay = kind === "illustration" && intrinsicWidth && intrinsicHeight;
 
   return (
     <div>
@@ -75,6 +161,16 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
               // fragment (app/render/concept_experience_renderer.py) or toc
               // fragment (app/render/toc_renderer.py), not user-supplied HTML.
               dangerouslySetInnerHTML={{ __html: inlineMarkup }}
+            />
+          ) : wantsOverlay && intrinsicWidth && intrinsicHeight ? (
+            <IllustrationWithOverlay
+              source={source}
+              alt={readText(block.content, "alt")}
+              width={intrinsicWidth}
+              height={intrinsicHeight}
+              labels={overlayLabels}
+              editable={editable}
+              onLabelsChange={(next) => onEdit("overlay_labels", next)}
             />
           ) : (
             // eslint-disable-next-line @next/next/no-img-element

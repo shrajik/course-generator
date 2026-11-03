@@ -741,6 +741,16 @@ class DiagramService:
                 "error": None,
                 "width": width,
                 "height": height,
+                # Edit Visuals (flowchart editor): persist the structured spec
+                # itself, not just the rendered SVG - without this there is
+                # nothing for a later edit to load (see
+                # DocumentService.update_visual_spec/preview_visual_spec,
+                # which read/write this exact key, same as
+                # concept_visual_service.py already does for
+                # concept_experience). A course generated before this field
+                # existed simply has no "spec" key here - see
+                # DocumentService.reconstruct_diagram_spec for that case.
+                "spec": spec.model_dump(mode="json"),
                 # Quality-governance follow-up: previously this state (retry
                 # exhausted, shipping anyway) was visible only in the log
                 # warning above - a real reviewer or the quality report had

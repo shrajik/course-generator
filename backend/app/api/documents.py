@@ -89,7 +89,7 @@ async def ai_edit(
     "/{document_id}/blocks/{block_id}/visual-spec",
     response_model=UpdateConceptVisualSpecResponse,
 )
-async def update_concept_visual_spec(
+async def update_visual_spec(
     document_id: str,
     block_id: str,
     request: UpdateConceptVisualSpecRequest,
@@ -97,17 +97,49 @@ async def update_concept_visual_spec(
     course_service: CourseService = Depends(_course_service),
     current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> UpdateConceptVisualSpecResponse:
-    """Edit the text inside a concept_experience visual (an entity/step
-    label or description) and re-render it deterministically - no AI call,
-    the exported PDF keeps rendering this the same static way it always has.
-    """
+    """Edit a concept_experience OR diagram (flow_chart/process/etc.)
+    visual's own structured spec (a label/color/node-order fix) and
+    re-render it deterministically - no AI call, the exported PDF keeps
+    rendering this the same static way it always has."""
     course_id = await check_document_owner(document_id, current_user, course_service, service)
-    response = await service.update_concept_visual_spec(document_id, block_id, request.spec)
+    response = await service.update_visual_spec(document_id, block_id, request.spec)
     if current_user is not None:
         await course_service.record_activity(
             course_id, str(current_user.id), current_user.email, "updated"
         )
     return response
+
+
+@router.post("/{document_id}/blocks/{block_id}/visual-spec/preview")
+async def preview_visual_spec(
+    document_id: str,
+    block_id: str,
+    request: UpdateConceptVisualSpecRequest,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict:
+    """Render a DRAFT spec exactly as Save would, without persisting
+    anything - the live-preview call a flowchart/concept editor makes on
+    every edit. Returns `{"svg": "..."}` or `{"html": "..."}`."""
+    await check_document_owner(document_id, current_user, course_service, service)
+    return await service.preview_visual_spec(document_id, block_id, request.spec)
+
+
+@router.post("/{document_id}/blocks/{block_id}/visual-spec/reconstruct")
+async def reconstruct_diagram_spec(
+    document_id: str,
+    block_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict:
+    """For a diagram block generated before spec persistence existed: one
+    AI call reconstructing a real, editable spec from the block's own
+    stored brief - never saved automatically, the editor seeds itself from
+    the result and only persists it via a normal Save."""
+    await check_document_owner(document_id, current_user, course_service, service)
+    return await service.reconstruct_diagram_spec(document_id, block_id)
 
 
 @router.post("/{document_id}/regenerate-visuals", response_model=RegenerateVisualsResponse)

@@ -146,7 +146,7 @@ class ConceptVisualService:
                 # just the rendered picture) so the editor can later let a
                 # user fix a label/description and re-render deterministically
                 # without a new AI planning call. See
-                # DocumentService.update_concept_visual_spec.
+                # DocumentService.update_visual_spec.
                 "spec": spec.model_dump(mode="json"),
                 "visual_qa_findings": visual_qa_finding_entries(
                     # Carries each issue's own real provenance (quality-

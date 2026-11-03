@@ -170,6 +170,26 @@ class ImageRelevanceCheck(BaseModel):
     educational_detail: str = ""
     errored: bool = False
 
+
+class SuggestedOverlayLabel(BaseModel):
+    text: str = ""
+    x_pct: float = 50.0
+    y_pct: float = 50.0
+    style: str = "label"  # "title" | "callout" | "label"
+
+
+class OverlayLabelSuggestions(BaseModel):
+    """Edit Visuals Part 2 - a vision-capable model's suggested default
+    overlay labels for a just-generated, text-free illustration (see
+    ImageService._suggest_overlay_labels). Best-effort and always optional:
+    a person edits/replaces/clears these freely in the editor afterward, and
+    an empty list here (a blank brief, a disabled setting, or a failed call)
+    is never an error - it just means the course ships with no pre-suggested
+    labels."""
+
+    labels: list[SuggestedOverlayLabel] = Field(default_factory=list)
+
+
 # Fixed, universal guidance for the DEFAULT ("" / decorative) illustration
 # style - see ImageContent.illustration_style. Replaces the old per-template
 # `CourseTemplate.image_guidance` (still used, unchanged, to inform the
@@ -655,6 +675,48 @@ class ImageService:
         except Exception as exc:  # noqa: BLE001 - never block on a QA-step failure
             log.warning("Image relevance check failed (inconclusive, never treated as a pass): %s", exc)
             return ImageRelevanceCheck(errored=True)
+
+    async def _suggest_overlay_labels(
+        self, image: bytes, *, brief: str, course_title: str
+    ) -> OverlayLabelSuggestions:
+        """Edit Visuals Part 2 - default overlay-label suggestions for a
+        just-generated, text-free illustration (the image itself carries no
+        baked-in text; these are a separate, client-rendered layer - see
+        ImageContent.overlay_labels). A vision-model judgment call, the same
+        shape as `_verify_image_relevance` right above: blank brief is a
+        no-op, never raises (a failed call returns an empty list, exactly
+        like "no labels suggested" - this is always best-effort, a person
+        can add/edit/remove labels by hand regardless)."""
+        if not brief.strip():
+            return OverlayLabelSuggestions()
+        try:
+            return await self.ai.structured(
+                schema=OverlayLabelSuggestions,
+                system=(
+                    "You are annotating a generated educational illustration with a small set of "
+                    "labels, the way a textbook caption-layer would - the picture itself has NO "
+                    "text baked into it, so your labels are the only text a learner will see "
+                    "pointing at its parts. Look at the attached image and name 2-5 short labels "
+                    "(1-4 words each) for real, clearly visible components or parts of the image - "
+                    "never a component that isn't actually depicted, never a generic restatement "
+                    "of the whole image's subject. For each label, estimate `x_pct`/`y_pct` (0-100, "
+                    "0,0 is the top-left corner of the image) pointing at roughly where that part "
+                    "sits in the picture. Set `style` to \"title\" only for a single label naming "
+                    "the whole picture's subject (at most one), \"callout\" for a label that needs "
+                    "a short phrase, \"label\" (the default) for a single part name. If the image "
+                    "has no clearly distinct labellable parts, return an empty list - never invent "
+                    "one to fill a quota."
+                ),
+                user=f"COURSE: {course_title}\n\nBRIEF (what this image depicts):\n{brief}\n\n"
+                "Suggest overlay labels for the attached image.",
+                model=self.settings.diagram_model,
+                purpose="image_overlay_suggestions",
+                phase="image",
+                image=image,
+            )
+        except Exception as exc:  # noqa: BLE001 - never block generation on a suggestion failure
+            log.warning("Overlay label suggestion failed (no labels suggested, not an error): %s", exc)
+            return OverlayLabelSuggestions()
 
     async def _generate_text_free_illustration(
         self, prompt: str, *, block_id: str, provider: str | None = None, size: str | None = None
@@ -1324,6 +1386,38 @@ class ImageService:
             )
         relative = self.storage.save_asset(course_id, data, extension=self._detect_extension(data))
         width, height = self._dimensions(data)
+        # Edit Visuals Part 2 - suggested overlay labels, only for a
+        # genuine, on-brief ship: never for the deliberately generic/
+        # content-safety/confirmed-QA-failure fallback paths above (each
+        # produces an image that no longer depicts the original, specific
+        # brief, so labels drawn from that brief would name parts the
+        # picture doesn't actually show). Gated the same way diagram/
+        # concept_experience generation already is (a settings flag), and
+        # skipped entirely for `section_intro` - those are deliberately
+        # simple, single-subject, no-label-wanted images by design.
+        overlay_labels: list[dict] = []
+        illustration_style = (block.content.get("illustration_style") or "").strip().lower()
+        if (
+            self.settings.enable_image_overlay_suggestions
+            and not is_safety_fallback
+            and not (confirmed_text_failure or confirmed_relevance_failure)
+            and illustration_style != "section_intro"
+        ):
+            overlay_brief = "\n".join(
+                part for part in (
+                    str(block.content.get("purpose") or ""),
+                    str(block.content.get("prompt") or ""),
+                    str(block.content.get("caption") or ""),
+                ) if part
+            )[:MAX_PROMPT_CHARS]
+            suggestions = await self._suggest_overlay_labels(
+                data, brief=overlay_brief, course_title=course_title
+            )
+            overlay_labels = [
+                {"id": f"ol{i}", "text": label.text, "x_pct": label.x_pct, "y_pct": label.y_pct, "style": label.style, "color": ""}
+                for i, label in enumerate(suggestions.labels)
+                if label.text.strip()
+            ]
         block.content = merge_content(
             block.type,
             block.content,
@@ -1342,6 +1436,7 @@ class ImageService:
                 "height": height,
                 "text_verified": text_verified,
                 "formula_verified": formula_verified,
+                "overlay_labels": overlay_labels,
                 "visual_qa_findings": existing_findings + formula_findings + relevance_findings,
                 "generation_mode": "mock" if self.ai.is_mock else "real",
             },

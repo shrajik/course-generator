@@ -1,6 +1,6 @@
 """Editing the text inside a concept_experience visual - deterministic,
 no AI call (a typo/wording fix, not a new concept). See
-DocumentService.update_concept_visual_spec and
+DocumentService.update_visual_spec and
 PUT /api/documents/{id}/blocks/{block_id}/visual-spec.
 """
 
@@ -71,7 +71,7 @@ async def test_editing_a_label_re_renders_with_the_new_text(service, documents, 
     edited = _spec_dict()
     edited["steps"][0]["label"] = "Step One (edited)"
 
-    response = await documents.update_concept_visual_spec(
+    response = await documents.update_visual_spec(
         record.document_id, "block_visual", edited
     )
 
@@ -88,7 +88,7 @@ async def test_a_new_asset_path_is_written_not_overwritten_in_place(service, doc
     edited = _spec_dict()
     edited["steps"][0]["label"] = "Changed"
 
-    response = await documents.update_concept_visual_spec(record.document_id, "block_visual", edited)
+    response = await documents.update_visual_spec(record.document_id, "block_visual", edited)
 
     assert response.block.content["path"] != original_path
 
@@ -104,7 +104,7 @@ async def test_reserved_height_grows_for_a_longer_description(service, documents
         "in this renderer grows with real content length."
     )
 
-    response = await documents.update_concept_visual_spec(record.document_id, "block_visual", edited)
+    response = await documents.update_visual_spec(record.document_id, "block_visual", edited)
 
     assert response.block.content["height"] >= original_height
 
@@ -115,7 +115,7 @@ async def test_version_bumps_and_the_change_is_retrievable_after_reload(service,
     edited = _spec_dict()
     edited["title"] = "Edited Title"
 
-    response = await documents.update_concept_visual_spec(record.document_id, "block_visual", edited)
+    response = await documents.update_visual_spec(record.document_id, "block_visual", edited)
     assert response.version == starting_version + 1
 
     reloaded = await documents.load(record.document_id)
@@ -138,7 +138,7 @@ async def test_editing_reflows_later_blocks_if_height_changed(service, documents
     edited["steps"].append(
         {"id": "s3", "label": "Step Three", "description": "A third step, taller overall.", "order": 2}
     )
-    await documents.update_concept_visual_spec(record.document_id, "block_visual", edited)
+    await documents.update_visual_spec(record.document_id, "block_visual", edited)
 
     reloaded = await documents.load(record.document_id)
     y_after = reloaded.find_block("block_after")[1].layout.y
@@ -148,7 +148,7 @@ async def test_editing_reflows_later_blocks_if_height_changed(service, documents
 async def test_unknown_block_id_is_a_404(service, documents, technical_input):
     record, document = await _seeded_document(service, documents, technical_input)
     with pytest.raises(NotFoundError):
-        await documents.update_concept_visual_spec(record.document_id, "no_such_block", _spec_dict())
+        await documents.update_visual_spec(record.document_id, "no_such_block", _spec_dict())
 
 
 async def test_a_non_concept_experience_block_is_rejected(service, documents, technical_input):
@@ -157,12 +157,12 @@ async def test_a_non_concept_experience_block_is_rejected(service, documents, te
         service, documents, technical_input, extra_blocks=[plain_paragraph]
     )
     with pytest.raises(ValidationFailedError):
-        await documents.update_concept_visual_spec(record.document_id, "block_plain", _spec_dict())
+        await documents.update_visual_spec(record.document_id, "block_plain", _spec_dict())
 
 
 async def test_an_invalid_spec_is_rejected(service, documents, technical_input):
     record, document = await _seeded_document(service, documents, technical_input)
     with pytest.raises(ValidationFailedError):
-        await documents.update_concept_visual_spec(
+        await documents.update_visual_spec(
             record.document_id, "block_visual", {"steps": "not a list"}
         )
