@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.core.config import get_settings
 from app.db.base import Base
-from app.db import models  # noqa: F401 - register mapped classes
+from app.db import am_models, kb_models, models  # noqa: F401 - register mapped classes
 
 config = context.config
 target_metadata = Base.metadata

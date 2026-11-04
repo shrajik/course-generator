@@ -137,6 +137,22 @@ def render_knowledge_excerpts(excerpts: list) -> str:
     return "\n\n".join(lines)
 
 
+def render_artifact_excerpts(excerpts: list) -> str:
+    """Approved artifacts from earlier courses, each with the reference the writer cites it by."""
+    if not excerpts:
+        return ""
+    lines = [
+        "APPROVED PRIOR MATERIAL (artifacts from earlier courses that a subject-matter expert has approved: "
+        "reuse or adapt them where they fit this chapter, stay consistent with what they say, and cite each "
+        "one you draw on with its reference in square brackets, for example [A7.2]):"
+    ]
+    for item in excerpts:
+        origin = f' (from the course "{item.course_title}")' if item.course_title else ""
+        kind = item.artifact_type.replace("_", " ")
+        lines.append(f'[{item.ref}] {kind} - "{item.title}"{origin}\n{item.text}')
+    return "\n\n".join(lines)
+
+
 class ChapterResearch(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -163,6 +179,7 @@ class ChapterResearch(BaseModel):
             for part in (
                 render_source_excerpts(getattr(self, "source_excerpts", None) or []),
                 render_knowledge_excerpts(getattr(self, "knowledge_excerpts", None) or []),
+                render_artifact_excerpts(getattr(self, "artifact_excerpts", None) or []),
             )
             if part
         )

@@ -20,6 +20,7 @@ from app.course.fact_check import (
     apply_verdicts,
     audit_blocks,
     collect_audit_blocks,
+    extract_refs,
     verification_candidates,
 )
 from app.schemas.audit import AuditFinding, AuditReport, ClaimVerdict, FindingStatus
@@ -94,13 +95,17 @@ class AuditService:
 
         # A claim the global library supports is supported, and a [G2.5] citation
         # is real if that passage exists.
+        blocks = collect_audit_blocks(document)
         if self.settings.enable_global_knowledge:
-            shared = get_knowledge_service().library()
+            # The citations the course already holds are passed along so a backend
+            # that retains superseded passages can include the ones cited.
+            cited = [ref for block in blocks for ref in extract_refs(block.text) if ref.startswith("G")]
+            shared = await get_knowledge_service().alibrary(extra_refs=list(dict.fromkeys(cited)))
             if shared.passages:
                 library = SourceLibrary(
                     {**library.passages, **shared.passages}, [*library.candidates, *shared.candidates]
                 )
-        result = audit_blocks(collect_audit_blocks(document), library)
+        result = audit_blocks(blocks, library)
         findings = result.findings
 
         ai_used = False

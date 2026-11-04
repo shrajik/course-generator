@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api import (
     activity,
     admin,
+    artifacts,
     auth,
     code,
     course_templates,
@@ -21,6 +22,7 @@ from app.api import (
     health,
     memory,
     pedagogy,
+    kb,
     knowledge,
     notifications,
     sources,
@@ -35,6 +37,7 @@ from app.course.templates.registry import (
     refresh_uploaded_templates,
 )
 from app.db.engine import dispose_engine
+from app.db.pgvector_check import log_pgvector_status
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -64,6 +67,8 @@ async def lifespan(app: FastAPI):
     # Same best-effort contract: an unavailable database just means uploaded
     # templates resolve again after the next upload or restart.
     await refresh_uploaded_templates()
+    if settings.use_database:
+        await log_pgvector_status()
     # Each worker caches templates in memory; this keeps a worker in step
     # with templates created, edited or deleted through another one.
     refresher = (
@@ -71,7 +76,25 @@ async def lifespan(app: FastAPI):
         if settings.use_database and settings.template_refresh_seconds > 0
         else None
     )
+    # The PostgreSQL knowledge base: its item numbers must stay above every one ever issued
+    # (a restored backup can rewind the sequence), and its ingestion jobs need a worker.
+    kb_stop: asyncio.Event | None = None
+    kb_worker: asyncio.Task | None = None
+    if settings.use_database and (settings.kb_backend == "postgres" or settings.kb_worker_enabled):
+        from app.kb.service import KbService
+        from app.kb.worker import KbWorker
+
+        try:
+            await KbService(settings=settings).ensure_number_sequence()
+        except Exception:  # noqa: BLE001 - an unreachable database must not block startup
+            log.exception("Could not verify the knowledge item number sequence")
+        kb_stop = asyncio.Event()
+        kb_worker = asyncio.create_task(KbWorker(settings=settings).run_forever(kb_stop))
     yield
+    if kb_stop is not None and kb_worker is not None:
+        kb_stop.set()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(kb_worker, 10)
     if refresher is not None:
         refresher.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -116,6 +139,8 @@ app.include_router(admin.router)
 app.include_router(activity.router)
 app.include_router(courses.router)
 app.include_router(documents.router)
+app.include_router(kb.router)
+app.include_router(artifacts.router)
 app.include_router(templates.router)
 app.include_router(course_templates.router)
 app.include_router(memory.router)

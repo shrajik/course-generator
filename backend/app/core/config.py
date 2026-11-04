@@ -142,6 +142,10 @@ class Settings(BaseSettings):
     #  requires a new migration, not just a config change.
     embedding_dimensions: int = Field(default=1536, ge=1, le=4096)
     embedding_batch_size: int = Field(default=64, ge=1, le=512)
+    # Query embeddings remembered per process (most recent first out). A regenerated or
+    # resumed course asks the same questions again, and the knowledge shadow comparison
+    # asks each one twice; neither should be paid for twice. 0 turns it off.
+    embedding_query_cache_size: int = Field(default=256, ge=0, le=10000)
     #  Below this cosine similarity (0..1), a semantic match is discarded
     #  rather than merged into results - keeps irrelevant nearest-neighbours
     #  out of the prompt. Tune per embedding model if this one changes.
@@ -204,8 +208,58 @@ class Settings(BaseSettings):
     # How close in meaning, and how much of the query's wording, a passage must
     # have to be offered to a chapter at all. The library covers many subjects;
     # these keep a chapter from being handed another subject's material.
+    # Run the PostgreSQL knowledge backend alongside the file one for every search and
+    # log whether they agree. The file backend still answers; nothing the backend returns
+    # reaches a course. Used to prove parity before the cutover (docs/KB_CUTOVER_RUNBOOK.md).
+    kb_shadow_compare: bool = False
+    # Which store the admin knowledge base reads and writes: the files under data/sources/global
+    # ("files", the default) or PostgreSQL ("postgres", needs USE_DATABASE and migration 0012 +
+    # the import - see docs/KB_CUTOVER_RUNBOOK.md). Flipping it back is a clean rollback only
+    # until the first write to PostgreSQL.
+    kb_backend: Literal["files", "postgres"] = "files"
+    # The durable ingestion worker for the PostgreSQL knowledge base (app/kb/worker.py).
+    # Off until the cutover: nothing writes to the kb_* tables before then.
+    # Permanent removal of an item's content (app/kb/purge.py). Off while the cutover rollback window is open.
+    kb_purge_enabled: bool = False
+    kb_worker_enabled: bool = False
+    kb_worker_poll_seconds: float = Field(default=2.0, ge=0.1, le=60)
+    kb_job_max_attempts: int = Field(default=5, ge=1, le=20)
+    # One small-model call per new document for title, description and tags; the free
+    # rules produce a usable draft without it. Never called with the offline mock client.
+    kb_ai_metadata: bool = True
+    kb_metadata_model: str = ""  # empty = the default model
+    # PostgreSQL knowledge search options (app/services/knowledge_pg.py). Those that can change which
+    # passages a course sees are off by default so the first cutover matches the file library exactly.
+    # Relationships between items: a superseded item is not offered while its replacement is published,
+    # and of two items marked duplicate_of only the original is. No effect until relationships exist.
+    knowledge_graph_rules: bool = True
+    # Drop a passage that repeats a better-ranked one (>= 90% shared terms) instead of spending tokens on it.
+    knowledge_dedupe: bool = False
+    # When a passage does not fit what is left of the character budget, keep its most relevant sentences
+    # instead of leaving it out. Extractive: nothing is rewritten.
+    knowledge_compress: bool = False
+    # After ranking, add up to this many passages from items directly related to the best match
+    # (related_to / references / depends_on), only if they are themselves relevant to the query. 0 = off.
+    knowledge_related_expansion: int = Field(default=0, ge=0, le=5)
+    # Search results remembered per process, valid until anything retrievable changes (the knowledge
+    # epoch moves). A resumed or regenerated course repeats its questions. 0 = off.
+    knowledge_cache_size: int = Field(default=256, ge=0, le=10000)
     knowledge_min_semantic: float = Field(default=0.3, ge=0.0, le=1.0)
     knowledge_min_coverage: float = Field(default=0.25, ge=0.0, le=1.0)
+
+    # --- artifact memory (Memory 2, app/artifacts) -----------------------------------------
+    # SME-approved, immutable course artifacts that later courses can reuse. Capturing follows the existing
+    # review workflow (submit -> approve / changes requested); reuse offers approved artifacts of OTHER
+    # courses to the writer. Both need the database. Independent of the knowledge base settings above.
+    enable_artifact_memory: bool = True
+    enable_artifact_reuse: bool = True
+    artifact_excerpts_per_chapter: int = Field(default=3, ge=1, le=10)
+    # Each reused artifact is cut to this many characters (extractively: its most relevant sentences),
+    # and all of them together to the total.
+    artifact_excerpt_chars: int = Field(default=1500, ge=200, le=10000)
+    artifact_total_chars: int = Field(default=4000, ge=500, le=30000)
+    artifact_min_semantic: float = Field(default=0.35, ge=0.0, le=1.0)
+    artifact_min_coverage: float = Field(default=0.25, ge=0.0, le=1.0)
 
     # --- fact-check audit (app/services/audit_service.py) ---------------------
     # Check a finished course against its source documents automatically.

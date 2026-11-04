@@ -9,6 +9,7 @@ search", never as a reason to fail course generation.
 from __future__ import annotations
 
 import hashlib
+from collections import OrderedDict
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
@@ -33,6 +34,8 @@ class EmbeddingService:
     def __init__(self, ai: AIClient | None = None, settings: Settings | None = None) -> None:
         self.ai = ai or get_ai_client()
         self.settings = settings or get_settings()
+        # (model, text) -> vector, least recently used first. Only successes are kept.
+        self._query_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
 
     @property
     def enabled(self) -> bool:
@@ -43,11 +46,21 @@ class EmbeddingService:
         text = (text or "").strip()
         if not self.enabled or not text:
             return None
+        key = (self.settings.embedding_model, text[:MAX_EMBED_CHARS])
+        cached = self._query_cache.get(key)
+        if cached is not None:
+            self._query_cache.move_to_end(key)
+            return list(cached)
         try:
             vectors = await self.ai.embed(
                 texts=[text[:MAX_EMBED_CHARS]], model=self.settings.embedding_model
             )
-            return vectors[0] if vectors else None
+            vector = vectors[0] if vectors else None
+            if vector is not None and self.settings.embedding_query_cache_size > 0:
+                self._query_cache[key] = list(vector)
+                while len(self._query_cache) > self.settings.embedding_query_cache_size:
+                    self._query_cache.popitem(last=False)
+            return vector
         except Exception as exc:  # noqa: BLE001 - embedding must never break the caller
             log.warning("Embedding generation failed: %s", exc)
             return None

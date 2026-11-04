@@ -1,5 +1,10 @@
 services:
   postgres:
+    # Pinned (was the floating `pg16` tag): the knowledge base relies on HNSW
+    # indexes and, for filtered search, pgvector 0.8's iterative index scans.
+    # Same Postgres 16 data format, so the existing volume is reused; recreate the
+    # container to pick the tag up (see docs/KB_CUTOVER_RUNBOOK.md). The backend
+    # logs the running pgvector version at startup.
     # pgvector/pgvector:pg16 is upstream Postgres 16 with the pgvector
     # extension precompiled in - a drop-in replacement for postgres:16-alpine
     # (same data format, same named volume below), needed for the semantic
@@ -10,7 +15,7 @@ services:
     # briefly. Do this at a time of your choosing; until then this service
     # keeps running on its previous image and the app keeps working on
     # keyword-only retrieval (semantic retrieval fails soft without pgvector).
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.0-pg16
     container_name: course_creator_postgres
     ports:
       - "5432:5432"
@@ -31,7 +36,7 @@ services:
   # `postgres` service above, which holds real course data. No named volume:
   # this is meant to be thrown away and recreated freely.
   postgres-test:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.0-pg16
     container_name: course_creator_postgres_test
     ports:
       - "5433:5432"

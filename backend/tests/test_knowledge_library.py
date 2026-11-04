@@ -437,3 +437,22 @@ async def test_a_chapter_nothing_matched_is_marked_web_research_only(client):
     client.post(f"/api/courses/{course['course_id']}/generate", json={"mode": "sync"})
     chapter = client.get(f"/api/courses/{course['course_id']}").json()["course"]["chapters"][0]
     assert chapter["sources_checked"] is True and chapter["sources_offered"] == []
+
+
+# --- the async KnowledgeBackend contract ------------------------------------------
+
+
+async def test_the_async_twins_match_the_sync_methods_and_satisfy_the_backend_contract(library):
+    from app.services.knowledge_backend import KnowledgeBackend
+
+    assert isinstance(library, KnowledgeBackend)
+    assert await library.ahas_documents() is False
+    await _add(library, "policy.txt", POLICY_TEXT)
+    assert await library.ahas_documents() is True
+    assert (await library.alibrary()).passages.keys() == library.library().passages.keys()
+    # `extra_refs` is accepted and changes nothing: the files keep no superseded passages.
+    assert (await library.alibrary(extra_refs=["G1.1"])).passages.keys() == library.library().passages.keys()
+    refs = ["G1.1", "G9.9"]
+    assert [e.ref for e in await library.apassages_by_refs(refs)] == [e.ref for e in library.passages_by_refs(refs)] == ["G1.1"]
+    query = "how long do refunds take after the product is returned"
+    assert [e.ref for e in await library.asearch(query, trace=("course_x", "ch_1"))] == [e.ref for e in await library.search(query)]

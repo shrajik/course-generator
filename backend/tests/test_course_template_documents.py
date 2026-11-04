@@ -91,7 +91,8 @@ def test_authenticated_user_can_upload_markdown_template(template_client, monkey
     author_email = _email("tpl-author-upload")
     _register(template_client, author_email)
 
-    content = b"# Sample Template\n\nSome **bold** guidance.\n"
+    # A template must say something a course can be generated from: a section and an instruction.
+    content = b"# Sample Template\n\n## Overview\n\nExplain each concept with a real-world example.\n"
     response = template_client.post(
         "/api/course-template-documents",
         data={"name": "Sample MD", "template_type": "technical", "description": "A sample"},

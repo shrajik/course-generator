@@ -105,7 +105,8 @@ class SourceUse(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    origin: Literal["knowledge", "upload"]  # the global knowledge library, or the creator's own upload
+    # the global knowledge library, the creator's own upload, or an SME-approved artifact of an earlier course
+    origin: Literal["knowledge", "upload", "artifact"]
     source_id: str
     filename: str
     passages: int = 0

@@ -233,14 +233,79 @@ class KnowledgeService:
         found = (library.excerpt(ref) for ref in dict.fromkeys(refs))
         return [e for e in found if e is not None]
 
+    # --- the KnowledgeBackend contract (app/services/knowledge_backend.py) ------
+    # Async twins of the methods above. The files hold no superseded passages and
+    # keep no retrieval log, so `trace` and `extra_refs` are accepted and unused.
+    async def asearch(
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        char_budget: int | None = None,
+        trace: tuple[str, str] | None = None,
+    ) -> list[SourceExcerpt]:
+        excerpts = await self.search(query, limit=limit, char_budget=char_budget)
+        if self.settings.kb_shadow_compare and self.settings.use_database and query.strip():
+            from app.services import knowledge_shadow
+
+            knowledge_shadow.schedule(
+                knowledge_shadow.compare_search(query, excerpts, limit=limit, char_budget=char_budget)
+            )
+        return excerpts
+
+    async def ahas_documents(self) -> bool:
+        return self.has_documents()
+
+    # --- what /api/knowledge offers, async so either backend can answer ------------------
+    async def aupload(self, filename: str, data: bytes, *, description: str = "", actor_id=None) -> SourceRecord:
+        return self.upload(filename, data, description=description)
+
+    async def alist_documents(self) -> list[SourceRecord]:
+        return self.list_documents()
+
+    async def aget(self, source_id: str) -> SourceRecord:
+        return self.get(source_id)
+
+    async def aupdate(self, source_id: str, *, enabled: bool | None = None, description: str | None = None, actor_id=None) -> SourceRecord:
+        return self.update(source_id, enabled=enabled, description=description)
+
+    async def adelete(self, source_id: str, *, actor_id=None) -> None:
+        self.delete(source_id)
+
+    async def achunks(self, source_id: str, offset: int = 0, limit: int = 50) -> list[SourceChunk]:
+        return self.chunks(source_id, offset, limit)
+
+    async def astats(self) -> dict[str, int]:
+        return self.stats()
+
+    async def alibrary(self, extra_refs: list[str] | None = None) -> SourceLibrary:
+        library = self.library()
+        if self.settings.kb_shadow_compare and self.settings.use_database:
+            from app.services import knowledge_shadow
+
+            knowledge_shadow.schedule(knowledge_shadow.compare_library({r for r in library.passages}))
+        return library
+
+    async def apassages_by_refs(self, refs: list[str], *, live_only: bool = False) -> list[SourceExcerpt]:
+        return self.passages_by_refs(refs)  # the files hold only live passages already
+
 
 _service: KnowledgeService | None = None
 
 
-def get_knowledge_service() -> KnowledgeService:
+def get_knowledge_service():
+    """The configured knowledge library: the files, or PostgreSQL when `KB_BACKEND=postgres`
+    (which needs the database). Both answer the same async contract
+    (app/services/knowledge_backend.py) and the same admin operations."""
     global _service
     if _service is None:
-        _service = KnowledgeService()
+        settings = get_settings()
+        if settings.kb_backend == "postgres" and settings.use_database:
+            from app.services.knowledge_pg_service import PostgresKnowledgeService  # lazy: it imports this module
+
+            _service = PostgresKnowledgeService(settings)
+        else:
+            _service = KnowledgeService()
     return _service
 
 

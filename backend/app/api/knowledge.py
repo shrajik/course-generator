@@ -16,7 +16,7 @@ from app.core.config import get_settings
 from app.core.errors import ValidationFailedError
 from app.db.models import User
 from app.schemas.source import SourceChunk, SourceExcerpt, SourceRecord
-from app.services.knowledge_service import KnowledgeService, get_knowledge_service
+from app.services.knowledge_service import KnowledgeService, get_knowledge_service  # noqa: F401
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
@@ -57,7 +57,7 @@ async def upload_document(
     data = await file.read(limit + 1)
     if len(data) > limit:
         raise ValidationFailedError(f"The file is larger than the {limit // (1024 * 1024)} MB limit.")
-    return service.upload(file.filename or "upload", data, description=description)
+    return await service.aupload(file.filename or "upload", data, description=description, actor_id=getattr(admin, "id", None))
 
 
 @router.get("", response_model=KnowledgeList)
@@ -65,7 +65,7 @@ async def list_documents(
     service: KnowledgeService = Depends(_service),
     admin: User = Depends(get_current_admin),
 ) -> KnowledgeList:
-    return KnowledgeList(documents=service.list_documents(), stats=service.stats())
+    return KnowledgeList(documents=await service.alist_documents(), stats=await service.astats())
 
 
 @router.post("/search", response_model=list[SourceExcerpt])
@@ -76,7 +76,7 @@ async def search_library(
 ) -> list[SourceExcerpt]:
     """Try a query against the library, exactly as a chapter's search would: the
     passages a course would be offered, with the references it would cite."""
-    return await service.search(request.query, limit=request.limit)
+    return await service.asearch(request.query, limit=request.limit)
 
 
 @router.get("/{source_id}", response_model=SourceRecord)
@@ -85,7 +85,7 @@ async def get_document(
     service: KnowledgeService = Depends(_service),
     admin: User = Depends(get_current_admin),
 ) -> SourceRecord:
-    return service.get(source_id)
+    return await service.aget(source_id)
 
 
 @router.get("/{source_id}/chunks", response_model=list[SourceChunk])
@@ -96,7 +96,7 @@ async def get_document_chunks(
     service: KnowledgeService = Depends(_service),
     admin: User = Depends(get_current_admin),
 ) -> list[SourceChunk]:
-    return service.chunks(source_id, offset, limit)
+    return await service.achunks(source_id, offset, limit)
 
 
 @router.patch("/{source_id}", response_model=SourceRecord)
@@ -107,7 +107,7 @@ async def update_document(
     admin: User = Depends(get_current_admin),
 ) -> SourceRecord:
     """Switch a document on or off for search, or change its description."""
-    return service.update(source_id, enabled=request.enabled, description=request.description)
+    return await service.aupdate(source_id, enabled=request.enabled, description=request.description, actor_id=getattr(admin, "id", None))
 
 
 @router.delete("/{source_id}", status_code=204)
@@ -116,4 +116,4 @@ async def delete_document(
     service: KnowledgeService = Depends(_service),
     admin: User = Depends(get_current_admin),
 ) -> None:
-    service.delete(source_id)
+    await service.adelete(source_id, actor_id=getattr(admin, "id", None))

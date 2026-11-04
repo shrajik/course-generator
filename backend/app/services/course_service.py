@@ -33,6 +33,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import ConflictError, NotFoundError, ValidationFailedError
 from app.schemas.research import ChapterResearch
 from app.course.review_brief import approval_blockers
+from app.artifacts.reuse import get_artifact_reuse
 from app.services.audit_service import get_audit_service
 from app.services.knowledge_service import get_knowledge_service
 from app.services.notification_service import get_notification_service
@@ -296,6 +297,7 @@ class CourseService:
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Course %s submitted for review", course_id)
+        await self._artifact_memory("submit", record, actor_id)
         try:
             notifier = get_notification_service()
             await notifier.notify(
@@ -337,6 +339,7 @@ class CourseService:
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Course %s approved by %s", course_id, reviewer_id)
+        await self._artifact_memory("approve", record, reviewer_id, comment)
         await self._tell_author(
             record, "course_approved", f"\u201c{record.input.course_title}\u201d was approved",
             comment or "A reviewer gave it final approval.",
@@ -365,10 +368,40 @@ class CourseService:
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Course %s sent back for changes by %s", course_id, reviewer_id)
+        await self._artifact_memory("request_changes", record, reviewer_id, comment)
         await self._tell_author(
             record, "changes_requested", f"Changes requested on \u201c{record.input.course_title}\u201d", comment
         )
         return record
+
+    # --- artifact memory (Memory 2) ----------------------------------------------
+    # The review workflow above decides; artifact memory follows. Submitting captures the course's
+    # artifacts for review, approving approves (and locks) them with it, sending back returns them.
+    # Like the notifications, this never blocks or changes the workflow: a failure here is logged.
+    async def _artifact_memory(self, action: str, record: CourseRecord, actor_id: str | None, comment: str | None = None) -> None:
+        if not (self.use_db and self.settings.enable_artifact_memory):
+            return
+        try:
+            from app.artifacts.service import get_artifact_service
+            from app.services.document_service import get_document_service
+
+            service = get_artifact_service()
+            if action in ("submit", "approve"):
+                # On approval the document is captured again first: a reviewer may have edited it under review,
+                # and what is approved must be what the reviewer saw last.
+                document = await get_document_service().load(record.document_id)
+                offered = {p.chapter_id: [ref for use in p.sources_offered for ref in use.refs] for p in record.chapters}
+                await service.sync_course(
+                    course_id=record.course_id, course_title=record.input.course_title, document=document, offered=offered,
+                    generation_run_id=record.run.job_id if record.run else None,
+                    model_info={"generated_with": document.meta.generated_with, "template_id": record.template_id}, actor_id=actor_id,
+                )
+            if action == "approve":
+                await service.approve_course(record.course_id, actor_id, comment)
+            elif action == "request_changes":
+                await service.request_changes_course(record.course_id, actor_id, comment or "")
+        except Exception as exc:  # noqa: BLE001 - never blocks the review
+            log.warning("Artifact memory could not follow '%s' for %s: %s", action, record.course_id, exc)
 
     # --- activity log --------------------------------------------------------
     # A thin, additive log alongside the actions above and the API routes that
@@ -1190,7 +1223,9 @@ class CourseService:
         """
         has_course_sources = bool(record.input.source_ids)
         library = get_knowledge_service()
-        if not has_course_sources and not library.has_documents():
+        reuse = get_artifact_reuse()
+        reusable = await reuse.available()
+        if not has_course_sources and not await library.ahas_documents() and not reusable:
             for chapter in targets:
                 self._record_sources(record, chapter.id, [], [])
             return research_map, []
@@ -1213,11 +1248,14 @@ class CourseService:
                     warnings.append(f"{chapter.id}: uploaded sources could not be searched")
             knowledge = []
             try:
-                knowledge = await library.search(query)
+                knowledge = await library.asearch(query, trace=(record.course_id, chapter.id))
             except Exception as exc:  # noqa: BLE001 - the library must never fail generation
                 log.warning("Knowledge search failed for %s/%s: %s", record.course_id, chapter.id, exc)
-            self._record_sources(record, chapter.id, excerpts, knowledge)
-            if not excerpts and not knowledge:
+            artifacts = []
+            if reusable:
+                artifacts, knowledge = await self._reusable_artifacts(record, chapter, query, library, knowledge)
+            self._record_sources(record, chapter.id, excerpts, knowledge, artifacts)
+            if not excerpts and not knowledge and not artifacts:
                 continue
             research = result.get(chapter.id)
             research = (
@@ -1227,6 +1265,7 @@ class CourseService:
             )
             research.source_excerpts = excerpts
             research.knowledge_excerpts = knowledge
+            research.artifact_excerpts = artifacts
             result[chapter.id] = research
         return result, warnings
 
@@ -1316,8 +1355,26 @@ class CourseService:
             return round(elapsed_per_chapter * waves_left, 1)
         return round(elapsed_per_chapter * remaining, 1)
 
+    async def _reusable_artifacts(self, record: CourseRecord, chapter, query: str, library, knowledge: list) -> tuple[list, list]:
+        """SME-approved artifacts of other courses for this chapter, plus the knowledge they were written
+        from if it is still published - within the knowledge budget, so reuse never inflates the prompt."""
+        try:
+            offer = await get_artifact_reuse().offer(
+                query, course_id=record.course_id, chapter_id=chapter.id, knowledge=library, already_offered={e.ref for e in knowledge}
+            )
+        except Exception as exc:  # noqa: BLE001 - reuse must never fail generation
+            log.warning("Artifact reuse failed for %s/%s: %s", record.course_id, chapter.id, exc)
+            return [], knowledge
+        room = self.settings.knowledge_excerpt_chars - sum(len(e.text) for e in knowledge)
+        extra = []
+        for passage in offer.linked_knowledge:
+            if len(passage.text) <= room:
+                extra.append(passage)
+                room -= len(passage.text)
+        return offer.artifacts, [*knowledge, *extra]
+
     @staticmethod
-    def _record_sources(record: CourseRecord, chapter_id: str, uploads: list, knowledge: list) -> None:
+    def _record_sources(record: CourseRecord, chapter_id: str, uploads: list, knowledge: list, artifacts: list = ()) -> None:
         """Note on the chapter's progress which documents it was given passages
         from, so the progress screen can say where its content comes from."""
         used: dict[tuple[str, str], SourceUse] = {}
@@ -1329,6 +1386,10 @@ class CourseService:
                 )
                 entry.passages += 1
                 entry.refs.append(excerpt.ref)
+        for artifact in artifacts:
+            entry = used.setdefault(("artifact", artifact.artifact_id), SourceUse(origin="artifact", source_id=artifact.artifact_id, filename=artifact.title))
+            entry.passages += 1
+            entry.refs.append(artifact.ref)
         for progress in record.chapters:
             if progress.chapter_id == chapter_id:
                 progress.sources_checked = True

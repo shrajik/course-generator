@@ -337,7 +337,7 @@ async def course_passages(
         owner_key_for(record.owner_id), record.input.source_ids, [r for r in wanted if r.startswith("S")]
     )
     # [G2.5] is a passage of the global knowledge library.
-    found += get_knowledge_service().passages_by_refs([r for r in wanted if r.startswith("G")])
+    found += await get_knowledge_service().apassages_by_refs([r for r in wanted if r.startswith("G")])
     return [p.model_dump(mode="json") for p in found]
 
 
