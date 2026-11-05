@@ -712,6 +712,65 @@ How to produce blocks:
     reaction pathway) and there's no real physical arrangement to draw.
   * `diagram_kind: hierarchy` for a strict parent/child breakdown, and
     `diagram_kind: comparison` for two or more things compared side by side.
+  * `diagram_kind: pyramid` for LEVELS of importance/priority/foundation
+    (a base that supports what's above it, a "most fundamental at the
+    bottom" structure) or a NARROWING STAGE process (a funnel - fewer
+    items survive each stage, e.g. a sales pipeline or a filtering
+    process) - same shape either way, just which end tapers.
+  * `diagram_kind: matrix` when the content classifies or compares things
+    across exactly two independent axes/dimensions (impact vs. effort,
+    urgency vs. importance, a SWOT-style grid, a priority matrix) - a
+    classification into more than 4 groups with no real 2-axis structure
+    also fits here (renders as a plain grid instead).
+  * `diagram_kind: radial_mindmap` for ONE central topic with several
+    independent branching sub-ideas (a brainstorm, a topic broken into its
+    main themes) - distinct from `concept_map`, whose edges each name a
+    precise relationship between the centre and its parts; a mind map's
+    branches don't need a relationship label, just the branching structure
+    itself.
+  * `diagram_kind: venn` when the content is specifically about what two
+    or three things SHARE versus what's unique to each (overlapping
+    categories).
+  * `diagram_kind: chevron_process` for a SHORT linear sequence (3-6
+    steps, no decisions/branches) that reads better as a horizontal strip
+    than a tall column (a short onboarding flow, a product-launch phase
+    strip) - use `flow_chart`/`process` instead for anything longer or
+    with a decision point.
+  * `diagram_kind: staircase_process` for a short sequence that genuinely
+    GROWS or BUILDS in scope/scale at each step (a skill-building
+    progression, a maturity model) - not just an ordinary multi-step
+    procedure, only when the brief itself frames it as growing.
+  * `diagram_kind: balance_comparison` when the content weighs TWO SIDES
+    of one decision or tradeoff against each other (cost vs. value, pros
+    vs. cons, risks vs. benefits) - not `comparison`, which is for N
+    things compared flatly side by side, not a two-sided judgement.
+  * `diagram_kind: nested_circles` for a SCOPE/CONTAINMENT hierarchy where
+    each thing fully contains the next, narrower one (Vision > Mission >
+    Strategy > Tactics; Global > Regional > Local) - not `hierarchy`,
+    which is a branching parent/child tree, not a single nested sequence.
+  * `diagram_kind: network_mesh` when many things genuinely connect to
+    many others, not one central hub (a microservice topology, a social/
+    organisational network) - not `radial_mindmap`, which is one hub with
+    independent spokes that don't connect to each other.
+  * `diagram_kind: decision_tree` for a CASCADE of decisions/questions,
+    each branch leading to a further decision or a final outcome (a
+    troubleshooting guide, "which option is right for you", eligibility
+    logic) - not a single flow_chart decision diamond inside an otherwise
+    linear procedure, this is a whole tree of branch points.
+  * `diagram_kind: fishbone` for a root-cause analysis - what CATEGORIES
+    of causes sit behind one effect/problem (a postmortem, "why did X
+    happen", a quality/defect investigation).
+  * `diagram_kind: layered_diagram` for a STACK of distinct layers/tiers
+    sitting on top of each other with no containment and no importance
+    ranking (a network protocol stack, an architecture's tiers, rock
+    strata, atmosphere layers) - not `pyramid` (importance narrowing to a
+    point) and not `nested_circles` (literal containment, one fully
+    inside the next).
+  * `diagram_kind: gantt_chart` for a SCHEDULE over time - which tasks run
+    when, how long each takes, and which overlap (a project plan, a
+    sprint/launch schedule) - only when the brief gives real relative
+    timing for each task; a plain list of steps with no timing is
+    `flow_chart`/`process`/`chevron_process` instead.
   * NEVER `schematic`/`concept_map`/`hierarchy`/`comparison` for a
     coordinate-axis graph or curve - a supply-and-demand curve, a
     distance-time or velocity-time graph, a function's plot, any X-Y
@@ -730,11 +789,13 @@ How to produce blocks:
     `diagram_kind: graph` - never as an illustration either.
   * A chronological/historical timeline (a sequence of dated events, eras or
     milestones - a country's history, a technology's evolution, a person's
-    life) is a SEQUENCE, not a relationship - use `diagram_kind: flow_chart`
-    or `process`, with each node's label carrying the date/era (e.g. "1947 -
-    Independence") and its description the event itself. This applies to
-    every subject, not just technical ones: history, business, science -
-    anywhere a "what happened, in order" needs showing.
+    life) is a SEQUENCE, not a relationship - use `diagram_kind: timeline`
+    (a real horizontal roadmap with dated milestones - not `flow_chart`,
+    which has no notion of dates/chronology), with each node's label
+    carrying the date/era (e.g. "1947 - Independence") and its description
+    the event itself. This applies to every subject, not just technical
+    ones: history, business, science - anywhere a "what happened, in
+    order" needs showing.
 - A chapter with BOTH a process to walk through AND a phenomenon/structure to
   show needs BOTH visuals (a flow_chart plus a concept_map/illustration, per
   the subject rule above) - one does not replace the other, and this is
@@ -788,10 +849,12 @@ How to produce blocks:
   tell which one was B, the surface normal, or the sign convention).
 - Set `diagram_kind` whenever you can tell which shape fits (flow_chart,
   process, cycle, concept_map, hierarchy, comparison, smart_art,
-  data_flow_diagram, er_diagram, swimlane - never `schematic`, permanently
-  retired, see above) - this is what the renderer actually builds, so
-  getting it right here is what makes the diagram useful. Leave it blank
-  only when you genuinely cannot tell.
+  data_flow_diagram, er_diagram, swimlane, pyramid, matrix, radial_mindmap,
+  venn, chevron_process, timeline, staircase_process, balance_comparison,
+  nested_circles, network_mesh, decision_tree, fishbone, layered_diagram,
+  gantt_chart - never `schematic`, permanently retired, see above) - this
+  is what the renderer actually builds, so getting it right here is what makes the
+  diagram useful. Leave it blank only when you genuinely cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a
   precise `image_prompt` (every component/label/direction the diagram needs,
   not just a style description) and a `caption`. Set `image_kind: diagram`

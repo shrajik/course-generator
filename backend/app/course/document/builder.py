@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 from app.core.ids import block_id as new_block_id
 from app.core.ids import document_id_for_course, page_id, utc_now_iso
 from app.core.logging import get_logger
 from app.course.document.layout import estimate_height, flow_blocks, page_visual_fraction
 from app.course.document.layout_validator import validate_document
-from app.render.toc_renderer import TocChapter, estimate_toc_pixel_size, render_toc_html
-from app.schemas.blocks import BlockType
+from app.render.toc_renderer import TocChapter, TocSection, estimate_toc_pixel_size, render_toc_html
+from app.schemas.blocks import BlockType, merge_content
 from app.schemas.blueprint import CourseBlueprint
 from app.schemas.document import (
     PAGE_HEIGHT,
@@ -503,3 +505,123 @@ def reflow_document(document: CourseDocument, template: CourseTemplate) -> Cours
     _log_visual_balance(document.pages)
     _log_layout_findings(document)
     return document
+
+
+_TOC_SECTION_MIN_LEVEL = 3  # a chapter's own title is level 2 - see _toc_page/HEADING usage elsewhere
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s")
+
+
+def _first_sentence(text: str) -> str:
+    """The first full sentence of `text`, never a mid-word/ellipsis cut -
+    "What You Will Learn" must stay fully visible (see finalize_toc_page's
+    own docstring); HTML wraps a long line naturally, it just shouldn't be
+    several paragraphs long, which a sentence boundary naturally avoids."""
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    return _SENTENCE_END_RE.split(text, maxsplit=1)[0].strip()
+
+
+def _chapter_first_pages(document: CourseDocument) -> dict[str, int]:
+    first: dict[str, int] = {}
+    for page in document.pages:
+        if page.kind != "content":
+            continue
+        for block in page.blocks:
+            chapter_id = block.meta.chapter_id
+            if chapter_id and chapter_id not in first:
+                first[chapter_id] = page.page_number
+    return first
+
+
+def _chapter_sections(document: CourseDocument, chapter: GeneratedChapter) -> list[TocSection]:
+    """Sub-section rows ("1.1 Learning Objectives") derived purely from
+    this chapter's own already-laid-out heading blocks - never invented,
+    never a new AI call (the same "computed, not generated" contract
+    app.course.companions/design_models already established in this
+    codebase). A chapter with no level>=3 heading simply gets no rows."""
+    sections: list[TocSection] = []
+    sequence = 0
+    for page in document.pages:
+        if page.kind != "content":
+            continue
+        blocks = page.blocks
+        for index, block in enumerate(blocks):
+            if block.meta.chapter_id != chapter.chapter_id or block.type is not BlockType.HEADING:
+                continue
+            if int(block.content.get("level") or 0) < _TOC_SECTION_MIN_LEVEL:
+                continue
+            title = str(block.content.get("text") or "").strip()
+            if not title:
+                continue
+            sequence += 1
+            learn_line = ""
+            if index + 1 < len(blocks):
+                nxt = blocks[index + 1]
+                if nxt.type is BlockType.PARAGRAPH:
+                    learn_line = _first_sentence(str(nxt.content.get("text") or ""))
+                elif nxt.type is BlockType.LEARNING_OBJECTIVES:
+                    items = nxt.content.get("items") or []
+                    learn_line = _first_sentence(str(items[0])) if items else ""
+            sections.append(
+                TocSection(f"{chapter.chapter_number}.{sequence}", title, page=page.page_number, learn_line=learn_line)
+            )
+    return sections
+
+
+def finalize_toc_page(
+    document: CourseDocument,
+    chapters: list[GeneratedChapter],
+    template: CourseTemplate,
+    *,
+    storage: StorageService,
+) -> None:
+    """Re-renders the document's existing TOC page (built as a placeholder
+    by `_toc_page`, with every page number blank) with REAL page numbers
+    and sub-section rows, now that the whole document's pagination is
+    final. Call this exactly ONCE, as late in the generation pipeline as
+    possible - after every reflow that could still move a page (image
+    generation, visual repair, diagram compaction all run first) - so the
+    numbers it writes are genuinely final, not a snapshot that goes stale
+    the moment something else moves a page.
+
+    Deliberately two-pass rather than one: `_toc_page` must run before any
+    chapter content exists to be numbered (chapters aren't laid out yet at
+    that point), so real page numbers simply can't be known on the first
+    pass. This function replaces ONLY the TOC block's own `content`
+    (path/asset_id/width/height) - the page itself keeps its existing
+    `page_number` (2) and reserved slot, so nothing else in the document
+    shifts; the one deliberate constraint this relies on (TOC always
+    exactly one page) is unchanged from `_toc_page`'s own contract.
+
+    Mutates `document` in place; does not save it - the caller's own
+    existing save step persists the result, same contract as
+    `audit_and_repair_visuals`/`compact_diagrams_for_spacing`."""
+    toc_page = next((page for page in document.pages if page.kind == "toc"), None)
+    if toc_page is None or not toc_page.blocks:
+        return
+    toc_block = next((b for b in toc_page.blocks if b.content.get("kind") == "toc"), None)
+    if toc_block is None:
+        return
+
+    first_pages = _chapter_first_pages(document)
+    toc_chapters = [
+        TocChapter(
+            number=chapter.chapter_number,
+            title=chapter.title,
+            summary=chapter.summary,
+            page=first_pages.get(chapter.chapter_id, 0),
+            sections=_chapter_sections(document, chapter),
+        )
+        for chapter in chapters
+    ]
+
+    html_bytes = render_toc_html(toc_chapters, course_title=document.course_title, theme=template.theme)
+    relative = storage.save_asset(document.course_id, html_bytes, extension="html")
+    width, height = estimate_toc_pixel_size(toc_chapters)
+    toc_block.content = merge_content(
+        toc_block.type,
+        toc_block.content,
+        {"path": relative, "asset_id": relative.rsplit("/", 1)[-1], "width": width, "height": height},
+    )
+    toc_block.layout.height = round(estimate_height(toc_block), 2)

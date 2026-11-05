@@ -51,7 +51,8 @@ from app.core.ids import course_id as new_course_id
 from app.core.ids import document_id_for_course, new_id, utc_now_iso
 from app.core.logging import get_logger
 from app.core.metrics import current_metrics, phase as metrics_phase, run_metrics
-from app.course.document.builder import build_document, reflow_document
+from app.course.document.builder import build_document, finalize_toc_page, reflow_document
+from app.course.document.diagram_compaction import compact_diagrams_for_spacing
 from app.course.document.layout import image_generation_failed
 from app.course.document.visual_repair import audit_and_repair_visuals
 from app.course.templates.registry import load_template
@@ -88,6 +89,7 @@ from app.services.image_service import ImageService
 from app.services.memory_embedding_sync import sync_embedding
 from app.services.memory_embedding_text import generation_run_text
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.pdf_spacing_qa import check_pdf_spacing
 from app.services.quality_framework import (
     QualityReport,
     build_course_quality_report,
@@ -1378,7 +1380,51 @@ class CourseService:
                         "Visual repair for %s: %s page(s) repaired, %s still deficient",
                         record.course_id, len(repair.repaired), len(repair.still_deficient),
                     )
+                # Diagram compaction: a page can still be left with a large
+                # trailing gap even after the above - a flow_chart diagram
+                # only a little too tall for its slot forced the whole
+                # group (it + its lead-in text) onto a fresh page, wasting
+                # the original page's remainder (see
+                # app.course.document.diagram_compaction's own docstring).
+                # Re-renders the SAME already-stored spec more compactly
+                # (tighter spacing only, never smaller text) - no new AI
+                # call - and re-paginates.
+                compaction = await compact_diagrams_for_spacing(document, template, storage=self.storage)
+                if compaction.compacted:
+                    log.info(
+                        "Diagram compaction for %s: %s diagram(s) compacted to recover page space",
+                        record.course_id, len(compaction.compacted),
+                    )
                 await self._save_document(document)
+                # QA gate: now that every image is in and the document is
+                # reflowed with real (not estimated) heights, catch a page
+                # a large image's real size left mostly blank, or a fully
+                # blank page - see app.services.pdf_spacing_qa's own
+                # docstring for the regression this closes. Advisory only
+                # (reuses the existing warnings channel, same as the
+                # continuity/quality-gate checks below) - it never blocks
+                # or retries generation; the fix lives in the layout engine
+                # itself (app.course.document.layout) plus the diagram
+                # compaction pass just above, both applied to every course
+                # automatically, so there is nothing further to re-apply here.
+                spacing_report = check_pdf_spacing(document)
+                if not spacing_report.ok:
+                    log.warning("PDF spacing QA for %s:\n%s", record.course_id, spacing_report.summary())
+                    warnings.append(
+                        f"PDF spacing check found {len(spacing_report.findings)} page(s) with excess "
+                        f"blank space and {len(spacing_report.blank_pages)} fully blank page(s) - see logs."
+                    )
+            # Real TOC page numbers: only knowable now that every page
+            # number in the document is truly final - unconditional
+            # (unlike the image-only steps above), since even a text-only
+            # (Content Level 1) course's chapters are already laid out onto
+            # real pages at this point. See finalize_toc_page's own
+            # docstring for why this must be the two-pass build's second
+            # pass, and why it's safe to call exactly here.
+            finalize_toc_page(
+                document, self.storage.load_all_chapters(record.course_id), template, storage=self.storage
+            )
+            await self._save_document(document)
             # The finished course is checked against the creator's own documents.
             if record.input.source_ids and self.settings.enable_fact_check:
                 warnings.extend(await self._audit_after_generation(record, document))

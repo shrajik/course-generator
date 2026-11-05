@@ -41,6 +41,19 @@ LABEL_SIZE = 19.0
 DETAIL_SIZE = 16.0
 LINE_HEIGHT = 1.35
 BOX_PADDING = 16.0
+# A ring/wheel node's own label font size (_circle_node's default) -
+# smaller than LABEL_SIZE (a per-node circle has less real estate than a
+# box), but NOT arbitrarily so: even the smallest possible diagram canvas
+# (CANVAS_WIDTH, 880px) scales down to ~0.757x at the page's real
+# CONTENT_WIDTH (666px) - confirmed real, measured floor: a 13.0px label
+# scales to <10px on the page, under MIN_READABLE_PX
+# (app.services.diagram_render_qa) in every case, not just a crowded one.
+# 15.0 clears that floor with real margin even in the worst case.
+# app.services.diagram_render_qa.readability_issues needs this exact value
+# too (not LABEL_SIZE) to correctly judge whether a wide multi-node ring's
+# text is still legible once scaled to page width.
+RING_LABEL_SIZE = 15.0
+KEY_TABLE_LABEL_SIZE = 13.5
 BADGE_RADIUS = 15.0
 _SANS_RATIO = 0.56
 # Bold glyphs are noticeably wider than the plain-weight ratio above
@@ -464,7 +477,8 @@ def _flow_degrees(
 
 
 def _layout_flow_chart(
-    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float,
+    gap_scale: float = 1.0,
 ) -> tuple[list[str], float, float]:
     """flow_chart/process: a single vertical spine with semantic start
     (green pill) / end (red pill) / process (blue box) / decision (purple
@@ -603,7 +617,12 @@ def _layout_flow_chart(
     if decision_sizes:
         process_w = max(process_w, max(w for w, _h in decision_sizes.values()))
 
-    gap = 50.0
+    # gap_scale (see render_diagram_svg_fitting) compacts ONLY this vertical
+    # spine gap when a generated diagram needs to fit a specific page slot -
+    # box heights, font sizes and horizontal spacing (col_gap, lane gaps)
+    # are deliberately untouched, so node text and chart proportions never
+    # shrink, only the breathing room between consecutive steps does.
+    gap = 50.0 * gap_scale
     col_gap = 40.0
     # The side column holds a decision's quick-exit branch - in practice a
     # short label ("Keep Task", "Escalate issue"), never the longest thing
@@ -1355,24 +1374,21 @@ def _layout_swimlane(
     lane_w = max((total_w - lane_gap * (len(lanes) - 1)) / len(lanes), 140.0)
     body_top = top + _LANE_HEADER_H + 24.0
 
-    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
     lane_x: dict[str, float] = {}
     x = MARGIN
-    for index, lane in enumerate(lanes):
-        fill, stroke = _LANE_COLORS[index % len(_LANE_COLORS)]
+    for lane in lanes:
         lane_x[lane] = x
-        elements.append(
-            f'<rect x="{x:.1f}" y="{top:.1f}" width="{lane_w:.1f}" height="{_LANE_HEADER_H:.1f}" '
-            f'rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
-        )
-        elements.append(
-            _fit_boxed_text(
-                x + lane_w / 2, top + _LANE_HEADER_H / 2, lane, width=lane_w * 0.85,
-                height=_LANE_HEADER_H * 0.65, color=stroke, theme=theme, base_size=14.5,
-            )
-        )
         x += lane_w + lane_gap
 
+    # Node/edge drawing happens FIRST (into its own list) specifically so
+    # the lane BACKGROUND bands below can be sized to the real final
+    # content height - a real, confirmed gap: this renderer used to draw
+    # only a coloured HEADER band at the top of each lane, with nothing
+    # marking a lane's own boundary any further down. A reader had no way
+    # to tell which lane a node belonged to once they looked below the
+    # header row (only inferable from x position) - the defining visual
+    # feature of a real swimlane diagram (BPMN-style full-height lane
+    # bands) was simply missing.
     positions: dict[str, tuple[float, float, float, float]] = {}
     node_w = lane_w - 20.0
     rows = _swimlane_rows(nodes, edges)
@@ -1381,6 +1397,7 @@ def _layout_swimlane(
         if node.id:
             rows_grouped.setdefault(rows[node.id], []).append(node)
 
+    node_elements: list[str] = []
     y = body_top
     for row_index in sorted(rows_grouped):
         row_height = 0.0
@@ -1388,27 +1405,839 @@ def _layout_swimlane(
             lane = node.lane.strip() or "General"
             node_x = lane_x[lane] + 10.0
             svg, height = _node_block(node, x=node_x, y=y, width=node_w, theme=theme)
-            elements.append(svg)
+            node_elements.append(svg)
             positions[node.id] = (node_x + node_w / 2, y + height / 2, node_w, height)
             row_height = max(row_height, height)
         y += row_height + 24.0
 
+    edge_elements: list[str] = []
     for edge in edges:
         a = positions.get(edge.source)
         b = positions.get(edge.target)
         if not a or not b:
             continue
         start, end = _shorten_to_box_edge((a[0], a[1]), (b[0], b[1]), w1=a[2], h1=a[3], w2=b[2], h2=b[3])
-        elements.append(
+        edge_elements.append(
             f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
             f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
         )
         if edge.label.strip():
             mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
-            elements.append(_edge_label(mid[0], mid[1] - 10, edge.label, theme, max_width=110.0))
+            edge_elements.append(_edge_label(mid[0], mid[1] - 10, edge.label, theme, max_width=110.0))
 
     max_bottom = y - 24.0 if rows_grouped else body_top
-    return elements, max_bottom - top
+    lane_bottom = max_bottom + 16.0
+
+    # Lane backgrounds drawn BEFORE (so they sit visually behind) the
+    # header/nodes/edges - a full-height, very light tint of the same
+    # lane colour, with a solid divider line between lanes, so a lane's
+    # own extent is obvious at a glance no matter how far down the
+    # diagram a reader is looking.
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    for index, lane in enumerate(lanes):
+        fill, stroke = _LANE_COLORS[index % len(_LANE_COLORS)]
+        lx = lane_x[lane]
+        elements.append(
+            f'<rect x="{lx:.1f}" y="{top:.1f}" width="{lane_w:.1f}" height="{lane_bottom - top:.1f}" '
+            f'fill="{fill}" fill-opacity="0.25" stroke="{stroke}" stroke-opacity="0.5" stroke-width="1"/>'
+        )
+    for index, lane in enumerate(lanes):
+        fill, stroke = _LANE_COLORS[index % len(_LANE_COLORS)]
+        lx = lane_x[lane]
+        elements.append(
+            f'<rect x="{lx:.1f}" y="{top:.1f}" width="{lane_w:.1f}" height="{_LANE_HEADER_H:.1f}" '
+            f'rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        elements.append(
+            _fit_boxed_text(
+                lx + lane_w / 2, top + _LANE_HEADER_H / 2, lane, width=lane_w * 0.85,
+                height=_LANE_HEADER_H * 0.65, color=stroke, theme=theme, base_size=14.5,
+            )
+        )
+    elements.extend(node_elements)
+    elements.extend(edge_elements)
+
+    return elements, lane_bottom - top
+
+
+# --- textbook-style ring/wheel (flow_chart/process/cycle, concept_map) ----
+# Replaces the old box-and-arrow look for exactly these kinds (see
+# render_diagram_svg's own dispatch) with a clean, numbered-circle diagram
+# plus a separate Key table for full explanations - no text ever sits on a
+# connector line, and a node label never truncates to "…" (see
+# _circle_node's own docstring). hierarchy/comparison/er_diagram/
+# data_flow_diagram/swimlane/schematic/graph/smart_art are untouched.
+
+# Strips a "Fig. N: " / "Fig. N.M: " caption prefix (see
+# app.services.diagram_service._with_figure_caption) before reusing a
+# diagram's own title as the ring layout's CENTER circle label - the
+# caption itself is already drawn above the canvas; repeating the "Fig. "
+# prefix a second time, cramped into a small circle, is just noise.
+_FIGURE_PREFIX_RE = re.compile(r"^Fig\.\s*\d+(?:\.\d+)?:\s*")
+
+_WHEEL_SEGMENT_COLORS = [
+    ("#bfdbfe", "#1d4ed8"),  # blue
+    ("#bbf7d0", "#16a34a"),  # green
+    ("#fde68a", "#b45309"),  # amber
+    ("#fbcfe8", "#be185d"),  # pink
+    ("#ddd6fe", "#6d28d9"),  # purple
+    ("#99f6e4", "#0f766e"),  # teal
+]
+
+# --- style-aware cycling palette ------------------------------------------
+# One shared (fill, stroke) colour cycle for every kind that just needs "a
+# different colour per item, no inherent meaning per colour" (a pyramid's
+# layers, a matrix's cells, a wheel/mindmap/network's nodes, a chevron/
+# staircase/timeline's steps) - as opposed to a kind whose colours carry
+# real MEANING (flow_chart's start/process/decision/end, hierarchy's depth,
+# balance_comparison's cost/value red-green) which stay their own fixed
+# palette regardless of style, unaffected by any of this.
+#
+# "default" is _WHEEL_SEGMENT_COLORS above, unchanged - every course
+# generated before this system existed keeps producing byte-identical
+# colours. "vibrant"/"muted" are new, selectable via
+# TemplateTheme.diagram_palette. The vibrant strokes are the validated,
+# colourblind-safe 8-hue categorical order from this workspace's own
+# dataviz skill (references/palette.md) - picked for real, checked hue
+# separation, not eyeballed - paired with a lighter tint of each hue as
+# the fill, matching this module's existing "pastel fill + saturated
+# stroke" convention; "muted" is a softer, lower-saturation professional
+# family in the same fill/stroke-pair shape, for formal/corporate content
+# that wants less visual energy than the default or vibrant sets.
+_CYCLING_PALETTES: dict[str, list[tuple[str, str]]] = {
+    "default": _WHEEL_SEGMENT_COLORS,
+    "vibrant": [
+        ("#cde2fb", "#2a78d6"),  # blue
+        ("#fbdbc9", "#eb6834"),  # orange
+        ("#c3f0dc", "#1baf7a"),  # aqua
+        ("#fbe6b3", "#c98500"),  # yellow (darker stroke step for text contrast)
+        ("#fad7e4", "#e87ba4"),  # magenta
+        ("#c2e8c2", "#008300"),  # green
+        ("#e1dcf8", "#6250d6"),  # violet
+        ("#fbd6d6", "#e34948"),  # red
+    ],
+    "muted": [
+        ("#e2e9f0", "#5b7a9d"),  # dusty blue
+        ("#e3ece4", "#6b8f71"),  # sage green
+        ("#f0e6d8", "#a67c52"),  # warm taupe
+        ("#f2e2d8", "#b76e49"),  # terracotta
+        ("#e8e4f2", "#7c6f9e"),  # muted lavender
+        ("#dcebeb", "#4f7c7c"),  # slate teal
+        ("#f2e0e4", "#a65d6e"),  # dusty rose
+    ],
+}
+
+
+def _cycling_palette(theme: TemplateTheme) -> list[tuple[str, str]]:
+    """The (fill, stroke) colour cycle this course's theme selected for
+    generically-coloured diagram shapes - see TemplateTheme.diagram_palette
+    and _CYCLING_PALETTES' own module docstring. An unset or unrecognised
+    value is "default", never an error - this is a cosmetic preference,
+    not a required field."""
+    return _CYCLING_PALETTES.get(theme.diagram_palette.strip().lower(), _WHEEL_SEGMENT_COLORS)
+
+
+def _circle_node_size(
+    label: str, *, min_radius: float, font_size: float
+) -> tuple[list[str], float]:
+    """The wrapped label lines and the radius a circle needs to hold them -
+    split out from `_circle_node` so a caller can learn a node's REAL size
+    (label text can grow it past `min_radius` - see `_circle_node`'s own
+    docstring) before positions are chosen, e.g. to space nodes around a
+    ring far enough apart that two full-sized circles never touch (see
+    `_layout_ring_process`'s own neighbour-clearance math, the same
+    chord-length approach `_layout_concept_map` already uses for its own
+    satellites)."""
+    width_budget = min_radius * 1.55
+    # max_lines is deliberately generous (not a small cap like _node_block's
+    # low ones, the actual source of the banned "…" cutoff) - wrapped
+    # first, UNBOUNDED, so the real line count this label needs is known
+    # before the circle is ever sized; a label the writer prompt's own
+    # 2-4-word guidance didn't catch (unusually long) widens the wrap
+    # budget once and re-wraps, so it grows into a wider, shorter block
+    # instead of a tall, narrow column of many short lines - never a
+    # truncation, in either pass.
+    lines = _wrap(label, font_size=font_size, width=width_budget, max_lines=999, bold=True)
+    if len(lines) > 4:
+        width_budget = max(width_budget, (len(label) * font_size * _BOLD_RATIO) ** 0.5 * 9.0)
+        lines = _wrap(label, font_size=font_size, width=width_budget, max_lines=999, bold=True)
+    text_h = len(lines) * font_size * LINE_HEIGHT
+    widest_chars = max((len(line) for line in lines), default=0)
+    text_w = widest_chars * font_size * _BOLD_RATIO
+    radius = max(min_radius, text_h / 1.15 + 24.0, text_w / 1.55 + 18.0)
+    return lines, radius
+
+
+def _circle_node(
+    label: str,
+    *,
+    cx: float,
+    cy: float,
+    theme: TemplateTheme,
+    number: str,
+    fill: str,
+    stroke: str,
+    min_radius: float = 64.0,
+    font_size: float = RING_LABEL_SIZE,
+    detail: str = "",
+    sizing: tuple[list[str], float] | None = None,
+) -> tuple[str, float]:
+    """A filled circle with a number badge (or none, for a centre/focal
+    node - pass `number=""`) and a short label wrapped inside. Never
+    truncates: `_wrap` is called with a generous `max_lines` (unlike
+    `_node_block`'s low caps, the actual source of the banned "…" cutoff),
+    and the circle's own radius grows past `min_radius` to fit however
+    many lines of real label text came back, rather than cutting them -
+    the writer prompt already asks for a short (2-4 word) label, so this
+    almost never needs to grow in practice, but never silently loses text
+    when a label runs long anyway. Returns (svg, the radius actually
+    used) so a caller positioning other elements around this node (an
+    arrow, a neighbour) works from its real size, not just `min_radius`.
+
+    Wrapped in the same `<g class="diagram-node" tabindex="0" role="group">`
+    + `<title>` tooltip + `.diagram-box` inner-element convention every
+    other node shape in this module already uses (see `_node_block`) - so
+    the existing global hover/focus CSS and keyboard-interactivity actually
+    apply to a circle too, not just the old rectangle shapes. `detail`
+    (full explanation, also shown unabridged in the Key table below) feeds
+    the tooltip even though it's never drawn inside the circle itself.
+
+    `sizing`: a caller that already called `_circle_node_size` itself (to
+    plan ring/wheel geometry around this node's REAL size before any
+    position was chosen - see `_layout_ring_process`/`_layout_concept_wheel`)
+    must pass that exact `(lines, radius)` back in here rather than let
+    this call re-derive it from `min_radius`. `_circle_node_size`'s wrap
+    width budget scales with `min_radius`, so feeding a GROWN radius back
+    in as `min_radius` widens the budget again and can wrap into a
+    DIFFERENT, even larger circle than the one geometry was planned
+    around - a real, measured bug (a focal/centre label long enough to
+    grow past its base radius came out larger when actually drawn than
+    the size the surrounding ring had been spaced for, overlapping it).
+    """
+    lines, radius = sizing if sizing is not None else _circle_node_size(label, min_radius=min_radius, font_size=font_size)
+
+    tooltip = label.strip()
+    if detail.strip():
+        tooltip = f"{tooltip} — {detail.strip()}" if tooltip else detail.strip()
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<circle class="diagram-box" cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" '
+        f'fill="{fill}" stroke="{stroke}" stroke-width="2.5"/>'
+    )
+    label_center_y = cy + font_size * 0.32
+    if number:
+        badge_y = cy - radius * 0.46
+        parts.append(
+            f'<text x="{cx:.1f}" y="{badge_y:.1f}" font-size="14" font-weight="800" '
+            f'fill="{stroke}" text-anchor="middle" font-family="{escape(theme.font_family)}">'
+            f"{escape(number)}</text>"
+        )
+        label_center_y = cy - font_size * 0.2
+    label_svg, label_h = _text(
+        cx,
+        label_center_y - (len(lines) - 1) * font_size * LINE_HEIGHT / 2,
+        lines,
+        font_size=font_size,
+        weight=700,
+        color=theme.text_color,
+        font_family=theme.font_family,
+        anchor="middle",
+    )
+    parts.append(label_svg)
+    group = f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+    return group, radius
+
+
+def _curved_connector(
+    x1: float, y1: float, x2: float, y2: float, *, cx: float, cy: float, theme: TemplateTheme
+) -> str:
+    """An arrow from one ring/wheel node to the next, bowed gently outward
+    from the ring's own centre (cx, cy) - never a straight line (reads as
+    flatter, more "textbook" than `_layout_cycle`'s old straight
+    connectors) and never carries a label (the "no text on arrows" rule -
+    an edge's own `label`, if the model set one, isn't drawn here at all;
+    the Key table below is where any such context belongs instead)."""
+    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+    dx, dy = mx - cx, my - cy
+    dist = max(math.hypot(dx, dy), 1.0)
+    # Scales down for a short chord (nodes placed close together, a dense
+    # ring) - a fixed 22px bow could swing the curve's midpoint back
+    # toward a tightly-packed neighbour it was never meant to approach;
+    # capped at 22px so a normal, spacious ring looks exactly as before.
+    chord = math.hypot(x2 - x1, y2 - y1)
+    bow = min(22.0, chord * 0.18)
+    ctrl = (mx + dx / dist * bow, my + dy / dist * bow)
+    return (
+        f'<path d="M{x1:.1f},{y1:.1f} Q{ctrl[0]:.1f},{ctrl[1]:.1f} {x2:.1f},{y2:.1f}" '
+        f'fill="none" stroke="{theme.accent_color}" stroke-width="2.5" marker-end="url(#diagram-arrow)"/>'
+    )
+
+
+def _key_table_rows(
+    entries: list[tuple[str, str, str]],
+    *,
+    top: float,
+    width: float,
+    theme: TemplateTheme,
+    row_gap_scale: float = 1.0,
+) -> tuple[list[str], float]:
+    """The full explanation for each ring/wheel node, moved OUT of the
+    diagram itself into a plain, textbook-style key below it - one row per
+    entry, `(number-or-"" , label, detail)`. Every line wraps generously
+    (`_wrap`'s own `max_lines` set high) rather than ever truncating -
+    the single reason this table exists at all is so a node's full
+    explanation has somewhere to go that ISN'T a cramped circle.
+    `row_gap_scale` (see _layout_ring_process's own docstring) only
+    compacts the whitespace BETWEEN rows - text size and content are
+    exactly as legible compacted as not."""
+    row_font, detail_font = KEY_TABLE_LABEL_SIZE, 12.0
+    elements: list[str] = [
+        f'<line x1="{MARGIN:.1f}" y1="{top:.1f}" x2="{MARGIN + width:.1f}" y2="{top:.1f}" '
+        f'stroke="{theme.border_color}" stroke-width="1"/>'
+    ]
+    y = top + 24.0 * row_gap_scale
+    for number, label, detail in entries:
+        if not label.strip():
+            continue
+        prefix = f"{number}. " if number else "• "
+        label_svg, label_h = _text(
+            MARGIN,
+            y,
+            [f"{prefix}{label.strip()}"],
+            font_size=row_font,
+            weight=700,
+            color=theme.text_color,
+            font_family=theme.font_family,
+            anchor="start",
+        )
+        elements.append(label_svg)
+        y += label_h + 3.0 * row_gap_scale
+        if detail.strip():
+            detail_lines = _wrap(detail, font_size=detail_font, width=width - 20.0, max_lines=999)
+            detail_svg, detail_h = _text(
+                MARGIN + 16.0,
+                y,
+                detail_lines,
+                font_size=detail_font,
+                weight=400,
+                color=theme.muted_color,
+                font_family=theme.font_family,
+                anchor="start",
+            )
+            elements.append(detail_svg)
+            y += detail_h + 4.0 * row_gap_scale
+        y += 12.0 * row_gap_scale
+        elements.append(
+            f'<line x1="{MARGIN:.1f}" y1="{y - 6.0:.1f}" x2="{MARGIN + width:.1f}" y2="{y - 6.0:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="0.75" opacity="0.5"/>'
+        )
+    return elements, y - top
+
+
+_RING_START_WORDS = {"start", "begin", "initial"}
+_RING_END_WORDS = {"end", "stop", "finish", "done"}
+
+
+def _ring_role_of(node: DiagramNode, *, is_first: bool, is_last: bool, closes_loop: bool) -> str:
+    """Which of _FLOW_ROLE_COLORS' fixed roles a ring node is coloured as -
+    reused via _node_colors (same function flow_chart's old box renderer
+    used), so a node's own explicit `role`/`color` override (Edit Visuals:
+    the flowchart editor) still has a real, visible effect on the new ring
+    rendering, exactly as it did before. Structural decision-branch
+    detection doesn't apply here any more (a ring has no branches - see
+    _layout_ring_process's own docstring), so only an explicit override, a
+    literal start/end label, or first/last ring position (for a ring that
+    doesn't close) ever produce anything other than "process"."""
+    override = node.role.strip().lower()
+    if override in ("start", "process", "decision", "end"):
+        return override
+    label = node.label.strip().lower()
+    if label in _RING_START_WORDS:
+        return "start"
+    if label in _RING_END_WORDS:
+        return "end"
+    if not closes_loop:
+        if is_first:
+            return "start"
+        if is_last:
+            return "end"
+    return "process"
+
+
+def _layout_ring_process(
+    nodes: list[DiagramNode],
+    edges: list[DiagramEdge],
+    *,
+    theme: TemplateTheme,
+    top: float,
+    title: str = "",
+    gap_scale: float = 1.0,
+) -> tuple[list[str], float, float]:
+    """Textbook-style numbered ring for flow_chart/process/cycle: each step
+    a numbered circle, joined by curved, unlabelled arrows in order. The
+    ring CLOSES (an arrow from the last step back to the first) only when
+    the spec's own edges already contain that exact connection - a real,
+    repeating cycle - and stays open otherwise, which is what correctly
+    draws an ordinary non-cyclic numbered sequence with the SAME layout:
+    a textbook draws both of these as a ring of numbered steps, the only
+    difference being whether the last arrow closes the loop.
+
+    `gap_scale` (see render_diagram_svg_fitting /
+    app.course.document.diagram_compaction) only compacts the Key table's
+    own row spacing below the ring - the ring itself (node size, spacing,
+    font) is never touched by it, same "whitespace only" contract
+    `_key_table_rows` documents."""
+    count = len(nodes)
+    if count == 0:
+        return [], CANVAS_WIDTH, 0.0
+
+    node_radius = 62.0
+    # The ring places every node at the SAME radius, so the one real node
+    # size that matters for spacing is the LARGEST one any label actually
+    # grows to (_circle_node_size, not just min_radius) - sized up front,
+    # before any position is chosen. Same chord-length "keep neighbours
+    # from touching" math _layout_concept_map already uses for its own
+    # satellites: a real, measured bug at high node counts (14, the
+    # documented max for a sequential kind) - the old fixed `count * 42.0`
+    # formula didn't account for labels growing nodes past min_radius, so
+    # neighbouring circles (and the curved connectors between them)
+    # crowded into each other.
+    max_node_radius = max(
+        (_circle_node_size(node.label, min_radius=node_radius, font_size=RING_LABEL_SIZE)[1] for node in nodes),
+        default=node_radius,
+    )
+    neighbour_clearance_radius = (
+        (2 * max_node_radius + 80.0) / (2 * math.sin(math.pi / count)) if count >= 2 else 0.0
+    )
+    # The ring must also clear the CENTRE title circle, not just its own
+    # neighbours - a real, measured bug: a long title (e.g. "Induction
+    # problem workflow") grows that centre circle well past its 54.0
+    # min_radius (see _circle_node_size), and with no term for it here the
+    # ring radius stayed fixed at 165.0, letting every surrounding node
+    # overlap the oversized centre. _layout_concept_wheel already does the
+    # equivalent for its own focal node; this mirrors that.
+    center_sizing = _circle_node_size(title.strip(), min_radius=54.0, font_size=13.5) if title.strip() else ([], 0.0)
+    ring_radius = max(165.0, neighbour_clearance_radius, center_sizing[1] + max_node_radius + 40.0)
+    cx = ring_radius + max_node_radius + 50.0
+    cy = top + ring_radius + max_node_radius + 50.0
+    canvas_w = max(CANVAS_WIDTH, 2 * cx)
+
+    has_closing_edge = count > 1 and any(
+        edge.source == nodes[-1].id and edge.target == nodes[0].id and nodes[-1].id and nodes[0].id
+        for edge in edges
+    )
+
+    centers: list[tuple[float, float, float]] = []
+    circle_svgs: list[str] = []
+    for index, node in enumerate(nodes):
+        angle = (2 * math.pi * index / count) - math.pi / 2
+        nx = cx + ring_radius * math.cos(angle)
+        ny = cy + ring_radius * math.sin(angle)
+        role = _ring_role_of(
+            node, is_first=index == 0, is_last=index == count - 1, closes_loop=has_closing_edge
+        )
+        fill, stroke = _node_colors(node, role)
+        svg, used_radius = _circle_node(
+            node.label, cx=nx, cy=ny, theme=theme, number=str(index + 1),
+            fill=fill, stroke=stroke, min_radius=node_radius, detail=node.detail,
+        )
+        centers.append((nx, ny, used_radius))
+        circle_svgs.append(svg)
+
+    elements = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    arrow_count = count if has_closing_edge else count - 1
+    for index in range(max(arrow_count, 0)):
+        x1, y1, r1 = centers[index]
+        x2, y2, r2 = centers[(index + 1) % count]
+        dx, dy = x2 - x1, y2 - y1
+        dist = max(math.hypot(dx, dy), 1.0)
+        ux, uy = dx / dist, dy / dist
+        # A small extra gap (not just the exact node radius) before the
+        # curve starts bowing - a real, measured bug: starting exactly ON
+        # a (possibly label-grown) node's own boundary let the curve's
+        # early bow swing back across that same boundary before it had
+        # moved far enough away, clipping the node it had JUST left.
+        clearance = 12.0
+        elements.append(
+            _curved_connector(
+                x1 + ux * (r1 + clearance), y1 + uy * (r1 + clearance),
+                x2 - ux * (r2 + clearance), y2 - uy * (r2 + clearance),
+                cx=cx, cy=cy, theme=theme,
+            )
+        )
+    elements.extend(circle_svgs)
+
+    center_label = title.strip()
+    if center_label:
+        center_svg, _ = _circle_node(
+            center_label, cx=cx, cy=cy, theme=theme, number="",
+            fill=theme.surface_color, stroke=theme.border_color, min_radius=54.0, font_size=13.5,
+            sizing=center_sizing,
+        )
+        elements.append(center_svg)
+
+    ring_bottom = cy + ring_radius + max_node_radius + 40.0
+    key_gap = 30.0 * gap_scale
+    key_elements, key_h = _key_table_rows(
+        [(str(i + 1), n.label, n.detail) for i, n in enumerate(nodes)],
+        top=ring_bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme, row_gap_scale=gap_scale,
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (ring_bottom + key_gap + key_h - top)
+
+
+def _layout_concept_wheel(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    """Textbook-style concept wheel for concept_map: a focal subject at the
+    centre, its parts/properties/components as numbered circles around it
+    in a fixed, cycling colour palette - deliberately no connecting lines
+    or edge labels at all. A wheel communicates "these belong to X" by
+    proximity and colour, not by a drawn relationship line, which is
+    exactly what sidesteps edge labels entirely (there's nothing to label
+    - see this module's "no text on arrows" rule)."""
+    if not nodes:
+        return [], CANVAS_WIDTH, 0.0
+    focal = _focal_node(nodes, edges)
+    satellites = [n for n in nodes if n is not focal]
+    count = max(len(satellites), 1)
+
+    sat_radius, focal_radius = 60.0, 76.0
+    # Same real-size-aware neighbour-clearance math as _layout_ring_process
+    # (see its own docstring for the measured bug this closes) - a focal
+    # with a long label, or satellites with long labels, can each grow
+    # well past their own min_radius; sizing the ring from the FIXED
+    # radii only let a grown satellite's circle spill past the canvas
+    # bounds entirely (confirmed: an 8-satellite concept map with long
+    # labels drew a point outside its own declared canvas).
+    max_sat_radius = max(
+        (_circle_node_size(sat.label, min_radius=sat_radius, font_size=RING_LABEL_SIZE)[1] for sat in satellites),
+        default=sat_radius,
+    )
+    focal_sizing = _circle_node_size(focal.label, min_radius=focal_radius, font_size=14.5)
+    focal_radius = focal_sizing[1]
+    neighbour_clearance_radius = (
+        (2 * max_sat_radius + 50.0) / (2 * math.sin(math.pi / count)) if count >= 2 else 0.0
+    )
+    ring_radius = max(190.0, focal_radius + max_sat_radius + 50.0, neighbour_clearance_radius)
+    cx = ring_radius + max_sat_radius + 50.0
+    cy = top + ring_radius + max_sat_radius + 50.0
+    canvas_w = max(CANVAS_WIDTH, 2 * cx)
+
+    focal_svg, _ = _circle_node(
+        focal.label, cx=cx, cy=cy, theme=theme, number="",
+        fill=theme.accent_soft, stroke=theme.accent_color, min_radius=focal_radius, font_size=14.5,
+        detail=focal.detail, sizing=focal_sizing,
+    )
+    elements = [focal_svg]
+
+    for index, sat in enumerate(satellites):
+        angle = (2 * math.pi * index / count) - math.pi / 2
+        sx = cx + ring_radius * math.cos(angle)
+        sy = cy + ring_radius * math.sin(angle)
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        svg, _ = _circle_node(
+            sat.label, cx=sx, cy=sy, theme=theme, number=str(index + 1),
+            fill=fill, stroke=stroke, min_radius=sat_radius, detail=sat.detail,
+        )
+        elements.append(svg)
+
+    wheel_bottom = cy + ring_radius + max_sat_radius + 40.0
+    key_entries = [("", focal.label, focal.detail)] + [
+        (str(i + 1), n.label, n.detail) for i, n in enumerate(satellites)
+    ]
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=wheel_bottom + 30.0, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (wheel_bottom + 30.0 + key_h - top)
+
+
+# --- textbook-style standard flowchart (flow_chart/process only - cycle
+# stays on the ring above, a true repeating process reads better as a ring
+# than forced into a straight line that has to loop back to its own top) --
+# Conventional notation - oval start/end, rectangle process, diamond
+# decision - in a single straight column, the way a textbook/whiteboard
+# actually draws a plain procedure. Reuses the already-proven _draw_pill/
+# _draw_diamond/_fit_boxed_text shapes (er_diagram, and the old box-based
+# flow_chart renderer kept below for backward compatibility) rather than
+# inventing new ones - only the LAYOUT (straight column, no side-branch
+# columns) and the "no detail text inside a node, no text on an arrow"
+# rules are new.
+
+# Public (no leading underscore) like RING_LABEL_SIZE - app.services.
+# diagram_render_qa imports this to know the REAL smallest label size this
+# kind renders at (the pill's own _PILL_LABEL_SIZE is larger, so this -
+# process/decision's shared size - is the worst-case readability floor).
+STANDARD_FLOWCHART_LABEL_SIZE = 15.0
+_MIN_PROCESS_BOX_W = 220.0
+_MAX_PROCESS_BOX_W = 380.0
+_MIN_PROCESS_BOX_H = 70.0
+_MIN_DECISION_BOX_W = 220.0
+_MAX_DECISION_BOX_W = 380.0
+_MIN_DECISION_BOX_H = 130.0
+
+
+def _draw_process_box(
+    node: DiagramNode, *, cx: float, cy: float, width: float, height: float, theme: TemplateTheme,
+    colors: tuple[str, str],
+) -> str:
+    """An ordinary process step - a plain rounded rectangle, label only.
+    Never `node.detail` inside the box - a node's full explanation belongs
+    in the Key table below (_key_table_rows), the same rule the ring/wheel
+    rendering already follows; `detail`, when set, still reaches the hover
+    tooltip."""
+    tooltip = node.label.strip()
+    if node.detail.strip():
+        tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+    fill, stroke = colors
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<rect class="diagram-box" x="{cx - width / 2:.1f}" y="{cy - height / 2:.1f}" '
+        f'width="{width:.1f}" height="{height:.1f}" rx="10" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+    )
+    parts.append(
+        _fit_boxed_text(
+            cx, cy, node.label, width=width * 0.85, height=height * 0.7,
+            color=theme.text_color, theme=theme,
+            base_size=STANDARD_FLOWCHART_LABEL_SIZE, min_size=STANDARD_FLOWCHART_LABEL_SIZE,
+        )
+    )
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+
+
+def _ideal_process_box_size(node: DiagramNode) -> tuple[float, float]:
+    """Sizes the box to its own label - the box grows to fit the text
+    (never the other way around), the same "enlarge the shape, don't
+    shrink or truncate the text" rule every shape in this module follows;
+    `_fit_boxed_text`'s own shrink-to-fit inside `_draw_process_box` is
+    only ever a defensive last resort once this already gave it generous
+    room."""
+    label = node.label.strip() or "—"
+    # max_lines deliberately unbounded (999, not a real cap) - a real,
+    # confirmed bug: an earlier version capped this at 3, so _wrap ITSELF
+    # silently truncated an unusually long label with "…" right here,
+    # during SIZING, before _draw_process_box's own _fit_boxed_text ever
+    # got a chance to give it room - the box was being sized to an
+    # already-mutilated line list. Mirrors _circle_node's own fix for the
+    # identical class of bug.
+    lines = _wrap(label, font_size=STANDARD_FLOWCHART_LABEL_SIZE, width=300.0, max_lines=999, bold=True) or [label]
+    longest = max(len(line) for line in lines)
+    line_w = longest * STANDARD_FLOWCHART_LABEL_SIZE * _BOLD_RATIO
+    text_h = len(lines) * STANDARD_FLOWCHART_LABEL_SIZE * LINE_HEIGHT
+    width = max(_MIN_PROCESS_BOX_W, min(_MAX_PROCESS_BOX_W, (line_w + 32.0) / 0.85))
+    height = max(_MIN_PROCESS_BOX_H, (text_h + 24.0) / 0.7)
+    return width, height
+
+
+def _ideal_decision_box_size(node: DiagramNode) -> tuple[float, float]:
+    """Mirrors `_layout_flow_chart`'s own (still kept, still used for
+    backward compatibility) `_ideal_decision_size` - reimplemented
+    standalone here, deliberately not extracted/shared, so this change can
+    never put that already-stable function's own behaviour at risk.
+    `_draw_diamond`'s own usable text area is (width*0.5, height*0.5) - a
+    rhombus is only that wide/tall at its own midline - so the diamond is
+    sized well past the label's own raw footprint. max_lines deliberately
+    unbounded - see _ideal_process_box_size's own comment on the identical
+    truncate-during-sizing bug this avoids."""
+    label = node.label.strip() or "?"
+    lines = _wrap(label, font_size=STANDARD_FLOWCHART_LABEL_SIZE, width=260.0, max_lines=999, bold=True) or [label]
+    longest = max(len(line) for line in lines)
+    line_w = longest * STANDARD_FLOWCHART_LABEL_SIZE * _BOLD_RATIO
+    width = max(_MIN_DECISION_BOX_W, min(_MAX_DECISION_BOX_W, (line_w + 24.0) / 0.5))
+    # A real, confirmed bug (pre-dating this specific function - it was
+    # already live in flow_chart's own decision diamonds, just never hit
+    # by a long-enough label in that kind's own tests): the wrap above
+    # assumes a FIXED 260px budget no matter where `width` actually lands.
+    # Once _MAX_DECISION_BOX_W caps it, the diamond's own usable text area
+    # (width*0.5, per this function's own docstring) can end up NARROWER
+    # than that 260px assumption - under-counting how many lines the
+    # label really needs and truncating it at draw time. Re-wrap at the
+    # REAL usable width once it's known; height has no cap, so it simply
+    # grows to fit however many lines that turns out to need, same "grow,
+    # never truncate" rule every shape in this module already follows.
+    usable_w = width * 0.5
+    if usable_w < 260.0:
+        lines = _wrap(label, font_size=STANDARD_FLOWCHART_LABEL_SIZE, width=usable_w, max_lines=999, bold=True) or [label]
+    text_h = len(lines) * STANDARD_FLOWCHART_LABEL_SIZE * LINE_HEIGHT
+    height = max(_MIN_DECISION_BOX_H, (text_h + 24.0) / 0.5)
+    return width, height
+
+
+def _flowchart_role(node: DiagramNode, *, out_degree: int) -> str:
+    """start/process/decision/end for one step of a standard flowchart -
+    an explicit override (Edit Visuals: the flowchart editor) wins first,
+    then real structure (2+ outgoing edges IS a decision, by construction,
+    same rule _layout_flow_chart's own role_of already uses), then a
+    literal start/end label match.
+
+    Deliberately NO first/last-position fallback (unlike the ring's own
+    _ring_role_of, or the old _layout_flow_chart's role_of): a real,
+    confirmed bug - `_draw_pill`'s oval is a fixed, non-growing size
+    (correct for a genuinely short "Start"/"End" label, the only thing a
+    real flowchart ever puts there), so misclassifying an ordinary,
+    possibly LONG first/last process step as "start"/"end" just because
+    of its position forced its label into a shape that can't grow to fit
+    it, truncating with "…" - the exact bug this whole rendering change
+    exists to remove. A node that isn't explicitly marked start/end
+    (override or label) is simply an ordinary process step by default,
+    which CAN grow (see _ideal_process_box_size) - the safe default."""
+    override = node.role.strip().lower()
+    if override in ("start", "process", "decision", "end"):
+        return override
+    if out_degree >= 2:
+        return "decision"
+    label = node.label.strip().lower()
+    if label in _RING_START_WORDS:
+        return "start"
+    if label in _RING_END_WORDS:
+        return "end"
+    return "process"
+
+
+def _flowchart_side_connector(
+    x1: float, y1: float, x2: float, y2: float, *, rail_x: float, theme: TemplateTheme
+) -> str:
+    """A secondary connector (a decision's alternate branch, a loop back
+    to an earlier step) - out the source's own right edge, straight down
+    (or up) a vertical "rail" placed far enough right to clear every node
+    it passes, then left into the target's own right edge - the standard
+    flowchart convention for a skip-ahead/loop-back branch, drawn as
+    straight right-angle segments (`stroke-linejoin="round"` only softens
+    the two corners, it never curves the segments themselves). Replaces an
+    earlier free-floating curved bow: a real, confirmed complaint (with a
+    screenshot) that it read as a stray circular arc hanging in empty
+    space, not a connector - it started/ended at an arbitrary offset from
+    each node's own CENTRE rather than touching its actual edge, so it
+    never visibly touched either shape. `x1`/`y1`/`x2`/`y2` here are each
+    node's own real edge point, so this one now visibly starts and ends on
+    the shapes it connects. Never carries a label, same as every other
+    connector this module's textbook-style kinds draw."""
+    return (
+        f'<path d="M{x1:.1f},{y1:.1f} L{rail_x:.1f},{y1:.1f} L{rail_x:.1f},{y2:.1f} L{x2:.1f},{y2:.1f}" '
+        f'fill="none" stroke="{theme.accent_color}" stroke-width="2" stroke-linejoin="round" '
+        f'marker-end="url(#diagram-arrow)"/>'
+    )
+
+
+def _layout_standard_flowchart(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float,
+    gap_scale: float = 1.0,
+) -> tuple[list[str], float, float]:
+    """Textbook-style standard flowchart for flow_chart/process (cycle
+    stays on the ring - see _layout_ring_process): a single, clean
+    vertical column of conventional symbols - oval for start/end,
+    rectangle for an ordinary step, diamond for a decision - connected
+    top to bottom by straight, unlabelled arrows. Full explanations never
+    go in a node, including a decision's own branch meaning ("Yes"/"No") -
+    see _key_table_rows, drawn below; a decision's own outgoing edge
+    labels are folded into its own Key row instead of ever sitting on the
+    arrow itself.
+
+    Deliberately a SINGLE straight column (max ~7 steps, per the brief)
+    rather than the old _layout_flow_chart's side-branching-column design:
+    any edge that doesn't connect two consecutive nodes in the given
+    order (a decision's secondary branch, a loop back) is drawn as a
+    right-angle connector routed out to the side and back (see
+    _flowchart_side_connector) instead of a persistent second column.
+
+    `gap_scale` (see render_diagram_svg_fitting /
+    app.course.document.diagram_compaction) only compacts the vertical
+    gap between consecutive nodes, and the Key table's own row spacing -
+    node/box sizes and font are never touched by it."""
+    if not nodes:
+        return [], CANVAS_WIDTH, 0.0
+
+    _, out_edges = _flow_degrees(nodes, edges)
+    index_by_id = {n.id: i for i, n in enumerate(nodes) if n.id}
+
+    cx = CANVAS_WIDTH / 2
+    gap = 50.0 * gap_scale
+    y = top
+    elements = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    positions: list[tuple[float, float, float]] = []  # (cx, top_y, bottom_y)
+    widths: list[float] = []  # each node's own drawn width, for side-connector clearance
+
+    for index, node in enumerate(nodes):
+        out_degree = len(out_edges.get(node.id, []))
+        role = _flowchart_role(node, out_degree=out_degree)
+        colors = _node_colors(node, role)
+        if role == "decision":
+            width, height = _ideal_decision_box_size(node)
+            svg = _draw_diamond(
+                node, cx=cx, cy=y + height / 2, width=width, height=height, theme=theme, colors=colors,
+                base_size=STANDARD_FLOWCHART_LABEL_SIZE, min_size=STANDARD_FLOWCHART_LABEL_SIZE,
+            )
+        elif role in ("start", "end"):
+            width, height = _PILL_W, _PILL_H
+            svg = _draw_pill(node, cx=cx, cy=y + height / 2, theme=theme, colors=colors)
+        else:
+            width, height = _ideal_process_box_size(node)
+            svg = _draw_process_box(node, cx=cx, cy=y + height / 2, width=width, height=height, theme=theme, colors=colors)
+        elements.append(svg)
+        positions.append((cx, y, y + height))
+        widths.append(width)
+        y += height + gap
+
+    for i in range(len(nodes) - 1):
+        bottom = positions[i][2]
+        top2 = positions[i + 1][1]
+        elements.append(
+            f'<line x1="{cx:.1f}" y1="{bottom:.1f}" x2="{cx:.1f}" y2="{top2:.1f}" '
+            f'stroke="{theme.accent_color}" stroke-width="2.5" marker-end="url(#diagram-arrow)"/>'
+        )
+
+    # Rails already claimed by an earlier side connector, as (y_lo, y_hi,
+    # rail_x) - a second connector whose own y-range overlaps an earlier
+    # one's is pushed further out past it (never onto the same rail_x), so
+    # two independent side connectors can never run down the exact same
+    # vertical line even when they both skip over the same stretch of
+    # nodes (a real, confirmed case: a "Route" decision's two branches
+    # reconverging on a shared "End" node needs one connector for each
+    # branch, and their y-ranges overlap).
+    placed_rails: list[tuple[float, float, float]] = []
+    for edge in edges:
+        si, ti = index_by_id.get(edge.source), index_by_id.get(edge.target)
+        if si is None or ti is None or ti == si + 1:
+            continue  # already drawn as the straight consecutive arrow above
+        lo, hi = min(si, ti), max(si, ti)
+        # The vertical rail must clear every node's own right edge from
+        # source to target INCLUSIVE (the rail starts/ends level with
+        # those two nodes too, not just the ones strictly between them) -
+        # a wide box anywhere in that range (e.g. a long-labelled process
+        # step) would otherwise sit right under the connector, the real
+        # bug this clearance math fixes (see _flowchart_side_connector's
+        # own docstring for the other real bug this geometry also fixes -
+        # the connector visibly touching each node's actual edge now,
+        # not a point floating off its centre).
+        rail_x = max(positions[i][0] + widths[i] / 2.0 for i in range(lo, hi + 1)) + 40.0
+        x1, y1 = positions[si][0] + widths[si] / 2.0, (positions[si][1] + positions[si][2]) / 2
+        x2, y2 = positions[ti][0] + widths[ti] / 2.0, (positions[ti][1] + positions[ti][2]) / 2
+        y_lo, y_hi = min(y1, y2), max(y1, y2)
+        for p_lo, p_hi, p_rail in placed_rails:
+            if y_lo < p_hi and p_lo < y_hi:  # overlapping y-ranges
+                rail_x = max(rail_x, p_rail + 40.0)
+        placed_rails.append((y_lo, y_hi, rail_x))
+        elements.append(_flowchart_side_connector(x1, y1, x2, y2, rail_x=rail_x, theme=theme))
+
+    bottom = positions[-1][2]
+    key_entries: list[tuple[str, str, str]] = []
+    for index, node in enumerate(nodes):
+        detail = node.detail.strip()
+        branch_notes = [
+            f"If {edge.label.strip()}: continues to step {index_by_id[edge.target] + 1}"
+            for edge in out_edges.get(node.id, [])
+            if edge.label.strip() and edge.target in index_by_id
+        ]
+        if branch_notes:
+            detail = f"{detail} {' '.join(branch_notes)}".strip()
+        key_entries.append((str(index + 1), node.label, detail))
+    key_gap = 30.0 * gap_scale
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=CANVAS_WIDTH - 2 * MARGIN, theme=theme, row_gap_scale=gap_scale,
+    )
+    elements.extend(key_elements)
+    return elements, CANVAS_WIDTH, (bottom + key_gap + key_h - top)
 
 
 def _layout_cycle(
@@ -1457,7 +2286,7 @@ def _layout_cycle(
 
 def _layout_hierarchy(
     nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
-) -> tuple[list[str], float]:
+) -> tuple[list[str], float, float]:
     """Nodes grouped into rows by `level`, connected to their parent edge.
     Each row's colour comes from _HIERARCHY_LEVEL_COLORS (root/children/
     deeper), the same fixed semantic-colour convention flow_chart uses -
@@ -1470,17 +2299,26 @@ def _layout_hierarchy(
 
     box_w = 190.0
     row_gap = 56.0
+
+    # Canvas width (and therefore each row's own centred starting x) needs
+    # the WIDEST row's width known up front - a real, confirmed bug: every
+    # row used to start flush at x=MARGIN regardless of its own width, so
+    # only the single widest row ever happened to span the canvas
+    # edge-to-edge; any NARROWER row (a lone root node, a shorter branch)
+    # sat stuck to the left instead of centred under the ones around it.
+    row_widths = {level: len(rows[level]) * box_w + (len(rows[level]) - 1) * 24.0 for level in levels}
+    max_row_width = max(row_widths.values(), default=0.0)
+    canvas_w = max(max_row_width + 2 * MARGIN, CANVAS_WIDTH)
+
     positions: dict[str, tuple[float, float, float]] = {}  # id -> (cx, top_y, bottom_y)
     elements: list[str] = []
     elements.append(_arrow_marker("diagram-arrow", theme.accent_color))
 
     y = top
-    max_row_width = 0.0
     for level in levels:
         row_nodes = rows[level]
-        row_width = len(row_nodes) * box_w + (len(row_nodes) - 1) * 24.0
-        max_row_width = max(max_row_width, row_width)
-        x = MARGIN
+        row_width = row_widths[level]
+        x = (canvas_w - row_width) / 2
         row_height = 0.0
         row_colors = _HIERARCHY_LEVEL_COLORS[min(level, len(_HIERARCHY_LEVEL_COLORS) - 1)]
         for node in row_nodes:
@@ -1504,7 +2342,6 @@ def _layout_hierarchy(
             f'fill="none" stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
         )
 
-    canvas_w = max(max_row_width + 2 * MARGIN, CANVAS_WIDTH)
     return elements, y - row_gap - top, canvas_w
 
 
@@ -1859,8 +2696,18 @@ def _layout_er(
                 elements.append(
                     _draw_attribute_oval(attr, cx=a_cx, cy=a_cy, width=_ER_ATTR_W, height=_ER_ATTR_H, theme=theme)
                 )
+                # A real, confirmed bug: every attribute's connector used to
+                # end at the SAME point (cx, main_top) - the entity's own
+                # centre - regardless of which attribute it was, so 2+
+                # attributes' lines converged on one identical spot instead
+                # of fanning out (duplicate_arrowhead_side correctly flagged
+                # this: two lines landing on the same point of an entity's
+                # edge read as one ambiguous connection, not two). Each
+                # attribute's own x position (a_cx) is where its connector
+                # should land instead - a proper fan, the standard ER
+                # attribute-oval convention.
                 elements.append(
-                    f'<line x1="{a_cx:.1f}" y1="{a_cy + _ER_ATTR_H / 2:.1f}" x2="{cx:.1f}" y2="{main_top:.1f}" '
+                    f'<line x1="{a_cx:.1f}" y1="{a_cy + _ER_ATTR_H / 2:.1f}" x2="{a_cx:.1f}" y2="{main_top:.1f}" '
                     f'stroke="{theme.border_color}" stroke-width="1.5"/>'
                 )
                 ax += _ER_ATTR_W + _ER_ATTR_GAP
@@ -2532,15 +3379,1406 @@ def _layout_graph(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tup
 
 
 # ---------------------------------------------------------------------------
+# pyramid / funnel, matrix, radial mind map, venn - new SmartArt-style kinds.
+# All four follow the exact same discipline every kind above already does:
+# a shape only ever holds a short label (never truncated - grow/shrink-to-
+# fit, never `_wrap`'s own ellipsis), the full explanation lives in the
+# shared Key table below instead, and every drawn shape/arrow carries the
+# common `class="diagram-box"`/`class="diagram-node"` markers so the
+# existing render-QA geometry checks and hover/focus CSS apply unchanged.
+# ---------------------------------------------------------------------------
+
+_PYRAMID_LABEL_SIZE = 15.0
+_PYRAMID_MIN_LAYER_H = 56.0
+_PYRAMID_APEX_W = 140.0
+_PYRAMID_BASE_W = 640.0
+
+
+def _layout_pyramid(
+    nodes: list[DiagramNode], *, theme: TemplateTheme, top: float, inverted: bool,
+) -> tuple[list[str], float]:
+    """Stacked trapezoid layers narrowing toward one end - a classic
+    pyramid (inverted=False: `nodes[0]` is the narrow APEX/top layer,
+    `nodes[-1]` the wide BASE/bottom layer - "levels of importance/
+    foundation" content) or a funnel (inverted=True: the same node order,
+    just drawn wide-top-narrow-bottom instead - "narrowing stages"
+    content). One fixed semantic colour per layer (not theme-derived - the
+    same "fixed palette" convention _WHEEL_SEGMENT_COLORS already uses),
+    cycling if there are more layers than colours. A layer's own short
+    label is centred and shrink-to-fit (_fit_boxed_text) - never
+    `node.detail`, which has almost no room in a narrow apex layer; detail
+    is a Key table row below instead, same rule as every ring/wheel/
+    flowchart node above."""
+    count = len(nodes)
+    if count == 0:
+        return [], 0.0
+    cx = CANVAS_WIDTH / 2
+    layer_h = max(_PYRAMID_MIN_LAYER_H, min(110.0, 420.0 / count))
+    if inverted:
+        edge_widths = [_PYRAMID_BASE_W - (_PYRAMID_BASE_W - _PYRAMID_APEX_W) * k / count for k in range(count + 1)]
+    else:
+        edge_widths = [_PYRAMID_APEX_W + (_PYRAMID_BASE_W - _PYRAMID_APEX_W) * k / count for k in range(count + 1)]
+
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    y = top
+    for index, node in enumerate(nodes):
+        w_top, w_bottom = edge_widths[index], edge_widths[index + 1]
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        points = (
+            f"{cx - w_top / 2:.1f},{y:.1f} {cx + w_top / 2:.1f},{y:.1f} "
+            f"{cx + w_bottom / 2:.1f},{y + layer_h:.1f} {cx - w_bottom / 2:.1f},{y + layer_h:.1f}"
+        )
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(
+            f'<polygon class="diagram-box" points="{points}" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        fit_w = max(min(w_top, w_bottom) * 0.9, 60.0)
+        parts.append(
+            _fit_boxed_text(
+                cx, y + layer_h / 2, node.label, width=fit_w, height=layer_h * 0.75,
+                color=theme.text_color, theme=theme, base_size=_PYRAMID_LABEL_SIZE, min_size=10.0,
+            )
+        )
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+        y += layer_h
+
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=y + key_gap, width=CANVAS_WIDTH - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, (y + key_gap + key_h - top)
+
+
+_MATRIX_LABEL_SIZE = 15.0
+_MATRIX_CELL_H = 150.0
+
+
+def _layout_matrix(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
+    """A quadrant/classification grid - one cell per node, reading order
+    (row-major: top-left, top-right, ..., same order as `nodes`). Exactly
+    4 labelled nodes PLUS at least one of the `matrix_x_*`/`matrix_y_*`
+    fields set draws the classic 2-axis quadrant cross (axis titles,
+    endpoint labels, a dividing "+") - a SWOT-style grid is just this with
+    no axis fields set at all, which renders as a plain 2x2 grid instead
+    (see DiagramSpec's own field docstrings - opt-in, never inferred). Any
+    other node count (a 3x3 priority grid, a simple classification list)
+    renders as a plain `ceil(sqrt(n))`-column grid, no axis cross. A cell's
+    own short label is shrink-to-fit centred (_fit_boxed_text); the full
+    explanation is a Key table row below, same rule as every kind above."""
+    nodes = spec.nodes
+    count = len(nodes)
+    if count == 0:
+        return [], 0.0
+    cols = max(math.ceil(math.sqrt(count)), 1)
+    rows = math.ceil(count / cols)
+    draw_axis_cross = count == 4 and any(
+        s.strip() for s in (
+            spec.matrix_x_label, spec.matrix_y_label,
+            spec.matrix_x_low, spec.matrix_x_high, spec.matrix_y_low, spec.matrix_y_high,
+        )
+    )
+    axis_margin = 52.0 if draw_axis_cross else 0.0
+    grid_left = MARGIN + axis_margin
+    # A real, confirmed bug: reserving the y-axis label's gutter ONLY on
+    # the left (subtracting axis_margin just once here) left the grid's
+    # own right edge flush with the canvas margin while its left edge sat
+    # inset by axis_margin - the grid itself (the dominant visual element)
+    # read as shifted right of centre, even though "axis label + grid"
+    # together technically filled the margin-to-margin width. Reserving a
+    # MATCHING empty gutter on the right (subtracting axis_margin twice)
+    # keeps the grid itself truly centred on the canvas, same as its own
+    # title above it.
+    grid_w = CANVAS_WIDTH - 2 * MARGIN - 2 * axis_margin
+    cell_w = grid_w / cols
+    grid_top = top
+
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    for index, node in enumerate(nodes):
+        r, c = divmod(index, cols)
+        x = grid_left + c * cell_w
+        y = grid_top + r * _MATRIX_CELL_H
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(
+            f'<rect class="diagram-box" x="{x + 4:.1f}" y="{y + 4:.1f}" '
+            f'width="{cell_w - 8:.1f}" height="{_MATRIX_CELL_H - 8:.1f}" rx="10" '
+            f'fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        parts.append(
+            _fit_boxed_text(
+                x + cell_w / 2, y + _MATRIX_CELL_H / 2, node.label,
+                width=cell_w - 32.0, height=_MATRIX_CELL_H - 32.0,
+                color=theme.text_color, theme=theme, base_size=_MATRIX_LABEL_SIZE, min_size=10.0,
+            )
+        )
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    grid_bottom = grid_top + rows * _MATRIX_CELL_H
+    axis_label_h = 0.0
+    if draw_axis_cross:
+        mid_x = grid_left + grid_w / 2
+        mid_y = grid_top + (grid_bottom - grid_top) / 2
+        elements.append(
+            f'<line x1="{mid_x:.1f}" y1="{grid_top:.1f}" x2="{mid_x:.1f}" y2="{grid_bottom:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="2"/>'
+        )
+        elements.append(
+            f'<line x1="{grid_left:.1f}" y1="{mid_y:.1f}" x2="{grid_left + grid_w:.1f}" y2="{mid_y:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="2"/>'
+        )
+        if spec.matrix_x_low.strip():
+            elements.append(_centered_text(
+                grid_left + 10, grid_bottom + 16, spec.matrix_x_low,
+                color=theme.muted_color, theme=theme, size=11.0, weight=500,
+            ))
+        if spec.matrix_x_high.strip():
+            elements.append(_centered_text(
+                grid_left + grid_w - 10, grid_bottom + 16, spec.matrix_x_high,
+                color=theme.muted_color, theme=theme, size=11.0, weight=500,
+            ))
+        if spec.matrix_x_label.strip():
+            elements.append(_centered_text(
+                mid_x, grid_bottom + 36, spec.matrix_x_label,
+                color=theme.text_color, theme=theme, size=13.0, weight=700,
+            ))
+            axis_label_h = 48.0
+        elif spec.matrix_x_low.strip() or spec.matrix_x_high.strip():
+            axis_label_h = 24.0
+        if spec.matrix_y_label.strip():
+            elements.append(
+                f'<text x="{(grid_left - 34):.1f}" y="{mid_y:.1f}" font-size="13" font-weight="700" '
+                f'fill="{theme.text_color}" text-anchor="middle" font-family="{escape(theme.font_family)}" '
+                f'transform="rotate(-90 {(grid_left - 34):.1f} {mid_y:.1f})">{escape(spec.matrix_y_label)}</text>'
+            )
+        if spec.matrix_y_low.strip():
+            elements.append(_centered_text(
+                grid_left - 34, grid_bottom - 6, spec.matrix_y_low,
+                color=theme.muted_color, theme=theme, size=11.0, weight=500,
+            ))
+        if spec.matrix_y_high.strip():
+            elements.append(_centered_text(
+                grid_left - 34, grid_top + 6, spec.matrix_y_high,
+                color=theme.muted_color, theme=theme, size=11.0, weight=500,
+            ))
+
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=grid_bottom + axis_label_h + key_gap, width=CANVAS_WIDTH - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, (grid_bottom + axis_label_h + key_gap + key_h - top)
+
+
+def _layout_radial_mindmap(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    """A central topic with branching sub-ideas radiating outward, each
+    branch connected to the centre by a visible curved line - what makes
+    this genuinely different from the concept wheel (_layout_concept_wheel,
+    kind concept_map/conceptual): a wheel deliberately draws NO connecting
+    lines at all ("parts/properties of X", shown by proximity/colour only -
+    see its own docstring); a mind map's whole point IS the visible
+    branching structure, so every branch is connected to the centre by a
+    real line. Two levels deep in this first pass: the centre (the node
+    with `level == 0`, or `nodes[0]`) and its direct branches (every other
+    node) - a branch's own further `edges` to a child node are deliberately
+    not drawn as a third ring here (documented simplification, not silently
+    dropped); that child node still appears, as a flat spoke off the
+    centre, so no content is ever lost, just not yet nested visually.
+    Canvas grows to fit (like _layout_cycle/_layout_concept_wheel) rather
+    than capping branch spacing, so a dense mind map never crowds."""
+    if not nodes:
+        return [], CANVAS_WIDTH, 0.0
+    center = next((n for n in nodes if n.level == 0), nodes[0])
+    branches = [n for n in nodes if n is not center]
+    branch_count = len(branches)
+
+    center_sizing = _circle_node_size(center.label, min_radius=70.0, font_size=RING_LABEL_SIZE)
+    # min_radius=75 (not a smaller, visually-"branch-sized" value) is
+    # deliberate: _circle_node_size's own wrap-width budget scales with
+    # min_radius, so a too-small one forces a long label into very few,
+    # very wide lines, actually growing the circle MUCH larger than a
+    # wider starting budget does - confirmed empirically (the same label
+    # measured 121.8px at min_radius=50 but only 87.4px at min_radius=75,
+    # wrapping into one more, better-balanced line instead of a few
+    # overly-wide ones).
+    branch_sizings = [_circle_node_size(b.label, min_radius=75.0, font_size=13.5) for b in branches]
+    max_branch_r = max((r for _, r in branch_sizings), default=0.0)
+
+    # Same chord-length "keep neighbours from touching" math
+    # _layout_ring_process/_layout_concept_wheel already use for their own
+    # evenly-spaced circles (see _layout_ring_process's own comment on the
+    # exact bug this avoids) - a fixed `branch_count * 34.0` heuristic
+    # doesn't account for a branch label long enough to grow its circle
+    # well past `min_radius`, which a real 6-branch/long-label mind map
+    # confirmed: adjacent branch circles overlapped at that fixed spacing.
+    # The extra sqrt(2) factor is for a second, DIFFERENT real bug the
+    # chord formula alone doesn't cover: render_qa's own node_overlap check
+    # compares each node's axis-aligned bounding SQUARE, not true circle-
+    # to-circle distance (see diagram_render_qa._node_shapes's own
+    # docstring on this exact gap) - at exactly 4 branches (90 degrees
+    # apart, starting from the top), two adjacent branch circles sit at a
+    # relative angle that makes their bounding squares touch even though
+    # the circles themselves clear each other with room to spare (a real,
+    # measured case: true centre distance 334.5 vs a radius sum of 238.1 -
+    # comfortably clear - while the bounding squares still overlapped).
+    # sqrt(2) is the worst-case ratio between the two measures (exactly at
+    # 90 degrees of separation - every other branch count needs less
+    # extra room, so this one factor covers all of them safely).
+    neighbour_clearance_radius = (
+        (2 * max_branch_r + 60.0) / (2 * math.sin(math.pi / branch_count)) * math.sqrt(2)
+        if branch_count >= 2 else 0.0
+    )
+    r1 = max(150.0, neighbour_clearance_radius, center_sizing[1] + max_branch_r + 30.0)
+    cx = max(CANVAS_WIDTH / 2, r1 + max_branch_r + MARGIN)
+    canvas_w = 2 * cx
+    cy = top + r1 + max(center_sizing[1], max_branch_r) + 40.0
+
+    elements = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    center_svg, center_r = _circle_node(
+        center.label, cx=cx, cy=cy, theme=theme, number="", fill=theme.accent_soft,
+        stroke=theme.accent_color, min_radius=70.0, font_size=RING_LABEL_SIZE,
+        detail=center.detail, sizing=center_sizing,
+    )
+    elements.append(center_svg)
+    key_entries: list[tuple[str, str, str]] = [("", center.label, center.detail)]
+
+    for index, branch in enumerate(branches):
+        angle = (2 * math.pi * index / max(branch_count, 1)) - math.pi / 2
+        ux, uy = math.cos(angle), math.sin(angle)
+        bx, by = cx + r1 * ux, cy + r1 * uy
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        branch_svg, branch_r = _circle_node(
+            branch.label, cx=bx, cy=by, theme=theme, number="", fill=fill, stroke=stroke,
+            min_radius=75.0, font_size=13.5, detail=branch.detail, sizing=branch_sizings[index],
+        )
+        start = (cx + center_r * ux, cy + center_r * uy)
+        end = (bx - branch_r * ux, by - branch_r * uy)
+        elements.append(_curved_connector(start[0], start[1], end[0], end[1], cx=cx, cy=cy, theme=theme))
+        elements.append(branch_svg)
+        key_entries.append((str(index + 1), branch.label, branch.detail))
+
+    bottom = cy + r1 + max_branch_r + 40.0
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (bottom + key_gap + key_h - top)
+
+
+_VENN_SET_COLORS = [
+    ("#bfdbfe", "#1d4ed8", 0.55),  # blue
+    ("#fde68a", "#b45309", 0.55),  # amber
+    ("#bbf7d0", "#16a34a", 0.55),  # green
+]
+_VENN_LABEL_SIZE = 14.0
+_VENN_RADIUS = 150.0
+
+
+def _layout_venn(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float]:
+    """2 or 3 overlapping circles (DiagramSpec.is_usable() rejects any
+    other count for this kind - Venn geometry only reads cleanly at 2-3
+    sets). Each circle gets only its own short set name, pulled toward its
+    own non-overlapping outer edge - never the WHY (what's unique to a set,
+    or what two sets share): a lens-shaped overlap region has no reliable
+    room to wrap real sentences into (unlike a rectangle or even a wedge),
+    so - the same rule every other kind in this module already follows for
+    its own full explanation - the Key table below carries it instead: one
+    row per set (`node.detail` - what's unique to it) plus one row per edge
+    whose both ends are real node ids and whose `label` is set (what the
+    two sets share)."""
+    count = len(nodes)
+    if count < 2:
+        return [], 0.0
+    r = _VENN_RADIUS
+    cx = CANVAS_WIDTH / 2
+    if count == 2:
+        cy = top + r
+        centers = [(cx - r * 0.55, cy), (cx + r * 0.55, cy)]
+        bottom = cy + r
+    else:
+        cy = top + r * 1.52
+        centers = [
+            (cx, cy - r * 0.52),
+            (cx - r * 0.45, cy + r * 0.26),
+            (cx + r * 0.45, cy + r * 0.26),
+        ]
+        bottom = cy + r * 1.26
+
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    for node, (nx, ny) in zip(nodes, centers):
+        index = len(key_entries)
+        fill, stroke, opacity = _VENN_SET_COLORS[index % len(_VENN_SET_COLORS)]
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        title = f"<title>{escape(tooltip)}</title>" if tooltip else ""
+        elements.append(
+            f'<g class="diagram-node" tabindex="0" role="group">{title}'
+            f'<circle class="diagram-box" cx="{nx:.1f}" cy="{ny:.1f}" r="{r:.1f}" '
+            f'fill="{fill}" fill-opacity="{opacity}" stroke="{stroke}" stroke-width="2.5"/></g>'
+        )
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    # Labels drawn AFTER every circle (so none sits under a later circle's
+    # own semi-transparent fill), pulled from each circle's own centre
+    # toward its outer edge, away from the shared hub point - exactly where
+    # a 3-circle Venn's triple-overlap region sits, which text must avoid.
+    hub = (
+        sum(c[0] for c in centers) / len(centers),
+        sum(c[1] for c in centers) / len(centers),
+    )
+    for node, (nx, ny) in zip(nodes, centers):
+        dx, dy = nx - hub[0], ny - hub[1]
+        dist = math.hypot(dx, dy)
+        ux, uy = (dx / dist, dy / dist) if dist > 1e-6 else (0.0, -1.0)
+        label_x, label_y = nx + ux * r * 0.45, ny + uy * r * 0.45
+        elements.append(
+            _fit_boxed_text(
+                label_x, label_y, node.label, width=r * 0.85, height=r * 0.6,
+                color=theme.text_color, theme=theme, base_size=_VENN_LABEL_SIZE, min_size=10.0,
+            )
+        )
+
+    by_id = {n.id: n.label for n in nodes if n.id}
+    for edge in edges:
+        if edge.source in by_id and edge.target in by_id and edge.label.strip():
+            key_entries.append(("", f"{by_id[edge.source]} ∩ {by_id[edge.target]}", edge.label))
+
+    key_gap = 20.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=CANVAS_WIDTH - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, (bottom + key_gap + key_h - top)
+
+
+CHEVRON_LABEL_SIZE = 15.0
+_CHEVRON_H = 90.0
+_CHEVRON_NOTCH = 22.0
+_CHEVRON_GAP = 14.0
+_CHEVRON_MIN_W = 150.0
+
+
+def _layout_chevron_process(nodes: list[DiagramNode], *, theme: TemplateTheme, top: float) -> tuple[list[str], float, float]:
+    """A horizontal row of arrow-shaped "chevron" steps pointing right -
+    the classic PowerPoint SmartArt process strip, visually distinct from
+    the vertical oval/rectangle/diamond column _layout_standard_flowchart
+    draws - best for a SHORT linear sequence shown as a strip (a product-
+    launch phase strip, a short onboarding flow) rather than a long
+    procedure with decisions, which the standard flowchart already covers.
+    Every chevron is drawn the SAME width (the widest one actually needs -
+    sized up front, never truncated), matching the classic uniform-chevron
+    look; a gap (not an overlapping/nested notch) separates consecutive
+    chevrons, so their own bounding boxes never register as a false
+    node_overlap. Only the short label lives inside a chevron - the full
+    explanation is a Key table row below, the same rule every kind in this
+    module already follows. Canvas grows wider to fit more steps (like the
+    ring/wheel) rather than wrapping to a second row."""
+    count = len(nodes)
+    if count == 0:
+        return [], CANVAS_WIDTH, 0.0
+    # _CHEVRON_H is fixed (every chevron is the same height), so sizing
+    # chevron_w from the WIDEST wrapped line alone isn't enough - a real,
+    # confirmed bug: a very long label wrapped at a narrow budget breaks
+    # into many short, narrow lines (a small `longest`, so a narrow
+    # chevron_w), but those many lines then don't fit the fixed height,
+    # silently truncating with "…" inside _fit_boxed_text's own shrink-
+    # then-truncate fallback at draw time - the box was sized to the wrong
+    # dimension. Widening the wrap budget (same technique
+    # _circle_node_size already uses) until the line count actually fits
+    # the available height is what makes this never truncate.
+    max_fit_lines = max(int((_CHEVRON_H * 0.7) // (CHEVRON_LABEL_SIZE * LINE_HEIGHT)), 1)
+    chevron_w = _CHEVRON_MIN_W
+    for node in nodes:
+        label = node.label.strip() or "—"
+        width_budget = _CHEVRON_MIN_W - 40.0
+        lines = _wrap(label, font_size=CHEVRON_LABEL_SIZE, width=width_budget, max_lines=999, bold=True)
+        while len(lines) > max_fit_lines and width_budget < 2000.0:
+            width_budget += 60.0
+            lines = _wrap(label, font_size=CHEVRON_LABEL_SIZE, width=width_budget, max_lines=999, bold=True)
+        longest = max((len(line) for line in lines), default=0)
+        chevron_w = max(chevron_w, longest * CHEVRON_LABEL_SIZE * _BOLD_RATIO + 60.0)
+
+    total_w = count * chevron_w + (count - 1) * _CHEVRON_GAP
+    canvas_w = max(CANVAS_WIDTH, total_w + 2 * MARGIN)
+    start_x = (canvas_w - total_w) / 2
+    y = top
+
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    for index, node in enumerate(nodes):
+        x = start_x + index * (chevron_w + _CHEVRON_GAP)
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        nd = _CHEVRON_NOTCH if index > 0 else 0.0  # the first chevron's left edge stays flat
+        points = (
+            f"{x:.1f},{y:.1f} {x + chevron_w - _CHEVRON_NOTCH:.1f},{y:.1f} "
+            f"{x + chevron_w:.1f},{y + _CHEVRON_H / 2:.1f} "
+            f"{x + chevron_w - _CHEVRON_NOTCH:.1f},{y + _CHEVRON_H:.1f} {x:.1f},{y + _CHEVRON_H:.1f} "
+            f"{x + nd:.1f},{y + _CHEVRON_H / 2:.1f}"
+        )
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(f'<polygon class="diagram-box" points="{points}" fill="{fill}" stroke="{stroke}" stroke-width="2"/>')
+        parts.append(
+            _fit_boxed_text(
+                x + chevron_w / 2, y + _CHEVRON_H / 2, node.label,
+                width=chevron_w - _CHEVRON_NOTCH - 20.0, height=_CHEVRON_H * 0.7,
+                color=theme.text_color, theme=theme, base_size=CHEVRON_LABEL_SIZE, min_size=10.0,
+            )
+        )
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    bottom = y + _CHEVRON_H
+    key_gap = 30.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (bottom + key_gap + key_h - top)
+
+
+TIMELINE_LABEL_SIZE = 15.0
+_TIMELINE_CARD_W = 118.0
+_TIMELINE_CARD_H = 70.0
+_TIMELINE_STEM = 40.0
+_TIMELINE_MARKER_R = 10.0
+
+
+def _layout_timeline(nodes: list[DiagramNode], *, theme: TemplateTheme, top: float) -> tuple[list[str], float, float]:
+    """A horizontal roadmap: an axis line with one evenly-spaced marker per
+    node, each connected by a short leader stem to a label card - cards
+    alternate above/below the axis (a zigzag) so consecutive cards never
+    crowd each other regardless of label length. The classic PowerPoint
+    SmartArt timeline/roadmap look, for genuinely chronological content
+    (dates/eras/milestones) - distinct from the vertical standard
+    flowchart, which already covers an ordinary non-chronological
+    procedure. Only the short label lives on a card - the full explanation
+    is a Key table row below, same rule as every kind in this module.
+    Canvas grows wider to fit more milestones (like the ring/wheel)."""
+    count = len(nodes)
+    if count == 0:
+        return [], CANVAS_WIDTH, 0.0
+    card_w = _TIMELINE_CARD_W
+    card_h = _TIMELINE_CARD_H
+    for node in nodes:
+        lines = _wrap(
+            node.label.strip() or "—", font_size=TIMELINE_LABEL_SIZE, width=_TIMELINE_CARD_W - 24.0,
+            max_lines=999, bold=True,
+        )
+        longest = max((len(line) for line in lines), default=0)
+        card_w = max(card_w, longest * TIMELINE_LABEL_SIZE * _BOLD_RATIO + 24.0)
+        card_h = max(card_h, len(lines) * TIMELINE_LABEL_SIZE * LINE_HEIGHT + 30.0)
+
+    gap = 20.0
+    slot_w = card_w + gap
+    total_w = count * slot_w
+    canvas_w = max(CANVAS_WIDTH, total_w + 2 * MARGIN)
+    start_x = (canvas_w - total_w) / 2 + slot_w / 2
+    axis_y = top + card_h + _TIMELINE_STEM + _TIMELINE_MARKER_R + 10.0
+
+    elements = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    elements.append(
+        f'<line x1="{MARGIN:.1f}" y1="{axis_y:.1f}" x2="{canvas_w - MARGIN:.1f}" y2="{axis_y:.1f}" '
+        f'stroke="{theme.border_color}" stroke-width="3" marker-end="url(#diagram-arrow)"/>'
+    )
+    key_entries: list[tuple[str, str, str]] = []
+    for index, node in enumerate(nodes):
+        cx = start_x + index * slot_w
+        above = index % 2 == 0
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        if above:
+            card_bottom = axis_y - _TIMELINE_STEM
+            card_top = card_bottom - card_h
+            stem_y1, stem_y2 = card_bottom, axis_y - _TIMELINE_MARKER_R
+        else:
+            card_top = axis_y + _TIMELINE_STEM
+            card_bottom = card_top + card_h
+            stem_y1, stem_y2 = axis_y + _TIMELINE_MARKER_R, card_top
+        elements.append(
+            f'<line x1="{cx:.1f}" y1="{stem_y1:.1f}" x2="{cx:.1f}" y2="{stem_y2:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="2"/>'
+        )
+        elements.append(
+            f'<circle cx="{cx:.1f}" cy="{axis_y:.1f}" r="{_TIMELINE_MARKER_R:.1f}" '
+            f'fill="{stroke}" stroke="{theme.page_background}" stroke-width="2"/>'
+        )
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(
+            f'<rect class="diagram-box" x="{cx - card_w / 2:.1f}" y="{card_top:.1f}" '
+            f'width="{card_w:.1f}" height="{card_h:.1f}" rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        parts.append(
+            _fit_boxed_text(
+                cx, (card_top + card_bottom) / 2, node.label, width=card_w - 20.0, height=card_h - 16.0,
+                color=theme.text_color, theme=theme, base_size=TIMELINE_LABEL_SIZE, min_size=10.0,
+            )
+        )
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    content_bottom = axis_y + _TIMELINE_STEM + card_h  # the lowest a "below" card ever reaches
+    key_gap = 30.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=content_bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (content_bottom + key_gap + key_h - top)
+
+
+STAIRCASE_LABEL_SIZE = 15.0
+_STAIRCASE_BAR_H = 56.0
+_STAIRCASE_GAP = 16.0
+_STAIRCASE_BADGE_R = 22.0
+_STAIRCASE_BASE_W = 220.0
+_STAIRCASE_STEP_W = 90.0
+
+
+def _layout_staircase_process(
+    nodes: list[DiagramNode], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    """A left-aligned column of numbered, ascending bars - each step's own
+    bar is visibly LONGER than the one above it, the classic PowerPoint
+    SmartArt "ascending/staircase process" look for content that genuinely
+    grows or builds in scope/scale step by step (a maturity model, a
+    skill-building progression) - distinct from both chevron_process
+    (equal-width horizontal arrows) and pyramid (a centred, symmetric
+    stack). A bar's own length is the LARGER of its "ascending" target
+    width and whatever its own label actually needs (never shrinks text to
+    force a shorter bar, never truncates a long label to keep the
+    staircase effect) - only the short label lives on a bar; the full
+    explanation is a Key table row below, same rule as every kind in this
+    module."""
+    count = len(nodes)
+    if count == 0:
+        return [], CANVAS_WIDTH, 0.0
+    x0 = MARGIN + _STAIRCASE_BADGE_R * 2 + 20.0
+    y = top
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    max_right = x0
+
+    for index, node in enumerate(nodes):
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        cy = y + _STAIRCASE_BAR_H / 2
+        badge_cx = MARGIN + _STAIRCASE_BADGE_R
+        elements.append(
+            f'<circle cx="{badge_cx:.1f}" cy="{cy:.1f}" r="{_STAIRCASE_BADGE_R:.1f}" '
+            f'fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        elements.append(_centered_text(badge_cx, cy, str(index + 1), color=stroke, theme=theme, size=15.0, weight=800))
+
+        # _STAIRCASE_BAR_H is fixed, so - the same real bug already found
+        # and fixed in _layout_chevron_process - sizing bar_w from the
+        # widest wrapped line alone isn't enough - a long label measured at
+        # a narrow fixed budget can wrap into more lines than the fixed
+        # bar height actually fits, truncating at draw time. Widen the
+        # wrap budget (same technique _circle_node_size/
+        # _layout_chevron_process already use) until the line count fits.
+        label = node.label.strip() or "—"
+        max_fit_lines = max(int((_STAIRCASE_BAR_H * 0.75) // (STAIRCASE_LABEL_SIZE * LINE_HEIGHT)), 1)
+        width_budget = _STAIRCASE_BASE_W - 30.0
+        lines = _wrap(label, font_size=STAIRCASE_LABEL_SIZE, width=width_budget, max_lines=999, bold=True)
+        while len(lines) > max_fit_lines and width_budget < 2000.0:
+            width_budget += 60.0
+            lines = _wrap(label, font_size=STAIRCASE_LABEL_SIZE, width=width_budget, max_lines=999, bold=True)
+        longest = max((len(line) for line in lines), default=0)
+        text_needed_w = longest * STAIRCASE_LABEL_SIZE * _BOLD_RATIO + 30.0
+        bar_w = max(_STAIRCASE_BASE_W + index * _STAIRCASE_STEP_W, text_needed_w)
+
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(
+            f'<rect class="diagram-box" x="{x0:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{_STAIRCASE_BAR_H:.1f}" '
+            f'rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        parts.append(
+            _fit_boxed_text(
+                x0 + bar_w / 2, cy, node.label, width=bar_w - 20.0, height=_STAIRCASE_BAR_H * 0.75,
+                color=theme.text_color, theme=theme, base_size=STAIRCASE_LABEL_SIZE, min_size=10.0,
+            )
+        )
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+        max_right = max(max_right, x0 + bar_w)
+        y += _STAIRCASE_BAR_H + _STAIRCASE_GAP
+
+    bottom = y - _STAIRCASE_GAP
+    canvas_w = max(CANVAS_WIDTH, max_right + MARGIN)
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (bottom + key_gap + key_h - top)
+
+
+BALANCE_LABEL_SIZE = 15.0
+_BALANCE_DETAIL_SIZE = 12.5
+_BALANCE_ROW_PAD = 14.0
+_BALANCE_GAP = 10.0
+_BALANCE_COL_W = 340.0
+_BALANCE_GUTTER = 50.0
+# Fixed semantic colours (not theme-derived, same convention every other
+# fixed palette in this module uses) - red/rose reads as "cost"/"con"
+# universally, green as "value"/"pro", regardless of which literal labels
+# a particular brief uses for the two columns.
+_BALANCE_LEFT_COLORS = ("#fecaca", "#b91c1c")
+_BALANCE_RIGHT_COLORS = ("#bbf7d0", "#16a34a")
+
+
+def _balance_row(
+    node: DiagramNode, *, x: float, y: float, width: float, fill: str, stroke: str, theme: TemplateTheme
+) -> tuple[str, float]:
+    """One row of a balance_comparison column: label (bold) + detail
+    (muted), both wrapped with NO max_lines cap - the box grows to fit
+    however much text is there (never `_node_block`'s fixed 2/3-line caps,
+    which truncate with "…" - the exact bug class this whole session has
+    repeatedly found and fixed elsewhere; this kind's own rows show their
+    real explanatory text directly, not deferred to a Key table, since a
+    growable left-aligned row already has the room a circle/diamond
+    doesn't)."""
+    inner_w = width - 2 * _BALANCE_ROW_PAD
+    label_lines = _wrap(node.label.strip() or "—", font_size=BALANCE_LABEL_SIZE, width=inner_w, max_lines=999, bold=True)
+    detail_lines = (
+        _wrap(node.detail, font_size=_BALANCE_DETAIL_SIZE, width=inner_w, max_lines=999) if node.detail.strip() else []
+    )
+    label_h = len(label_lines) * BALANCE_LABEL_SIZE * LINE_HEIGHT
+    detail_h = (len(detail_lines) * _BALANCE_DETAIL_SIZE * LINE_HEIGHT + 4.0) if detail_lines else 0.0
+    box_h = 2 * _BALANCE_ROW_PAD + label_h + detail_h
+
+    tooltip = node.label.strip()
+    if node.detail.strip():
+        tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+    parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+    parts.append(
+        f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{box_h:.1f}" '
+        f'rx="8" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+    )
+    label_svg, _label_h = _text(
+        x + _BALANCE_ROW_PAD, y + _BALANCE_ROW_PAD + BALANCE_LABEL_SIZE * 0.85, label_lines,
+        font_size=BALANCE_LABEL_SIZE, weight=700, color=theme.text_color, font_family=theme.font_family,
+        anchor="start",
+    )
+    parts.append(label_svg)
+    if detail_lines:
+        detail_svg, _detail_h = _text(
+            x + _BALANCE_ROW_PAD, y + _BALANCE_ROW_PAD + label_h + _BALANCE_DETAIL_SIZE * 0.85 + 4.0, detail_lines,
+            font_size=_BALANCE_DETAIL_SIZE, weight=400, color=theme.muted_color, font_family=theme.font_family,
+            anchor="start",
+        )
+        parts.append(detail_svg)
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>', box_h
+
+
+def _layout_balance_comparison(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
+    """Two colour-coded columns (fixed red/rose "cost"/"con" side, fixed
+    green "value"/"pro" side), split by `node.shape_role` ("left"/"right")
+    when the model set it, otherwise by position (first half left, rest
+    right) - the classic PowerPoint SmartArt "cost vs. value"/pros-and-cons
+    comparison. Each row grows to fit its own real text (see
+    _balance_row's own docstring) rather than deferring to a Key table -
+    distinct from `comparison` (plain side-by-side columns, one per thing
+    being compared, no colour framing) in both visual treatment and intent
+    (a two-SIDED judgement, not a flat N-way comparison)."""
+    nodes = spec.nodes
+    if not nodes:
+        return [], 0.0
+    has_explicit = any(n.shape_role.strip().lower() in ("left", "right") for n in nodes)
+    if has_explicit:
+        left = [n for n in nodes if n.shape_role.strip().lower() != "right"]
+        right = [n for n in nodes if n.shape_role.strip().lower() == "right"]
+    else:
+        split = math.ceil(len(nodes) / 2)
+        left, right = nodes[:split], nodes[split:]
+
+    col_w = _BALANCE_COL_W
+    left_x = CANVAS_WIDTH / 2 - _BALANCE_GUTTER / 2 - col_w
+    right_x = CANVAS_WIDTH / 2 + _BALANCE_GUTTER / 2
+    y = top
+    elements: list[str] = []
+    if spec.balance_left_label.strip() or spec.balance_right_label.strip():
+        if spec.balance_left_label.strip():
+            elements.append(_centered_text(
+                left_x + col_w / 2, y + 18, spec.balance_left_label,
+                color=_BALANCE_LEFT_COLORS[1], theme=theme, size=16.0, weight=800,
+            ))
+        if spec.balance_right_label.strip():
+            elements.append(_centered_text(
+                right_x + col_w / 2, y + 18, spec.balance_right_label,
+                color=_BALANCE_RIGHT_COLORS[1], theme=theme, size=16.0, weight=800,
+            ))
+        y += 34.0
+
+    rows_top = y
+    ly = y
+    for node in left:
+        svg, h = _balance_row(
+            node, x=left_x, y=ly, width=col_w, fill=_BALANCE_LEFT_COLORS[0], stroke=_BALANCE_LEFT_COLORS[1],
+            theme=theme,
+        )
+        elements.append(svg)
+        ly += h + _BALANCE_GAP
+
+    ry = y
+    for node in right:
+        svg, h = _balance_row(
+            node, x=right_x, y=ry, width=col_w, fill=_BALANCE_RIGHT_COLORS[0], stroke=_BALANCE_RIGHT_COLORS[1],
+            theme=theme,
+        )
+        elements.append(svg)
+        ry += h + _BALANCE_GAP
+
+    bottom = max(ly, ry, rows_top) - _BALANCE_GAP
+    if left and right:
+        elements.append(
+            f'<line x1="{CANVAS_WIDTH / 2:.1f}" y1="{rows_top:.1f}" x2="{CANVAS_WIDTH / 2:.1f}" y2="{bottom:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="2" stroke-dasharray="4 4"/>'
+        )
+    return elements, (bottom - top)
+
+
+NESTED_CIRCLES_LABEL_SIZE = 15.0
+_NESTED_MIN_RADIUS = 50.0
+_NESTED_RADIUS_STEP = 60.0
+
+
+def _layout_nested_circles(nodes: list[DiagramNode], *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
+    """Concentric rings, outermost first - `nodes[0]` is the broadest/
+    outermost ring, `nodes[-1]` the narrowest/innermost - the classic
+    PowerPoint SmartArt "scope/containment" look (Vision > Mission >
+    Strategy > Tactics; Global > Regional > Local). Each ring is drawn
+    outermost-to-innermost so inner circles paint on top, automatically
+    showing every outer ring as a coloured band around it - no manual
+    annulus/donut math needed. A ring's own short label sits near the top
+    of its own band; the full explanation is a Key table row below, same
+    rule as every kind in this module. Deliberately NOT exempt from the
+    rest of this module's geometry conventions except node_overlap (every
+    ring legitimately contains the next - see validate_rendered_svg's own
+    `if kind != "venn"` guard, extended to this kind too)."""
+    count = len(nodes)
+    if count == 0:
+        return [], 0.0
+    cx = CANVAS_WIDTH / 2
+    outer_r = _NESTED_MIN_RADIUS + (count - 1) * _NESTED_RADIUS_STEP
+    cy = top + outer_r + 10.0
+
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    for index, node in enumerate(nodes):
+        r = outer_r - index * _NESTED_RADIUS_STEP
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(
+            f'<circle class="diagram-box" cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" '
+            f'fill="{fill}" fill-opacity="0.88" stroke="{stroke}" stroke-width="2"/>'
+        )
+        # A ring's own RADIUS is fixed by its position in the nesting
+        # order (never grown to fit text - the whole point of this kind is
+        # a monotonically decreasing sequence of radii), so unlike every
+        # size-from-content shape elsewhere in this module, the label here
+        # can't grow its own container. _fit_boxed_text's shrink-then-
+        # truncate fallback was a real, confirmed bug for exactly this
+        # reason (a long label on a modest-radius ring hit the truncate
+        # path) - wrapping directly with an UNBOUNDED max_lines instead
+        # (same philosophy _circle_node/_key_table_rows already use) and
+        # just letting the label run an extra line down into the ring's
+        # own band is what makes this never truncate; the band widens
+        # once, modestly, only if that still isn't enough room.
+        label = node.label.strip() or "—"
+        band_w = max(min(2 * r * 0.75, 260.0), 70.0)
+        label_lines = _wrap(label, font_size=NESTED_CIRCLES_LABEL_SIZE, width=band_w, max_lines=999, bold=True)
+        if len(label_lines) > 3:
+            band_w = min(band_w * 1.4, 2 * r * 0.92)
+            label_lines = _wrap(label, font_size=NESTED_CIRCLES_LABEL_SIZE, width=band_w, max_lines=999, bold=True)
+        label_top_y = cy - r + 22.0
+        label_svg, _label_h = _text(
+            cx, label_top_y + NESTED_CIRCLES_LABEL_SIZE * 0.8, label_lines,
+            font_size=NESTED_CIRCLES_LABEL_SIZE, weight=700, color=theme.text_color, font_family=theme.font_family,
+            anchor="middle",
+        )
+        parts.append(label_svg)
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    bottom = cy + outer_r + 20.0
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=CANVAS_WIDTH - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, (bottom + key_gap + key_h - top)
+
+
+NETWORK_LABEL_SIZE = 15.0
+
+
+def _layout_network_mesh(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    """A genuine many-to-many network - nodes evenly spaced on a circle
+    (same trigonometry _layout_cycle already uses), with a straight,
+    unlabelled line for every real edge, however many a node actually
+    has - distinct from radial_mindmap (exactly one hub, every other node
+    a leaf) and from cycle (only ADJACENT ring nodes ever connect). Best
+    for content whose whole point is that many things connect to many
+    others (a microservice topology, a social/organisational network) -
+    not a hub-and-spoke or a strict hierarchy, which have their own,
+    clearer dedicated kinds. Edge lines are drawn BEFORE the node circles
+    (so a line's own endpoint is cleanly covered by the circle it connects
+    to, never visibly poking past it) - only the short label lives on a
+    node; the full explanation is a Key table row below, same rule as
+    every kind in this module."""
+    count = len(nodes)
+    if count == 0:
+        return [], CANVAS_WIDTH, 0.0
+    sizings = [_circle_node_size(n.label, min_radius=55.0, font_size=NETWORK_LABEL_SIZE) for n in nodes]
+    max_r = max((r for _, r in sizings), default=55.0)
+    radius = (
+        (2 * max_r + 60.0) / (2 * math.sin(math.pi / count)) * math.sqrt(2) if count >= 2 else 0.0
+    )
+    radius = max(170.0, radius)
+    cx = max(CANVAS_WIDTH / 2, radius + max_r + MARGIN)
+    canvas_w = 2 * cx
+    cy = top + radius + max_r + 20.0
+
+    positions: list[tuple[float, float]] = []
+    for index in range(count):
+        angle = 2 * math.pi * index / count - math.pi / 2
+        positions.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+
+    def _pulled_back(px: float, py: float, toward_x: float, toward_y: float, pull: float) -> tuple[float, float]:
+        """A point `pull` px from (px, py) along the direction toward
+        (toward_x, toward_y) - used to start/end an edge at a node's own
+        BOUNDARY instead of its centre. A real, confirmed bug: every edge
+        here used to start/end at `positions[i]` directly (the node's own
+        CENTRE) - the first several pixels of any edge were then, by
+        construction, inside its own source/target node's circle (a
+        56px-radius node starting a line from its exact centre has no
+        chance of escaping a 6px endpoint-trim margin), which
+        edge_crosses_node correctly flagged as crossing that very node."""
+        dx, dy = toward_x - px, toward_y - py
+        dist = max(math.hypot(dx, dy), 1.0)
+        return px + dx / dist * pull, py + dy / dist * pull
+
+    elements: list[str] = []
+    by_id = {n.id: i for i, n in enumerate(nodes) if n.id}
+    for edge in edges:
+        si, ti = by_id.get(edge.source), by_id.get(edge.target)
+        if si is None or ti is None or si == ti:
+            continue
+        cx1, cy1 = positions[si]
+        cx2, cy2 = positions[ti]
+        r1, r2 = sizings[si][1], sizings[ti][1]
+        hop = min(abs(si - ti), count - abs(si - ti))
+        if hop <= 1:
+            # Directly adjacent on the circle - a straight chord between
+            # them never passes near any OTHER node (there's nothing
+            # positioned between two neighbours), so this is always safe.
+            x1, y1 = _pulled_back(cx1, cy1, cx2, cy2, r1)
+            x2, y2 = _pulled_back(cx2, cy2, cx1, cy1, r2)
+            elements.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                f'stroke="{theme.border_color}" stroke-width="1.5" opacity="0.65"/>'
+            )
+        else:
+            # A real, confirmed bug: a straight chord between two NON-
+            # adjacent nodes on the circle cuts across the interior and
+            # can pass directly through one or more nodes positioned
+            # between them (a dense real topology measured 200+
+            # edge_crosses_node hits). Bowing the chord's own midpoint
+            # radially OUTWARD, past the whole node ring, routes it around
+            # the OUTSIDE of whatever sits between the two endpoints
+            # instead - the curve only ever touches the ring's own radius
+            # at its two connected endpoints, nowhere else, so it can
+            # never cross a third node regardless of hop distance.
+            mx, my = (cx1 + cx2) / 2, (cy1 + cy2) / 2
+            dx, dy = mx - cx, my - cy
+            dist = max(math.hypot(dx, dy), 1.0)
+            bow = max_r + 50.0
+            ctrl = (mx + dx / dist * bow, my + dy / dist * bow)
+            x1, y1 = _pulled_back(cx1, cy1, ctrl[0], ctrl[1], r1)
+            x2, y2 = _pulled_back(cx2, cy2, ctrl[0], ctrl[1], r2)
+            elements.append(
+                f'<path d="M{x1:.1f},{y1:.1f} Q{ctrl[0]:.1f},{ctrl[1]:.1f} {x2:.1f},{y2:.1f}" '
+                f'fill="none" stroke="{theme.border_color}" stroke-width="1.5" opacity="0.65"/>'
+            )
+
+    key_entries: list[tuple[str, str, str]] = []
+    for index, node in enumerate(nodes):
+        nx, ny = positions[index]
+        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        svg, _r = _circle_node(
+            node.label, cx=nx, cy=ny, theme=theme, number=str(index + 1), fill=fill, stroke=stroke,
+            min_radius=55.0, font_size=NETWORK_LABEL_SIZE, detail=node.detail, sizing=sizings[index],
+        )
+        elements.append(svg)
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    bottom = cy + radius + max_r + 30.0
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (bottom + key_gap + key_h - top)
+
+
+_DECISION_TREE_ROW_GAP = 70.0
+_DECISION_TREE_COL_GAP = 24.0
+
+
+def _layout_decision_tree(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    """A cascading branching tree of decisions - each DECISION node (has
+    outgoing edges) a diamond, each OUTCOME/leaf node (no outgoing edges) a
+    rounded box - distinct from both `hierarchy` (a flat parent/child
+    CATEGORISATION with no decision semantics, every node the same shape)
+    and flow_chart's own single inline decision diamond (one branch point
+    inside an otherwise linear procedure, not a whole cascading TREE of
+    them). Reuses the exact same diamond/box drawing and sizing
+    (_draw_diamond/_draw_process_box/_ideal_decision_box_size/
+    _ideal_process_box_size) flow_chart already relies on - same "grow to
+    fit, never truncate" guarantee, already proven. Rows are grouped by
+    `level` (0 = root decision) and centred with the same two-pass
+    "measure every row's real width first, THEN centre each row" fix
+    _layout_hierarchy needed (a real, confirmed bug there: rows used to
+    start flush-left instead of centred - this kind is built with that fix
+    already in place, not needing it added later). A branch's own
+    condition (edge.label - "Yes"/"No", a threshold) is never drawn on the
+    connector line itself (this module's "no text on arrows" rule, kept
+    consistent here) - it's a Key table row below instead: "If {label}:
+    leads to {child}"."""
+    if not nodes:
+        return [], CANVAS_WIDTH, 0.0
+    _, out_edges = _flow_degrees(nodes, edges)
+    by_id = {n.id: n for n in nodes if n.id}
+
+    def role_of(node: DiagramNode) -> str:
+        override = node.role.strip().lower()
+        if override in ("decision", "outcome"):
+            return override
+        return "decision" if out_edges.get(node.id) else "outcome"
+
+    def size_of(node: DiagramNode) -> tuple[float, float]:
+        return _ideal_decision_box_size(node) if role_of(node) == "decision" else _ideal_process_box_size(node)
+
+    rows: dict[int, list[DiagramNode]] = {}
+    for node in nodes:
+        rows.setdefault(max(node.level, 0), []).append(node)
+    levels = sorted(rows)
+    row_sizes = {level: [size_of(n) for n in rows[level]] for level in levels}
+    row_widths = {
+        level: sum(w for w, _h in sizes) + _DECISION_TREE_COL_GAP * (len(sizes) - 1)
+        for level, sizes in row_sizes.items()
+    }
+    max_row_width = max(row_widths.values(), default=0.0)
+    canvas_w = max(max_row_width + 2 * MARGIN, CANVAS_WIDTH)
+
+    outcome_palette = _cycling_palette(theme)
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    # id -> (cx, top_y, bottom_y)
+    positions: dict[str, tuple[float, float, float]] = {}
+    key_entries: list[tuple[str, str, str]] = []
+    outcome_index = 0
+    y = top
+    for level in levels:
+        row_nodes = rows[level]
+        sizes = row_sizes[level]
+        row_w = row_widths[level]
+        x = (canvas_w - row_w) / 2
+        row_height = max((h for _w, h in sizes), default=0.0)
+        for node, (w, h) in zip(row_nodes, sizes):
+            role = role_of(node)
+            node_cx = x + w / 2
+            node_cy = y + h / 2
+            if role == "decision":
+                colors = _node_colors(node, "decision")
+                svg = _draw_diamond(
+                    node, cx=node_cx, cy=node_cy, width=w, height=h, theme=theme, colors=colors,
+                    base_size=STANDARD_FLOWCHART_LABEL_SIZE, min_size=STANDARD_FLOWCHART_LABEL_SIZE,
+                )
+            else:
+                if _HEX_RE.match(node.color.strip()):
+                    stroke = node.color.strip()
+                    colors = (_tint(stroke), stroke)
+                else:
+                    colors = outcome_palette[outcome_index % len(outcome_palette)]
+                    outcome_index += 1
+                svg = _draw_process_box(node, cx=node_cx, cy=node_cy, width=w, height=h, theme=theme, colors=colors)
+            elements.append(svg)
+            if node.id:
+                positions[node.id] = (node_cx, y, y + h)
+            key_entries.append((str(len(key_entries) + 1), node.label, node.detail))
+            x += w + _DECISION_TREE_COL_GAP
+        y += row_height + _DECISION_TREE_ROW_GAP
+
+    # Straight elbow routing (trunk down, bus across, drop down into each
+    # child) - the standard decision-tree/org-chart connector. A curved
+    # Bezier per edge used to bow into a wavy S-curve whenever a child sat
+    # off-centre from its parent. Drawing one trunk+drop PER EDGE (rather
+    # than grouped per parent) also used to draw the exact same vertical
+    # segment twice whenever a decision had more than one child (both
+    # edges share the same parent-bottom-to-mid_y run) - a real, confirmed
+    # shared_edge_segment regression. Grouping by source draws that shared
+    # trunk once, then a single horizontal bus to each child's own column,
+    # then one unique drop per child - nothing ever retraced.
+    edges_by_source: dict[str, list[DiagramEdge]] = {}
+    for edge in edges:
+        if edge.source in positions and edge.target in positions:
+            edges_by_source.setdefault(edge.source, []).append(edge)
+
+    for source_id, child_edges in edges_by_source.items():
+        parent = positions[source_id]
+        children = [(edge, positions[edge.target]) for edge in child_edges]
+        mid_y = (parent[2] + min(child[1] for _, child in children)) / 2
+        trunk_x = parent[0]
+        elements.append(
+            f'<line x1="{trunk_x:.1f}" y1="{parent[2]:.1f}" x2="{trunk_x:.1f}" y2="{mid_y:.1f}" '
+            f'stroke="{theme.accent_color}" stroke-width="2"/>'
+        )
+        if len(children) > 1:
+            xs = [trunk_x] + [child[0] for _, child in children]
+            elements.append(
+                f'<line x1="{min(xs):.1f}" y1="{mid_y:.1f}" x2="{max(xs):.1f}" y2="{mid_y:.1f}" '
+                f'stroke="{theme.accent_color}" stroke-width="2"/>'
+            )
+        for edge, child in children:
+            elements.append(
+                f'<path d="M{child[0]:.1f},{mid_y:.1f} L{child[0]:.1f},{child[1] - 2:.1f}" '
+                f'fill="none" stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+            if edge.label.strip() and edge.target in by_id:
+                child_label = by_id[edge.target].label.strip()
+                key_entries.append(("", f"If {edge.label.strip()}", f"leads to “{child_label}”"))
+
+    bottom = y - _DECISION_TREE_ROW_GAP
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (bottom + key_gap + key_h - top)
+
+
+_FISHBONE_BONE_RISE = 85.0
+_FISHBONE_BONE_LEAN = 45.0
+_FISHBONE_MIN_CAUSE_W = 140.0
+_FISHBONE_MIN_CAUSE_H = 60.0
+
+
+def _ideal_fishbone_cause_size(node: DiagramNode) -> tuple[float, float]:
+    """Same grow-to-fit, never-truncate wrap logic as
+    _ideal_process_box_size, but with a SMALLER minimum width - a cause
+    CATEGORY name ("People", "Process", "Equipment") is conventionally
+    much shorter than a flow_chart action step's own label, and a
+    fishbone's own canvas grows wider per category (more categories need
+    more spine length - see _layout_fishbone's own docstring on why), so
+    reusing the generic 220px floor tuned for longer step phrases made a
+    realistic 4-6 category "6M" fishbone (the standard template - Man,
+    Machine, Material, Method, Measurement, Environment) shrink past the
+    page's own readability floor sooner than it needed to."""
+    label = node.label.strip() or "—"
+    lines = _wrap(label, font_size=STANDARD_FLOWCHART_LABEL_SIZE, width=220.0, max_lines=999, bold=True) or [label]
+    longest = max(len(line) for line in lines)
+    line_w = longest * STANDARD_FLOWCHART_LABEL_SIZE * _BOLD_RATIO
+    text_h = len(lines) * STANDARD_FLOWCHART_LABEL_SIZE * LINE_HEIGHT
+    width = max(_FISHBONE_MIN_CAUSE_W, (line_w + 28.0) / 0.85)
+    height = max(_FISHBONE_MIN_CAUSE_H, (text_h + 20.0) / 0.7)
+    return width, height
+
+
+def _layout_fishbone(nodes: list[DiagramNode], *, theme: TemplateTheme, top: float) -> tuple[list[str], float, float]:
+    """A root-cause-analysis ("Ishikawa"/fishbone) diagram: a horizontal
+    spine pointing at the EFFECT box on the right (`nodes[0]`), with one
+    diagonal "bone" per CAUSE CATEGORY (every other node), alternating
+    above/below the spine, each leaning toward the tail (the classic
+    fishbone silhouette). A category's own sub-causes are never crammed
+    into its small label box - they're `node.detail` (a comma/semicolon-
+    separated list reads well), shown in full in the Key table below,
+    same rule as every kind in this module. Reuses _draw_process_box/
+    _ideal_process_box_size - the exact same grow-to-fit, never-truncate
+    box flow_chart/decision_tree already rely on - for both the head and
+    every category box.
+
+    Consecutive SAME-ROW category boxes (index i and i+2, both above or
+    both below) are only 2 attach-slots apart, not 1 - a real, confirmed
+    bug: evenly dividing a FIXED spine length by node count let two
+    same-row boxes' real widths (which grow past the 220px minimum for a
+    longer category name) overlap each other, since the fixed division
+    never checked against the boxes' own actual size. The spine's own
+    length now grows (same "grow the canvas, don't shrink the content"
+    rule every other kind in this module follows) to guarantee each
+    slot's own width clears the widest category box, however many
+    categories or however long their names are."""
+    if len(nodes) < 2:
+        return [], CANVAS_WIDTH, 0.0
+    head, causes = nodes[0], nodes[1:]
+    count = len(causes)
+
+    head_w, head_h = _ideal_process_box_size(head)
+    cause_sizes = [_ideal_fishbone_cause_size(n) for n in causes]
+    max_cause_w = max((w for w, _h in cause_sizes), default=0.0)
+    max_cause_h = max((h for _, h in cause_sizes), default=0.0)
+
+    # Two same-row boxes sit 2 slots apart - for their real widths to
+    # clear each other (plus a visible gap), each slot needs at least
+    # half that combined width.
+    slot_spacing = max_cause_w / 2 + 30.0
+    spine_span = slot_spacing * (count + 1)
+    canvas_w = max(CANVAS_WIDTH, spine_span + head_w + 2 * MARGIN + 40.0)
+
+    spine_y = top + _FISHBONE_BONE_RISE + max_cause_h / 2 + 10.0
+    head_cx = canvas_w - MARGIN - head_w / 2
+    spine_right = head_cx - head_w / 2
+    spine_left = spine_right - spine_span
+    attach_xs = [spine_left + slot_spacing * (i + 1) for i in range(count)]
+
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    elements.append(
+        f'<line x1="{spine_left:.1f}" y1="{spine_y:.1f}" x2="{spine_right:.1f}" y2="{spine_y:.1f}" '
+        f'stroke="{theme.accent_color}" stroke-width="2.5" marker-end="url(#diagram-arrow)"/>'
+    )
+
+    palette = _cycling_palette(theme)
+    key_entries: list[tuple[str, str, str]] = [("", head.label, head.detail)]
+    for index, (node, (w, h)) in enumerate(zip(causes, cause_sizes)):
+        above = index % 2 == 0
+        attach_x = attach_xs[index]
+        box_cx = max(attach_x - _FISHBONE_BONE_LEAN, MARGIN + w / 2)
+        box_cy = spine_y - _FISHBONE_BONE_RISE if above else spine_y + _FISHBONE_BONE_RISE
+        # A real, confirmed bug (the same class already found and fixed in
+        # _layout_network_mesh): the bone line used to start at the box's
+        # own CENTRE, not its edge - its first several sample points were
+        # then, by construction, inside the box it was drawn from.
+        # _ray_box_exit finds the box's real boundary along the direction
+        # toward the attach point instead.
+        dx, dy = attach_x - box_cx, spine_y - box_cy
+        dist = max(math.hypot(dx, dy), 1.0)
+        start_x, start_y = _ray_box_exit(box_cx, box_cy, dx / dist, dy / dist, w / 2, h / 2)
+        elements.append(
+            f'<line x1="{start_x:.1f}" y1="{start_y:.1f}" x2="{attach_x:.1f}" y2="{spine_y:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="2"/>'
+        )
+        fill, stroke = palette[index % len(palette)]
+        elements.append(_draw_process_box(node, cx=box_cx, cy=box_cy, width=w, height=h, theme=theme, colors=(fill, stroke)))
+        key_entries.append((str(index + 1), node.label, node.detail))
+
+    elements.append(_draw_process_box(head, cx=head_cx, cy=spine_y, width=head_w, height=head_h, theme=theme, colors=_FLOW_ROLE_COLORS["end"]))
+
+    bottom = spine_y + _FISHBONE_BONE_RISE + max_cause_h / 2 + 20.0
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=canvas_w - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, canvas_w, (bottom + key_gap + key_h - top)
+
+
+_LAYERED_BAND_MIN_H = 60.0
+_LAYERED_BAND_GAP = 6.0
+
+
+def _layout_layered_bands(nodes: list[DiagramNode], *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
+    """A flat stack of EQUAL-width horizontal layers (the OSI networking
+    model, geological strata, "layers of a system architecture") - deliberately
+    distinct from `pyramid`, which TAPERS (narrow apex to wide base,
+    showing a hierarchy of IMPORTANCE/scale). Every band here is the same
+    full width - the only thing that matters is stacking ORDER, not size.
+    Each band's own height grows to fit its label (never truncates, same
+    rule as every kind in this module); `node.detail`, when set, is a Key
+    table row below rather than crammed into the band itself."""
+    count = len(nodes)
+    if count == 0:
+        return [], 0.0
+    band_w = CANVAS_WIDTH - 2 * MARGIN
+    palette = _cycling_palette(theme)
+    elements: list[str] = []
+    key_entries: list[tuple[str, str, str]] = []
+    y = top
+    for index, node in enumerate(nodes):
+        label = node.label.strip() or "—"
+        lines = _wrap(label, font_size=STANDARD_FLOWCHART_LABEL_SIZE, width=band_w * 0.85, max_lines=999, bold=True)
+        text_h = len(lines) * STANDARD_FLOWCHART_LABEL_SIZE * LINE_HEIGHT
+        band_h = max(_LAYERED_BAND_MIN_H, (text_h + 24.0) / 0.7)
+        fill, stroke = palette[index % len(palette)]
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        parts = [f"<title>{escape(tooltip)}</title>"] if tooltip else []
+        parts.append(
+            f'<rect class="diagram-box" x="{MARGIN:.1f}" y="{y:.1f}" width="{band_w:.1f}" height="{band_h:.1f}" '
+            f'rx="6" fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
+        )
+        parts.append(
+            _fit_boxed_text(
+                CANVAS_WIDTH / 2, y + band_h / 2, node.label, width=band_w * 0.85, height=band_h * 0.7,
+                color=theme.text_color, theme=theme, base_size=STANDARD_FLOWCHART_LABEL_SIZE, min_size=10.0,
+            )
+        )
+        elements.append(f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>')
+        key_entries.append((str(index + 1), node.label, node.detail))
+        y += band_h + _LAYERED_BAND_GAP
+
+    bottom = y - _LAYERED_BAND_GAP
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(key_entries, top=bottom + key_gap, width=band_w, theme=theme)
+    elements.extend(key_elements)
+    return elements, (bottom + key_gap + key_h - top)
+
+
+_GANTT_LABEL_COL_W = 190.0
+_GANTT_ROW_H = 44.0
+_GANTT_ROW_GAP = 10.0
+GANTT_LABEL_SIZE = 15.0
+_GANTT_AXIS_LABEL_SIZE = 11.0
+
+
+def _layout_gantt_chart(nodes: list[DiagramNode], *, theme: TemplateTheme, top: float) -> tuple[list[str], float]:
+    """A project-schedule chart - one row per task, a task NAME in the
+    left column and a DURATION BAR in the chart area to the right,
+    positioned and sized by `node.gantt_start`/`node.gantt_duration` (a
+    relative time unit - day/week/sprint - never a literal calendar date).
+    Distinct from `timeline` (single POINT-IN-TIME milestones on an axis)
+    - this kind's whole point is showing tasks that span a RANGE, often
+    overlapping with each other, the standard project-management view.
+    Tick gridlines mark every whole time unit across the full
+    start..(start+duration) range actually used, auto-scaled to fit."""
+    count = len(nodes)
+    if count == 0:
+        return [], 0.0
+    starts = [max(n.gantt_start, 0.0) for n in nodes]
+    durations = [max(n.gantt_duration, 0.1) for n in nodes]
+    ends = [s + d for s, d in zip(starts, durations)]
+    span = max(max(ends, default=1.0), 1.0)
+
+    chart_left = MARGIN + _GANTT_LABEL_COL_W + 16.0
+    chart_right = CANVAS_WIDTH - MARGIN
+    chart_w = max(chart_right - chart_left, 100.0)
+    unit_w = chart_w / span
+
+    # Each row's own height grows to fit its task label (never a fixed
+    # height a long name could overflow into the row below - the same
+    # "measure every real line count before laying anything out" rule
+    # fishbone/chevron/staircase already needed after a confirmed bug) -
+    # the bar itself stays a fixed, modest height regardless, vertically
+    # centred within whatever its own row ends up being.
+    label_lines_per_row: list[list[str]] = []
+    row_heights: list[float] = []
+    for node in nodes:
+        lines = _wrap(
+            node.label.strip() or "—", font_size=GANTT_LABEL_SIZE, width=_GANTT_LABEL_COL_W, max_lines=999,
+            bold=True,
+        )
+        label_lines_per_row.append(lines)
+        text_h = len(lines) * GANTT_LABEL_SIZE * LINE_HEIGHT
+        row_heights.append(max(_GANTT_ROW_H, text_h + 16.0))
+
+    axis_top = top + 6.0
+    rows_top = axis_top + _GANTT_AXIS_LABEL_SIZE + 14.0
+    rows_bottom = rows_top + sum(row_heights) + _GANTT_ROW_GAP * (count - 1)
+    elements: list[str] = []
+    # One gridline per whole time unit - a plain, recessive reference grid,
+    # the standard Gantt convention, never a label-bearing element itself.
+    tick_count = math.ceil(span) + 1
+    for tick in range(tick_count):
+        tx = chart_left + tick * unit_w
+        if tx > chart_right + 1.0:
+            break
+        elements.append(
+            f'<line x1="{tx:.1f}" y1="{rows_top:.1f}" x2="{tx:.1f}" y2="{rows_bottom:.1f}" '
+            f'stroke="{theme.border_color}" stroke-width="1" opacity="0.6"/>'
+        )
+        elements.append(_centered_text(
+            tx, axis_top + _GANTT_AXIS_LABEL_SIZE, str(tick), color=theme.muted_color, theme=theme,
+            size=_GANTT_AXIS_LABEL_SIZE, weight=500,
+        ))
+
+    palette = _cycling_palette(theme)
+    key_entries: list[tuple[str, str, str]] = []
+    y = rows_top
+    for index, node in enumerate(nodes):
+        row_h = row_heights[index]
+        row_cy = y + row_h / 2
+        label_lines = label_lines_per_row[index]
+        label_svg, _h = _text(
+            MARGIN, row_cy - (len(label_lines) - 1) * GANTT_LABEL_SIZE * LINE_HEIGHT / 2 + GANTT_LABEL_SIZE * 0.3,
+            label_lines, font_size=GANTT_LABEL_SIZE, weight=600, color=theme.text_color,
+            font_family=theme.font_family, anchor="start",
+        )
+        elements.append(label_svg)
+
+        bar_x = chart_left + starts[index] * unit_w
+        bar_w = max(durations[index] * unit_w, 6.0)
+        bar_h = min(_GANTT_ROW_H - 12.0, row_h - 12.0)
+        fill, stroke = palette[index % len(palette)]
+        tooltip = node.label.strip()
+        if node.detail.strip():
+            tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
+        title = f"<title>{escape(tooltip)}</title>" if tooltip else ""
+        elements.append(
+            f'<g class="diagram-node" tabindex="0" role="group">{title}'
+            f'<rect class="diagram-box" x="{bar_x:.1f}" y="{row_cy - bar_h / 2:.1f}" width="{bar_w:.1f}" '
+            f'height="{bar_h:.1f}" rx="6" fill="{fill}" stroke="{stroke}" stroke-width="2"/></g>'
+        )
+        key_entries.append((str(index + 1), node.label, node.detail))
+        y += row_h + _GANTT_ROW_GAP
+
+    bottom = y - _GANTT_ROW_GAP
+    key_gap = 28.0
+    key_elements, key_h = _key_table_rows(
+        key_entries, top=bottom + key_gap, width=CANVAS_WIDTH - 2 * MARGIN, theme=theme
+    )
+    elements.extend(key_elements)
+    return elements, (bottom + key_gap + key_h - top)
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
 
-def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, int, int]:
+def render_diagram_svg(
+    spec: DiagramSpec, theme: TemplateTheme, *, gap_scale: float = 1.0
+) -> tuple[bytes, int, int]:
     """Render a validated `DiagramSpec` to a standalone SVG document.
 
     Returns (utf-8 svg bytes, intrinsic width, intrinsic height) so the caller
     can store them exactly like a generated image's dimensions.
+
+    `gap_scale` (1.0 = normal) only affects a flow_chart/process's own
+    vertical spine spacing - see _layout_flow_chart's own comment on its
+    `gap` variable, and render_diagram_svg_fitting, the caller that actually
+    searches for a value that fits a given page slot. Every other kind
+    ignores it; this is deliberately a narrow, additive capability, not a
+    blanket "shrink everything" knob.
     """
     kind = spec.normalised_kind()
     top = MARGIN
@@ -2559,26 +4797,72 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
         top += title_h + 20
 
     canvas_w = CANVAS_WIDTH
-    if kind in ("flow_chart", "process"):
-        elements, canvas_w, content_h = _layout_flow_chart(spec.nodes, spec.edges, theme=theme, top=top)
+    if kind == "cycle":
+        # The caption drawn ABOVE the canvas (title_svg, just above) already
+        # shows the diagram's full title, including the "Fig. N: " prefix
+        # app.services.diagram_service._with_figure_caption adds - passing
+        # that SAME, already-prefixed string to the ring's own CENTER
+        # circle too (see _layout_ring_process) would literally repeat
+        # "Fig. 1: ..." a second time, redundant and visually confirmed
+        # cramped on a real generated diagram. The center circle gets the
+        # bare concept name instead.
+        elements, canvas_w, content_h = _layout_ring_process(
+            spec.nodes, spec.edges, theme=theme, top=top,
+            title=_FIGURE_PREFIX_RE.sub("", spec.title), gap_scale=gap_scale,
+        )
+    elif kind in ("flow_chart", "process"):
+        # A plain sequential procedure - not a repeating cycle - reads as
+        # the conventional oval/rectangle/diamond notation instead (see
+        # _layout_standard_flowchart's own docstring for why this is a
+        # separate kind from the ring above, split out from a single
+        # combined dispatch branch).
+        elements, canvas_w, content_h = _layout_standard_flowchart(
+            spec.nodes, spec.edges, theme=theme, top=top, gap_scale=gap_scale
+        )
     elif kind == "data_flow_diagram":
         elements, content_h = _layout_dfd(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "swimlane":
         elements, content_h = _layout_swimlane(spec.nodes, spec.edges, theme=theme, top=top)
-    elif kind == "cycle":
-        elements, canvas_w, content_h = _layout_cycle(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "hierarchy":
         elements, content_h, canvas_w = _layout_hierarchy(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "comparison":
         elements, content_h = _layout_comparison(spec.nodes, theme=theme, top=top)
     elif kind in ("concept_map", "conceptual"):
-        elements, canvas_w, content_h = _layout_concept_map(spec.nodes, spec.edges, theme=theme, top=top)
+        elements, canvas_w, content_h = _layout_concept_wheel(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "er_diagram":
         elements, canvas_w, content_h = _layout_er(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "schematic":
         elements, content_h = _layout_schematic(spec, theme=theme, top=top)
     elif kind == "graph":
         elements, content_h = _layout_graph(spec, theme=theme, top=top)
+    elif kind == "pyramid":
+        elements, content_h = _layout_pyramid(spec.nodes, theme=theme, top=top, inverted=spec.pyramid_inverted)
+    elif kind == "matrix":
+        elements, content_h = _layout_matrix(spec, theme=theme, top=top)
+    elif kind == "radial_mindmap":
+        elements, canvas_w, content_h = _layout_radial_mindmap(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "venn":
+        elements, content_h = _layout_venn(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "chevron_process":
+        elements, canvas_w, content_h = _layout_chevron_process(spec.nodes, theme=theme, top=top)
+    elif kind == "timeline":
+        elements, canvas_w, content_h = _layout_timeline(spec.nodes, theme=theme, top=top)
+    elif kind == "staircase_process":
+        elements, canvas_w, content_h = _layout_staircase_process(spec.nodes, theme=theme, top=top)
+    elif kind == "balance_comparison":
+        elements, content_h = _layout_balance_comparison(spec, theme=theme, top=top)
+    elif kind == "nested_circles":
+        elements, content_h = _layout_nested_circles(spec.nodes, theme=theme, top=top)
+    elif kind == "network_mesh":
+        elements, canvas_w, content_h = _layout_network_mesh(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "decision_tree":
+        elements, canvas_w, content_h = _layout_decision_tree(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "fishbone":
+        elements, canvas_w, content_h = _layout_fishbone(spec.nodes, theme=theme, top=top)
+    elif kind == "layered_diagram":
+        elements, content_h = _layout_layered_bands(spec.nodes, theme=theme, top=top)
+    elif kind == "gantt_chart":
+        elements, content_h = _layout_gantt_chart(spec.nodes, theme=theme, top=top)
     else:  # smart_art: numbered list, no connecting arrows
         elements, content_h = _layout_vertical(
             spec.nodes, spec.edges, theme=theme, connected=False, top=top
@@ -2589,9 +4873,21 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
     # Hover/focus feedback only takes effect where the caller inlines this SVG
     # into the page DOM (not when it's referenced via `<img src>`) - the
     # frontend does that for diagrams specifically, see ImageBlock.tsx.
+    # A subtle, consistent drop shadow on every shape (every kind's own
+    # nodes already share this one "diagram-box" class, so one rule here
+    # lifts the whole library's visual quality at once rather than
+    # threading a shadow through ~20 separate _draw_*/_layout_* functions
+    # individually) - small blur, low opacity, the same restrained amount
+    # of depth real presentation-software SmartArt themes use; never so
+    # heavy it reads as a cartoon bevel or risks clipping at the canvas
+    # edge (MARGIN=40 comfortably clears a 1-2px offset, 3px blur shadow).
+    # Decorative, non-"diagram-box" elements (lane background bands, the
+    # page background rect) are deliberately unaffected - a shadow on a
+    # flat full-height background band would look wrong, not polished.
     style = (
         "<style>.diagram-node{cursor:pointer}"
-        ".diagram-node .diagram-box{transition:stroke .15s ease,fill .15s ease}"
+        ".diagram-node .diagram-box{transition:stroke .15s ease,fill .15s ease;"
+        "filter:drop-shadow(0 1px 2px rgba(15,23,42,.14))}"
         ".diagram-node:hover .diagram-box,.diagram-node:focus .diagram-box{"
         f"stroke:{theme.accent_color};stroke-width:2.5;fill:{theme.accent_soft}}}"
         ".diagram-node:focus{outline:none}</style>"
@@ -2628,3 +4924,53 @@ def render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme) -> tuple[bytes, 
         f"{title_svg}{body}</svg>"
     )
     return svg.encode("utf-8"), int(round(canvas_w)), int(round(canvas_h))
+
+
+# How far render_diagram_svg_fitting is willing to compact a flow_chart's
+# vertical spine gap, and in how many steps - stops well short of the
+# spine gap vanishing entirely (0.4 still leaves a real, visible 20px gap
+# at the 50px base), so consecutive steps never look like they're touching.
+_FITTING_GAP_SCALES = (1.0, 0.85, 0.7, 0.55, 0.4)
+
+
+def render_diagram_svg_fitting(
+    spec: DiagramSpec, theme: TemplateTheme, *, max_height: float | None
+) -> tuple[bytes, int, int]:
+    """Like render_diagram_svg, but when the normal render is taller than
+    `max_height`, retries with a tighter gap_scale (see _layout_flow_chart's
+    own comment on it) until it fits or the compaction floor is reached -
+    never touching box sizes or font sizes, so node/edge text is exactly as
+    legible as the normal, uncompacted render.
+
+    This is the actual fix for a real, measured bug: a flow_chart diagram
+    only a little too tall for the page slot it needed to share with its
+    own lead-in text used to always force that ENTIRE slot's page to move
+    whole to a fresh page - discarding the ORIGINAL page's own leftover
+    space (confirmed via a real generated course, up to 750px/78% of a
+    page) - even though the diagram's content didn't actually need that
+    much room, just more of it packed a little closer together.
+
+    `max_height=None`, or a kind other than flow_chart/process/cycle (the
+    only kinds gap_scale affects - all three now share _layout_ring_process,
+    see its own dispatch in render_diagram_svg), is just render_diagram_svg's
+    normal, full-size output - this function never makes anything WORSE
+    than that baseline. Returns the best-fitting attempt even when nothing
+    fits `max_height` - the caller
+    (app.course.document.diagram_compaction) decides whether that's still
+    worth using over the uncompacted version.
+    """
+    svg, width, height = render_diagram_svg(spec, theme)
+    if (
+        max_height is None
+        or height <= max_height
+        or spec.normalised_kind() not in ("flow_chart", "process", "cycle")
+    ):
+        return svg, width, height
+
+    best = (svg, width, height)
+    for scale in _FITTING_GAP_SCALES[1:]:
+        svg, width, height = render_diagram_svg(spec, theme, gap_scale=scale)
+        best = (svg, width, height)
+        if height <= max_height:
+            break
+    return best

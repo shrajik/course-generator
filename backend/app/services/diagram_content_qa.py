@@ -83,6 +83,9 @@ _GRADED_KINDS = frozenset(
     {
         "flow_chart", "process", "cycle", "hierarchy", "comparison", "smart_art",
         "concept_map", "data_flow_diagram", "er_diagram", "swimlane",
+        "pyramid", "matrix", "radial_mindmap", "venn", "chevron_process", "timeline", "staircase_process",
+        "balance_comparison", "nested_circles", "network_mesh", "decision_tree", "fishbone",
+        "layered_diagram", "gantt_chart",
     }
 )
 

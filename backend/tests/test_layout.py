@@ -22,6 +22,7 @@ from app.schemas.document import (
     CONTENT_HEIGHT,
     CONTENT_WIDTH,
     PAGE_MARGIN_TOP,
+    PAGE_MARGIN_X,
     Block,
     BlockStyle,
 )
@@ -269,21 +270,68 @@ def test_two_visuals_placed_back_to_back_move_together_not_split_across_pages():
     second one alone didn't fit the remaining page space, it used to get
     bumped to a fresh page by itself, stranding the first - often just a
     heading + a tiny icon - behind on an otherwise near-empty page. The two
-    images must always land on the same page as each other.
+    images must always land on the same page as each other - whether that
+    takes moving them to a fresh page together (the original fix) or a
+    gentle, still-legible narrowing of the diagram that lets both fit right
+    where they already are (try_shrink_trailing_visual, a later addition) -
+    either is a valid way to honour the same guarantee, so this only asserts
+    the guarantee itself, not which mechanism delivered it.
 
     Sized (confirmed empirically) so heading+icon+diagram genuinely don't
-    all fit one page - without the fix, this exact scenario put the heading
-    and icon on page 1 and the diagram alone on page 2."""
+    fit one page at full size - without the fix, this exact scenario put
+    the heading and icon on page 1 and the diagram alone on page 2."""
     heading = _heading("Visual Explanation")
     small_icon = _section_intro_image()
     large_diagram = _image_block("diagram", width=666, height=750)
 
     pages = flow_blocks([heading, small_icon, large_diagram])
-    assert len(pages) > 1, "scenario didn't actually force a page split - test isn't exercising anything"
+    assert len(pages) > 1 or large_diagram.layout.width < 666, (
+        "scenario didn't actually force anything (no split, no shrink) - test isn't exercising anything"
+    )
 
     icon_page = next(page for page in pages if small_icon in page)
     diagram_page = next(page for page in pages if large_diagram in page)
     assert icon_page is diagram_page, "the two back-to-back images were split across pages"
+
+
+def test_a_near_miss_diagram_is_gently_narrowed_to_fit_instead_of_wasting_a_page():
+    """A real, measured bug: a diagram only a LITTLE too tall for what's
+    left on the page used to forfeit that entire remaining space (confirmed
+    via a real generated course, pages up to 80%+ blank) by moving whole to
+    a fresh page - even though previously-excluded-from-shrinking diagrams
+    don't need to be: a few percent narrower keeps node/axis labels legible
+    (see shrink_image_width_to_fit's _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION,
+    capped at a ~15% reduction) while reclaiming the page instead of
+    wasting it."""
+    heading = _heading("Visual Explanation")
+    small_icon = _section_intro_image()
+    near_miss_diagram = _image_block("diagram", width=666, height=750)
+
+    pages = flow_blocks([heading, small_icon, near_miss_diagram])
+
+    assert len(pages) == 1
+    assert 0.70 * 666 <= near_miss_diagram.layout.width < 666
+    # A real, confirmed bug: a narrowed block left at its old full-width x
+    # (margin_x) renders pinned to the page's left edge instead of centered
+    # - .figure-box's own flex centering (course.html.j2) only centers
+    # WITHIN the block's own (now too-narrow, left-pinned) box, not within
+    # the page. x must move inward by half of whatever width was trimmed.
+    expected_x = CONTENT_WIDTH / 2 + PAGE_MARGIN_X - near_miss_diagram.layout.width / 2
+    assert near_miss_diagram.layout.x == pytest.approx(expected_x)
+
+
+def test_a_near_miss_diagram_bridged_by_pending_visual_run_is_also_centered():
+    """Same bug, the OTHER code path that can apply a preset shrink width
+    (_pending_visual_run, via a text lead-in rather than a back-to-back
+    visual pair - see try_shrink_trailing_visual's own two call sites)."""
+    lead_in = _paragraph(200)
+    near_miss_diagram = _image_block("diagram", width=666, height=800)
+
+    flow_blocks([_paragraph(110), lead_in, near_miss_diagram])
+
+    assert near_miss_diagram.layout.width < 666  # shrink actually happened
+    expected_x = CONTENT_WIDTH / 2 + PAGE_MARGIN_X - near_miss_diagram.layout.width / 2
+    assert near_miss_diagram.layout.x == pytest.approx(expected_x)
 
 
 def test_page_visual_fraction_of_an_all_text_page_is_zero():

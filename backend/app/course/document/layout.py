@@ -50,6 +50,15 @@ MIN_ORPHAN_SPACE = 140.0  # don't leave a heading alone at the bottom of a page
 # on a page that's already substantially, genuinely full of text just because
 # it hasn't crossed an arbitrary ratio - which is exactly the "text-heavy
 # page can't make room for its visual" gap this module exists to close.
+#
+# Tried raising this to close a specific observed case (a block already
+# forced onto its own fresh page, then abandoned again moments later by the
+# very next bridging decision) - measured on a real course and reverted: it
+# helped that one spot but made the overall page count WORSE elsewhere
+# (fewer legitimate early breaks fired, so more visuals landed without
+# their lead-in and needed their own separate, less efficient placement).
+# This constant trades one failure mode for another at any value; the real
+# fix for oversized-visual waste lives in shrink_image_width_to_fit instead.
 _MIN_CONTENT_BEFORE_EARLY_BREAK = 150.0
 
 # How many upcoming non-visual blocks this module will bridge over to find a
@@ -252,6 +261,89 @@ def image_box_height(block: Block, *, width_hint: float | None = None) -> float:
     if kind == "diagram":
         return min(height, MAX_DIAGRAM_IMAGE_HEIGHT)
     return min(height, MAX_IMAGE_HEIGHT)
+
+
+# A page's remaining space below this (px) isn't worth shrinking an image
+# into - too little room left for the result to be a useful picture, so the
+# normal "doesn't fit, move it whole to a fresh page" handling applies.
+_MIN_SHRINK_AVAILABLE = 260.0
+# Never shrink an ordinary photo/illustration's rendered WIDTH below this
+# fraction of the normal full content width - a measured, deliberate floor
+# so a tight page can never squeeze a picture down to an illegible sliver
+# just to avoid moving it to a fresh page.
+_MIN_SHRINK_WIDTH_FRACTION = 0.55
+# A diagram carries its own text (node/axis labels) baked into the raster -
+# shrinking its width shrinks that text too, in a way an ordinary photo
+# never risks. Its own floor is still gentler than an ordinary photo's (at
+# most a ~30% reduction, vs up to 45% for a photo) so a diagram's labels
+# stay reasonably sized, while still being enough to close the common
+# near-miss case (confirmed via a real generated course: a diagram needing
+# only a modest narrowing - e.g. 880x559 needing ~73% of its full width -
+# to fit a page that would otherwise strand a block ahead of it with 500-
+# 800px wasted). A diagram that would need MORE than this to fit still
+# moves whole to a fresh page, same as before - this is a bounded
+# trade-off, not an unlimited one.
+_MIN_DIAGRAM_SHRINK_WIDTH_FRACTION = 0.70
+
+
+def shrink_image_width_to_fit(block: Block, available: float) -> float | None:
+    """If `block` (an ordinary photo/illustration image with a known real
+    aspect ratio) doesn't fit in `available` px at its normal full width, but
+    would fit at some narrower width that's still a legible picture, return
+    that narrower width - callers place the image at that width instead of
+    bumping it whole to a fresh page. None when shrinking isn't applicable
+    (no real aspect ratio yet, a kind that manages its own sizing) or isn't
+    worthwhile (too little `available` room, or the fit would need going
+    narrower than _MIN_SHRINK_WIDTH_FRACTION allows).
+
+    A real, measured fix: an unsplittable visual that's merely a little too
+    tall for what's left on the page used to always forfeit that ENTIRE
+    remaining space (sometimes 300-900px) by moving whole to a fresh page -
+    confirmed via a real generated course - even though a very slightly
+    narrower rendering of the exact same picture would have fit perfectly
+    well. Width (not height) is what's solved for, deliberately: every
+    caller of this same image's height - image_box_height, caption_height -
+    already derives its number from `block.layout.width`, so setting a
+    narrower width keeps the image, its aspect ratio and its caption's own
+    wrap width all self-consistent through the ordinary, unchanged code path
+    instead of this function having to special-case any of them.
+    """
+    content = block.content
+    kind = content.get("kind")
+    if kind in _UNCAPPED_IMAGE_KINDS or (content.get("illustration_style") or "") == "section_intro":
+        return None
+    intrinsic_w = content.get("width")
+    intrinsic_h = content.get("height")
+    if not intrinsic_w or not intrinsic_h:
+        return None  # no real aspect ratio yet (placeholder) - nothing to measure a shrink against
+    if available < _MIN_SHRINK_AVAILABLE:
+        return None
+
+    full_width = float(block.layout.width or CONTENT_WIDTH)
+    min_fraction = _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION if kind == "diagram" else _MIN_SHRINK_WIDTH_FRACTION
+    min_width = full_width * min_fraction
+    pad = _padding(block)
+    aspect = float(intrinsic_h) / float(intrinsic_w)
+    if aspect <= 0:
+        return None
+    non_image_reserve = caption_height(block) + 2 * pad + 8
+    image_budget = available - non_image_reserve
+    if image_budget <= 0:
+        return None  # no room left for the picture at all, caption alone exhausts it
+
+    # total(width) = min((width - 2*pad) * aspect, cap) + non_image_reserve is
+    # non-decreasing in width, and (by construction - see this function's own
+    # docstring, callers only reach here once the FULL width didn't fit) the
+    # cap can't be what's blocking the fit here: if it were, the full-width
+    # box would already have been exactly `cap + non_image_reserve`, which
+    # would mean `available >= image_budget + non_image_reserve >= cap +
+    # non_image_reserve` - i.e. it would already have fit. So the uncapped,
+    # purely-linear solution for "the width whose aspect-driven height is
+    # exactly image_budget" is the one width worth checking.
+    candidate = image_budget / aspect + 2 * pad
+    if candidate < min_width or candidate >= full_width:
+        return None
+    return round(candidate, 2)
 
 
 # A section_intro illustration (see app.schemas.blocks.ImageContent's own
@@ -676,12 +768,29 @@ def _pending_visual_run(current_block: Block, queue: list[Block]) -> list[Block]
     blocks starting right after `current_block`, return
     `[current_block, ...bridged blocks..., visual]` - the whole group that
     needs to land on the same page together. None when `current_block` is
-    itself a visual (nothing to "keep it with"), or no visual appears within
-    `_VISUAL_LOOKAHEAD_LIMIT` blocks."""
+    itself a visual (nothing to "keep it with"), no visual appears within
+    `_VISUAL_LOOKAHEAD_LIMIT` blocks, or a HEADING appears first.
+
+    A heading marks a new section starting - the lookahead stops there
+    rather than bridging through it. A real, measured bug: without this, a
+    block from the PREVIOUS section (e.g. that section's own closing
+    learning_objectives) could get bridged across an intervening heading to
+    "protect" a visual that actually belongs to, and is already properly
+    led into by, the NEW section - confirmed via a real generated course
+    where this stranded a lone learning_objectives block alone on a page
+    with 80%+ blank space, for a diagram two blocks and one heading later
+    that was never what it was "explaining" in the first place. The new
+    section's own heading, once IT becomes `current_block` on a later
+    iteration, still bridges forward to protect its own diagram - unchanged
+    and correct; what's removed is only reaching backward across the
+    section boundary to begin with.
+    """
     if current_block.type in VISUAL_BLOCK_TYPES:
         return None
     run = [current_block]
     for candidate in queue[:_VISUAL_LOOKAHEAD_LIMIT]:
+        if candidate.type is BlockType.HEADING:
+            return None
         run.append(candidate)
         if candidate.type in VISUAL_BLOCK_TYPES:
             return run
@@ -732,6 +841,10 @@ def flow_blocks(
     current: list[Block] = []
     y = margin_top
     bottom = margin_top + box.content_height
+    # A width _pending_visual_run decided on for a not-yet-placed trailing
+    # image, ahead of that image reaching the front of the queue - see its
+    # own call site below for why.
+    preset_widths: dict[str, float] = {}
 
     def start_new_page() -> None:
         nonlocal current, y
@@ -739,6 +852,28 @@ def flow_blocks(
             pages.append(current)
         current = []
         y = margin_top
+
+    def try_shrink_trailing_visual(run: list[Block], space_here: float) -> bool:
+        """`run` doesn't fit in `space_here` at normal size. If `run` ends in
+        an eligible image (not yet placed - its layout isn't set), see
+        whether narrowing just that image (see shrink_image_width_to_fit)
+        would make the WHOLE run fit after all, and if so record that width
+        in `preset_widths` for when the image itself reaches the front of
+        the queue. True on success - the caller should skip its own
+        start_new_page() and let the run place normally."""
+        trailing = run[-1]
+        if trailing.type is not BlockType.IMAGE:
+            return False
+        non_trailing_total = sum(estimate_height(b) for b in run[:-1]) + BLOCK_GAP * (len(run) - 1)
+        image_budget = space_here - non_trailing_total
+        if image_budget <= 0:
+            return False
+        trailing.layout.width = content_width  # the geometry-correct baseline shrink_image_width_to_fit measures from
+        shrunk_width = shrink_image_width_to_fit(trailing, image_budget)
+        if shrunk_width is None:
+            return False
+        preset_widths[trailing.id] = shrunk_width
+        return True
 
     queue = list(blocks)
     while queue:
@@ -792,12 +927,29 @@ def flow_blocks(
             # below); the paragraph stays queued and is processed normally
             # on the next iteration.
 
-        block.layout.x = margin_x
         # A section_intro picture with no paragraph to sit beside (its section
         # opens with a list, a callout, a quiz...) keeps its small size. It
         # used to fall through to full width, which blew a 4:3 thumbnail up to
-        # a page-wide 665x465 picture.
-        block.layout.width = SECTION_INTRO_IMAGE_WIDTH if _is_section_intro(block) else content_width
+        # a page-wide 665x465 picture. A width _pending_visual_run already
+        # pre-decided for this exact block (see its own call site) wins over
+        # both - it already accounted for what's left on the page.
+        preset_width = preset_widths.pop(block.id, None)
+        if preset_width is not None:
+            # A real, confirmed bug: left at margin_x (the line just below,
+            # unconditionally, before this branch existed) with a width
+            # narrower than content_width, the block - and everything
+            # inside its own .figure-box, which only centers WITHIN its own
+            # parent box (course.html.j2) - renders pinned to the page's
+            # left edge instead of centered, exactly like an unshrunk image
+            # would be. Centering x here is what shrink_image_width_to_fit's
+            # OTHER call site (the direct "doesn't fit, try shrink" fallback
+            # below) already does for the same reason - this path was
+            # simply missing it.
+            block.layout.width = preset_width
+            block.layout.x = margin_x + (content_width - preset_width) / 2
+        else:
+            block.layout.x = margin_x
+            block.layout.width = SECTION_INTRO_IMAGE_WIDTH if _is_section_intro(block) else content_width
         height = estimate_height(block)
 
         gap = 0.0
@@ -827,7 +979,7 @@ def flow_blocks(
                 space_here = bottom - (y + gap)
                 would_strand_pair = pair_height > space_here
                 pair_fits_a_fresh_page = pair_height <= box.content_height
-                if would_strand_pair and pair_fits_a_fresh_page:
+                if would_strand_pair and not try_shrink_trailing_visual(visual_pair, space_here) and pair_fits_a_fresh_page:
                     start_new_page()
                     gap = 0.0
 
@@ -855,7 +1007,7 @@ def flow_blocks(
                 space_here = bottom - (y + gap)
                 would_strand_visual = run_height > space_here
                 fits_a_fresh_page = run_height <= box.content_height
-                if would_strand_visual and fits_a_fresh_page:
+                if would_strand_visual and not try_shrink_trailing_visual(run, space_here) and fits_a_fresh_page:
                     start_new_page()
                     gap = 0.0
 
@@ -868,6 +1020,38 @@ def flow_blocks(
 
         # Doesn't fit: try to split it across the page boundary.
         available = bottom - (y + gap)
+
+        # An ordinary photo/illustration doesn't split like text - but it
+        # doesn't have to move whole to a fresh page either. If a slightly
+        # narrower rendering of the SAME picture (never below
+        # _MIN_SHRINK_WIDTH_FRACTION of its normal width) fits what's left
+        # here, use that instead of forfeiting the whole remaining space -
+        # see shrink_image_width_to_fit's own docstring for the measured bug
+        # this closes.
+        if block.type is BlockType.IMAGE and current:
+            shrunk_width = shrink_image_width_to_fit(block, available)
+            if shrunk_width is not None:
+                original_width = block.layout.width
+                block.layout.width = shrunk_width
+                shrunk_height = estimate_height(block)
+                # shrink_image_width_to_fit solves a closed-form approximation
+                # that assumes the caption's own height doesn't change at the
+                # narrower width - usually true, but a caption that wraps to
+                # an extra line at the narrower width can make the real
+                # estimate taller than planned. Verify against the real
+                # estimator and roll back rather than risk the block
+                # overflowing its own page (see this file's own "estimates
+                # err high, min-height tolerates it" rule - tolerated only
+                # when the OVER-estimate is on the safe side, never here).
+                if shrunk_height <= available:
+                    block.layout.x = margin_x + (content_width - shrunk_width) / 2  # stay centered, not left-pinned
+                    block.layout.y = y + gap
+                    block.layout.height = round(shrunk_height, 2)
+                    current.append(block)
+                    y = block.layout.y + block.layout.height
+                    continue
+                block.layout.width = original_width
+
         if block.type is BlockType.CODE_CELL:
             pieces = (
                 split_code_cell(block, available, box.content_height)

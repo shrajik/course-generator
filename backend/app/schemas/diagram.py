@@ -45,6 +45,20 @@ DIAGRAM_KINDS = (
     "er_diagram",
     "swimlane",
     "graph",
+    "pyramid",
+    "matrix",
+    "radial_mindmap",
+    "venn",
+    "chevron_process",
+    "timeline",
+    "staircase_process",
+    "balance_comparison",
+    "nested_circles",
+    "network_mesh",
+    "decision_tree",
+    "fishbone",
+    "layered_diagram",
+    "gantt_chart",
 )
 
 # "graph" is its own, third family - neither a sequence nor a labelled-box
@@ -61,8 +75,20 @@ DIAGRAM_KINDS = (
 # both sequential (data/work moves from node to node, across lanes for
 # swimlane); er_diagram is a structure (entities and their relationships
 # have no inherent order), so it joins RELATIONSHIP_KINDS instead.
-SEQUENTIAL_KINDS = ("flow_chart", "process", "cycle", "data_flow_diagram", "swimlane")
-RELATIONSHIP_KINDS = ("concept_map", "conceptual", "hierarchy", "schematic", "er_diagram")
+SEQUENTIAL_KINDS = (
+    "flow_chart", "process", "cycle", "data_flow_diagram", "swimlane", "chevron_process", "timeline",
+    "staircase_process", "gantt_chart",
+)
+RELATIONSHIP_KINDS = (
+    "concept_map", "conceptual", "hierarchy", "schematic", "er_diagram", "matrix", "radial_mindmap", "venn",
+    "balance_comparison", "nested_circles", "network_mesh", "decision_tree", "fishbone",
+)
+# "pyramid" deliberately joins neither tuple, the same reasoning "graph"
+# already documents above: its layers have a top-to-bottom ORDER (narrowest
+# to widest, or the reverse for a funnel) but aren't a sequence of STEPS that
+# happen one after another in time - so a sequential-vs-relationship hint
+# conflict check (_kind_conflicts, app.services.diagram_service) shouldn't
+# flag it against either family.
 
 
 def max_nodes_for(kind: str) -> int:
@@ -112,6 +138,15 @@ class DiagramNode(BaseModel):
     detail: str = ""
     # hierarchy: depth (0 = root). concept_map: 0 = the central/focal thing
     # being explained, >=1 = a labelled component/relationship around it.
+    # radial_mindmap: same convention as concept_map - 0 = the one central
+    # topic (the hub), >=1 = a branch at that depth from the centre (a
+    # branch's own children, if any, connect to it via `edges`, same as
+    # hierarchy). pyramid: this node's own layer order top-to-bottom as
+    # given in `nodes` is what's actually drawn (`level` itself is ignored)
+    # - listed here only so a model that sets it anyway does no harm.
+    # nested_circles: same as pyramid - `nodes` order IS the nesting order
+    # (nodes[0] = outermost/broadest ring, nodes[-1] = innermost/most
+    # specific), `level` itself ignored.
     # Ignored by other kinds.
     level: int = 0
     # Which shape this node draws as - meaning is kind-specific, ignored by
@@ -124,6 +159,10 @@ class DiagramNode(BaseModel):
     #   = a relationship between two entities (diamond), "attribute" = a
     #   single field belonging to one entity or relationship (oval) - see
     #   `parent_id`.
+    # balance_comparison: "left" or "right" - which column this row
+    #   belongs to (e.g. "left" = cost/con, "right" = value/pro). ""
+    #   (default) falls back to position: the first half of `nodes` is the
+    #   left column, the rest is the right column.
     shape_role: str = ""
     # er_diagram only, and only meaningful when shape_role == "attribute":
     # the id of the entity/relationship node this attribute belongs to -
@@ -148,6 +187,14 @@ class DiagramNode(BaseModel):
     # hex colour) keeps the existing fixed _FLOW_ROLE_COLORS palette exactly
     # as it was before this field existed.
     color: str = ""
+    # gantt_chart only: this task's own bar, in whatever time unit the
+    # brief uses (day/week/sprint number - never a literal calendar date,
+    # this is a relative schedule chart, not a date-aware one).
+    # gantt_start: how many units after the project's own start this task
+    # begins. gantt_duration: how many units it spans. Both ignored by
+    # every other kind.
+    gantt_start: float = 0.0
+    gantt_duration: float = 1.0
 
 
 class DiagramEdge(BaseModel):
@@ -612,6 +659,37 @@ class DiagramSpec(BaseModel):
     categories: list[str] = Field(default_factory=list)
     series: list[GraphSeries] = Field(default_factory=list)
 
+    # --- pyramid (only meaningful for kind == "pyramid") --------------------
+    # False (default): a classic pyramid - nodes[0] is the narrow APEX (top
+    # layer), nodes[-1] is the widest BASE (bottom layer) - "levels of
+    # importance/foundation" content (e.g. Maslow's hierarchy). True: a
+    # funnel - nodes[0] is the widest TOP, nodes[-1] the narrow bottom -
+    # "narrowing stages" content (e.g. a sales/conversion funnel). Same
+    # renderer, same node list, just which end tapers.
+    pyramid_inverted: bool = False
+
+    # --- matrix (only meaningful for kind == "matrix") -----------------------
+    # Axis titles for a 2-axis quadrant matrix (e.g. "Effort" / "Impact") -
+    # only drawn when exactly 4 labelled nodes are given (one per quadrant,
+    # in reading order: top-left, top-right, bottom-left, bottom-right); a
+    # different node count renders as a plain labelled grid instead, with no
+    # axis cross. All four blank is a plain grid even at 4 nodes - the axis
+    # cross is opt-in, not inferred.
+    matrix_x_label: str = ""
+    matrix_y_label: str = ""
+    # Endpoint labels for each axis (e.g. "Low" / "High") - purely cosmetic,
+    # blank draws no endpoint tick label.
+    matrix_x_low: str = ""
+    matrix_x_high: str = ""
+    matrix_y_low: str = ""
+    matrix_y_high: str = ""
+
+    # --- balance_comparison (only meaningful for kind == "balance_comparison") --
+    # Headers for the two columns (e.g. "Cost" / "Value", "Cons" / "Pros") -
+    # drawn above each column; blank draws no header for that side.
+    balance_left_label: str = ""
+    balance_right_label: str = ""
+
     def normalised_kind(self) -> str:
         value = (self.kind or "").strip().lower().replace(" ", "_")
         return value if value in DIAGRAM_KINDS else "smart_art"
@@ -688,4 +766,8 @@ class DiagramSpec(BaseModel):
             # least 2 distinct lanes, connected by something.
             lanes = {n.lane.strip() for n in self.nodes if n.lane.strip()}
             return bool(self.edges) and len(lanes) >= 2
+        if kind == "venn":
+            # Venn geometry only reads cleanly at 2 or 3 overlapping circles -
+            # the generic 2..9 node-count check above is too permissive here.
+            return 2 <= len(labelled) <= 3
         return True

@@ -102,7 +102,11 @@ def test_diagram_spec_unknown_kind_falls_back_to_smart_art():
 
 @pytest.mark.parametrize(
     "kind",
-    ["flow_chart", "process", "cycle", "comparison", "smart_art", "conceptual", "concept_map"],
+    [
+        "flow_chart", "process", "cycle", "comparison", "smart_art", "conceptual", "concept_map",
+        "pyramid", "matrix", "radial_mindmap", "chevron_process", "timeline", "staircase_process",
+        "balance_comparison", "nested_circles", "network_mesh", "decision_tree",
+    ],
 )
 def test_render_diagram_svg_produces_well_formed_svg(kind):
     nodes = [
@@ -119,6 +123,332 @@ def test_render_diagram_svg_produces_well_formed_svg(kind):
     assert width > 0 and height > 0
 
 
+# ---------------------------------------------------------------------------
+# render_diagram_svg_fitting (generation-time diagram compaction)
+# ---------------------------------------------------------------------------
+
+
+def _linear_flow_chart(n: int = 4, *, detail: bool = False) -> DiagramSpec:
+    nodes = [
+        DiagramNode(
+            id=f"n{i}", label=f"Step {i}",
+            detail="Some supporting detail text for this step's own Key table row." if detail else "",
+        )
+        for i in range(n)
+    ]
+    edges = [DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(n - 1)]
+    return DiagramSpec(kind="flow_chart", title="A linear procedure", nodes=nodes, edges=edges)
+
+
+def test_fitting_returns_the_normal_render_when_it_already_fits():
+    # Byte-for-byte equality isn't meaningful here - render_diagram_svg gives
+    # every marker id a fresh random suffix per call (see its own docstring),
+    # so two calls of the identical spec never produce identical bytes.
+    # Dimensions (what gap_scale actually controls) are the real signal.
+    from app.render.diagram_renderer import render_diagram_svg_fitting
+
+    spec = _linear_flow_chart()
+    _, normal_w, normal_h = render_diagram_svg(spec, TemplateTheme())
+    _, fitted_w, fitted_h = render_diagram_svg_fitting(spec, TemplateTheme(), max_height=normal_h + 50)
+    assert (fitted_w, fitted_h) == (normal_w, normal_h)
+
+
+def test_fitting_returns_the_normal_render_when_max_height_is_none():
+    from app.render.diagram_renderer import render_diagram_svg_fitting
+
+    spec = _linear_flow_chart()
+    _, normal_w, normal_h = render_diagram_svg(spec, TemplateTheme())
+    _, fitted_w, fitted_h = render_diagram_svg_fitting(spec, TemplateTheme(), max_height=None)
+    assert (fitted_w, fitted_h) == (normal_w, normal_h)
+
+
+def test_fitting_compacts_vertical_spacing_without_touching_node_count_or_text():
+    """Unlike the old `_layout_flow_chart`, gap_scale on the new
+    `_layout_ring_process` only compacts the Key table's own row spacing
+    (the ring's own node size/spacing is never touched by it - see
+    `_layout_ring_process`'s own docstring) - a bigger node count with real
+    `detail` text gives the Key table enough weight for that compaction to
+    produce a measurable, realistically-achievable height reduction."""
+    from app.render.diagram_renderer import render_diagram_svg_fitting
+
+    spec = _linear_flow_chart(8, detail=True)
+    normal_svg, normal_w, normal_h = render_diagram_svg(spec, TemplateTheme())
+    target = normal_h - 60  # a modest, realistically-closeable shortfall
+    fitted_svg, fitted_w, fitted_h = render_diagram_svg_fitting(spec, TemplateTheme(), max_height=target)
+
+    assert fitted_h <= target
+    assert fitted_h < normal_h
+    assert fitted_w == normal_w  # width (and therefore on-page scale) is untouched
+    for node in spec.nodes:
+        assert f">{node.label}<" in fitted_svg.decode("utf-8")  # every label still rendered, same text
+    normal_root = ET.fromstring(normal_svg)
+    fitted_root = ET.fromstring(fitted_svg)
+    normal_font_sizes = {el.get("font-size") for el in normal_root.iter() if el.get("font-size")}
+    fitted_font_sizes = {el.get("font-size") for el in fitted_root.iter() if el.get("font-size")}
+    assert fitted_font_sizes == normal_font_sizes  # compaction never changes font size
+
+
+def test_fitting_never_returns_something_taller_than_the_normal_render():
+    """Even an impossible target (far below what any compaction could reach)
+    must come back no worse than the uncompacted baseline - this function's
+    own contract (see its docstring: "never makes anything WORSE")."""
+    from app.render.diagram_renderer import render_diagram_svg_fitting
+
+    spec = _linear_flow_chart(6)
+    normal_h = render_diagram_svg(spec, TemplateTheme())[2]
+    fitted_h = render_diagram_svg_fitting(spec, TemplateTheme(), max_height=1.0)[2]
+    assert fitted_h <= normal_h
+
+
+def test_fitting_ignores_max_height_for_a_kind_gap_scale_does_not_affect():
+    from app.render.diagram_renderer import render_diagram_svg_fitting
+
+    spec = DiagramSpec(
+        kind="hierarchy",
+        nodes=[DiagramNode(id="root", label="Root", level=0), DiagramNode(id="a", label="Child", level=1)],
+        edges=[DiagramEdge(source="root", target="a")],
+    )
+    _, normal_w, normal_h = render_diagram_svg(spec, TemplateTheme())
+    _, fitted_w, fitted_h = render_diagram_svg_fitting(spec, TemplateTheme(), max_height=1.0)
+    assert (fitted_w, fitted_h) == (normal_w, normal_h)
+
+
+# ---------------------------------------------------------------------------
+# textbook-style ring (flow_chart/process/cycle) and concept wheel
+# (concept_map) - replaces the old box-and-arrow look for exactly these
+# kinds (see render_diagram_svg's own dispatch)
+# ---------------------------------------------------------------------------
+
+
+def test_ring_process_never_truncates_a_long_node_label_with_an_ellipsis():
+    """The actual bug this whole rendering change fixes: a node's label
+    text must never be cut short with "…" - the circle grows to fit it
+    instead (see _circle_node's own docstring)."""
+    long_label = "A genuinely long step description that would have overflowed the old small flow_chart box"
+    spec = DiagramSpec(
+        kind="cycle",
+        nodes=[DiagramNode(id="a", label=long_label), DiagramNode(id="b", label="Next")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "…" not in text
+    # every word of the long label survives somewhere in the output (the
+    # node circle itself, wrapped across lines).
+    for word in long_label.split():
+        assert word in text, f"word lost: {word}"
+
+
+def test_ring_process_detail_never_truncates_in_the_key_table():
+    """Same guarantee for the Key table's own explanation column - detail
+    text moved OUT of the node (see _layout_ring_process's own docstring)
+    must still never be cut short, however long."""
+    long_detail = (
+        "A much longer supporting explanation sentence for this one step that would never have "
+        "fit cleanly inside a small circular node, which is exactly why it lives in the Key table instead."
+    )
+    spec = DiagramSpec(
+        kind="cycle",
+        nodes=[
+            DiagramNode(id="a", label="Step", detail=long_detail),
+            DiagramNode(id="b", label="Next"),
+        ],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "…" not in text
+    for word in long_detail.split():
+        assert word in text, f"word lost: {word}"
+
+
+def test_ring_process_never_draws_text_on_a_connector_arrow():
+    """No arrow (<path> or <line> with an arrowhead marker) may carry a
+    text label - an edge's own `label`, even when the model set one, is
+    simply not rendered anywhere on the connector (see
+    _curved_connector's own docstring)."""
+    spec = DiagramSpec(
+        kind="cycle",
+        nodes=[DiagramNode(id="a", label="Start"), DiagramNode(id="b", label="End")],
+        edges=[DiagramEdge(source="a", target="b", label="a label that must never appear on the arrow")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "a label that must never appear on the arrow" not in text
+    assert 'marker-end="url(#diagram-arrow' in text  # the arrow itself still drew
+
+
+def test_ring_process_stays_open_for_a_non_cyclic_sequence():
+    """A plain step-by-step procedure with no real last->first edge must
+    NOT draw a closing arrow back to the start - only genuine cycles
+    close the ring (see _layout_ring_process's own docstring)."""
+    nodes = [DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(4)]
+    edges = [DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(3)]  # no n3 -> n0
+    spec = DiagramSpec(kind="cycle", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    arrow_count = text.count('marker-end="url(#diagram-arrow')
+    assert arrow_count == 3  # N-1 arrows, ring left open
+
+
+def test_ring_process_closes_for_a_genuine_cycle():
+    """A spec whose own edges genuinely close the loop (a real repeating
+    cycle) gets the matching extra closing arrow."""
+    nodes = [DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(4)]
+    edges = [DiagramEdge(source=f"n{i}", target=f"n{(i + 1) % 4}") for i in range(4)]  # n3 -> n0 included
+    spec = DiagramSpec(kind="cycle", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    arrow_count = text.count('marker-end="url(#diagram-arrow')
+    assert arrow_count == 4  # N arrows, ring closed
+
+
+# --- standard flowchart (flow_chart/process - oval/rectangle/diamond) ------
+
+
+def test_standard_flowchart_never_truncates_a_long_label_with_an_ellipsis():
+    long_label = "A genuinely long step description that would have overflowed a small flowchart box"
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label=long_label), DiagramNode(id="b", label="Next")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "…" not in text
+    for word in long_label.split():
+        assert word in text, f"word lost: {word}"
+
+
+def test_standard_flowchart_detail_never_truncates_in_the_key_table():
+    long_detail = (
+        "A much longer supporting explanation sentence for this one step that would never have "
+        "fit cleanly inside a small flowchart box, which is exactly why it lives in the Key table instead."
+    )
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="Step", detail=long_detail), DiagramNode(id="b", label="Next")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "…" not in text
+    for word in long_detail.split():
+        assert word in text, f"word lost: {word}"
+
+
+def test_standard_flowchart_never_draws_edge_labels_on_a_connector():
+    """No arrow itself may carry a text label - an edge's own `label` is
+    never rendered on the connector element. Unlike the ring/wheel (which
+    never uses edge labels anywhere), a standard flowchart deliberately
+    folds a branch's meaning into its source node's own Key table row
+    instead of discarding it (see
+    test_standard_flowcharts_decision_branch_meaning_lands_in_the_key_table) -
+    so the real guarantee under test is "not ON the arrow", not "nowhere
+    in the output"."""
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="a", label="Start"), DiagramNode(id="b", label="End")],
+        edges=[DiagramEdge(source="a", target="b", label="a label that must never appear on the arrow")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    # The label legitimately appears, but only wrapped into the Key
+    # table's own explanatory row - never as bare text riding the arrow.
+    assert "If a label that must never appear on the arrow:" in text
+    assert 'marker-end="url(#diagram-arrow' in text  # the arrow itself still drew
+
+
+def test_standard_flowchart_uses_the_conventional_oval_rectangle_diamond_shapes():
+    """Start/end -> oval(pill), an ordinary step -> rectangle, a real
+    decision (2+ outgoing edges) -> diamond - the standard notation the
+    brief asks for, not the old uniform rounded-box look."""
+    nodes = [
+        DiagramNode(id="s", label="Start"),
+        DiagramNode(id="p", label="Do the thing"),
+        DiagramNode(id="d", label="Ready?"),
+        DiagramNode(id="e", label="End"),
+    ]
+    edges = [
+        DiagramEdge(source="s", target="p"),
+        DiagramEdge(source="p", target="d"),
+        DiagramEdge(source="d", target="e", label="Yes"),
+        DiagramEdge(source="d", target="s", label="No"),
+    ]
+    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert text.count("<polygon") >= 1  # the decision diamond
+    assert 'rx="28.0"' in text or "rx=\"28" in text  # a pill's rx == half its own height (_PILL_H / 2)
+    assert "<rect" in text  # the ordinary process rectangle
+
+
+def test_standard_flowcharts_decision_branch_meaning_lands_in_the_key_table():
+    """A decision's own edge labels ("Yes"/"No") are never lost - they
+    move into that node's own Key table row instead of ever sitting on
+    the arrow (see test_standard_flowchart_never_draws_edge_labels_on_a_connector)."""
+    nodes = [
+        DiagramNode(id="d", label="Ready?"),
+        DiagramNode(id="go", label="Proceed"),
+        DiagramNode(id="wait", label="Wait"),
+    ]
+    edges = [
+        DiagramEdge(source="d", target="go", label="Yes"),
+        DiagramEdge(source="d", target="wait", label="No"),
+    ]
+    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "Yes" in text and "Proceed" in text
+    assert "No" in text and "Wait" in text
+
+
+def test_standard_flowchart_draws_a_side_connector_for_a_non_consecutive_edge():
+    """A decision's alternate branch (not the next node in sequence) is a
+    short curved side connector, never a persistent second column (see
+    _layout_standard_flowchart's own docstring)."""
+    nodes = [DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(4)]
+    edges = [
+        DiagramEdge(source="n0", target="n1"),
+        DiagramEdge(source="n1", target="n2"),
+        DiagramEdge(source="n2", target="n3"),
+        DiagramEdge(source="n1", target="n3"),  # skips n2 - a non-consecutive edge
+    ]
+    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    # 3 straight consecutive arrows (<line>) + 1 curved side connector (<path> with an arrowhead).
+    assert text.count("<line") >= 3
+    assert "marker-end" in text and "<path d=" in text
+
+
+def test_concept_wheel_draws_no_connecting_lines_between_focal_and_satellites():
+    """A wheel communicates "parts of X" by proximity/colour only - no
+    connecting line or arrow between the focal centre and any satellite,
+    and so no edge label anywhere either (see _layout_concept_wheel's own
+    docstring)."""
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[
+            DiagramNode(id="subj", label="Subject", level=0),
+            DiagramNode(id="a", label="Part A", level=1),
+            DiagramNode(id="b", label="Part B", level=1),
+        ],
+        edges=[
+            DiagramEdge(source="a", target="subj", label="belongs to"),
+            DiagramEdge(source="b", target="subj", label="belongs to"),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    # The Key table below legitimately draws plain <line> divider rules
+    # between rows - what must never exist is a connector, which always
+    # carries an arrowhead marker (every <line>/<path> this module ever
+    # draws as a connector does - see _curved_connector).
+    assert 'marker-end="url(#diagram-arrow' not in text
+    assert "belongs to" not in text
+
+
 def test_render_diagram_svg_hierarchy_layout():
     nodes = [
         DiagramNode(id="root", label="Root", level=0),
@@ -133,215 +463,48 @@ def test_render_diagram_svg_hierarchy_layout():
     assert width > 0 and height > 0
 
 
-def test_flow_chart_long_transition_labels_never_overlap_the_stacked_boxes():
-    """The gap reserved between stacked flow_chart/process boxes must fit a
-    wrapped two-line transition label without crowding either box - same
-    class of bug as the concept_map/schematic label overlaps, here in the
-    vertical-stack layout used by flow_chart, process and smart_art."""
-    nodes = [DiagramNode(id=f"n{i}", label=f"Stage {i}") for i in range(4)]
-    edges = [
-        DiagramEdge(source=f"n{i}", target=f"n{i + 1}", label="a long transition condition that wraps to two lines")
-        for i in range(3)
-    ]
-    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
-    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    boxes = _rects_by_class(text, "diagram-box")
-    labels = _rects_by_class(text, "diagram-edge-label")
-    assert boxes and labels
-    offenders = [(label, box) for label in labels for box in boxes if _bboxes_overlap(label, box)]
-    assert not offenders, f"flow_chart transition label(s) overlap a box: {offenders}"
-
-
-def test_flow_chart_process_boxes_use_the_semantic_blue_not_a_neutral_fill():
-    """A plain chain with no literal Start/End labels is every node
-    "process" - blue, not the old neutral theme.surface_color fill."""
-    nodes = [DiagramNode(id=f"n{i}", label=f"Stage {i}") for i in range(3)]
-    edges = [DiagramEdge(source=f"n{i}", target=f"n{i+1}") for i in range(2)]
-    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    assert text.count('fill="#bfdbfe"') == 3
-
-
-def test_flow_chart_literal_start_end_labels_render_as_coloured_pills():
+def test_hierarchy_rows_are_centred_on_the_canvas_not_stuck_left():
+    """A real, confirmed bug: every row used to start flush at x=MARGIN
+    regardless of its own width, so only the single WIDEST row ever
+    happened to span the canvas edge-to-edge - a narrower row (a lone
+    root node, a shorter branch) sat stuck to the left instead of centred
+    under the wider rows around it. Uses an uneven tree (1 root, 2
+    children, 1 grandchild) specifically because a perfectly even tree
+    can't distinguish "centred" from "stuck left" - every row would
+    coincidentally share the same width either way."""
     nodes = [
-        DiagramNode(id="a", label="Start"),
-        DiagramNode(id="b", label="Do the work"),
-        DiagramNode(id="c", label="End"),
-    ]
-    edges = [DiagramEdge(source="a", target="b"), DiagramEdge(source="b", target="c")]
-    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    assert 'fill="#bbf7d0"' in text  # start = green
-    assert 'fill="#fecaca"' in text  # end = red
-    assert 'fill="#bfdbfe"' in text  # the one process box in between
-
-
-def test_flow_chart_decision_branches_render_side_by_side_and_converge():
-    """The "Decision Flowchart" shape: a node with 2 outgoing edges is a
-    decision (purple diamond); its two branches, each a single dead-end
-    node here, land side by side below it."""
-    nodes = [
-        DiagramNode(id="start", label="Start"),
-        DiagramNode(id="check", label="Is number > 0?"),
-        DiagramNode(id="pos", label="Positive number"),
-        DiagramNode(id="neg", label="Negative number"),
+        DiagramNode(id="root", label="Root", level=0),
+        DiagramNode(id="a", label="Child A", level=1),
+        DiagramNode(id="b", label="Child B", level=1),
+        DiagramNode(id="c", label="Grandchild", level=2),
     ]
     edges = [
-        DiagramEdge(source="start", target="check"),
-        DiagramEdge(source="check", target="pos", label="Yes"),
-        DiagramEdge(source="check", target="neg", label="No"),
+        DiagramEdge(source="root", target="a"), DiagramEdge(source="root", target="b"),
+        DiagramEdge(source="a", target="c"),
     ]
-    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    ET.fromstring(svg_bytes)
-
-    assert "<polygon" in text  # the decision diamond
-    assert "Is number &gt; 0?" in text or "Is number > 0?" in text
-    assert "Yes" in text and "No" in text
-    assert "Positive number" in text and "Negative number" in text
-    boxes = _rects_by_class(text, "diagram-box")
-    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
-    assert not offenders, f"flow_chart decision branches overlap: {offenders}"
-    assert width > 0 and height > 0
-
-
-def test_flow_chart_loop_back_edge_draws_a_return_path_not_a_box():
-    """The "Flowchart with Loops" shape: one branch of a decision loops back
-    to the decision itself (a classic while-loop) instead of ending - it
-    must draw a return path, never try to render the decision a second
-    time as a new box."""
-    nodes = [
-        DiagramNode(id="start", label="Start"),
-        DiagramNode(id="init", label="Initialize i = 1"),
-        DiagramNode(id="check", label="Is i <= 5?"),
-        DiagramNode(id="print", label="Print i"),
-        DiagramNode(id="incr", label="i = i + 1"),
-        DiagramNode(id="end", label="End"),
-    ]
-    edges = [
-        DiagramEdge(source="start", target="init"),
-        DiagramEdge(source="init", target="check"),
-        DiagramEdge(source="check", target="print", label="Yes"),
-        DiagramEdge(source="print", target="incr"),
-        DiagramEdge(source="incr", target="check"),  # the loop-back
-        DiagramEdge(source="check", target="end", label="No"),
-    ]
-    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    ET.fromstring(svg_bytes)
-
-    for label in ("Initialize i = 1", "Is i &lt;= 5?", "Print i", "i = i + 1"):
-        assert label in text or label.replace("&lt;", "<") in text
-    # exactly one diamond drawn - the loop-back must never re-render "Is i <= 5?"
-    assert text.count("<polygon") == 1
-    boxes = _rects_by_class(text, "diagram-box")
-    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
-    assert not offenders, f"flow_chart loop overlaps: {offenders}"
-    assert width > 0 and height > 0
-
-
-def _delegation_workflow_spec() -> DiagramSpec:
-    """A real, user-reported case: one branch of a decision ("Delegate")
-    runs through several plain steps before reaching a SECOND decision
-    ("Monitor & Close or Escalate") partway through - out-of-scope for
-    `resolve_branch` (a second decision mid-chain), which used to make the
-    OUTER decision ("Decide") dump the entire rest of the diagram into
-    flat, unbranched stacking: "Delegate" and "Keep" appeared as if
-    sequential steps with a fabricated arrow between them, and worse, the
-    INNER decision's own two branches ("End" and "Escalate") also lost
-    their branch geometry, with "Escalate" ending up stacked AFTER "End"
-    joined by a fabricated "End -> Escalate" arrow that was never a real
-    edge (the real edge is "Monitor & Close or Escalate -> Escalate")."""
-    nodes = [
-        DiagramNode(id="start", label="Start"),
-        DiagramNode(id="assess", label="Assess Request", detail="Value, cost, urgency, skill, authority"),
-        DiagramNode(id="decide", label="Decide"),
-        DiagramNode(id="delegate", label="Delegate"),
-        DiagramNode(id="keep", label="Keep"),
-        DiagramNode(id="select", label="Select Assignee"),
-        DiagramNode(id="scope", label="Define Scope", detail="Outcome, constraints, authority"),
-        DiagramNode(id="criteria", label="Add Criteria & Checkpoints", detail="Acceptance criteria and checkpoints"),
-        DiagramNode(id="confirm", label="Confirm Handoff", detail="Assignee accepts"),
-        DiagramNode(id="monitor", label="Monitor & Close or Escalate", detail="Monitor checkpoints, close or escalate"),
-        DiagramNode(id="end", label="End"),
-        DiagramNode(id="escalate", label="Escalate"),
-    ]
-    edges = [
-        DiagramEdge(source="start", target="assess"),
-        DiagramEdge(source="assess", target="decide"),
-        DiagramEdge(source="decide", target="delegate", label="Delegate"),
-        DiagramEdge(source="decide", target="keep", label="Keep"),
-        DiagramEdge(source="delegate", target="select"),
-        DiagramEdge(source="select", target="scope"),
-        DiagramEdge(source="scope", target="criteria"),
-        DiagramEdge(source="criteria", target="confirm"),
-        DiagramEdge(source="confirm", target="monitor"),
-        DiagramEdge(source="monitor", target="end"),
-        DiagramEdge(source="keep", target="end"),
-        DiagramEdge(source="monitor", target="escalate", label="Escalate"),
-    ]
-    return DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
-
-
-def test_flow_chart_never_draws_more_arrows_than_real_edges_exist():
-    """The confirmed root cause, checked as a structural invariant rather
-    than by eyeballing the picture: the old fallback connected whatever was
-    drawn immediately before to whatever came next in spec order,
-    regardless of whether a real edge existed between them (confirmed real
-    case: a fabricated "End -> Escalate" arrow, when the real edge is
-    "Monitor & Close or Escalate -> Escalate"). It is structurally
-    impossible to fabricate an arrow without ALSO drawing more arrow
-    elements than the spec has real edges - so this count can never exceed
-    `len(spec.edges)`, on a spec specifically shaped to trigger the
-    fallback path that used to violate it."""
-    spec = _delegation_workflow_spec()
-    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow[^)]*\)"', text))
-    assert arrow_count <= len(spec.edges)
-    assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
-
-
-def test_flow_chart_a_decision_interrupted_mid_branch_still_lets_a_later_decision_branch_cleanly():
-    """The core fix: "Decide"'s branches don't form a shape this layout
-    resolves (the "Delegate" chain runs into a second decision partway
-    through), but that must not prevent the LATER, independently
-    well-formed "Monitor & Close or Escalate" decision from getting its
-    own proper side-by-side branch geometry - it must not be dragged into
-    the outer decision's fallback just for coming later in the document."""
-    spec = _delegation_workflow_spec()
-    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    ET.fromstring(svg_bytes)
-
-    # two diamonds: "Decide" and "Monitor & Close or Escalate".
-    assert text.count("<polygon") == 2
-
-    # "End" and "Escalate" (Monitor's two branches) sit at different X
-    # centres (side by side), not stacked one under the other.
-    end_x = re.search(r'<title>End</title><rect class="diagram-box" x="([\d.]+)"', text)
-    escalate_x = re.search(r'<title>Escalate</title><rect class="diagram-box" x="([\d.]+)"', text)
-    assert end_x is not None and escalate_x is not None
-    assert float(end_x.group(1)) != float(escalate_x.group(1))
-
-    # every original label survives exactly once - nothing lost, nothing
-    # duplicated, despite the fallback path for "Decide".
-    for label in (
-        "Assess Request", "Delegate", "Keep", "Select Assignee", "Define Scope",
-        "Add Criteria &amp; Checkpoints", "Confirm Handoff", "Monitor &amp;", "End", "Escalate",
-    ):
-        assert text.count(label) >= 1, f"missing: {label}"
+    spec = DiagramSpec(kind="hierarchy", nodes=nodes, edges=edges)
+    svg_bytes, width, _height = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    boxes = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    # Group boxes into rows by their own y - each row's own centre must
+    # land on the canvas centre, not just the widest row's.
+    rows: dict[float, list[tuple[float, float]]] = {}
+    for box in boxes:
+        y = round(float(box.get("y")), 1)
+        x, w = float(box.get("x")), float(box.get("width"))
+        rows.setdefault(y, []).append((x, x + w))
+    assert len(rows) == 3  # 3 distinct levels
+    for y, spans in rows.items():
+        left = min(s[0] for s in spans)
+        right = max(s[1] for s in spans)
+        assert abs((left + right) / 2 - width / 2) < 1.0, f"row at y={y} is not centred"
 
 
 # ---------------------------------------------------------------------------
-# regression tests for the 4 remaining issues from the delegation-workflow
-# report: a missing edge between consecutive real nodes, misaligned columns,
-# multiple/unconnected End nodes, and font-size minimums. `_real_delegation_spec`
-# is the EXACT structure a real API call produced (captured directly, not
-# hand-guessed) for "a manager's delegation decision workflow" - the spec
-# that first exposed all four problems together.
+# `_real_delegation_spec` is the EXACT structure a real API call produced
+# (captured directly, not hand-guessed) for "a manager's delegation decision
+# workflow" - still used below for connectivity validation and font-size
+# checks against the new ring rendering.
 # ---------------------------------------------------------------------------
 
 
@@ -376,114 +539,6 @@ def _real_delegation_spec() -> DiagramSpec:
         DiagramEdge(source="keep_task", target="end"),
     ]
     return DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
-
-
-def test_flow_chart_every_real_edge_gets_exactly_one_arrow():
-    """Regression test for the reported bug: no arrow between "Select
-    Assignee" and "Define Scope" despite a real edge connecting them -
-    caused by a decision's fallback handling resetting the layout's single
-    "previous node" cursor, so the very next real connection had nothing
-    to draw from. Checked as an exact count (not just an upper bound): the
-    real spec has 13 edges, so the render must have exactly 13 arrows."""
-    spec = _real_delegation_spec()
-    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    arrow_count = len(re.findall(r'marker-end="url\(#diagram-arrow[^)]*\)"', text))
-    assert arrow_count == len(spec.edges)
-    assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
-
-
-def test_flow_chart_select_assignee_connects_to_define_scope():
-    """The exact reported case, checked geometrically rather than just via
-    the aggregate arrow count above: "Select Assignee" leads onward through
-    three more steps into a SECOND decision, so it's the branch that stays
-    on the main spine (see _layout_flow_chart's own docstring) - directly
-    above "Define Scope", joined by a plain straight `<line>`, not a
-    routed `<path>` at all. A prior version of this renderer put "Select
-    Assignee" in a side column instead, which needed a margin-routed
-    connector and visibly misaligned it from "Define Scope" below - this
-    checks the improved connection is the SIMPLEST possible shape, not
-    just that some connector exists."""
-    spec = _real_delegation_spec()
-    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    def box(label: str) -> tuple[float, float, float, float]:
-        m = re.search(
-            rf'<title>{re.escape(label)}</title><rect class="diagram-box" '
-            r'x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"',
-            text,
-        )
-        assert m is not None, f"box not found: {label}"
-        x, y, w, h = (float(g) for g in m.groups())
-        return x, y, w, h
-
-    sx, sy, sw, sh = box("Select Assignee")
-    dx, dy, dw, dh = box("Define Scope")
-    assert (sx, sw) == (dx, dw)  # same spine column
-
-    select_bottom_x, select_bottom_y = sx + sw / 2, sy + sh
-    scope_top_x, scope_top_y = dx + dw / 2, dy
-
-    lines = re.findall(
-        r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"[^>]*marker-end="url\(#diagram-arrow[^)]*\)"', text
-    )
-    matching = [
-        (x1, y1, x2, y2)
-        for x1, y1, x2, y2 in lines
-        if abs(float(x1) - select_bottom_x) < 1.0
-        and abs(float(y1) - select_bottom_y) < 1.0
-        and abs(float(x2) - scope_top_x) < 1.0
-        and abs(float(y2) - scope_top_y) < 1.0
-    ]
-    assert matching, (
-        f"no straight connector found from Select Assignee's bottom ({select_bottom_x}, {select_bottom_y}) "
-        f"to Define Scope's top ({scope_top_x}, {scope_top_y}); lines were: {lines}"
-    )
-
-
-def test_flow_chart_process_boxes_in_the_same_chain_share_x_and_width():
-    """Regression test for the reported misalignment: every node on the
-    main spine - including "Select Assignee", which used to sit in its own
-    side column, misaligned from "Define Scope" below it - shares one
-    consistent centre-x and width; the decision's OTHER (quicker-exit)
-    branch, drawn in the single side column, likewise shares one
-    consistent centre-x and width with any other side-column box, even one
-    fed by a completely different decision."""
-    spec = _real_delegation_spec()
-    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    def box(label: str) -> tuple[float, float]:
-        m = re.search(rf'<title>{re.escape(label)}</title><rect class="diagram-box" x="([\d.]+)" '
-                       r'y="[\d.]+" width="([\d.]+)"', text)
-        assert m is not None, f"box not found: {label}"
-        return float(m.group(1)), float(m.group(2))
-
-    define_scope = box("Define Scope")
-    add_criteria = box("Add Criteria &amp; Checkpoints")
-    confirm_handoff = box("Confirm Handoff")
-    select_assignee = box("Select Assignee")
-    escalate = box("Escalate")
-    # main-spine chain: identical x AND width throughout, including
-    # "Select Assignee" (it leads onward into a second decision, so it
-    # stays on the spine - see the docstring) and "Escalate" ("Monitor"'s
-    # two branches - "Close" and "Escalate" - are tied in priority, both
-    # simply reaching the shared "End"; the tie-break keeps whichever is
-    # listed FIRST as the SIDE branch, and "Close" is listed first, so
-    # "Escalate" - listed second - is the one that stays on the spine).
-    assert define_scope == add_criteria == confirm_handoff == select_assignee == escalate
-
-    close = box("Close")
-    keep_task = box("Keep Task")
-    # the single side column, fed by two different decisions: same x and
-    # width as each other - narrower than the spine's own column width by
-    # design (see _MAX_SIDE_W's own comment: a decision's quick-exit
-    # branch is never the widest content in the diagram, and giving it
-    # the spine's own full width needlessly doubled the canvas).
-    assert close == keep_task
-    assert close[1] < define_scope[1]
-    assert close[0] != define_scope[0]  # a genuinely different column
 
 
 def test_flow_chart_connectivity_issues_flags_multiple_disconnected_ends():
@@ -947,76 +1002,14 @@ async def test_diagram_content_qa_falls_back_to_illustration_after_exhausted_ret
     assert findings[0]["deterministic"] is False
 
 
-def test_flow_chart_a_deep_branch_still_gets_real_branch_geometry_not_a_fallback():
-    """A branch has no depth limit any more - a long chain of plain steps
-    before it dead-ends must still render as a real side column (with its
-    own diamond and both columns), not silently degrade to the plain
-    linear fallback just because it's several boxes deep."""
-    nodes = [DiagramNode(id="start", label="Start"), DiagramNode(id="check", label="Check")]
-    chain_ids = [f"deep{i}" for i in range(6)]
-    nodes += [DiagramNode(id=cid, label=f"Step {i}") for i, cid in enumerate(chain_ids)]
-    nodes.append(DiagramNode(id="other", label="Other branch"))
-    edges = [
-        DiagramEdge(source="start", target="check"),
-        DiagramEdge(source="check", target=chain_ids[0], label="Yes"),
-        DiagramEdge(source="check", target="other", label="No"),
-    ]
-    edges += [DiagramEdge(source=chain_ids[i], target=chain_ids[i + 1]) for i in range(len(chain_ids) - 1)]
-
-    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    ET.fromstring(svg_bytes)
-    text = svg_bytes.decode("utf-8")
-    for node in nodes:
-        assert node.label in text, f"{node.label} missing"
-    assert text.count("<polygon") == 1  # exactly one decision diamond - real branch geometry, not a fallback
-    boxes = _rects_by_class(text, "diagram-box")
-    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
-    assert not offenders, f"deep branch overlaps: {offenders}"
-    assert width > 0 and height > 0
-
-
-def test_flow_chart_branches_reconverging_at_the_same_node_continue_the_spine():
-    """The common "both outcomes lead to the same next step" pattern: two
-    branches that each dead-end into the SAME later node must merge into
-    one shared box, drawn once, with the main spine continuing below it -
-    not two separate copies of that node."""
-    nodes = [
-        DiagramNode(id="start", label="Start"),
-        DiagramNode(id="check", label="Is number > 0?"),
-        DiagramNode(id="pos", label="Positive number"),
-        DiagramNode(id="neg", label="Negative number"),
-        DiagramNode(id="log", label="Log the result"),
-        DiagramNode(id="end", label="End"),
-    ]
-    edges = [
-        DiagramEdge(source="start", target="check"),
-        DiagramEdge(source="check", target="pos", label="Yes"),
-        DiagramEdge(source="check", target="neg", label="No"),
-        DiagramEdge(source="pos", target="log"),
-        DiagramEdge(source="neg", target="log"),
-        DiagramEdge(source="log", target="end"),
-    ]
-    svg_bytes, width, height = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    ET.fromstring(svg_bytes)
-    text = svg_bytes.decode("utf-8")
-
-    for node in nodes:
-        label = node.label
-        assert label in text or escape(label) in text, label
-    assert text.count("<polygon") == 1  # exactly one diamond
-    # "Log the result" must appear exactly once as a real node (its own
-    # title tooltip), not once per branch.
-    assert text.count("<title>Log the result</title>") == 1
-    boxes = _rects_by_class(text, "diagram-box")
-    offenders = [(a, b) for i, a in enumerate(boxes) for b in boxes[i + 1 :] if _bboxes_overlap(a, b)]
-    assert not offenders, f"reconverging branches overlap: {offenders}"
-    assert width > 0 and height > 0
-
-
 def test_flow_chart_asymmetric_reconvergence_falls_back_to_linear_not_a_crash():
-    """One branch reconverging while the other dead-ends separately is more
-    tangled than this function gives real geometry to - must still render
-    every node via the safe linear fallback, never drop content or crash."""
+    """`_layout_ring_process` has no notion of decision branches/
+    reconvergence at all any more - every node, however tangled its real
+    edges are, just takes its own position on the ring. This asymmetric
+    topology (one branch reconverges, the other doesn't) used to be the
+    exact shape that broke the old box-and-branch renderer's fallback
+    logic; kept as a regression guard that the new, topology-agnostic
+    layout never drops a node or crashes on it either."""
     nodes = [
         DiagramNode(id="start", label="Start"),
         DiagramNode(id="check", label="Check"),
@@ -1042,42 +1035,9 @@ def test_flow_chart_asymmetric_reconvergence_falls_back_to_linear_not_a_crash():
     ET.fromstring(svg_bytes)
     text = svg_bytes.decode("utf-8")
     for node in nodes:
-        assert node.label in text, f"{node.label} missing after fallback"
+        assert node.label in text, f"{node.label} missing"
     assert width > 0 and height > 0
 
-
-def test_flow_chart_fallback_nodes_still_use_semantic_colours_not_the_old_neutral_style():
-    """Regression guard for a real reported bug: everything BEFORE the
-    unresolvable decision used the new green/blue/purple/red colours, but
-    the fallback used to reuse the old _layout_vertical - plain neutral
-    boxes with numbered badges - producing one diagram that visibly
-    switched styles halfway through. The fallback must colour its nodes
-    exactly like every other node in this function: process boxes blue,
-    a literal "Start"/"End" a coloured pill, a decision (even one this
-    function can't branch) still a purple diamond - and never a numbered
-    badge, which only the old smart_art-style renderer uses."""
-    nodes = [
-        DiagramNode(id="start", label="Start"),
-        DiagramNode(id="check", label="Check"),
-        DiagramNode(id="a", label="Branch A"),
-        DiagramNode(id="b", label="Branch B"),
-        DiagramNode(id="shared", label="Shared next step"),
-        DiagramNode(id="after_shared", label="After shared"),
-        DiagramNode(id="isolated", label="Other trigger"),
-    ]
-    edges = [
-        DiagramEdge(source="start", target="check"),
-        DiagramEdge(source="check", target="a", label="Yes"),
-        DiagramEdge(source="check", target="b", label="No"),
-        DiagramEdge(source="b", target="shared"),
-        DiagramEdge(source="isolated", target="shared"),
-        DiagramEdge(source="shared", target="after_shared"),
-    ]
-    svg_bytes, _, _ = render_diagram_svg(DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges), TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    assert 'fill="#bbf7d0"' in text  # Start pill still green
-    assert text.count('fill="#bfdbfe"') >= 5  # every plain node, including the fallback ones, still blue
-    assert f'r="{15.0:.1f}"' not in text  # BADGE_RADIUS - the old numbered-badge circle never appears
 
 
 def test_render_diagram_svg_escapes_untrusted_text():
@@ -1360,31 +1320,6 @@ async def test_diagram_blocks_render_as_svg_through_the_full_pipeline(
 # ---------------------------------------------------------------------------
 
 
-def test_concept_map_has_distinct_hub_and_spoke_geometry():
-    """A concept map must not just be smart_art's flat list with a new name -
-    it needs its own layout (radial, sized from node count) to actually show
-    a central subject and its labelled relationships."""
-    nodes = [
-        DiagramNode(id="coil", label="Coil", level=0),
-        DiagramNode(id="magnet", label="Bar magnet", level=1),
-        DiagramNode(id="field", label="Field lines", level=1),
-        DiagramNode(id="current", label="Induced current", level=1),
-    ]
-    edges = [
-        DiagramEdge(source="magnet", target="coil", label="moving toward"),
-        DiagramEdge(source="field", target="coil", label="passes through"),
-        DiagramEdge(source="coil", target="current", label="induces"),
-    ]
-    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
-    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
-    ET.fromstring(svg_bytes)
-    text = svg_bytes.decode("utf-8")
-
-    assert width != 880  # not smart_art's fixed-width list canvas
-    assert "moving toward" in text and "induces" in text  # relationship labels survive
-    assert text.count("<title>") >= 4  # every node still gets its hover tooltip
-
-
 def _rects_by_class(svg_text: str, css_class: str) -> list[tuple[float, float, float, float]]:
     pattern = re.compile(
         rf'<rect class="{css_class}" x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"'
@@ -1396,37 +1331,6 @@ def _bboxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float,
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
     return not (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
-
-
-def test_concept_map_relationship_labels_never_render_inside_a_node_box():
-    """Regression test for the reported readability bug: a relationship
-    label (e.g. "moving toward", "produces EMF due to changing magnetic
-    flux") must be positioned outside every node's box, never inside or
-    clipping it - with labels long enough to previously overflow their pill
-    and land back on top of a neighbouring node."""
-    nodes = [
-        DiagramNode(id="coil", label="Coil", level=0),
-        DiagramNode(id="magnet", label="Bar magnet", level=1),
-        DiagramNode(id="field", label="Magnetic field lines", level=1),
-        DiagramNode(id="current", label="Induced current", level=1),
-    ]
-    edges = [
-        DiagramEdge(source="magnet", target="coil", label="moving toward the coil"),
-        DiagramEdge(source="field", target="coil", label="changes with the motion of the magnet"),
-        DiagramEdge(source="coil", target="current", label="produces EMF and induces a current"),
-    ]
-    spec = DiagramSpec(kind="concept_map", title="Electromagnetic Induction", nodes=nodes, edges=edges)
-    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    boxes = _rects_by_class(text, "diagram-box")
-    labels = _rects_by_class(text, "diagram-edge-label")
-    assert boxes and labels
-
-    offenders = [
-        (label, box) for label in labels for box in boxes if _bboxes_overlap(label, box)
-    ]
-    assert not offenders, f"relationship label(s) overlap a node box: {offenders}"
 
 
 @pytest.mark.parametrize("satellite_count", [1, 2, 3, 4, 5, 6, 7, 8])
@@ -1458,71 +1362,6 @@ def test_concept_map_labels_stay_clear_of_nodes_across_sizes(
 
     offenders = [(label, box) for label in labels for box in boxes if _bboxes_overlap(label, box)]
     assert not offenders, f"n={satellite_count} overlaps: {offenders}"
-
-
-def test_concept_map_node_box_contains_only_the_short_title_not_the_relationship_text():
-    """The node/circle itself must stay clean - only its own short title
-    inside it, never a neighbouring edge's relationship text."""
-    nodes = [
-        DiagramNode(id="coil", label="Coil", level=0),
-        DiagramNode(id="magnet", label="Bar magnet", level=1),
-    ]
-    edges = [DiagramEdge(source="magnet", target="coil", label="Produces EMF")]
-    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
-    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    # The relationship text appears exactly once (inside its own label pill),
-    # never duplicated into a node's own text content.
-    assert text.count("Produces EMF") == 1
-    assert "Coil</tspan>" in text or "Coil<" in text
-    assert "Bar magnet" in text
-
-
-def test_concept_map_satellite_to_satellite_edges_curve_instead_of_cutting_through_the_centre():
-    """Reproduces the reported bug exactly: a real concept map (C++ value
-    categories -> overload preference) whose relationships aren't all
-    hub-and-spoke - several point from one satellite to another (e.g.
-    "std::move produces an xvalue"). A straight chord between two ring
-    positions cuts across the focal box and every satellite in between,
-    which is what read as messy crossing lines; those edges must render as
-    curved paths bowing away from the centre, and the labels/curves must
-    still stay clear of every node box."""
-    nodes = [
-        DiagramNode(id="focal", label="Expression Value Categories", level=0),
-        DiagramNode(id="lvalue", label="lvalue", level=1),
-        DiagramNode(id="prvalue", label="prvalue", level=1),
-        DiagramNode(id="xvalue", label="xvalue", level=1),
-        DiagramNode(id="f_ref", label="void f(T&)", level=1),
-        DiagramNode(id="f_cref", label="void f(const T&)", level=1),
-        DiagramNode(id="f_rref", label="void f(T&&)", level=1),
-        DiagramNode(id="std_move", label="std::move", level=1),
-    ]
-    edges = [
-        DiagramEdge(source="focal", target="lvalue", label="classifies"),
-        DiagramEdge(source="focal", target="prvalue", label="classifies"),
-        DiagramEdge(source="focal", target="xvalue", label="classifies"),
-        DiagramEdge(source="lvalue", target="f_ref", label="prefers"),
-        DiagramEdge(source="prvalue", target="f_rref", label="prefers"),
-        DiagramEdge(source="xvalue", target="f_rref", label="prefers"),
-        DiagramEdge(source="std_move", target="xvalue", label="produces"),
-    ]
-    spec = DiagramSpec(kind="concept_map", title="Expression value categories", nodes=nodes, edges=edges)
-    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    ET.fromstring(svg_bytes)  # still well-formed
-
-    # 3 hub spokes stay straight <line>s; 4 satellite-to-satellite
-    # relationships become curved (quadratic-bezier "Q") <path>s - the arrow
-    # marker's own tiny triangle is also a <path>, so distinguish by the "Q"
-    # command rather than counting every <path> in the document.
-    assert text.count("<line") == 3
-    assert text.count(" Q") == 4
-
-    boxes = _rects_by_class(text, "diagram-box")
-    labels = _rects_by_class(text, "diagram-edge-label")
-    offenders = [(label, box) for label in labels for box in boxes if _bboxes_overlap(label, box)]
-    assert not offenders, f"relationship label(s) overlap a node box: {offenders}"
 
 
 def test_edge_label_wraps_long_text_instead_of_overflowing_its_pill():
@@ -1569,31 +1408,6 @@ def test_edge_label_pill_width_uses_the_same_calibrated_ratio_as_node_boxes():
 
     assert abs(width - calibrated_width) < 0.2
     assert width > old_ad_hoc_width
-
-
-def test_concept_map_edge_labels_always_paint_after_every_node_box():
-    """Paint-order regression: a label painted before a node box can be
-    visually clipped by that box if its (necessarily estimated) width ever
-    runs long - a real, confirmed case: a label's leading character
-    vanished under a node box painted on top of it. Labels must always be
-    the LAST elements in the SVG, regardless of geometry."""
-    nodes = [
-        DiagramNode(id="focal", label="Hub", level=0),
-        DiagramNode(id="a", label="A", level=1),
-        DiagramNode(id="b", label="B", level=1),
-        DiagramNode(id="c", label="C", level=1),
-    ]
-    edges = [
-        DiagramEdge(source="focal", target="a", label="connects to"),
-        DiagramEdge(source="b", target="c", label="relates to"),
-    ]
-    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
-    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-
-    last_box_index = text.rindex('class="diagram-box"')
-    first_label_index = text.index('class="diagram-edge-label"')
-    assert first_label_index > last_box_index
 
 
 def test_concept_map_focal_node_is_chosen_by_real_connectivity_not_declared_level():
@@ -1750,7 +1564,12 @@ async def test_diagram_service_retries_once_when_hint_is_ignored(service):
     assert len(calls) == 2  # the corrective retry actually happened
     assert "REQUESTED DIAGRAM TYPE: concept_map" in calls[1]
     svg_path = service.storage.asset_abs_path("course_kind_retry", block.content["path"])
-    assert "acts on" in svg_path.read_text(encoding="utf-8")  # the corrected spec was rendered
+    # The corrected spec's own node labels were rendered - not its edge
+    # label ("acts on"), which concept_map's new wheel layout never draws
+    # anywhere (no connecting lines between focal and satellite at all -
+    # see _layout_concept_wheel's own docstring).
+    rendered = svg_path.read_text(encoding="utf-8")
+    assert "Subject" in rendered and "Component" in rendered
 
 
 async def test_diagram_service_still_produces_a_diagram_after_a_persistent_mismatch(service):
@@ -3099,6 +2918,30 @@ def test_er_diagram_two_attribute_fans_never_overlap_each_other():
     assert max(a_cxs) < min(b_cxs)
 
 
+def test_er_diagram_attribute_connectors_fan_out_to_their_own_x_not_one_point():
+    """A real, confirmed bug: every attribute's own connector line used to
+    end at the SAME point (the entity's centre x) regardless of which
+    attribute it was, so 2+ attributes' lines visually converged on one
+    identical spot instead of fanning out to each attribute's own
+    position - confirmed via diagram_render_qa's duplicate_arrowhead_side
+    check, which correctly flagged it. Each connector must land at its
+    OWN attribute's x position."""
+    nodes = [
+        DiagramNode(id="e", label="Entity"),
+        DiagramNode(id="f0", label="field_a", shape_role="attribute", parent_id="e"),
+        DiagramNode(id="f1", label="field_b", shape_role="attribute", parent_id="e"),
+    ]
+    spec = DiagramSpec(kind="er_diagram", nodes=nodes, edges=[])
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    connector_x2s = [
+        float(m.group(1))
+        for m in re.finditer(r'<line x1="[\d.]+" y1="[\d.]+" x2="([\d.]+)" y2="[\d.]+"', text)
+    ]
+    assert len(connector_x2s) == 2
+    assert connector_x2s[0] != connector_x2s[1]  # each lands at its own attribute's x, not a shared point
+
+
 # ---------------------------------------------------------------------------
 # swimlane: one column per lane, cross-lane connectors
 # ---------------------------------------------------------------------------
@@ -3142,6 +2985,30 @@ def test_swimlane_renders_one_header_per_lane_and_all_nodes():
     for node in spec.nodes:
         assert node.label in text
     assert width > 0 and height > 0
+
+
+def test_swimlane_draws_a_full_height_lane_band_not_just_a_header():
+    """A real, confirmed design gap: this renderer used to draw only a
+    coloured HEADER at the top of each lane, with nothing marking a
+    lane's own boundary any further down - a reader had no way to tell
+    which lane a node belonged to once they looked below the header row
+    (only inferable from x position). A full-height background band per
+    lane, reaching all the way to the diagram's own bottom, is the
+    defining visual feature of a real swimlane diagram."""
+    spec = _swimlane_spec()
+    svg_bytes, _w, height = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    # Lane bands are the only <rect> elements with a fill-opacity (the
+    # light tint) - distinct from the solid header rects and the node
+    # boxes (diagram-box class), neither of which set fill-opacity.
+    bands = [el for el in root.iter() if el.tag.endswith("rect") and el.get("fill-opacity")]
+    assert len(bands) == 3  # Customer, Support Agent, Billing System
+    for band in bands:
+        band_height = float(band.get("height"))
+        # A band spanning only the header's own height (~70px) would mean
+        # the fix regressed back to a header-only band; it must reach
+        # most of the way down the diagram's real content height.
+        assert band_height > height * 0.5
 
 
 def test_swimlane_cross_lane_edges_never_overlap_a_box():
@@ -3269,16 +3136,32 @@ def test_flow_chart_font_sizes_meet_minimums_after_page_scaling():
     )
 
 
-def test_flow_chart_rendered_font_size_attributes_match_the_source_constants():
+def test_node_box_rendered_font_size_attributes_match_the_source_constants():
     """The SVG's own `font-size` attributes must actually use the sized-up
     constants - a real, confirmed prior gap: raising a module constant
     doesn't help if a rendering call site hardcodes its own number instead
-    of referencing it."""
-    spec = _real_delegation_spec()
-    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
-    text = svg_bytes.decode("utf-8")
-    assert f'font-size="{LABEL_SIZE:.1f}"' in text
-    assert f'font-size="{EDGE_LABEL_FONT_SIZE:.1f}"' in text
+    of referencing it. flow_chart/process/cycle/concept_map no longer go
+    through `_node_block`/`_edge_label` at all (see _layout_ring_process/
+    _layout_concept_wheel's own, different font sizes) - hierarchy
+    (LABEL_SIZE, still `_node_block`-based) and data_flow_diagram
+    (EDGE_LABEL_FONT_SIZE, still edge-labelled) are the still-active kinds
+    this guard now applies to."""
+    nodes = [DiagramNode(id="root", label="Root", level=0), DiagramNode(id="child", label="Child", level=1)]
+    hierarchy_svg, _w, _h = render_diagram_svg(
+        DiagramSpec(kind="hierarchy", nodes=nodes, edges=[DiagramEdge(source="root", target="child")]),
+        TemplateTheme(),
+    )
+    assert f'font-size="{LABEL_SIZE:.1f}"' in hierarchy_svg.decode("utf-8")
+
+    dfd_nodes = [DiagramNode(id=f"n{i}", label=f"Node {i}") for i in range(2)]
+    dfd_svg, _w, _h = render_diagram_svg(
+        DiagramSpec(
+            kind="data_flow_diagram", nodes=dfd_nodes,
+            edges=[DiagramEdge(source="n0", target="n1", label="data")],
+        ),
+        TemplateTheme(),
+    )
+    assert f'font-size="{EDGE_LABEL_FONT_SIZE:.1f}"' in dfd_svg.decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -3400,3 +3283,685 @@ def test_render_graph_svg_never_evaluates_an_unsafe_expression():
     )
     svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())  # must not raise
     ET.fromstring(svg_bytes)  # still well-formed, even with zero plotted points
+
+
+# ---------------------------------------------------------------------------
+# style-aware cycling palette (TemplateTheme.diagram_palette)
+# ---------------------------------------------------------------------------
+
+
+def test_diagram_palette_default_is_unchanged_from_before_the_palette_system():
+    """A blank diagram_palette (every course generated before this system
+    existed) must keep producing byte-identical colours - this is a purely
+    additive, opt-in preference, never a behaviour change for existing
+    content."""
+    from app.render.diagram_renderer import _WHEEL_SEGMENT_COLORS, _cycling_palette
+
+    assert _cycling_palette(TemplateTheme()) == _WHEEL_SEGMENT_COLORS
+
+
+def test_diagram_palette_vibrant_and_muted_are_both_real_distinct_palettes():
+    from app.render.diagram_renderer import _cycling_palette
+
+    default = _cycling_palette(TemplateTheme())
+    vibrant = _cycling_palette(TemplateTheme(diagram_palette="vibrant"))
+    muted = _cycling_palette(TemplateTheme(diagram_palette="muted"))
+    assert vibrant != default
+    assert muted != default
+    assert vibrant != muted
+    assert len(vibrant) >= 6 and len(muted) >= 6
+
+
+def test_diagram_palette_unrecognised_value_falls_back_to_default():
+    from app.render.diagram_renderer import _cycling_palette
+
+    assert _cycling_palette(TemplateTheme(diagram_palette="not-a-real-palette")) == _cycling_palette(TemplateTheme())
+
+
+def test_diagram_palette_vibrant_actually_changes_rendered_colours():
+    spec = DiagramSpec(
+        kind="pyramid", title="t", nodes=[DiagramNode(id=f"n{i}", label=f"Layer {i}") for i in range(3)]
+    )
+    default_svg = render_diagram_svg(spec, TemplateTheme())[0].decode("utf-8")
+    vibrant_svg = render_diagram_svg(spec, TemplateTheme(diagram_palette="vibrant"))[0].decode("utf-8")
+    assert default_svg != vibrant_svg
+
+
+def test_diagram_palette_never_affects_a_semantic_colour_kind():
+    """flow_chart's start/process/decision/end colours carry real meaning
+    (green=start, red=end, the universal flowchart convention) and must
+    stay fixed regardless of diagram_palette - only the generically-
+    coloured kinds (pyramid, matrix, wheel/mindmap/network, chevron/
+    staircase/timeline) are style-aware."""
+    spec = DiagramSpec(
+        kind="flow_chart", title="t",
+        nodes=[DiagramNode(id="s", label="Start"), DiagramNode(id="e", label="End")],
+        edges=[DiagramEdge(source="s", target="e")],
+    )
+    default_svg = render_diagram_svg(spec, TemplateTheme())[0].decode("utf-8")
+    vibrant_svg = render_diagram_svg(spec, TemplateTheme(diagram_palette="vibrant"))[0].decode("utf-8")
+    assert "#bbf7d0" in default_svg and "#bbf7d0" in vibrant_svg  # start green, unchanged
+
+
+# ---------------------------------------------------------------------------
+# new SmartArt-style kinds: pyramid/funnel, matrix, radial_mindmap, venn
+# ---------------------------------------------------------------------------
+
+
+def test_pyramid_is_usable_with_2_to_9_labelled_layers():
+    assert not DiagramSpec(kind="pyramid", nodes=[DiagramNode(id="a", label="Only one")]).is_usable()
+    usable = DiagramSpec(
+        kind="pyramid", nodes=[DiagramNode(id=f"n{i}", label=f"Layer {i}") for i in range(4)]
+    )
+    assert usable.is_usable()
+
+
+def test_pyramid_draws_a_narrow_apex_and_a_wide_base():
+    """nodes[0] (drawn first, at the top) must be the NARROWEST trapezoid
+    and nodes[-1] (bottom) the WIDEST - the defining shape of a pyramid."""
+    spec = DiagramSpec(
+        kind="pyramid", title="A pyramid",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Layer {i}") for i in range(4)],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    polygons = [el for el in root.iter() if el.tag.endswith("polygon")]
+    assert len(polygons) == 4
+
+    def _width(points: str) -> float:
+        xs = [float(pair.split(",")[0]) for pair in points.strip().split(" ")]
+        return max(xs) - min(xs)
+
+    widths = [_width(p.get("points")) for p in polygons]
+    assert widths == sorted(widths)  # strictly non-decreasing top to bottom
+    assert widths[0] < widths[-1]
+
+
+def test_pyramid_inverted_draws_a_wide_top_and_a_narrow_bottom():
+    """pyramid_inverted=True (a funnel) reverses which end is wide - same
+    node order, same data, just drawn the other way up."""
+    spec = DiagramSpec(
+        kind="pyramid", pyramid_inverted=True, title="A funnel",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Stage {i}") for i in range(4)],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    polygons = [el for el in root.iter() if el.tag.endswith("polygon")]
+
+    def _width(points: str) -> float:
+        xs = [float(pair.split(",")[0]) for pair in points.strip().split(" ")]
+        return max(xs) - min(xs)
+
+    widths = [_width(p.get("points")) for p in polygons]
+    assert widths == sorted(widths, reverse=True)  # strictly non-increasing top to bottom
+    assert widths[0] > widths[-1]
+
+
+def test_pyramid_never_truncates_a_long_layer_label_with_an_ellipsis():
+    long_label = "A genuinely long layer description that would overflow a narrow apex trapezoid"
+    spec = DiagramSpec(
+        kind="pyramid", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="Base")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_matrix_four_nodes_with_axis_fields_draws_the_axis_cross():
+    spec = DiagramSpec(
+        kind="matrix", title="t", matrix_x_label="Effort", matrix_y_label="Impact",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Quadrant {i}") for i in range(4)],
+    )
+    text = render_diagram_svg(spec, TemplateTheme())[0].decode("utf-8")
+    assert "Effort" in text and "Impact" in text
+    assert text.count("<line") >= 2  # the "+" axis cross
+
+
+def test_matrix_four_nodes_with_no_axis_fields_draws_a_plain_grid():
+    spec = DiagramSpec(
+        kind="matrix", title="t",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Group {i}") for i in range(4)],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    cells = [el for el in root.iter() if "diagram-box" in (el.get("class") or "")]
+    assert len(cells) == 4
+
+
+def test_matrix_non_quadrant_count_renders_as_a_grid_not_an_axis_cross():
+    spec = DiagramSpec(
+        kind="matrix", title="t", matrix_x_label="Should not appear as an axis cross",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Group {i}") for i in range(3)],
+    )
+    text = render_diagram_svg(spec, TemplateTheme())[0].decode("utf-8")
+    assert "Should not appear as an axis cross" not in text
+
+
+def test_matrix_never_truncates_a_long_cell_label_with_an_ellipsis():
+    long_label = "A genuinely long quadrant description that would overflow a small matrix cell"
+    spec = DiagramSpec(
+        kind="matrix", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="Other")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_matrix_axis_cross_grid_is_centred_on_the_canvas_not_shifted_right():
+    """A real, confirmed bug: the y-axis label's own left-side gutter used
+    to be subtracted from the grid's width only ONCE, so the grid's right
+    edge stayed flush with the canvas margin while its left edge was
+    pushed in - the grid itself read as shifted right of centre (measured
+    26px off on an 880px canvas), not symmetric under its own title. Only
+    a quadrant count (4 nodes) with at least one axis field set draws the
+    cross - see _layout_matrix's own docstring."""
+    spec = DiagramSpec(
+        kind="matrix", title="t", matrix_x_label="Effort", matrix_y_label="Impact",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Q{i}") for i in range(4)],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    cells = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    xs = [float(c.get("x")) for c in cells]
+    ws = [float(c.get("width")) for c in cells]
+    left = min(xs)
+    right = max(x + w for x, w in zip(xs, ws))
+    canvas_w = float(root.get("width"))
+    assert abs((left + right) / 2 - canvas_w / 2) < 1.0
+
+
+def test_radial_mindmap_connects_every_branch_to_the_centre():
+    spec = DiagramSpec(
+        kind="radial_mindmap", title="t",
+        nodes=[
+            DiagramNode(id="center", label="Central Topic", level=0),
+            DiagramNode(id="b1", label="Branch One"),
+            DiagramNode(id="b2", label="Branch Two"),
+            DiagramNode(id="b3", label="Branch Three"),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert text.count("<path") >= 3  # one curved connector per branch
+    for node in spec.nodes:
+        assert node.label in text
+
+
+def test_radial_mindmap_never_truncates_a_long_branch_label_with_an_ellipsis():
+    long_label = "A genuinely long branch idea description that would overflow a small spoke circle"
+    spec = DiagramSpec(
+        kind="radial_mindmap", title="t",
+        nodes=[
+            DiagramNode(id="center", label="Central Topic", level=0),
+            DiagramNode(id="b1", label=long_label),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_venn_is_usable_only_at_2_or_3_sets():
+    assert not DiagramSpec(kind="venn", nodes=[DiagramNode(id="a", label="Only one")]).is_usable()
+    assert DiagramSpec(
+        kind="venn", nodes=[DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B")]
+    ).is_usable()
+    assert DiagramSpec(
+        kind="venn",
+        nodes=[DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B"), DiagramNode(id="c", label="C")],
+    ).is_usable()
+    assert not DiagramSpec(
+        kind="venn",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Set {i}") for i in range(4)],
+    ).is_usable()
+
+
+def test_venn_draws_one_circle_per_set_and_no_text_on_any_edge():
+    """No connecting line/arrow exists in a Venn diagram at all (sets relate
+    by overlap, not by drawn edges) - and an overlap's own shared-idea text
+    (edge.label) never sits inside the lens-shaped overlap region itself,
+    only in the Key table below (see _layout_venn's own docstring)."""
+    spec = DiagramSpec(
+        kind="venn", title="t",
+        nodes=[
+            DiagramNode(id="a", label="Set A", detail="Unique to A"),
+            DiagramNode(id="b", label="Set B", detail="Unique to B"),
+        ],
+        edges=[DiagramEdge(source="a", target="b", label="Shared idea")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    circles = [el for el in root.iter() if "diagram-box" in (el.get("class") or "") and el.tag.endswith("circle")]
+    assert len(circles) == 2
+    # No connector/arrow between the two circles at all - only the Key
+    # table's own plain divider <line>s (checked separately) exist.
+    assert not [el for el in root.iter() if el.tag.endswith("path")]
+    assert not [el for el in root.iter() if el.get("marker-end")]
+    text = svg_bytes.decode("utf-8")
+    assert "Shared idea" in text  # present in the Key table...
+    assert "Set A" in text and "Set B" in text
+    assert "Unique to A" in text and "Unique to B" in text
+
+
+def test_venn_never_truncates_a_long_set_label_with_an_ellipsis():
+    long_label = "A genuinely long set name that would overflow a fixed-radius Venn circle"
+    spec = DiagramSpec(
+        kind="venn", title="t",
+        nodes=[DiagramNode(id="a", label=long_label), DiagramNode(id="b", label="Other set")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_chevron_process_draws_a_chevron_per_node_and_never_truncates():
+    labels = ["Research", "Design", "Build", "Launch"]
+    nodes = [DiagramNode(id=f"n{i}", label=l, detail="Some supporting detail.") for i, l in enumerate(labels)]
+    spec = DiagramSpec(kind="chevron_process", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    polygons = [el for el in root.iter() if el.tag.endswith("polygon") and "diagram-box" in (el.get("class") or "")]
+    assert len(polygons) == 4
+    text = svg_bytes.decode("utf-8")
+    for label in labels:
+        assert label in text
+    assert "…" not in text
+
+
+def test_chevron_process_never_truncates_a_long_step_label_with_an_ellipsis():
+    long_label = "A genuinely long step name that would overflow a narrow chevron arrow"
+    spec = DiagramSpec(
+        kind="chevron_process", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="Next")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_timeline_draws_an_axis_and_alternates_cards_above_and_below():
+    nodes = [
+        DiagramNode(id="n0", label="1991 - First release", detail="Guido van Rossum releases it"),
+        DiagramNode(id="n1", label="2000 - Python 2.0", detail="List comprehensions"),
+        DiagramNode(id="n2", label="2008 - Python 3.0", detail="Major redesign"),
+    ]
+    spec = DiagramSpec(kind="timeline", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    cards = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(cards) == 3
+    # alternating above/below means NOT every card shares the same y.
+    assert len({c.get("y") for c in cards}) > 1
+    markers = [el for el in root.iter() if el.tag.endswith("circle")]
+    assert len(markers) == 3
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text
+
+
+def test_timeline_never_truncates_a_long_milestone_label_with_an_ellipsis():
+    long_label = "A genuinely long dated milestone description that would overflow a small timeline card"
+    spec = DiagramSpec(
+        kind="timeline", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="2020 - Next")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_timeline_is_a_sequential_kind_with_the_14_node_ceiling():
+    from app.schemas.diagram import SEQUENTIAL_KINDS, max_nodes_for
+
+    assert "timeline" in SEQUENTIAL_KINDS
+    assert max_nodes_for("timeline") == 14
+
+
+def test_chevron_process_is_a_sequential_kind_with_the_14_node_ceiling():
+    """chevron_process has no dedicated node-count ceiling in is_usable()
+    (same generic 2..max_nodes_for(kind) check every unlisted kind gets -
+    see DiagramSpec.is_usable); it's correctly classified SEQUENTIAL,
+    earning the 14-node (not 9) cap that family gets. Staying short in
+    PRACTICE (3-6 nodes) is the writer prompt's own guidance, not a
+    schema-level ceiling specific to this kind - see DIAGRAM_SYSTEM's
+    "use flow_chart for anything longer" instruction."""
+    from app.schemas.diagram import SEQUENTIAL_KINDS, max_nodes_for
+
+    assert "chevron_process" in SEQUENTIAL_KINDS
+    assert max_nodes_for("chevron_process") == 14
+
+
+def test_staircase_process_draws_ascending_bars_and_never_truncates():
+    labels = ["Beginner", "Intermediate", "Advanced", "Expert"]
+    nodes = [DiagramNode(id=f"n{i}", label=l, detail="Some supporting detail.") for i, l in enumerate(labels)]
+    spec = DiagramSpec(kind="staircase_process", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    bars = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(bars) == 4
+    widths = [float(b.get("width")) for b in bars]
+    assert widths == sorted(widths)  # each bar is at least as wide as the one before it
+    assert widths[0] < widths[-1]  # and genuinely ascends, not just flat
+    text = svg_bytes.decode("utf-8")
+    for label in labels:
+        assert label in text
+    assert "…" not in text
+
+
+def test_staircase_process_never_truncates_a_long_step_label_with_an_ellipsis():
+    long_label = "A genuinely long step name that would overflow a narrow staircase bar"
+    spec = DiagramSpec(
+        kind="staircase_process", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="Next")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_staircase_process_is_a_sequential_kind_with_the_14_node_ceiling():
+    from app.schemas.diagram import SEQUENTIAL_KINDS, max_nodes_for
+
+    assert "staircase_process" in SEQUENTIAL_KINDS
+    assert max_nodes_for("staircase_process") == 14
+
+
+def test_balance_comparison_splits_by_position_into_two_coloured_columns():
+    nodes = [
+        DiagramNode(id="n0", label="Variable costs", detail="Scale with usage."),
+        DiagramNode(id="n1", label="Fixed costs", detail="Flat monthly spend."),
+        DiagramNode(id="n2", label="Value for the client", detail="Faster delivery."),
+        DiagramNode(id="n3", label="Value for us", detail="Recurring revenue."),
+    ]
+    spec = DiagramSpec(
+        kind="balance_comparison", title="t", balance_left_label="Cost", balance_right_label="Value", nodes=nodes,
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    rects = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(rects) == 4
+    xs = sorted({round(float(r.get("x")), 1) for r in rects})
+    assert len(xs) == 2  # exactly two distinct column x-positions
+    text = svg_bytes.decode("utf-8")
+    assert "Cost" in text and "Value" in text
+    for node in nodes:
+        assert node.label in text
+        assert node.detail in text
+
+
+def test_balance_comparison_respects_explicit_shape_role_for_an_uneven_split():
+    nodes = [
+        DiagramNode(id="n0", label="Risk A", shape_role="left"),
+        DiagramNode(id="n1", label="Risk B", shape_role="left"),
+        DiagramNode(id="n2", label="Risk C", shape_role="left"),
+        DiagramNode(id="n3", label="Benefit A", shape_role="right"),
+    ]
+    spec = DiagramSpec(kind="balance_comparison", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    rects = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    # 3 left rows share one x, 1 right row has a different x.
+    left_x = {round(float(r.get("x")), 1) for r in rects[:3]}
+    right_x = {round(float(r.get("x")), 1) for r in rects[3:]}
+    assert len(left_x) == 1 and len(right_x) == 1
+    assert left_x != right_x
+
+
+def test_balance_comparison_never_truncates_a_long_detail_with_an_ellipsis():
+    long_label = "A genuinely long cost item label that keeps going well past a normal short label"
+    long_detail = "An equally long explanatory sentence describing exactly why this matters so much."
+    spec = DiagramSpec(
+        kind="balance_comparison", title="t",
+        nodes=[
+            DiagramNode(id="n0", label=long_label, detail=long_detail),
+            DiagramNode(id="n1", label="Value", shape_role="right"),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_balance_comparison_is_a_relationship_kind():
+    from app.schemas.diagram import RELATIONSHIP_KINDS
+
+    assert "balance_comparison" in RELATIONSHIP_KINDS
+
+
+def test_nested_circles_draws_strictly_decreasing_radii_outermost_first():
+    labels = ["Vision", "Mission", "Strategy", "Tactics"]
+    nodes = [DiagramNode(id=f"n{i}", label=l, detail="Some supporting detail.") for i, l in enumerate(labels)]
+    spec = DiagramSpec(kind="nested_circles", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    circles = [el for el in root.iter() if el.tag.endswith("circle") and "diagram-box" in (el.get("class") or "")]
+    assert len(circles) == 4
+    radii = [float(c.get("r")) for c in circles]
+    assert radii == sorted(radii, reverse=True)  # strictly non-increasing, outermost first
+    assert radii[0] > radii[-1]
+    text = svg_bytes.decode("utf-8")
+    for label in labels:
+        assert label in text
+    assert "…" not in text
+
+
+def test_nested_circles_never_truncates_a_long_ring_label_with_an_ellipsis():
+    long_label = "A genuinely long outer scope name that goes on and on past a short label"
+    spec = DiagramSpec(
+        kind="nested_circles", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="Inner")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_network_mesh_draws_a_line_per_edge_and_never_truncates():
+    nodes = [DiagramNode(id=f"n{i}", label=l) for i, l in enumerate(["Frontend", "API Gateway", "Database"])]
+    edges = [DiagramEdge(source="n0", target="n1"), DiagramEdge(source="n1", target="n2")]
+    spec = DiagramSpec(kind="network_mesh", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    circles = [el for el in root.iter() if el.tag.endswith("circle") and "diagram-box" in (el.get("class") or "")]
+    assert len(circles) == 3
+    connectors = [el for el in root.iter() if el.tag.endswith("line") and el.get("stroke") not in (None,)]
+    assert len(connectors) >= 2
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text
+    assert "…" not in text
+
+
+def test_network_mesh_never_truncates_a_long_node_label_with_an_ellipsis():
+    long_label = "A genuinely long node name that goes on and on past a short label"
+    spec = DiagramSpec(
+        kind="network_mesh", title="t",
+        nodes=[DiagramNode(id="n0", label=long_label), DiagramNode(id="n1", label="Other")],
+        edges=[DiagramEdge(source="n0", target="n1")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_decision_tree_draws_a_diamond_for_a_decision_and_a_box_for_an_outcome():
+    nodes = [
+        DiagramNode(id="root", label="Is it causing bugs?", level=0),
+        DiagramNode(id="refactor", label="Refactor now", level=1),
+        DiagramNode(id="wait", label="Wait and monitor", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="refactor", label="Yes"),
+        DiagramEdge(source="root", target="wait", label="No"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    diamonds = [el for el in root.iter() if el.tag.endswith("polygon") and "diagram-box" in (el.get("class") or "")]
+    boxes = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(diamonds) == 1  # the root decision
+    assert len(boxes) == 2  # the two outcomes
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text
+    assert "If Yes" in text and "If No" in text  # branch conditions in the Key table, not on the arrow
+    assert "…" not in text
+
+
+def test_decision_tree_rows_are_centred_on_the_canvas():
+    nodes = [
+        DiagramNode(id="root", label="Root question?", level=0),
+        DiagramNode(id="a", label="A", level=1),
+        DiagramNode(id="b", label="B", level=1),
+        DiagramNode(id="c", label="Grandchild outcome", level=2),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="a", label="Yes"),
+        DiagramEdge(source="root", target="b", label="No"),
+        DiagramEdge(source="a", target="c", label="Yes"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", nodes=nodes, edges=edges)
+    svg_bytes, width, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    shapes = [
+        el for el in root.iter()
+        if "diagram-box" in (el.get("class") or "") and el.tag.endswith(("rect", "polygon"))
+    ]
+    xs = []
+    for el in shapes:
+        if el.tag.endswith("rect"):
+            xs.append((float(el.get("x")), float(el.get("x")) + float(el.get("width"))))
+        else:
+            pts = [tuple(map(float, p.split(","))) for p in el.get("points").split()]
+            pxs = [p[0] for p in pts]
+            xs.append((min(pxs), max(pxs)))
+    # the single-node root row must itself be centred on the canvas
+    root_left, root_right = xs[0]
+    assert abs((root_left + root_right) / 2 - width / 2) < 1.0
+
+
+def test_decision_tree_never_truncates_a_long_label_with_an_ellipsis():
+    long_label = "A genuinely long decision question that keeps going well past a short label"
+    spec = DiagramSpec(
+        kind="decision_tree", title="t",
+        nodes=[DiagramNode(id="root", label=long_label, level=0), DiagramNode(id="a", label="Outcome", level=1)],
+        edges=[DiagramEdge(source="root", target="a", label="Yes")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_fishbone_draws_spine_and_one_bone_per_cause_category():
+    nodes = [
+        DiagramNode(id="head", label="Production Outage"),
+        DiagramNode(id="people", label="People", detail="Insufficient training"),
+        DiagramNode(id="process", label="Process", detail="No checklist"),
+        DiagramNode(id="tech", label="Technology", detail="Unpatched dependency"),
+    ]
+    spec = DiagramSpec(kind="fishbone", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    boxes = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(boxes) == 4  # head + 3 categories
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text
+        if node.detail:
+            assert node.detail in text
+    assert "…" not in text
+
+
+def test_fishbone_is_usable_with_at_least_one_cause_category():
+    assert not DiagramSpec(kind="fishbone", nodes=[DiagramNode(id="head", label="Problem")]).is_usable()
+    assert DiagramSpec(
+        kind="fishbone",
+        nodes=[DiagramNode(id="head", label="Problem"), DiagramNode(id="c1", label="Category")],
+    ).is_usable()
+
+
+def test_fishbone_never_truncates_a_long_label_with_an_ellipsis():
+    spec = DiagramSpec(
+        kind="fishbone", title="t",
+        nodes=[
+            DiagramNode(id="head", label="A genuinely long effect description that keeps going on"),
+            DiagramNode(id="c1", label="A genuinely long cause category name that also keeps going"),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_layered_diagram_draws_one_band_per_layer_top_to_bottom():
+    nodes = [
+        DiagramNode(id="app", label="Application Layer"),
+        DiagramNode(id="transport", label="Transport Layer"),
+        DiagramNode(id="network", label="Network Layer"),
+        DiagramNode(id="physical", label="Physical Layer"),
+    ]
+    spec = DiagramSpec(kind="layered_diagram", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    boxes = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(boxes) == 4
+    tops = [float(b.get("y")) for b in boxes]
+    assert tops == sorted(tops)  # drawn top-to-bottom in the order given
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text
+    assert "…" not in text
+
+
+def test_layered_diagram_never_truncates_a_long_label_with_an_ellipsis():
+    spec = DiagramSpec(
+        kind="layered_diagram", title="t",
+        nodes=[
+            DiagramNode(id="a", label="A genuinely long layer name that keeps going well past a short label"),
+            DiagramNode(id="b", label="Another genuinely long layer name that also keeps going on"),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_gantt_chart_draws_one_bar_per_task_sized_by_duration():
+    nodes = [
+        DiagramNode(id="n0", label="Research", gantt_start=0, gantt_duration=2),
+        DiagramNode(id="n1", label="Design", gantt_start=1, gantt_duration=2),
+        DiagramNode(id="n2", label="Development", gantt_start=3, gantt_duration=4),
+    ]
+    spec = DiagramSpec(kind="gantt_chart", title="t", nodes=nodes)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    bars = [el for el in root.iter() if el.tag.endswith("rect") and "diagram-box" in (el.get("class") or "")]
+    assert len(bars) == 3
+    by_width = sorted(float(b.get("width")) for b in bars)
+    # the 4-unit task's bar must be visibly wider than the two 2-unit tasks'
+    assert by_width[-1] > by_width[0] * 1.5
+    text = svg_bytes.decode("utf-8")
+    for node in nodes:
+        assert node.label in text
+    assert "…" not in text
+
+
+def test_gantt_chart_never_truncates_a_long_label_with_an_ellipsis():
+    spec = DiagramSpec(
+        kind="gantt_chart", title="t",
+        nodes=[
+            DiagramNode(id="n0", label="A genuinely long task name that keeps going well past a short label",
+                        gantt_start=0, gantt_duration=2),
+            DiagramNode(id="n1", label="Another genuinely long task name that also keeps going on",
+                        gantt_start=1, gantt_duration=3),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_new_smart_art_kinds_are_the_complete_graded_content_qa_set():
+    """pyramid/matrix/radial_mindmap/venn/chevron_process/timeline/
+    staircase_process/balance_comparison/nested_circles/network_mesh/
+    decision_tree/fishbone/layered_diagram/gantt_chart must be registered
+    with diagram_content_qa's semantic grading - a new kind silently NOT
+    graded (left out of _GRADED_KINDS by mistake) would ship with zero
+    content quality checking, which is the exact regression this guards
+    against."""
+    from app.services.diagram_content_qa import _GRADED_KINDS
+
+    for kind in (
+        "pyramid", "matrix", "radial_mindmap", "venn", "chevron_process", "timeline", "staircase_process",
+        "balance_comparison", "nested_circles", "network_mesh", "decision_tree", "fishbone",
+        "layered_diagram", "gantt_chart",
+    ):
+        assert kind in _GRADED_KINDS

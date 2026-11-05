@@ -26,7 +26,7 @@ Course Input → Planner → Blueprint → Deep Research → Research Artifacts
 ```bash
 cp .env.example .env      # then put your OPENAI_API_KEY in it
 docker compose up --build -d
-docker compose exlhost:3000ec backend alembic upgrade head   # first run only, see below
+docker compose exec backend alembic upgrade head  # first run only, see below
 ```
 
 - App: <http://loca>

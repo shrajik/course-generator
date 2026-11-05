@@ -21,7 +21,20 @@ import re
 from dataclasses import dataclass
 from xml.etree import ElementTree as ET
 
-from app.render.diagram_renderer import BOX_PADDING, LABEL_SIZE, _SANS_RATIO
+from app.render.diagram_renderer import (
+    BALANCE_LABEL_SIZE,
+    BOX_PADDING,
+    CHEVRON_LABEL_SIZE,
+    GANTT_LABEL_SIZE,
+    LABEL_SIZE,
+    NESTED_CIRCLES_LABEL_SIZE,
+    NETWORK_LABEL_SIZE,
+    RING_LABEL_SIZE,
+    STAIRCASE_LABEL_SIZE,
+    STANDARD_FLOWCHART_LABEL_SIZE,
+    TIMELINE_LABEL_SIZE,
+    _SANS_RATIO,
+)
 from app.schemas.document import CONTENT_WIDTH
 
 _SVG_NS = "{http://www.w3.org/2000/svg}"
@@ -119,6 +132,16 @@ def _node_boxes(root: ET.Element) -> list[BBox]:
     return boxes
 
 
+def _node_shapes(root: ET.Element) -> list[ET.Element]:
+    """The `class="diagram-box"` elements themselves (not just their
+    bounding box) - `edge_crosses_node` needs the real shape, because a
+    circle's axis-aligned bounding SQUARE is a bad stand-in for containment:
+    a point can sit well outside the circle (e.g. near a corner of that
+    square, at ~45 degrees) while still falling inside the square, which
+    would falsely flag an edge that cleanly clears the circle."""
+    return [el for el in root.iter() if "diagram-box" in (el.get("class") or "").split()]
+
+
 def _parse_points(raw: str) -> list[tuple[float, float]]:
     pairs = re.findall(r"(-?[\d.]+)[,\s]+(-?[\d.]+)", raw)
     return [(float(x), float(y)) for x, y in pairs]
@@ -169,6 +192,19 @@ def _point_in_box(point: tuple[float, float], box: BBox) -> bool:
     return x0 < point[0] < x1 and y0 < point[1] < y1
 
 
+def _point_in_shape(point: tuple[float, float], el: ET.Element, margin: float) -> bool:
+    """Like `_point_in_box`, but circle-aware: a circle's real containment
+    test is Euclidean distance-from-centre, not its bounding square -
+    see `_node_shapes`."""
+    if _local(el.tag) == "circle":
+        cx, cy, r = _f(el, "cx"), _f(el, "cy"), _f(el, "r")
+        return _distance(point, (cx, cy)) < (r - margin)
+    box = _shape_bbox(el)
+    if box is None:
+        return False
+    return _point_in_box(point, _inset(box, margin))
+
+
 def _boxes_overlap(a: BBox, b: BBox) -> bool:
     ax0, ay0, ax1, ay1 = a
     bx0, by0, bx1, by1 = b
@@ -206,13 +242,15 @@ def effective_font_size(
     return base_font_size * scale
 
 
-def readability_issues(canvas_width: float, *, display_width: float = CONTENT_WIDTH) -> list[RenderQAIssue]:
-    effective = effective_font_size(canvas_width, display_width=display_width)
+def readability_issues(
+    canvas_width: float, *, base_font_size: float = LABEL_SIZE, display_width: float = CONTENT_WIDTH
+) -> list[RenderQAIssue]:
+    effective = effective_font_size(canvas_width, base_font_size=base_font_size, display_width=display_width)
     if effective < MIN_READABLE_PX:
         return [RenderQAIssue(
             "text_too_small_after_scaling",
             f"canvas is {canvas_width:.0f}px wide; displayed at {display_width:.0f}px its "
-            f"{LABEL_SIZE:.1f}px label text would render at only {effective:.1f}px, "
+            f"{base_font_size:.1f}px label text would render at only {effective:.1f}px, "
             f"below the {MIN_READABLE_PX:.0f}px readability floor",
         )]
     return []
@@ -285,12 +323,28 @@ def text_overflow_issues(root: ET.Element) -> list[RenderQAIssue]:
             if _local(text_el.tag) != "text":
                 continue
             font_size = _f(text_el, "font-size", 15.0)
+            # `x` means a different edge of the text depending on its own
+            # `text-anchor` - a real, confirmed gap: this always assumed
+            # "start" (x = the text's own LEFT edge, `_node_block`'s only
+            # convention), so a `text-anchor="middle"` element (every
+            # ring/wheel circle's own label - see _circle_node/_text) had
+            # its right edge measured as `x + full_width` instead of
+            # `x + half_width`, double-counting half the text and reporting
+            # a false overflow on centered text that was never actually
+            # too wide for its node.
+            anchor = text_el.get("text-anchor") or "start"
             for tspan in text_el:
                 if _local(tspan.tag) != "tspan" or not (tspan.text or "").strip():
                     continue
                 tspan_x = _f(tspan, "x", _f(text_el, "x"))
                 estimated_width = len(tspan.text) * font_size * _SANS_RATIO
-                overflow = (tspan_x + estimated_width) - right_edge - _TEXT_OVERFLOW_TOLERANCE
+                if anchor == "middle":
+                    text_right_edge = tspan_x + estimated_width / 2
+                elif anchor == "end":
+                    text_right_edge = tspan_x
+                else:
+                    text_right_edge = tspan_x + estimated_width
+                overflow = text_right_edge - right_edge - _TEXT_OVERFLOW_TOLERANCE
                 if overflow > 0:
                     issues.append(RenderQAIssue(
                         "text_overflows_node",
@@ -466,17 +520,37 @@ def border_collinear_issues(root: ET.Element) -> list[RenderQAIssue]:
 
 
 _ARROWHEAD_SIDE_TOLERANCE = 6.0
+# How close two landing points on the SAME side of the SAME box need to be
+# (along that side - x for top/bottom, y for left/right) to count as a real
+# duplicate - genuinely overlapping/indistinguishable - rather than two
+# legitimately distinct connectors that both happen to land on that side. A
+# real, confirmed false positive: an er_diagram entity with 2+ attribute
+# ovals fanning out across its own top edge (standard ER notation, each
+# attribute's own connector landing at its own x) used to be flagged here
+# just for having "2 arrowheads on its top side", even though they were
+# over 100px apart and nowhere near visually ambiguous. Two points only a
+# few px apart (the ACTUAL "read as one line" case the real reported bug -
+# a spine arrow and a loop-back both entering at the same spot - this
+# tolerance is built around) still get caught.
+_DUPLICATE_LANDING_TOLERANCE = 20.0
 
 
 def duplicate_arrowhead_issues(root: ET.Element) -> list[RenderQAIssue]:
-    """Every node side (top/bottom/left/right) may receive at most ONE
-    arrowhead - two arrows landing on the same spot are visually
-    indistinguishable, reading as a single ambiguous connection rather
-    than two distinct ones (a real reported case: an ordinary spine arrow
-    and an unrelated loop-back both entered the same node at its top)."""
+    """Two arrows landing on (nearly) the same spot on the same node side
+    are visually indistinguishable, reading as a single ambiguous
+    connection rather than two distinct ones (a real reported case: an
+    ordinary spine arrow and an unrelated loop-back both entered the same
+    node at its top). Two connectors merely sharing a SIDE - without
+    landing close together on it - are not flagged; a legitimately fanned-
+    out set of connectors (e.g. an ER entity's own attribute ovals) is
+    normal notation, not an overlap (see _DUPLICATE_LANDING_TOLERANCE)."""
     boxes = _node_boxes(root)
     edges = _edge_segments(root)
-    side_hits: dict[tuple[int, str], int] = {}
+    # (box_i, side) -> list of this landing's own position ALONG that side
+    # (x for top/bottom, y for left/right) - compared pairwise below so
+    # only genuinely CLOSE landings count as a duplicate, not just any two
+    # sharing the same side.
+    side_landings: dict[tuple[int, str], list[float]] = {}
     for edge in edges:
         if len(edge) < 2:
             continue
@@ -485,23 +559,27 @@ def duplicate_arrowhead_issues(root: ET.Element) -> list[RenderQAIssue]:
             x0, y0, x1, y1 = box
             tol = _ARROWHEAD_SIDE_TOLERANCE
             if abs(end[1] - y0) < tol and x0 - tol <= end[0] <= x1 + tol:
-                side = "top"
+                side, along = "top", end[0]
             elif abs(end[1] - y1) < tol and x0 - tol <= end[0] <= x1 + tol:
-                side = "bottom"
+                side, along = "bottom", end[0]
             elif abs(end[0] - x0) < tol and y0 - tol <= end[1] <= y1 + tol:
-                side = "left"
+                side, along = "left", end[1]
             elif abs(end[0] - x1) < tol and y0 - tol <= end[1] <= y1 + tol:
-                side = "right"
+                side, along = "right", end[1]
             else:
                 continue
-            side_hits[(i, side)] = side_hits.get((i, side), 0) + 1
+            side_landings.setdefault((i, side), []).append(along)
             break
     issues: list[RenderQAIssue] = []
-    for (box_i, side), count in side_hits.items():
-        if count > 1:
-            issues.append(RenderQAIssue(
-                "duplicate_arrowhead_side", f"node {boxes[box_i]} has {count} arrowheads on its {side} side"
-            ))
+    for (box_i, side), positions in side_landings.items():
+        positions = sorted(positions)
+        for a, b in zip(positions, positions[1:]):
+            if b - a < _DUPLICATE_LANDING_TOLERANCE:
+                issues.append(RenderQAIssue(
+                    "duplicate_arrowhead_side",
+                    f"node {boxes[box_i]} has 2 arrowheads {b - a:.1f}px apart on its {side} side",
+                ))
+                break
     return issues
 
 
@@ -544,38 +622,117 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
     canvas_h = _f(root, "height")
     nodes = _node_boxes(root)
     edges = _edge_segments(root)
+    # cycle/concept_map render as a ring/wheel of circles
+    # (app.render.diagram_renderer._layout_ring_process/_layout_concept_wheel),
+    # deliberately at RING_LABEL_SIZE - smaller than LABEL_SIZE, since a
+    # circle has less usable room than a box. radial_mindmap/venn also draw
+    # circles at this same size (_circle_node/_fit_boxed_text at
+    # _VENN_LABEL_SIZE, close enough to share this bucket rather than add a
+    # third one for a 1pt difference). flow_chart/process render as
+    # a standard oval/rectangle/diamond flowchart instead
+    # (_layout_standard_flowchart) at its own, different
+    # STANDARD_FLOWCHART_LABEL_SIZE (the smallest size it actually uses -
+    # its pill shape renders larger). readability_issues needs the REAL
+    # base size each kind actually draws at to judge "too small once
+    # scaled", never the old box convention's LABEL_SIZE for any of these.
+    _RING_KINDS = ("cycle", "concept_map", "conceptual", "radial_mindmap", "venn")
+    _STANDARD_FLOWCHART_KINDS = ("flow_chart", "process", "decision_tree", "fishbone", "layered_diagram")
+    if kind in _RING_KINDS:
+        label_base_size = RING_LABEL_SIZE
+    elif kind in _STANDARD_FLOWCHART_KINDS:
+        label_base_size = STANDARD_FLOWCHART_LABEL_SIZE
+    elif kind == "chevron_process":
+        label_base_size = CHEVRON_LABEL_SIZE
+    elif kind == "timeline":
+        label_base_size = TIMELINE_LABEL_SIZE
+    elif kind == "staircase_process":
+        label_base_size = STAIRCASE_LABEL_SIZE
+    elif kind == "balance_comparison":
+        label_base_size = BALANCE_LABEL_SIZE
+    elif kind == "nested_circles":
+        label_base_size = NESTED_CIRCLES_LABEL_SIZE
+    elif kind == "network_mesh":
+        label_base_size = NETWORK_LABEL_SIZE
+    elif kind == "gantt_chart":
+        label_base_size = GANTT_LABEL_SIZE
+    else:
+        label_base_size = LABEL_SIZE
     issues: list[RenderQAIssue] = [
         *text_overflow_issues(root),
-        *readability_issues(canvas_w),
+        *readability_issues(canvas_w, base_font_size=label_base_size),
         *occupancy_issues(root, canvas_w, canvas_h),
         *shared_segment_issues(root),
-        *border_collinear_issues(root),
-        *duplicate_arrowhead_issues(root),
-        *(font_size_issues(root, canvas_w) if kind in ("flow_chart", "process") else []),
+        # Same reasoning as the edge_crosses_node exemption just below:
+        # gantt_chart's tick gridlines are DESIGNED to run collinear with
+        # (behind) every task bar in their column - that's the standard
+        # Gantt reference-grid convention, not a connector drifting along
+        # an unrelated node's border.
+        *(border_collinear_issues(root) if kind != "gantt_chart" else []),
+        # network_mesh draws genuinely undirected connections - plain,
+        # 65%-opacity lines/curves, never an arrowhead marker (see
+        # _layout_network_mesh) - so even a close landing there is a much
+        # smaller visual risk than two actual ARROWHEADS converging (this
+        # check's own motivating case). A real, dense topology (9 edges
+        # across 6 nodes - well past the "2-8 nodes" guidance, closer to a
+        # complete graph than typical real content) can still produce an
+        # occasional few-px-apart landing even after _DUPLICATE_LANDING_
+        # TOLERANCE's fix for the unrelated ER false-positive below -
+        # exempting this kind specifically keeps that fix from also
+        # re-litigating an already-verified-clean network render.
+        *(duplicate_arrowhead_issues(root) if kind != "network_mesh" else []),
+        # font_size_issues checks role-specific floors calibrated to
+        # _node_block's box title/subtitle structure (LABEL_SIZE/
+        # DETAIL_SIZE). flow_chart/process used to draw that structure and
+        # were the only kinds this ever applied to; they no longer do (see
+        # _RING_KINDS above - both now route to the ring instead), so this
+        # check no longer has anything left to apply to. Kept (rather than
+        # deleted) in case a future kind reintroduces that same box
+        # structure. readability_issues above still covers every kind's
+        # real font size either way.
+        *(font_size_issues(root, canvas_w) if kind in () else []),
     ]
 
-    for i, a in enumerate(nodes):
-        for b in nodes[i + 1 :]:
-            if _boxes_overlap(a, b):
-                issues.append(RenderQAIssue("node_overlap", f"{a} overlaps {b}"))
+    # venn's own circles are SUPPOSED to overlap - that overlap is the
+    # entire semantic point of the diagram (_layout_venn), not a layout
+    # bug - so this is one of two kinds exempt from the overlap check, the
+    # same "a real, structural reason this kind's geometry doesn't fit the
+    # generic rule" exemption schematic/graph already get elsewhere in
+    # this module's own docstring. nested_circles is the other one - its
+    # whole point is FULL containment (an inner ring sits entirely inside
+    # every ring around it, by design - see _layout_nested_circles).
+    _OVERLAP_EXEMPT_KINDS = ("venn", "nested_circles")
+    if kind not in _OVERLAP_EXEMPT_KINDS:
+        for i, a in enumerate(nodes):
+            for b in nodes[i + 1 :]:
+                if _boxes_overlap(a, b):
+                    issues.append(RenderQAIssue("node_overlap", f"{a} overlaps {b}"))
 
-    inset_nodes = [_inset(box, _NODE_INSET) for box in nodes]
-    for edge in edges:
-        for p0, p1 in zip(edge, edge[1:]):
-            samples = _sample_segment(p0, p1)
-            # Trim samples near either endpoint of the WHOLE edge (not each
-            # sub-segment) so a legitimate touch at the connected node's
-            # boundary is never flagged.
-            trimmed = [
-                pt for pt in samples
-                if _distance(pt, edge[0]) > _EDGE_ENDPOINT_MARGIN
-                and _distance(pt, edge[-1]) > _EDGE_ENDPOINT_MARGIN
-            ]
-            for pt in trimmed:
-                for box in inset_nodes:
-                    if _point_in_box(pt, box):
-                        issues.append(RenderQAIssue("edge_crosses_node", f"edge point {pt} inside {box}"))
-                        break
+    # gantt_chart's own "edges" (per _edge_segments, which treats any
+    # <line>/<path> generically) are really its reference-grid tick
+    # lines, not connectors - those are DRAWN to run the full height of
+    # the chart, behind every task bar, the standard Gantt convention
+    # (see _layout_gantt_chart). This check's whole premise ("a connector
+    # accidentally passing through an unrelated node") doesn't apply to a
+    # background gridline doing exactly what it's there to do.
+    node_shapes = _node_shapes(root)
+    if kind != "gantt_chart":
+        for edge in edges:
+            for p0, p1 in zip(edge, edge[1:]):
+                samples = _sample_segment(p0, p1)
+                # Trim samples near either endpoint of the WHOLE edge (not each
+                # sub-segment) so a legitimate touch at the connected node's
+                # boundary is never flagged.
+                trimmed = [
+                    pt for pt in samples
+                    if _distance(pt, edge[0]) > _EDGE_ENDPOINT_MARGIN
+                    and _distance(pt, edge[-1]) > _EDGE_ENDPOINT_MARGIN
+                ]
+                for pt in trimmed:
+                    for shape in node_shapes:
+                        if _point_in_shape(pt, shape, _NODE_INSET):
+                            box = _shape_bbox(shape)
+                            issues.append(RenderQAIssue("edge_crosses_node", f"edge point {pt} inside {box}"))
+                            break
 
     all_points = [pt for box in nodes for pt in ((box[0], box[1]), (box[2], box[3]))]
     all_points += [pt for edge in edges for pt in edge]
