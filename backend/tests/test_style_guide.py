@@ -84,6 +84,33 @@ def test_the_brief_never_contains_a_line_the_mock_ai_would_misread():
         assert label not in brief
 
 
+# --- flag_voice_conflicts (Content Studio Phase 2) -----------------------------
+
+
+def test_flag_voice_conflicts_defaults_to_true_the_pre_existing_behaviour():
+    assert StyleGuide().flag_voice_conflicts is True
+
+
+def test_the_conflict_note_is_included_by_default_with_overrides():
+    brief = style_guide_brief(StyleGuide(brand_terms=["AcmeCloud"]))
+    assert "say so in one short note" in brief
+
+
+def test_turning_the_toggle_off_drops_the_say_so_instruction_but_still_says_follow_the_override():
+    brief = style_guide_brief(StyleGuide(brand_terms=["AcmeCloud"], flag_voice_conflicts=False))
+    assert "say so in one short note" not in brief
+    assert "follow the override" in brief
+
+
+def test_the_toggle_has_no_effect_with_no_overrides_at_all():
+    """Nothing to conflict with, so the whole overrides block (and this
+    line in particular) never appears either way."""
+    on = style_guide_brief(StyleGuide(flag_voice_conflicts=True))
+    off = style_guide_brief(StyleGuide(flag_voice_conflicts=False))
+    assert on == off
+    assert "conflicts" not in on
+
+
 def _input(style: StyleGuide | None, profile: LearnerProfile | None = None) -> CourseInput:
     return CourseInput(
         course_title="T", toc=[{"title": "One"}], target_audience="Engineers", template="technical",

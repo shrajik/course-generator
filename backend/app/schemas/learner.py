@@ -20,6 +20,22 @@ from pydantic import BaseModel, ConfigDict, Field
 AgeGroup = Literal["KG_PRIMARY", "MIDDLE_SECONDARY", "HIGHER_ED", "PROFESSIONAL"]
 EduLevel = Literal["PRIMARY", "SECONDARY", "BACHELORS", "MASTERS_PHD"]
 
+# MOM Phase 3 - finer-grained personalization WITHIN the PROFESSIONAL
+# archetype (app/course/pedagogy.py's ARCHETYPES["PROFESSIONAL"] already
+# covers "corporate adult learner" broadly; these two fields narrow it
+# further, the same way age_group/edu_level already narrow the broader
+# course). Both None by default (no opinion) - meaningless outside
+# age_group=="PROFESSIONAL", and `pedagogy.learner_brief` only ever reads
+# them in that branch. Deliberately plain Literals, not sliders: the MOM's
+# own distinction ("generalist is not superficial, specialist is not
+# unnecessarily verbose") is a content-shape choice (which topics, which
+# terminology, which examples), not a continuous intensity the existing
+# jargon_density/scaffolding_depth sliders already cover - see
+# professional_profile_brief/seniority_brief in pedagogy.py for exactly
+# what each value changes.
+ProfessionalProfile = Literal["generalist", "specialist"]
+Seniority = Literal["junior", "middle", "senior"]
+
 AGE_GROUP_LABELS: dict[str, str] = {
     "KG_PRIMARY": "KG to Primary (ages 5-10)",
     "MIDDLE_SECONDARY": "Middle/Secondary (ages 11-17)",
@@ -47,6 +63,20 @@ class LearnerProfile(BaseModel):
     # --- Panel A: demographics ----------------------------------------------
     age_group: AgeGroup = "PROFESSIONAL"
     edu_level: EduLevel = "BACHELORS"
+
+    # --- Panel D: professional personalization (MOM Phase 3) ----------------
+    # Both None = no opinion, which keeps the brief byte-identical to before
+    # these fields existed (same contract as `learner_profile` itself being
+    # optional on CourseInput) - only meaningful when age_group ==
+    # "PROFESSIONAL"; see pedagogy.py's own guard. Depth and breadth stay
+    # modeled by the EXISTING jargon_density/scaffolding_depth sliders above
+    # (MOM Phase 3.3 explicitly treats depth/breadth as separate dimensions
+    # from the learner's role/seniority, not duplicated here) - a specialist
+    # can still ask for a broad overview by leaving scaffolding_depth/
+    # jargon_density at their defaults or hand-tuning them with
+    # manual_override, exactly as any other profile already can.
+    professional_profile: ProfessionalProfile | None = None
+    seniority: Seniority | None = None
 
     # --- Panel B: the cognitive bridge --------------------------------------
     # Free text rather than an enum: the client's examples (STEM, COMMERCE,

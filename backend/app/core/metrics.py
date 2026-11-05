@@ -15,6 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Iterator
 
+from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
@@ -22,6 +23,16 @@ log = get_logger(__name__)
 
 @dataclass
 class CallRecord:
+    """One real AI call. Never recorded for a deterministic/code-only stage
+    (an SVG diagram, a concept_experience HTML render) - those paths simply
+    don't call `_record()` at all (see ImageService/DiagramService), so a
+    report built from this list can't misattribute deterministic output to a
+    model: a stage with no record for it was deterministic, not a stage that
+    silently used a model nobody logged. See AI Model Transparency (MOM
+    Phase 2.2) - `provider`/`timestamp`/`used_fallback` exist specifically so
+    a persisted record answers "which provider/deployment, when, and was
+    this the originally-requested model or a fallback" without guessing."""
+
     kind: str  # structured | research | image
     purpose: str
     model: str
@@ -30,6 +41,16 @@ class CallRecord:
     output_tokens: int = 0
     retries: int = 0
     failed: bool = False
+    # "azure" | "azure_mai" | "openai" - which backend actually served this
+    # call, not just which model name was requested (the same model name can
+    # resolve to different providers for images - see ImageService).
+    provider: str = ""
+    timestamp: str = field(default_factory=utc_now_iso)
+    # True when `model` is settings.fallback_model and the originally
+    # requested model was unavailable (see OpenAIClient._resolve_model) -
+    # never silently indistinguishable from "this model was requested and
+    # used as normal".
+    used_fallback: bool = False
 
 
 @dataclass

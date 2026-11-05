@@ -9,9 +9,26 @@ way a diffusion image model garbles text.
 
 from __future__ import annotations
 
+import ast
+
 from pydantic import BaseModel, ConfigDict, Field
 
 _AI = ConfigDict(extra="ignore")
+
+
+def _parses(expression: str) -> bool:
+    """Cheap, dependency-free syntax check (stdlib `ast` only - this module
+    stays free of any app.render/app.services import, same as every other
+    schema module) used only to reject an obviously-malformed function
+    expression at is_usable() time, before the raster-illustration fallback
+    would otherwise be reached. The actual safe, whitelisted evaluation at
+    render time is app.render.graph_math.safe_eval - this check is a cheaper
+    pre-filter, not a substitute for it."""
+    try:
+        ast.parse(expression, mode="eval")
+        return True
+    except (SyntaxError, ValueError):
+        return False
 
 DIAGRAM_KINDS = (
     "flow_chart",
@@ -27,7 +44,28 @@ DIAGRAM_KINDS = (
     "data_flow_diagram",
     "er_diagram",
     "swimlane",
+    "graph",
+    "pyramid",
+    "matrix",
+    "radial_mindmap",
+    "venn",
+    "chevron_process",
+    "timeline",
+    "staircase_process",
+    "balance_comparison",
+    "nested_circles",
+    "network_mesh",
+    "decision_tree",
+    "fishbone",
+    "layered_diagram",
+    "gantt_chart",
 )
+
+# "graph" is its own, third family - neither a sequence nor a labelled-box
+# relationship, so it deliberately joins neither SEQUENTIAL_KINDS nor
+# RELATIONSHIP_KINDS below. _kind_conflicts (app.services.diagram_service)
+# only ever flags a conflict for a hint that IS in one of those two tuples,
+# so leaving "graph" out of both is what keeps it safely inert there.
 
 # Kinds that show a SEQUENCE (steps happen in this order) - as opposed to
 # concept_map, which shows a STRUCTURE (things and how they relate, with no
@@ -37,8 +75,20 @@ DIAGRAM_KINDS = (
 # both sequential (data/work moves from node to node, across lanes for
 # swimlane); er_diagram is a structure (entities and their relationships
 # have no inherent order), so it joins RELATIONSHIP_KINDS instead.
-SEQUENTIAL_KINDS = ("flow_chart", "process", "cycle", "data_flow_diagram", "swimlane")
-RELATIONSHIP_KINDS = ("concept_map", "conceptual", "hierarchy", "schematic", "er_diagram")
+SEQUENTIAL_KINDS = (
+    "flow_chart", "process", "cycle", "data_flow_diagram", "swimlane", "chevron_process", "timeline",
+    "staircase_process", "gantt_chart",
+)
+RELATIONSHIP_KINDS = (
+    "concept_map", "conceptual", "hierarchy", "schematic", "er_diagram", "matrix", "radial_mindmap", "venn",
+    "balance_comparison", "nested_circles", "network_mesh", "decision_tree", "fishbone",
+)
+# "pyramid" deliberately joins neither tuple, the same reasoning "graph"
+# already documents above: its layers have a top-to-bottom ORDER (narrowest
+# to widest, or the reverse for a funnel) but aren't a sequence of STEPS that
+# happen one after another in time - so a sequential-vs-relationship hint
+# conflict check (_kind_conflicts, app.services.diagram_service) shouldn't
+# flag it against either family.
 
 
 def max_nodes_for(kind: str) -> int:
@@ -88,6 +138,15 @@ class DiagramNode(BaseModel):
     detail: str = ""
     # hierarchy: depth (0 = root). concept_map: 0 = the central/focal thing
     # being explained, >=1 = a labelled component/relationship around it.
+    # radial_mindmap: same convention as concept_map - 0 = the one central
+    # topic (the hub), >=1 = a branch at that depth from the centre (a
+    # branch's own children, if any, connect to it via `edges`, same as
+    # hierarchy). pyramid: this node's own layer order top-to-bottom as
+    # given in `nodes` is what's actually drawn (`level` itself is ignored)
+    # - listed here only so a model that sets it anyway does no harm.
+    # nested_circles: same as pyramid - `nodes` order IS the nesting order
+    # (nodes[0] = outermost/broadest ring, nodes[-1] = innermost/most
+    # specific), `level` itself ignored.
     # Ignored by other kinds.
     level: int = 0
     # Which shape this node draws as - meaning is kind-specific, ignored by
@@ -100,6 +159,10 @@ class DiagramNode(BaseModel):
     #   = a relationship between two entities (diamond), "attribute" = a
     #   single field belonging to one entity or relationship (oval) - see
     #   `parent_id`.
+    # balance_comparison: "left" or "right" - which column this row
+    #   belongs to (e.g. "left" = cost/con, "right" = value/pro). ""
+    #   (default) falls back to position: the first half of `nodes` is the
+    #   left column, the rest is the right column.
     shape_role: str = ""
     # er_diagram only, and only meaningful when shape_role == "attribute":
     # the id of the entity/relationship node this attribute belongs to -
@@ -112,6 +175,26 @@ class DiagramNode(BaseModel):
     # node needs one for a sensible layout; a blank lane groups with any
     # other blank-lane nodes into its own column.
     lane: str = ""
+    # Edit Visuals (flowchart editor) - flow_chart/process only. "" (default)
+    # keeps diagram_renderer.role_of()'s existing in/out-degree + label-text
+    # auto-detection exactly as it was before this field existed; one of
+    # "start"/"process"/"decision"/"end" overrides it explicitly, letting a
+    # person re-type a node's role from the editor without renaming it to a
+    # magic word like "Start"/"End".
+    role: str = ""
+    # Optional "#rrggbb"/"#rgb" hex override of the role's default fill/
+    # stroke pair - "" (default, or anything that doesn't parse as a real
+    # hex colour) keeps the existing fixed _FLOW_ROLE_COLORS palette exactly
+    # as it was before this field existed.
+    color: str = ""
+    # gantt_chart only: this task's own bar, in whatever time unit the
+    # brief uses (day/week/sprint number - never a literal calendar date,
+    # this is a relative schedule chart, not a date-aware one).
+    # gantt_start: how many units after the project's own start this task
+    # begins. gantt_duration: how many units it spans. Both ignored by
+    # every other kind.
+    gantt_start: float = 0.0
+    gantt_duration: float = 1.0
 
 
 class DiagramEdge(BaseModel):
@@ -120,6 +203,32 @@ class DiagramEdge(BaseModel):
     source: str = ""
     target: str = ""
     label: str = ""
+
+
+# --- graph/chart (kind == "graph") -------------------------------------------
+
+
+class GraphFunction(BaseModel):
+    """One plotted curve, only meaningful when DiagramSpec.graph_type ==
+    "function". `expression` is a Python-style expression of `x` (e.g.
+    "x**2", "sin(x)") evaluated safely by app.render.graph_math.safe_eval -
+    never passed to eval()/exec()."""
+
+    model_config = _AI
+
+    expression: str = ""
+    label: str = ""
+
+
+class GraphSeries(BaseModel):
+    """One bar/line series, only meaningful when DiagramSpec.graph_type is
+    "bar" or "line". `values` must have exactly one entry per
+    DiagramSpec.categories, in the same order."""
+
+    model_config = _AI
+
+    label: str = ""
+    values: list[float] = Field(default_factory=list)
 
 
 # The semantic-relationship vocabulary a schematic's `DiagramSpec.relationships`
@@ -534,6 +643,53 @@ class DiagramSpec(BaseModel):
     # declarative-only content, never layout).
     validation_criteria: list[str] = Field(default_factory=list)
 
+    # --- graph/chart fields (only meaningful for kind == "graph") -----------
+    graph_type: str = ""  # "function" | "bar" | "line"
+    x_label: str = ""
+    y_label: str = ""
+    # Domain for graph_type == "function". A rendering-range default
+    # (-10..10) applies when unset - see is_usable() - never an invented
+    # data value, the same category as DEFAULT_IMAGE_ASPECT elsewhere in
+    # this codebase.
+    x_min: float | None = None
+    x_max: float | None = None
+    functions: list[GraphFunction] = Field(default_factory=list)
+    # Shared by graph_type "bar"/"line": the x-axis groups, and one or more
+    # named series with exactly one value per category.
+    categories: list[str] = Field(default_factory=list)
+    series: list[GraphSeries] = Field(default_factory=list)
+
+    # --- pyramid (only meaningful for kind == "pyramid") --------------------
+    # False (default): a classic pyramid - nodes[0] is the narrow APEX (top
+    # layer), nodes[-1] is the widest BASE (bottom layer) - "levels of
+    # importance/foundation" content (e.g. Maslow's hierarchy). True: a
+    # funnel - nodes[0] is the widest TOP, nodes[-1] the narrow bottom -
+    # "narrowing stages" content (e.g. a sales/conversion funnel). Same
+    # renderer, same node list, just which end tapers.
+    pyramid_inverted: bool = False
+
+    # --- matrix (only meaningful for kind == "matrix") -----------------------
+    # Axis titles for a 2-axis quadrant matrix (e.g. "Effort" / "Impact") -
+    # only drawn when exactly 4 labelled nodes are given (one per quadrant,
+    # in reading order: top-left, top-right, bottom-left, bottom-right); a
+    # different node count renders as a plain labelled grid instead, with no
+    # axis cross. All four blank is a plain grid even at 4 nodes - the axis
+    # cross is opt-in, not inferred.
+    matrix_x_label: str = ""
+    matrix_y_label: str = ""
+    # Endpoint labels for each axis (e.g. "Low" / "High") - purely cosmetic,
+    # blank draws no endpoint tick label.
+    matrix_x_low: str = ""
+    matrix_x_high: str = ""
+    matrix_y_low: str = ""
+    matrix_y_high: str = ""
+
+    # --- balance_comparison (only meaningful for kind == "balance_comparison") --
+    # Headers for the two columns (e.g. "Cost" / "Value", "Cons" / "Pros") -
+    # drawn above each column; blank draws no header for that side.
+    balance_left_label: str = ""
+    balance_right_label: str = ""
+
     def normalised_kind(self) -> str:
         value = (self.kind or "").strip().lower().replace(" ", "_")
         return value if value in DIAGRAM_KINDS else "smart_art"
@@ -541,19 +697,26 @@ class DiagramSpec(BaseModel):
     def is_usable(self) -> bool:
         """A diagram needs at least two labelled things to relate to each
         other, and a relationship-shaped diagram needs at least one labelled
-        relationship - a bare list of boxes isn't a concept map. A schematic
-        needs at least two recognised shapes, and every state (if any) needs
-        its own shapes - an empty "before" panel isn't a comparison."""
+        relationship - a bare list of boxes isn't a concept map.
+
+        `schematic` is permanently retired - never usable, regardless of
+        content. Real, confirmed failure modes: the anchor-based shape
+        layout produced genuinely overlapping, unreadable results (a label
+        shape landing directly on top of its own parent box's text), and a
+        multi-state "before/after" comparison doubled that risk across two
+        stacked panels. Rather than trust prompt guidance alone to stop the
+        model from ever picking this kind, `is_usable() == False` here makes
+        the EXISTING "unusable spec -> fall back to a raster illustration"
+        path (see DiagramService.generate_for_block) catch it unconditionally
+        - every apparatus/structure topic that used to go through schematic
+        (physics, chemistry, mechanical AND biology/life-science alike) now
+        reliably lands on `kind: "illustration"` with `illustration_style:
+        "textbook"` instead, a real photographic-style depiction rather than
+        a labelled-box schematic, regardless of what any future prompt or
+        model happens to request."""
         kind = self.normalised_kind()
         if kind == "schematic":
-            if self.states:
-                if len(self.states) < 2:
-                    return False
-                return all(len(state.shapes) >= 1 for state in self.states) and (
-                    sum(len(state.shapes) for state in self.states) >= 3
-                )
-            valid = [s for s in self.shapes if s.type in SHAPE_TYPES]
-            return len(valid) >= 2
+            return False
 
         if kind == "concept_experience":
             # Not every representation needs entities (a pure step sequence
@@ -563,6 +726,20 @@ class DiagramSpec(BaseModel):
             return bool(self.concept.strip()) and (
                 len(self.entities) + len(self.steps) + len(self.concept_states) >= 1
             )
+
+        if kind == "graph":
+            if self.graph_type == "function":
+                valid_functions = [f for f in self.functions if f.expression.strip() and _parses(f.expression)]
+                if not valid_functions:
+                    return False
+                x_min = self.x_min if self.x_min is not None else -10.0
+                x_max = self.x_max if self.x_max is not None else 10.0
+                return x_min < x_max
+            if self.graph_type in ("bar", "line"):
+                if not self.categories or not self.series:
+                    return False
+                return all(len(s.values) == len(self.categories) for s in self.series)
+            return False
 
         labelled = [n for n in self.nodes if n.label.strip()]
         # See max_nodes_for: er_diagram's node count includes attributes,
@@ -589,4 +766,8 @@ class DiagramSpec(BaseModel):
             # least 2 distinct lanes, connected by something.
             lanes = {n.lane.strip() for n in self.nodes if n.lane.strip()}
             return bool(self.edges) and len(lanes) >= 2
+        if kind == "venn":
+            # Venn geometry only reads cleanly at 2 or 3 overlapping circles -
+            # the generic 2..9 node-count check above is too permissive here.
+            return 2 <= len(labelled) <= 3
         return True

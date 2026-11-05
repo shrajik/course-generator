@@ -26,6 +26,7 @@ from app.schemas.template import CourseTemplate
 from app.services.concept_qa import DiagramQAResult, evaluate_concept_experience
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.quality_framework import visual_qa_finding_entries
 from app.services.storage_service import StorageService, get_storage
 from app.services.visual_planner import VisualPlanner
 
@@ -124,6 +125,13 @@ class ConceptVisualService:
         # makes the NEXT block overlap this one (see estimate_pixel_size's
         # own docstring).
         width, height = estimate_pixel_size(spec)
+        # TASK 3 (quality audit follow-up) - unlike DiagramService, this
+        # pipeline has no fallback-on-QA-failure: it renders `spec` either
+        # way, keeping the better of the original/retried attempt. So when
+        # `result.issues` is still non-empty here, that is the FINAL,
+        # SHIPPED state, not a problem a fallback already absorbed -
+        # recorded explicitly (including the clean "[]" case) so a re-render
+        # never leaves a stale list from an earlier, worse attempt.
         block.content = merge_content(
             block.type,
             block.content,
@@ -138,8 +146,21 @@ class ConceptVisualService:
                 # just the rendered picture) so the editor can later let a
                 # user fix a label/description and re-render deterministically
                 # without a new AI planning call. See
-                # DocumentService.update_concept_visual_spec.
+                # DocumentService.update_visual_spec.
                 "spec": spec.model_dump(mode="json"),
+                "visual_qa_findings": visual_qa_finding_entries(
+                    # Carries each issue's own real provenance (quality-
+                    # governance follow-up, Phase 3.7) - Layer 1 (structural)
+                    # issues are deterministic=True, Layer 2 (concept_qa's
+                    # one LLM critique call) issues are deterministic=False;
+                    # never collapsed to one blanket value here, since a
+                    # single result can (by evaluate_concept_experience's
+                    # own short-circuit contract) only ever be ALL layer-1 or
+                    # ALL layer-2 - but reading each issue's own flag keeps
+                    # this correct even if that contract ever changes.
+                    [(issue.reason, issue.detail, issue.deterministic) for issue in result.issues],
+                    resolution="rendered_with_unresolved_issues",
+                ),
             },
         )
         log.info(

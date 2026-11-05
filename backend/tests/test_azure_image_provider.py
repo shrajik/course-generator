@@ -207,6 +207,41 @@ async def test_transient_5xx_is_retried_then_succeeds():
     assert calls["count"] == 2
 
 
+async def test_malformed_2xx_body_is_retried_then_succeeds():
+    """A real, confirmed production case: Azure returned a 200 whose body
+    was missing the expected `data[0]` entry entirely - this must get the
+    same bounded retry treatment as a 502/503, not fail on the first
+    malformed response."""
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(200, json={"data": []})
+        return _b64_response()
+
+    result = await generate_image(
+        prompt="p", size="1024x1024", settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert result == _PNG_BYTES
+    assert calls["count"] == 2
+
+
+async def test_persistently_malformed_2xx_body_eventually_raises_clearly():
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(200, json={"data": []})
+
+    with pytest.raises(AIServiceError, match="data\\[0\\]"):
+        await generate_image(
+            prompt="p", size="1024x1024", settings=_settings(max_call_retries=3),
+            transport=httpx.MockTransport(handler),
+        )
+    assert calls["count"] == 3
+
+
 async def test_retries_are_bounded_by_max_call_retries():
     calls = {"count": 0}
 
@@ -348,23 +383,69 @@ async def test_unsupported_image_provider_fails_clearly(monkeypatch):
         await client.image(prompt="p")
 
 
-async def test_image_provider_defaults_to_openai_when_unset(monkeypatch):
-    """Settings.image_provider's own default - confirms OpenAI stays the
-    default behaviour with no configuration changes at all."""
-    settings = Settings(openai_api_key="test-fake-openai-key")
-    assert settings.image_provider == "openai"
+async def test_image_provider_defaults_to_azure_when_unset(monkeypatch):
+    """Settings.image_provider's own default - confirms FLUX.2-flex (Azure)
+    is the default behaviour with no configuration changes at all. Changed
+    from "openai" after the OpenAI account's image-generation credit ran
+    out - gpt-image-1 is no longer used anywhere by default."""
+    settings = Settings()
+    assert settings.image_provider == "azure"
     client = OpenAIClient(settings)
 
-    async def fake_openai(**_kwargs):
-        return b"openai-bytes"
+    async def fake_azure(**_kwargs):
+        return b"azure-bytes"
 
     async def fail_if_called(**_kwargs):
-        raise AssertionError("azure path should never be used by default")
+        raise AssertionError("openai (gpt-image-1) should never be used by default")
+
+    monkeypatch.setattr(client, "_image_azure", fake_azure)
+    monkeypatch.setattr(client, "_image_openai", fail_if_called)
+
+    assert await client.image(prompt="p") == b"azure-bytes"
+
+
+async def test_image_provider_param_overrides_the_configured_default(monkeypatch):
+    """ImageService forces `provider="openai"` for a textbook-style
+    illustration regardless of the configured default (see Settings.
+    textbook_image_provider) - the per-call override must win, and must
+    never mutate `settings.image_provider` itself (every other call keeps
+    using the configured default)."""
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    called = {"openai": False, "azure": False}
+
+    async def fake_openai(**_kwargs):
+        called["openai"] = True
+        return b"openai-bytes"
+
+    async def fake_azure(**_kwargs):
+        called["azure"] = True
+        return b"azure-bytes"
 
     monkeypatch.setattr(client, "_image_openai", fake_openai)
-    monkeypatch.setattr(client, "_image_azure", fail_if_called)
+    monkeypatch.setattr(client, "_image_azure", fake_azure)
 
-    assert await client.image(prompt="p") == b"openai-bytes"
+    result = await client.image(prompt="p", provider="openai")
+    assert result == b"openai-bytes"
+    assert called == {"openai": True, "azure": False}
+    assert settings.image_provider == "azure"  # untouched
+
+
+async def test_image_provider_param_none_falls_back_to_the_configured_default(monkeypatch):
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    async def fake_azure(**_kwargs):
+        return b"azure-bytes"
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("openai path should not be used when provider=None")
+
+    monkeypatch.setattr(client, "_image_openai", fail_if_called)
+    monkeypatch.setattr(client, "_image_azure", fake_azure)
+
+    assert await client.image(prompt="p", provider=None) == b"azure-bytes"
 
 
 # ---------------------------------------------------------------------------

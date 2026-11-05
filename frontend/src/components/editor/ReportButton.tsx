@@ -6,8 +6,10 @@ import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { ApiError } from "@/lib/api/client";
 import {
+  getCompanionDeliverables,
   getComplianceReport,
   getDesignOutputs,
+  type CompanionDeliverables,
   type ComplianceReport,
   type DesignOutputs,
 } from "@/lib/api/documents";
@@ -32,6 +34,7 @@ export function ReportButton() {
   const [schema, setSchema] = useState<"lom" | "dublin_core">("lom");
   const [report, setReport] = useState<ComplianceReport | null>(null);
   const [plans, setPlans] = useState<DesignOutputs>({});
+  const [companions, setCompanions] = useState<CompanionDeliverables>({});
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -43,6 +46,8 @@ export function ReportButton() {
       setReport(await getComplianceReport(documentId, schema));
       // Plan documents exist only when a design model that produces one was chosen.
       setPlans(await getDesignOutputs(documentId).catch(() => ({})));
+      // Companion content exists only when the brief asked for one.
+      setCompanions(await getCompanionDeliverables(documentId).catch(() => ({})));
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : "The report could not be built.");
     } finally {
@@ -58,7 +63,7 @@ export function ReportButton() {
 
   return (
     <>
-      <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+      <Button variant="outline" size="sm" className="shrink-0" onClick={() => setOpen(true)}>
         <ClipboardCheck size={13} />
         Report
       </Button>
@@ -82,6 +87,7 @@ export function ReportButton() {
         ) : null}
         {report ? <ReportBody report={report} schema={schema} onSchema={setSchema} /> : null}
         {report ? <DesignPlans plans={plans} /> : null}
+        {report ? <CompanionDeliverablesSection companions={companions} /> : null}
         {editor.document ? <FactCheckSection courseId={editor.document.course_id} /> : null}
       </Modal>
     </>
@@ -268,6 +274,81 @@ function DesignPlans({ plans }: { plans: DesignOutputs }) {
             external collection: {kirkpatrick.data_sources.external_collection.join(", ")}.
           </p>
           <p className="text-[12px] text-ink-500">{kirkpatrick.data_sources.note}</p>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+/** Job aid / quick-reference card / manager coaching guide content, for
+ * whichever companion deliverables the brief requested. */
+function CompanionDeliverablesSection({ companions }: { companions: CompanionDeliverables }) {
+  const { job_aid, quick_ref, manager_guide } = companions;
+  if (!job_aid && !quick_ref && !manager_guide) return null;
+  return (
+    <div className="text-[13px]">
+      {job_aid ? (
+        <section>
+          <PlanHeading>{job_aid.title}</PlanHeading>
+          {job_aid.sections.map((section) => (
+            <div key={section.chapter} className="mb-3">
+              <p className="font-medium text-ink">{section.chapter}</p>
+              <ul className="list-disc space-y-1 pl-5 text-ink-600">
+                {section.checklist.map((item, index) => (
+                  <li key={index}>{item}</li>
+                ))}
+              </ul>
+              {section.watch_outs.length > 0 ? (
+                <ul className="mt-1 space-y-1">
+                  {section.watch_outs.map((item, index) => (
+                    <li key={index} className="text-[12px] text-amber-800">
+                      Watch out: {item}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ))}
+        </section>
+      ) : null}
+
+      {quick_ref ? (
+        <section>
+          <PlanHeading>{quick_ref.title}</PlanHeading>
+          {quick_ref.sections.map((section) => (
+            <div key={section.chapter} className="mb-3">
+              <p className="font-medium text-ink">{section.chapter}</p>
+              <ul className="list-disc space-y-1 pl-5 text-ink-600">
+                {section.key_points.map((item, index) => (
+                  <li key={index}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
+      ) : null}
+
+      {manager_guide ? (
+        <section>
+          <PlanHeading>{manager_guide.title}</PlanHeading>
+          <p className="mb-3 text-ink-600">{manager_guide.note}</p>
+          {manager_guide.sections.map((section) => (
+            <div key={section.chapter} className="mb-3">
+              <p className="font-medium text-ink">{section.chapter}</p>
+              <ul className="list-disc space-y-1 pl-5 text-ink-600">
+                {section.coaching_prompts.map((item, index) => (
+                  <li key={index}>{item}</li>
+                ))}
+              </ul>
+              {section.scenario_notes.length > 0 ? (
+                <ul className="mt-1 list-disc space-y-1 pl-5 text-[12px] text-ink-500">
+                  {section.scenario_notes.map((item, index) => (
+                    <li key={index}>{item}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ))}
         </section>
       ) : null}
     </div>

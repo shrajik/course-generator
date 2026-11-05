@@ -92,7 +92,14 @@ function CourseTable({ courses, isLoading }: { courses: AdminCourse[]; isLoading
             <tr key={course.id}>
               <td className="max-w-[250px] px-4 py-3.5"><p className="truncate font-semibold text-ink">{course.title}</p><p className="mt-1 truncate font-mono text-[10px] text-ink-400">{course.course_id}</p></td>
               <td className="max-w-[170px] truncate px-4 py-3.5 text-ink-500">{course.owner ?? "Not tracked"}</td>
-              <td className="px-4 py-3.5"><AdminStatusBadge tone={statusTone(course.status)}>{formatStatus(course.status)}</AdminStatusBadge></td>
+              <td className="px-4 py-3.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <AdminStatusBadge tone={statusTone(course.status)}>{formatStatus(course.status)}</AdminStatusBadge>
+                  {course.quality_outcome === "failed" ? (
+                    <AdminStatusBadge tone="warning">Quality attention</AdminStatusBadge>
+                  ) : null}
+                </div>
+              </td>
               <td className="whitespace-nowrap px-4 py-3.5 text-ink-500">{formatDate(course.updated_at)}</td>
               <td className="px-4 py-3.5 text-right"><Link href="/admin/courses" className="inline-flex items-center gap-1 rounded-[7px] border border-line px-2.5 py-1.5 font-medium text-ink-500 transition-colors hover:border-brand-200 hover:bg-brand-50 hover:text-brand-700">Details <ChevronRight size={13} /></Link></td>
             </tr>

@@ -313,6 +313,65 @@ INFORMATION_TYPES: dict[str, str] = {
 }
 
 
+# --- Panel D: professional personalization (MOM Phase 3) --------------------
+# Content-SHAPE guidance (which topics, which terminology, which examples) -
+# deliberately not slider nudges: depth/breadth stay owned by the existing
+# jargon_density/scaffolding_depth sliders (MOM 3.3 treats them as a
+# separate dimension from role/seniority). Matches the MOM's own bullet
+# lists for each value near-verbatim, since those are the agreed definitions
+# ("generalist is not superficial, specialist is not unnecessarily verbose").
+
+_PROFESSIONAL_PROFILE_GUIDANCE: dict[str, list[str]] = {
+    "generalist": [
+        "Cover broad understanding across relevant adjacent topics, not just the one named topic in isolation.",
+        "Highlight cross-functional relationships: how this connects to neighbouring roles, teams or disciplines.",
+        "Keep specialist jargon to the minimum needed to understand key principles - define any term a non-specialist in this field would not already know.",
+        "Prefer examples that span multiple related domains over one narrow deep technical dive.",
+    ],
+    "specialist": [
+        "Go deep on technical and domain-specific mechanisms, constraints, trade-offs and edge cases.",
+        "Use precise, industry-native terminology - define it once on first use, then use it freely afterward.",
+        "Prefer rigorous, domain-specific examples and applications over generic cross-domain ones.",
+        "Do not pad the content with introductory material a specialist in this field already knows.",
+    ],
+}
+
+_SENIORITY_GUIDANCE: dict[str, list[str]] = {
+    "junior": [
+        "Build from foundational concepts and definitions; never assume prior exposure to this specific topic.",
+        "Walk through worked examples step by step.",
+        "Call out common mistakes explicitly, with practical guidance on avoiding them.",
+        "Order material so difficulty increases gradually across the chapter.",
+    ],
+    "middle": [
+        "Emphasise independent application: decision-making, trade-offs and problem-solving, not just procedure-following.",
+        "Use realistic, moderately complex work situations, including debugging and implementation considerations.",
+        "Include collaboration/communication aspects where genuinely relevant to the task at hand.",
+    ],
+    "senior": [
+        "Frame content around architecture-level and strategic decisions, system-level trade-offs and organisational implications.",
+        "Include risk assessment, governance and scalability considerations where relevant.",
+        "Use complex scenarios with incomplete information rather than clean, fully-specified ones.",
+        "Evaluate alternative approaches and their consequences rather than presenting a single 'correct' path.",
+    ],
+}
+
+
+def professional_profile_brief(profile: LearnerProfile | None) -> list[str]:
+    """[] when there is nothing to say - no profile, not a PROFESSIONAL-
+    archetype course, or `professional_profile` left unset (no opinion)."""
+    if profile is None or profile.age_group != "PROFESSIONAL" or profile.professional_profile is None:
+        return []
+    return _PROFESSIONAL_PROFILE_GUIDANCE[profile.professional_profile]
+
+
+def seniority_brief(profile: LearnerProfile | None) -> list[str]:
+    """[] when there is nothing to say - see professional_profile_brief."""
+    if profile is None or profile.age_group != "PROFESSIONAL" or profile.seniority is None:
+        return []
+    return _SENIORITY_GUIDANCE[profile.seniority]
+
+
 # --- brief rendering ---------------------------------------------------------
 
 
@@ -349,6 +408,18 @@ def learner_brief(profile: LearnerProfile | None) -> str:
     lines.extend(f"- {item}" for item in rules.output_mechanics)
     if rules.hard_rules:
         lines.extend(f"- {item}" for item in rules.hard_rules)
+
+    profile_lines = professional_profile_brief(profile)
+    if profile_lines:
+        lines.append("")
+        lines.append(f"PROFESSIONAL AUDIENCE TYPE ({profile.professional_profile}):")
+        lines.extend(f"- {item}" for item in profile_lines)
+
+    seniority_lines = seniority_brief(profile)
+    if seniority_lines:
+        lines.append("")
+        lines.append(f"CORPORATE SENIORITY LEVEL ({profile.seniority}):")
+        lines.extend(f"- {item}" for item in seniority_lines)
 
     lines.append("")
     lines.append("STYLE TUNING (obey these positions exactly):")

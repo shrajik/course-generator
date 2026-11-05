@@ -180,7 +180,23 @@ async def generate_image(
                 continue
 
             if response.status_code // 100 == 2:
-                return _decode_image_bytes(response)
+                # A 2xx status only means the HTTP transaction itself
+                # succeeded - Azure has been observed returning a 200 whose
+                # body is missing the expected `data[0]` entry entirely (a
+                # real, confirmed production case), which is exactly the
+                # same kind of transient provider flakiness a 502/503
+                # already gets retried for, not a deterministic "this
+                # request can never succeed" failure - so it gets the same
+                # bounded retry budget rather than failing on the first
+                # malformed response.
+                try:
+                    return _decode_image_bytes(response)
+                except AIServiceError:
+                    failures += 1
+                    if failures >= attempts:
+                        raise
+                    await asyncio.sleep(_backoff_seconds(failures))
+                    continue
 
             last_status = response.status_code
             if response.status_code == 429:

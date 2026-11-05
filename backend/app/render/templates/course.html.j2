@@ -138,6 +138,21 @@
     max-width: 100%; max-height: 100%; width: auto; height: auto;
     display: block; border-radius: inherit;
   }
+  /* Edit Visuals Part 2 - a text-free illustration's own contain-fit rect,
+     sized by the browser's own layout engine from its real aspect-ratio
+     (never computed in Python/JS) - see ImageBlock.tsx's identical
+     ".figure-frame" for why this makes an overlay label's x_pct/y_pct land
+     on the same picture pixel here and in the live editor. */
+  .figure-frame { position: relative; display: block; max-width: 100%; max-height: 100%; }
+  .figure-frame img.figure { width: 100%; height: 100%; max-width: none; max-height: none; }
+  .overlay-label {
+    position: absolute; transform: translate(-50%, -50%); white-space: nowrap;
+    background: rgba(255,255,255,0.95); border: 1px solid {{ theme.border_color }};
+    border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 500;
+    color: {{ theme.text_color }}; box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }
+  .overlay-label-title { font-size: 13px; font-weight: 700; padding: 4px 11px; }
+  .overlay-label-callout { font-size: 11.5px; font-weight: 500; padding: 3px 9px; }
   .img-missing {
     box-sizing: border-box; width: 100%; display: flex; align-items: center;
     justify-content: center; text-align: center; font-size: 12.5px;
@@ -175,7 +190,19 @@
         <div class="figure-box cev-pdf-wrap" style="height:{{ b.image_box }}px">{{ b.inline_html | safe }}</div>
       {% elif b.image_src %}
         <div class="figure-box" style="height:{{ b.image_box }}px">
+          {% if c.get('overlay_labels') and c.get('width') and c.get('height') %}
+          <div class="figure-frame" style="aspect-ratio:{{ c.get('width') }}/{{ c.get('height') }}">
+            <img class="figure" src="{{ b.image_src }}" alt="{{ '' if c.get('decorative') else c.get('alt', '') }}">
+            {% for label in c.get('overlay_labels') %}
+            <div class="overlay-label overlay-label-{{ label.get('style', 'label') }}"
+                 style="left:{{ label.get('x_pct', 50) }}%; top:{{ label.get('y_pct', 50) }}%;{% if label.get('color') %} border-color:{{ label.get('color') }}; color:{{ label.get('color') }};{% endif %}">
+              {{ label.get('text', '') }}
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
           <img class="figure" src="{{ b.image_src }}" alt="{{ '' if c.get('decorative') else c.get('alt', '') }}">
+          {% endif %}
         </div>
       {% else %}
         {#- A failed/pending generation NEVER shows its internal error here -

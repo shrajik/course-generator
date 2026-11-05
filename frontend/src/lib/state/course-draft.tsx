@@ -15,7 +15,20 @@ import {
   useMemo,
   useState,
 } from "react";
-import type { DesignModels, LearnerProfile, StyleGuide, TemplateKind, TocItem } from "@/lib/types/course";
+import {
+  LEVEL_OPTIONS,
+  type AccessibilitySettings,
+  type CompanionDeliverable,
+  type ContentLevel,
+  type DesignModels,
+  type LearnerProfile,
+  type LearningApproach,
+  type MetadataSettings,
+  type PackagingSettings,
+  type StyleGuide,
+  type TemplateKind,
+  type TocItem,
+} from "@/lib/types/course";
 import type { CourseTemplateType } from "@/lib/api/course-templates";
 
 /** The uploaded reference document (or the hardcoded "Default Template")
@@ -63,11 +76,34 @@ export interface CourseDraft {
   /** Panels A-C of the creator interface. Null until the designer opens the
    * Learner Profile section, which keeps it genuinely optional end to end. */
   learnerProfile: LearnerProfile | null;
+  /** MOM Phase 4 - Content Level. Always sent explicitly (not omitted) so
+   * the choice is visible in the payload even at its default value. */
+  contentLevel: ContentLevel;
+  /** MOM Phase 5 - HOW each concept is taught. Empty means "let the writer
+   * judge per section", the pre-existing default behaviour. */
+  learningApproaches: LearningApproach[];
   /** Instructional-design models. Null until one is picked, so a course made
    * without touching it generates exactly as before. */
   designModels: DesignModels | null;
   /** Writing style guide and client overrides. Null = not chosen. */
   styleGuide: StyleGuide | null;
+  /** Content Studio Phase 2 - packaging/delivery-tracking standard. Null = not chosen. */
+  packaging: PackagingSettings | null;
+  /** Content Studio Phase 2 - accessibility target/extras/brand colours. Null = not chosen. */
+  accessibility: AccessibilitySettings | null;
+  /** Content Studio Phase 2 - metadata schema preference/org tagging/owner. Null = not chosen. */
+  metadataSettings: MetadataSettings | null;
+  /** Content Studio Phase 1/4 - tasks the learner must be able to do; each
+   * becomes at least one learning objective. */
+  tasks: string[];
+  /** Content Studio Phase 1/4 - the business/performance goal this course
+   * exists to move (independent of DesignModels.business_goal). */
+  businessGoal: string;
+  /** Content Studio Phase 1/4 - optional; left blank, the Analysis phase drafts one. */
+  performanceGap: string;
+  /** Content Studio Phase 1/4 - companion deliverables requested alongside
+   * the course (schema only - does not yet generate the document). */
+  companions: CompanionDeliverable[];
   /** Uploaded source documents to ground the course in. */
   sourceIds: string[];
   toc: TocItem[];
@@ -95,14 +131,23 @@ export const DEFAULT_DONTS = [
 
 export const EMPTY_DRAFT: CourseDraft = {
   courseTitle: "",
-  targetAudience: "",
+  targetAudience: LEVEL_OPTIONS[1].value,
   dos: DEFAULT_DOS,
   donts: DEFAULT_DONTS,
   template: "technical",
   selectedTemplate: null,
   learnerProfile: null,
+  contentLevel: 2,
+  learningApproaches: [],
   designModels: null,
   styleGuide: null,
+  packaging: null,
+  accessibility: null,
+  metadataSettings: null,
+  tasks: [],
+  businessGoal: "",
+  performanceGap: "",
+  companions: [],
   sourceIds: [],
   toc: [],
   tocDraftedFor: null,

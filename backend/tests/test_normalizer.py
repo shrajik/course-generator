@@ -57,6 +57,25 @@ def test_illustration_style_blank_by_default():
     assert content["illustration_style"] == ""
 
 
+def test_formula_expression_passes_through():
+    """Regression guard: the writer is told to set `image_formula_expression`
+    (app/agents/prompts.py) for any block depicting a governing equation, and
+    app.services.image_service reads `content["formula_expression"]` to run
+    formula_qa - this is the one field connecting the two. It was previously
+    missing from DraftBlock entirely, so the model's own output for it was
+    silently discarded before draft_to_content ever ran, making formula_qa a
+    permanent no-op in production."""
+    draft = _image_draft("illustration")
+    draft.image_formula_expression = "  F = m * a  "
+    content = draft_to_content(draft)
+    assert content["formula_expression"] == "F = m * a"
+
+
+def test_formula_expression_blank_by_default():
+    content = draft_to_content(_image_draft("illustration"))
+    assert content["formula_expression"] == ""
+
+
 # ---------------------------------------------------------------------------
 # tag_section_intro_illustrations - the structural fallback for the writer's
 # own illustration_style: section_intro instruction (see WRITER_SYSTEM)

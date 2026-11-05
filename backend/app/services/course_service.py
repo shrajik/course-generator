@@ -21,8 +21,10 @@ Performance shape of this module:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import uuid
+from typing import Any
 
 from app.agents.planner import PlannerAgent
 from app.agents.prompts import ContinuityContext
@@ -30,10 +32,17 @@ from app.agents.reviewer import ReviewerAgent
 from app.agents.writer import WriterAgent, to_generated_chapter
 from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
-from app.core.errors import ConflictError, NotFoundError, ValidationFailedError
-from app.schemas.research import ChapterResearch
+from app.core.errors import (
+    ConflictError,
+    IncompleteChapterInventoryError,
+    NotFoundError,
+    QualityApprovalBlockedError,
+    QualityEvaluationFailedError,
+    ValidationFailedError,
+)
 from app.course.review_brief import approval_blockers
 from app.artifacts.reuse import get_artifact_reuse
+from app.schemas.research import ChapterResearch
 from app.services.audit_service import get_audit_service
 from app.services.knowledge_service import get_knowledge_service
 from app.services.notification_service import get_notification_service
@@ -43,7 +52,8 @@ from app.core.ids import course_id as new_course_id
 from app.core.ids import document_id_for_course, new_id, utc_now_iso
 from app.core.logging import get_logger
 from app.core.metrics import current_metrics, phase as metrics_phase, run_metrics
-from app.course.document.builder import build_document, reflow_document
+from app.course.document.builder import build_document, finalize_toc_page, reflow_document
+from app.course.document.diagram_compaction import compact_diagrams_for_spacing
 from app.course.document.layout import image_generation_failed
 from app.course.document.visual_repair import audit_and_repair_visuals
 from app.services.visual_review import VisualReviewService
@@ -51,6 +61,8 @@ from app.course.templates.registry import ensure_template_loaded, load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import (
     ChapterProgress,
+    CoursePhase,
+    CoursePhases,
     CourseActivityEntry,
     CourseInput,
     CourseRecord,
@@ -58,13 +70,20 @@ from app.schemas.course import (
     GenerateResponse,
     ImproveTocRequest,
     ImproveTocResponse,
+    OverrideEvidence,
+    PhaseApproval,
     ReviewHistoryEntry,
     RunInfo,
     SourceUse,
     WorkspaceActivityEntry,
 )
 from app.schemas.document import CourseDocument
-from app.schemas.draft import GeneratedChapter
+from app.schemas.draft import (
+    ChapterInventoryIssue,
+    ChapterResearchIssue,
+    GeneratedChapter,
+    StructuralFinding,
+)
 from app.schemas.memory import GenerationRunEntry
 from app.schemas.review import ChapterReview
 from app.schemas.template import CourseTemplate
@@ -73,6 +92,15 @@ from app.services.image_service import ImageService
 from app.services.memory_embedding_sync import sync_embedding
 from app.services.memory_embedding_text import generation_run_text
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.pdf_spacing_qa import check_pdf_spacing
+from app.services.quality_framework import (
+    QualityReport,
+    build_course_quality_report,
+    quality_gate_evaluation_failed_warning,
+    quality_gate_incomplete_inventory_warning,
+    quality_gate_warning,
+    quality_snapshot_from_report,
+)
 from app.services.research_service import ResearchService
 from app.services.storage_service import StorageService, get_storage
 
@@ -214,6 +242,11 @@ class CourseService:
         self, course_input: CourseInput, *, run_planner: bool = True, owner_id: str | None = None
     ) -> CourseRecord:
         course_id = new_course_id()
+        design = course_input.design_models
+        # Content Studio Phase 3 - phase-gated approval is an ADDIE concept;
+        # SAM already has its own, different iteration-gating mechanism
+        # (_sam_iteration_targets) that this never touches or competes with.
+        phases = CoursePhases() if design is not None and design.has("addie") and not design.has("sam") else None
         record = CourseRecord(
             course_id=course_id,
             document_id=document_id_for_course(course_id),
@@ -222,6 +255,7 @@ class CourseService:
             template_id=course_input.template_id,
             owner_id=owner_id,
             outline_approved=False,
+            phases=phases,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
         )
@@ -256,9 +290,53 @@ class CourseService:
         record.outline_approved = True
         record.outline_approved_at = now
         record.outline_approved_by = actor_id
+        # Content Studio Phase 3 - approving the outline already *is*
+        # approving Analysis + Design (the blueprint carries both); this
+        # reuses this one existing action rather than a parallel endpoint.
+        if record.phases is not None and record.phases.analysis_design.status != "approved":
+            record.phases.analysis_design = PhaseApproval(status="approved", approved_at=now, approved_by=actor_id)
         record.updated_at = now
         record = await self._save_course(record)
         log.info("Outline approved for %s by %s", course_id, actor_id)
+        return record
+
+    # --- Content Studio Phase 3: ADDIE phase-gated approval -----------------
+    async def approve_phase(self, course_id: str, phase: CoursePhase, actor_id: str | None) -> CourseRecord:
+        """Sign off one ADDIE phase so the next may proceed. See CoursePhases'
+        own docstring for why there are 3 real phases, not 5: `analysis_design`
+        is approved via `approve_outline` instead (the blueprint already
+        carries both, so that's the single source of truth for it, not this
+        method) - calling this with that phase is a client error."""
+        record = await self._load_course(course_id)
+        if record.phases is None:
+            raise ConflictError(f"Course '{course_id}' does not have phase-gated approval active")
+        if phase == "analysis_design":
+            raise ConflictError("Analysis & Design is approved via approve_outline, not approve_phase")
+
+        current = getattr(record.phases, phase)
+        if current.status == "approved":
+            return record  # idempotent: approving twice changes nothing
+
+        if phase == "development":
+            if record.phases.analysis_design.status != "approved":
+                raise ConflictError("Analysis & Design must be approved before Development")
+            if current.status != "in_review":
+                raise ConflictError("Development has not finished generating yet")
+        elif phase == "implementation_evaluation":
+            if record.phases.development.status != "approved":
+                raise ConflictError("Development must be approved before Implementation & Evaluation")
+
+        now = utc_now_iso()
+        setattr(record.phases, phase, PhaseApproval(status="approved", approved_at=now, approved_by=actor_id))
+        if phase == "development" and record.phases.implementation_evaluation.status == "pending":
+            # Free to compute (app.course.design_models.design_outputs is an
+            # instant derived summary, no AI call) - no separate "generate"
+            # trigger needed, so it's ready to review the moment Development
+            # is approved.
+            record.phases.implementation_evaluation.status = "in_review"
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Phase %s approved for %s by %s", phase, course_id, actor_id)
         return record
 
     def _require_outline_approved(self, record: CourseRecord) -> None:
@@ -282,6 +360,29 @@ class CourseService:
         if record.review_status not in self._RESUBMITTABLE_STATUSES:
             raise ConflictError(
                 f"Course cannot be submitted for review from status '{record.review_status}'"
+            )
+        # MOM quality-governance follow-up: `record.status == "ready"` alone
+        # does NOT reliably mean every blueprint-planned chapter exists - it
+        # only reflects whether the chapters a given `generate()` call
+        # targeted succeeded (targeted/partial generation is supported), so
+        # a partially-generated course can read "ready" while chapters are
+        # still entirely unattempted. This independently verifies the real
+        # chapter inventory against `record.chapters` (the stable,
+        # blueprint-derived expected set) rather than trusting `status`.
+        inventory_issues = await self._verify_inventory(record)
+        if inventory_issues:
+            raise IncompleteChapterInventoryError(
+                f"Course '{course_id}' cannot be submitted for review: "
+                f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
+                details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
+        # Content Studio Phase 3 - for an ADDIE course with phase-gating
+        # active, every phase must be stepped through in order before the
+        # whole-course review workflow (unchanged otherwise) can start.
+        if record.phases is not None and record.phases.implementation_evaluation.status != "approved":
+            raise ConflictError(
+                f"Course '{course_id}' cannot be submitted for review: Implementation & Evaluation "
+                "has not been approved yet"
             )
         now = utc_now_iso()
         record.review_status = "in_review"
@@ -315,11 +416,36 @@ class CourseService:
     async def approve_course(
         self, course_id: str, reviewer_id: str, comment: str | None = None
     ) -> CourseRecord:
+        """Ordinary approval - deliberately free of any override parameter
+        (see OverrideApprovalRequest's own docstring and the four
+        `approve_course_override_*` methods below): every quality gate
+        below is fully enforced, with no bypass available here."""
         record = await self._load_course(course_id)
         if record.review_status != "in_review":
             raise ConflictError(
                 f"Course is not ready for review approval (status '{record.review_status}')"
             )
+        inventory_issues, report, eval_error = await self._evaluate_quality_for_approval(record)
+        if inventory_issues:
+            raise IncompleteChapterInventoryError(
+                f"Course '{course_id}' cannot be approved: "
+                f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
+                details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
+        if eval_error is not None:
+            raise QualityEvaluationFailedError(
+                f"Quality evaluation could not be completed for '{course_id}': {eval_error}"
+            ) from eval_error
+        blocking = report.approval_blocking_findings if report is not None else []
+        if blocking:
+            raise QualityApprovalBlockedError(
+                f"Course '{course_id}' has {len(blocking)} unresolved quality blocker(s)",
+                details={"findings": [f.model_dump(mode="json") for f in blocking]},
+            )
+        # origin/visual-and-flowchart's separate, orthogonal gate - only
+        # engages for a course with uploaded sources, checking its
+        # fact-check audit rather than structural/code/reviewer findings.
+        # Preserved alongside the quality gate above, never replacing it.
         if self.settings.require_findings_resolved:
             blockers = approval_blockers(
                 has_sources=bool(record.input.source_ids),
@@ -345,6 +471,250 @@ class CourseService:
             comment or "A reviewer gave it final approval.",
         )
         return record
+
+    async def _verify_inventory(self, record: CourseRecord) -> list[ChapterInventoryIssue]:
+        expected_ids = [c.chapter_id for c in record.chapters]
+        return self.storage.verify_chapter_inventory(record.course_id, expected_ids)
+
+    def _verify_research_citations(
+        self, course_id: str, chapters: list[GeneratedChapter]
+    ) -> list[ChapterResearchIssue]:
+        """Deterministic, chapter-level check (MOM quality-governance
+        follow-up, Phase 3.8C): does this chapter's persisted research
+        artifact record at least one non-blank reference URL? A non-blank
+        URL is only evidence a reference was recorded - it never proves a
+        claim is true or reliably sourced (see
+        app.services.quality_framework.research_findings for the exact
+        finding this becomes, and ChapterResearchIssue's own docstring).
+
+        Deliberately narrow:
+        - A genuinely MISSING research artifact is skipped, not flagged -
+          many chapters predate this check and never had one; that is
+          legacy-compatible, not a defect.
+        - A successfully-loaded `mode == "mock"` artifact is exempt -
+          offline/test-pipeline research is not real research.
+        - An EXISTING but unreadable/corrupt artifact fails closed
+          (`status="unreadable"`) rather than being silently treated as
+          "missing" - `has_research` already confirmed its presence, so
+          its unreadability is itself the finding."""
+        issues: list[ChapterResearchIssue] = []
+        for chapter in chapters:
+            if not self.storage.has_research(course_id, chapter.chapter_id, chapter.chapter_number):
+                continue  # genuinely absent - legacy compatibility, never a finding
+            try:
+                research = self.storage.load_research(
+                    course_id, chapter.chapter_id, chapter.chapter_number
+                )
+            except (NotFoundError, ValueError, OSError) as exc:
+                # Narrow, expected failure modes for an artifact `has_research`
+                # just confirmed exists: ValueError covers a JSON parse
+                # failure, a text-decoding failure, and a pydantic schema-
+                # validation failure (all ValueError subclasses); OSError
+                # covers a filesystem read failure; NotFoundError covers the
+                # narrow TOCTOU race where the file is removed between the
+                # `has_research` check above and this read. Anything else is
+                # a genuine bug and must propagate, never be reclassified as
+                # "the artifact is corrupt".
+                issues.append(
+                    ChapterResearchIssue(
+                        chapter_id=chapter.chapter_id, status="unreadable", detail=str(exc)[:500]
+                    )
+                )
+                continue
+            if research.mode == "mock":
+                continue  # offline/test-pipeline research, not real research
+            has_citation = any(str(ref.url or "").strip() for ref in research.payload.references)
+            if not has_citation:
+                issues.append(ChapterResearchIssue(chapter_id=chapter.chapter_id, status="uncited"))
+        return issues
+
+    async def _evaluate_quality_for_approval(
+        self, record: CourseRecord
+    ) -> tuple[list[ChapterInventoryIssue], QualityReport | None, Exception | None]:
+        """Never raises - the caller (plain `approve_course` or one of the
+        four `approve_course_override_*` methods) decides what each
+        category of problem means for it. Always computes all three
+        pieces (inventory issues, report, evaluation error) so an override
+        has the full picture to build its audit evidence from, even when
+        it only ultimately needs one of them."""
+        inventory_issues = await self._verify_inventory(record)
+        report: QualityReport | None = None
+        eval_error: Exception | None = None
+        try:
+            chapters = self.storage.load_all_chapters(record.course_id)
+            document = (
+                await self._load_document(record.course_id)
+                if await self._has_document(record.course_id)
+                else None
+            )
+            research_issues = self._verify_research_citations(record.course_id, chapters)
+            report = build_course_quality_report(
+                course_id=record.course_id,
+                document_id=document.document_id if document else "",
+                chapters=chapters,
+                document=document,
+                inventory_issues=inventory_issues,
+                research_issues=research_issues,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never swallowed silently
+            eval_error = exc
+        return inventory_issues, report, eval_error
+
+    # --- admin-only quality-gate overrides ----------------------------------
+    # Four distinct, server-enforced bypasses (MOM quality-governance
+    # follow-up) - each lifts exactly ONE gate and no other. All four still
+    # require `review_status == "in_review"` (the same precondition as plain
+    # `approve_course`) and still run every OTHER gate normally: an override
+    # for one category never silently waves through a different, unrelated
+    # problem - including the source/fact-check audit gate below, which none
+    # of the four is scoped to lift. See ReviewHistoryEntry.action /
+    # OverrideEvidence for the audit-trail shape this persists.
+    async def _approve_with_override(
+        self,
+        course_id: str,
+        admin_id: str,
+        reason: str,
+        *,
+        action: str,
+    ) -> CourseRecord:
+        if not reason or not reason.strip():
+            raise ValidationFailedError("A reason is required to override the quality gate")
+        record = await self._load_course(course_id)
+        if record.review_status != "in_review":
+            raise ConflictError(
+                f"Course is not ready for review approval (status '{record.review_status}')"
+            )
+        inventory_issues, report, eval_error = await self._evaluate_quality_for_approval(record)
+        evidence = OverrideEvidence()
+
+        if inventory_issues and action != "override_approved_incomplete_chapters":
+            # This override is scoped to a different category - an
+            # incomplete inventory is never silently waved through by it.
+            raise IncompleteChapterInventoryError(
+                f"Course '{course_id}' cannot be approved: "
+                f"{len(inventory_issues)} expected chapter(s) are missing or unreadable",
+                details={"issues": [i.model_dump(mode="json") for i in inventory_issues]},
+            )
+        if inventory_issues:
+            evidence.affected_chapters = [
+                {"chapter_id": i.chapter_id, "status": i.status, "detail": i.detail}
+                for i in inventory_issues
+            ]
+        elif action == "override_approved_incomplete_chapters":
+            raise ValidationFailedError(
+                "This course's chapter inventory is already complete; use normal approval instead"
+            )
+
+        if eval_error is not None:
+            if action != "override_approved_evaluation_failure":
+                raise QualityEvaluationFailedError(
+                    f"Quality evaluation could not be completed for '{course_id}': {eval_error}"
+                ) from eval_error
+            evidence.evaluation_error = str(eval_error)[:500]
+        elif action == "override_approved_evaluation_failure":
+            raise ValidationFailedError(
+                "Quality evaluation succeeded for this course; use normal approval instead"
+            )
+        else:
+            assert report is not None
+            # Inventory issues are handled above, via their own category -
+            # never double-counted here as a "confirmed blocker" too.
+            remaining = [
+                f
+                for f in report.approval_blocking_findings
+                if f.reason != "incomplete_chapter_inventory"
+            ]
+            confirmed = [f for f in remaining if f.verification_status == "independently_verified"]
+            verification_failed = [f for f in remaining if f.verification_status == "verification_failed"]
+
+            if confirmed and action != "override_approved_blockers":
+                raise QualityApprovalBlockedError(
+                    f"Course '{course_id}' has {len(confirmed)} confirmed quality blocker(s)",
+                    details={"category": "confirmed_blockers", "findings": [f.model_dump(mode="json") for f in confirmed]},
+                )
+            if verification_failed and action != "override_approved_verification_failed":
+                raise QualityApprovalBlockedError(
+                    f"Course '{course_id}' has {len(verification_failed)} verification-failed "
+                    "quality blocker(s)",
+                    details={
+                        "category": "verification_failed",
+                        "findings": [f.model_dump(mode="json") for f in verification_failed],
+                    },
+                )
+            if action == "override_approved_blockers":
+                if not confirmed:
+                    raise ValidationFailedError(
+                        "No confirmed blocking findings to override; use normal approval instead"
+                    )
+                evidence.standards_version = report.standards_version
+                evidence.findings = [f.model_dump(mode="json") for f in confirmed]
+            if action == "override_approved_verification_failed":
+                if not verification_failed:
+                    raise ValidationFailedError(
+                        "No verification-failed findings to override; use normal approval instead"
+                    )
+                evidence.findings = [f.model_dump(mode="json") for f in verification_failed]
+                verifiers = sorted({f.verifier for f in verification_failed if f.verifier})
+                evidence.verifier = ", ".join(verifiers) if verifiers else None
+                errors = [f.verification_error for f in verification_failed if f.verification_error]
+                evidence.verification_error = "; ".join(errors)[:1000] if errors else None
+
+        # None of the four actions above is scoped to the source/fact-check
+        # audit gate (origin/visual-and-flowchart) - per this method's own
+        # docstring, an override for one category must never silently waive
+        # a different, unrelated one. Same check, same failure policy, same
+        # error as plain `approve_course` below - just enforced here too.
+        if self.settings.require_findings_resolved:
+            blockers = approval_blockers(
+                has_sources=bool(record.input.source_ids),
+                audit=get_audit_service().load(course_id),
+            )
+            if blockers:
+                raise ConflictError("Final approval is blocked: " + " ".join(blockers))
+
+        now = utc_now_iso()
+        record.review_status = "approved"
+        record.review_comment = reason
+        record.reviewer_id = admin_id
+        record.reviewed_at = now
+        record.review_history = [
+            *record.review_history,
+            ReviewHistoryEntry(
+                action=action, by=admin_id, at=now, comment=reason, override_evidence=evidence
+            ),
+        ]
+        record.updated_at = now
+        record = await self._save_course(record)
+        log.info("Course %s approved via %s by %s", course_id, action, admin_id)
+        return record
+
+    async def approve_course_override_blockers(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_blockers"
+        )
+
+    async def approve_course_override_verification_failed(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_verification_failed"
+        )
+
+    async def approve_course_override_evaluation_failure(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_evaluation_failure"
+        )
+
+    async def approve_course_override_incomplete_chapters(
+        self, course_id: str, admin_id: str, reason: str
+    ) -> CourseRecord:
+        return await self._approve_with_override(
+            course_id, admin_id, reason, action="override_approved_incomplete_chapters"
+        )
 
     async def request_changes(
         self, course_id: str, reviewer_id: str, comment: str
@@ -454,6 +824,41 @@ class CourseService:
         async with get_database_service() as db:
             return await db.list_generation_runs(course_id, limit, offset)
 
+    async def get_latest_model_usage(self, course_id: str) -> dict | None:
+        """Admin-only (see app.api.admin's model-usage endpoint) - the full
+        per-call AI model usage list from the most recent generation run.
+        None when nothing has ever been generated/persisted for this
+        course (mock mode, or no run yet) - never fabricated."""
+        if not self.use_db:
+            return None
+        async with get_database_service() as db:
+            return await db.get_latest_generation_run_model_usage(course_id)
+
+    async def get_quality_report(self, course_id: str) -> QualityReport:
+        """On-demand quality report for a course - available any time after
+        generation, not only at the moment `_finalise` runs (see that
+        method's own comment on why it isn't snapshotted). Reads only
+        already-persisted chapters/document, so it reflects the course's
+        CURRENT state, including any hand-edits made since generation."""
+        await self.get_course_record(course_id)  # raises NotFoundError if unknown
+        try:
+            chapters = self.storage.load_all_chapters(course_id)
+            document = (
+                await self._load_document(course_id) if await self._has_document(course_id) else None
+            )
+            research_issues = self._verify_research_citations(course_id, chapters)
+            return build_course_quality_report(
+                course_id=course_id,
+                document_id=document.document_id if document else "",
+                chapters=chapters,
+                document=document,
+                research_issues=research_issues,
+            )
+        except Exception as exc:  # noqa: BLE001 - a crashed computation is its own distinct category
+            raise QualityEvaluationFailedError(
+                f"Quality evaluation could not be completed for '{course_id}': {exc}"
+            ) from exc
+
     # --- phase 1: plan -----------------------------------------------------
     async def plan_course(self, record: CourseRecord) -> CourseBlueprint:
         with metrics_phase("planner"):
@@ -468,6 +873,12 @@ class CourseService:
             ChapterProgress(chapter_id=chapter.id, title=chapter.title)
             for chapter in blueprint.chapters
         ]
+        # Content Studio Phase 3 - the blueprint (Analysis + Design content)
+        # now exists and is ready to approve. Never regresses an already-
+        # approved phase (a later re-plan, if ever called, must not silently
+        # unapprove it).
+        if record.phases is not None and record.phases.analysis_design.status == "pending":
+            record.phases.analysis_design.status = "in_review"
         await self._save_course(record)
         return blueprint
 
@@ -487,7 +898,15 @@ class CourseService:
         self._require_outline_approved(record)
 
         if request.mode == "sync":
-            return await self.generate(course_id, request)
+            # A real, confirmed gap: a sync-mode call used to run `generate()`
+            # with no job_id at all (`job_id=""` is the parameter's own
+            # default), which made `_record_generation_run`'s own `if not
+            # self.use_db or not job_id: return` guard silently skip
+            # persisting that run's history AND its model-usage record (see
+            # MOM Phase 2.2) - every sync-mode generation left no audit trail
+            # whatsoever. Background mode already mints a job_id up front
+            # (`new_id("job")` just below); sync mode now does the same.
+            return await self.generate(course_id, request, job_id=new_id("job"))
 
         existing = self._jobs.get(course_id)
         if existing is not None and not existing.done():
@@ -599,6 +1018,7 @@ class CourseService:
                         started=started,
                         job_id=job_id,
                         metrics_summary=metrics.summary(),
+                        metrics_obj=metrics,
                     )
                 raise ValidationFailedError("No matching chapters to generate")
 
@@ -845,6 +1265,7 @@ class CourseService:
             )
 
             review: ChapterReview | None = None
+            structural_findings: list[StructuralFinding] = []
             revisions = 0
             try:
                 # ChapterReview is a critique object (scores/issues), not prose,
@@ -852,7 +1273,7 @@ class CourseService:
                 # just mark the phase so the UI can say "Reviewing" for real,
                 # exactly when the reviewer call actually starts.
                 hub.start(record.course_id, chapter.id, "reviewing")
-                review = await self.reviewer.review_chapter(
+                review, structural_findings = await self.reviewer.review_chapter(
                     blueprint=blueprint,
                     chapter=chapter,
                     template=template,
@@ -877,7 +1298,7 @@ class CourseService:
                         on_delta=make_stream_sink(record.course_id, chapter.id, "reviewing"),
                     )
                     hub.start(record.course_id, chapter.id, "reviewing")
-                    review = await self.reviewer.review_chapter(
+                    review, structural_findings = await self.reviewer.review_chapter(
                         blueprint=blueprint,
                         chapter=chapter,
                         template=template,
@@ -896,6 +1317,7 @@ class CourseService:
                 review=review,
                 revisions=revisions,
                 model="mock" if self.ai.is_mock else self.settings.writer_model,
+                structural_findings=structural_findings,
             )
             self.storage.save_chapter(record.course_id, artifact)
             await self._mark_progress(
@@ -960,6 +1382,17 @@ class CourseService:
                 if request.generate_images is None
                 else request.generate_images
             )
+            # MOM Phase 4 - Content Level 1 (text-only) structural backstop:
+            # the writer is already prompted not to plan any image block (see
+            # content_level_brief in app/agents/prompts.py), but this is a
+            # second, independent guarantee that no visual generation runs at
+            # all for a Level 1 course even if the model asks for one anyway
+            # or the request explicitly passed generate_images=True. Always
+            # wins over the request's own override - Content Level is the
+            # user's explicit choice for THIS course, not a default to be
+            # silently overridden per-call.
+            if record.input.content_level == 1:
+                generate_images = False
             if generate_images:
                 # Images run after the document is already readable, so they are
                 # never what the user is waiting on to start editing.
@@ -985,6 +1418,21 @@ class CourseService:
                         "Visual repair for %s: %s page(s) repaired, %s still deficient",
                         record.course_id, len(repair.repaired), len(repair.still_deficient),
                     )
+                # Diagram compaction: a page can still be left with a large
+                # trailing gap even after the above - a flow_chart diagram
+                # only a little too tall for its slot forced the whole
+                # group (it + its lead-in text) onto a fresh page, wasting
+                # the original page's remainder (see
+                # app.course.document.diagram_compaction's own docstring).
+                # Re-renders the SAME already-stored spec more compactly
+                # (tighter spacing only, never smaller text) - no new AI
+                # call - and re-paginates.
+                compaction = await compact_diagrams_for_spacing(document, template, storage=self.storage)
+                if compaction.compacted:
+                    log.info(
+                        "Diagram compaction for %s: %s diagram(s) compacted to recover page space",
+                        record.course_id, len(compaction.compacted),
+                    )
                 # Check every real picture and diagram against its text, and
                 # regenerate only the ones that fail.
                 if self.settings.enable_visual_review:
@@ -999,15 +1447,113 @@ class CourseService:
                         log.warning("Visual review failed for %s: %s", record.course_id, exc)
                         warnings.append("The visual check could not be run.")
                 await self._save_document(document)
+                # QA gate: now that every image is in and the document is
+                # reflowed with real (not estimated) heights, catch a page
+                # a large image's real size left mostly blank, or a fully
+                # blank page - see app.services.pdf_spacing_qa's own
+                # docstring for the regression this closes. Advisory only
+                # (reuses the existing warnings channel, same as the
+                # continuity/quality-gate checks below) - it never blocks
+                # or retries generation; the fix lives in the layout engine
+                # itself (app.course.document.layout) plus the diagram
+                # compaction pass just above, both applied to every course
+                # automatically, so there is nothing further to re-apply here.
+                spacing_report = check_pdf_spacing(document)
+                if not spacing_report.ok:
+                    log.warning("PDF spacing QA for %s:\n%s", record.course_id, spacing_report.summary())
+                    warnings.append(
+                        f"PDF spacing check found {len(spacing_report.findings)} page(s) with excess "
+                        f"blank space and {len(spacing_report.blank_pages)} fully blank page(s) - see logs."
+                    )
+            # Real TOC page numbers: only knowable now that every page
+            # number in the document is truly final - unconditional
+            # (unlike the image-only steps above), since even a text-only
+            # (Content Level 1) course's chapters are already laid out onto
+            # real pages at this point. See finalize_toc_page's own
+            # docstring for why this must be the two-pass build's second
+            # pass, and why it's safe to call exactly here.
+            finalize_toc_page(
+                document, self.storage.load_all_chapters(record.course_id), template, storage=self.storage
+            )
+            await self._save_document(document)
             # The finished course is checked against the creator's own documents.
             if record.input.source_ids and self.settings.enable_fact_check:
                 warnings.extend(await self._audit_after_generation(record, document))
             pages = len(document.pages)
             record.has_document = True
 
+            # MOM Phase 9 - final document completeness gate. Reuses the
+            # EXISTING `warnings` channel (already shown to the user for
+            # continuity/research issues above) rather than a new status or
+            # a new field: `status` keeps meaning "the pipeline ran and a
+            # document exists" (its established, already-tested meaning
+            # across the rest of this service), while a quality-gate hard
+            # failure is surfaced as a specific, visible warning so a course
+            # with real, unresolved gaps is never indistinguishable from a
+            # clean one just because it reached "ready". The full structured
+            # findings remain available on demand via `get_quality_report`
+            # (no AI calls, reads only already-persisted data) rather than
+            # being snapshotted here, so they can never go stale relative to
+            # a later hand-edit.
+            quality_report: QualityReport | None = None
+            try:
+                quality_chapters = self.storage.load_all_chapters(record.course_id)
+                # MOM quality-governance follow-up: this gate is advisory
+                # (never fatal to generation, exactly as before), so an
+                # incomplete inventory is surfaced as a visible, distinct
+                # warning here - never as a raised IncompleteChapterInventoryError,
+                # which is reserved for the hard submission/approval gates.
+                inventory_issues = await self._verify_inventory(record)
+                quality_report = build_course_quality_report(
+                    course_id=record.course_id,
+                    document_id=document.document_id,
+                    chapters=quality_chapters,
+                    document=document,
+                    inventory_issues=inventory_issues,
+                )
+                gate_warning = quality_gate_warning(quality_report)
+                if gate_warning:
+                    warnings.append(gate_warning)
+                inventory_warning = quality_gate_incomplete_inventory_warning(inventory_issues)
+                if inventory_warning:
+                    warnings.append(inventory_warning)
+            except Exception as exc:  # noqa: BLE001 - the gate is advisory, never fatal to generation
+                # An evaluation that could not run must never be silently
+                # indistinguishable from "evaluated and clean" - this used to
+                # only log server-side, so the course shipped with zero
+                # quality-related warnings on a genuine evaluation failure.
+                log.warning("Quality report failed for %s: %s", record.course_id, exc)
+                warnings.append(quality_gate_evaluation_failed_warning(exc))
+
+            # TASK 2 (quality audit follow-up) - the audit trail snapshot:
+            # standards version/status, when this was evaluated, and the
+            # outcome, persisted alongside the course record (see
+            # CourseRecord.quality_snapshot and COURSE_RECORD_COLUMN_FIELDS
+            # in app/db/service.py - any new CourseRecord field not in that
+            # frozenset flows into the existing `metadata_json` column
+            # automatically, no migration needed). `None` when evaluation
+            # itself failed - never fabricate an outcome that wasn't
+            # actually produced.
+            if quality_report is not None:
+                record.quality_snapshot = quality_snapshot_from_report(quality_report)
+
         record.status = "failed" if failed and not generated else "ready"
         record.last_error = f"chapters failed: {', '.join(failed)}" if failed else None
         record.warnings = warnings
+        # Content Studio Phase 3 - `development` only advances once the REAL
+        # chapter inventory is complete, never just because this particular
+        # generate() call reports "ready" - a targeted/partial run can set
+        # that status without every blueprint-planned chapter existing (see
+        # submit_for_review's own identical caution). Never regresses an
+        # already-approved phase.
+        if (
+            record.phases is not None
+            and record.status == "ready"
+            and record.phases.development.status == "pending"
+        ):
+            inventory_issues = await self._verify_inventory(record)
+            if not inventory_issues:
+                record.phases.development.status = "in_review"
         if record.status == "ready":
             await self._tell_author(
                 record, "generation_done", f"\u201c{record.input.course_title}\u201d is ready",
@@ -1015,9 +1561,18 @@ class CourseService:
             )
 
         summary = metrics_summary
-        if summary is None and metrics_obj is not None:
-            summary = metrics_obj.summary()
-            metrics_obj.log_waterfall(f"course {record.course_id}")
+        model_usage: list[dict[str, Any]] = []
+        if metrics_obj is not None:
+            if summary is None:
+                summary = metrics_obj.summary()
+                metrics_obj.log_waterfall(f"course {record.course_id}")
+            # The full per-call list (see CallRecord) - `summary` above is
+            # only ever a rolled-up aggregate (counts/totals/top-5-slowest),
+            # not enough to answer "which model actually wrote chapter 3" -
+            # see MOM Phase 2.2 (AI Model Transparency). Persisted as-is into
+            # GenerationRun.payload_json below; never logged or exposed to a
+            # non-admin caller (see the admin-gated model-usage endpoint).
+            model_usage = [dataclasses.asdict(call) for call in metrics_obj.calls]
 
         record.run = RunInfo(
             job_id=job_id or (record.run.job_id if record.run else ""),
@@ -1042,12 +1597,14 @@ class CourseService:
             failed=failed,
             warnings=warnings,
             error=record.last_error,
+            model_usage=model_usage,
         )
 
         return GenerateResponse(
             course_id=record.course_id,
             document_id=record.document_id,
             status=record.status,
+            quality_outcome=record.quality_snapshot.outcome if record.quality_snapshot else None,
             chapters_generated=generated,
             chapters_failed=failed,
             images_generated=images,
@@ -1070,9 +1627,15 @@ class CourseService:
         failed: list[str] | None = None,
         warnings: list[str] | None = None,
         error: str | None = None,
+        model_usage: list[dict[str, Any]] | None = None,
     ) -> None:
         """One row per generation attempt (see GenerationRun/generation_runs) -
-        best-effort and never allowed to affect the run it's recording."""
+        best-effort and never allowed to affect the run it's recording.
+
+        `model_usage` (see CallRecord/MOM Phase 2.2) is the full per-call AI
+        model usage list for this run - admin-only; see
+        app.api.admin's model-usage endpoint, which is the only reader of
+        this field. Never surfaced to a non-admin caller or logged here."""
         if not self.use_db or not job_id:
             return
         try:
@@ -1085,6 +1648,7 @@ class CourseService:
                         "chapters_generated": generated or [],
                         "chapters_failed": failed or [],
                         "warnings": warnings or [],
+                        "model_usage": model_usage or [],
                     },
                     error=error,
                 )

@@ -131,7 +131,17 @@ async def test_document_blocks_are_traceable_to_chapters(service, technical_inpu
     document = service.storage.load_document(record.course_id)
     content_pages = [page for page in document.pages if page.kind == "content"]
     chapter_ids = {
-        block.meta.chapter_id for page in content_pages for block in page.blocks
+        block.meta.chapter_id
+        for page in content_pages
+        for block in page.blocks
+        # The Sources page (see app.course.document.builder._source_blocks)
+        # deliberately shares `kind="content"` with real chapter pages (so it
+        # gets the same page footer/rendering - see SOURCES_SECTION_KEY's own
+        # docstring), but it's system-appended, aggregated across every
+        # chapter's research - never attributable to one chapter, exactly
+        # like the TOC page (excluded above via `kind != "toc"`) is not
+        # chapter content either.
+        if block.meta.origin != "system"
     }
     assert chapter_ids == {"chapter_1", "chapter_2"}
 

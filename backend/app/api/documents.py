@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from app.api.course_authorization import check_document_owner
 from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.ids import slugify
+from app.course.companions import companion_deliverables
 from app.course.compliance import build_report
 from app.course.design_models import design_outputs
 from app.db.models import User
@@ -90,7 +91,7 @@ async def ai_edit(
     "/{document_id}/blocks/{block_id}/visual-spec",
     response_model=UpdateConceptVisualSpecResponse,
 )
-async def update_concept_visual_spec(
+async def update_visual_spec(
     document_id: str,
     block_id: str,
     request: UpdateConceptVisualSpecRequest,
@@ -98,17 +99,49 @@ async def update_concept_visual_spec(
     course_service: CourseService = Depends(_course_service),
     current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> UpdateConceptVisualSpecResponse:
-    """Edit the text inside a concept_experience visual (an entity/step
-    label or description) and re-render it deterministically - no AI call,
-    the exported PDF keeps rendering this the same static way it always has.
-    """
+    """Edit a concept_experience OR diagram (flow_chart/process/etc.)
+    visual's own structured spec (a label/color/node-order fix) and
+    re-render it deterministically - no AI call, the exported PDF keeps
+    rendering this the same static way it always has."""
     course_id = await check_document_owner(document_id, current_user, course_service, service)
-    response = await service.update_concept_visual_spec(document_id, block_id, request.spec)
+    response = await service.update_visual_spec(document_id, block_id, request.spec)
     if current_user is not None:
         await course_service.record_activity(
             course_id, str(current_user.id), current_user.email, "updated"
         )
     return response
+
+
+@router.post("/{document_id}/blocks/{block_id}/visual-spec/preview")
+async def preview_visual_spec(
+    document_id: str,
+    block_id: str,
+    request: UpdateConceptVisualSpecRequest,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict:
+    """Render a DRAFT spec exactly as Save would, without persisting
+    anything - the live-preview call a flowchart/concept editor makes on
+    every edit. Returns `{"svg": "..."}` or `{"html": "..."}`."""
+    await check_document_owner(document_id, current_user, course_service, service)
+    return await service.preview_visual_spec(document_id, block_id, request.spec)
+
+
+@router.post("/{document_id}/blocks/{block_id}/visual-spec/reconstruct")
+async def reconstruct_diagram_spec(
+    document_id: str,
+    block_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict:
+    """For a diagram block generated before spec persistence existed: one
+    AI call reconstructing a real, editable spec from the block's own
+    stored brief - never saved automatically, the editor seeds itself from
+    the result and only persists it via a normal Save."""
+    await check_document_owner(document_id, current_user, course_service, service)
+    return await service.reconstruct_diagram_spec(document_id, block_id)
 
 
 @router.post("/{document_id}/regenerate-visuals", response_model=RegenerateVisualsResponse)
@@ -192,7 +225,10 @@ async def repair_visual_coverage(
 @router.get("/{document_id}/compliance")
 async def compliance_report(
     document_id: str,
-    schema: str = Query(default="lom", pattern="^(lom|dublin_core)$"),
+    # None (the default) falls back to the course's own stored schema
+    # preference (CourseInput.metadata.schema_preference), then "lom" - an
+    # explicit query param still overrides either, unchanged.
+    schema: str | None = Query(default=None, pattern="^(lom|dublin_core)$"),
     service: DocumentService = Depends(_service),
     course_service: CourseService = Depends(_course_service),
     current_user: User | None = Depends(get_current_user_if_db_enabled),
@@ -203,12 +239,17 @@ async def compliance_report(
     course_id = await check_document_owner(document_id, current_user, course_service, service)
     document = await service.load(document_id)
     record = await course_service.get_course_record(course_id)
+    metadata_settings = record.input.metadata
+    resolved_schema = schema or (metadata_settings.schema_preference if metadata_settings else None) or "lom"
     report = build_report(
         document,
-        schema=schema,  # type: ignore[arg-type]
+        schema=resolved_schema,  # type: ignore[arg-type]
         owner=current_user.email if current_user is not None else None,
         language=record.input.language,
         profile=record.input.learner_profile,
+        packaging=record.input.packaging,
+        accessibility=record.input.accessibility,
+        metadata_settings=metadata_settings,
     )
     return report.to_dict()
 
@@ -227,6 +268,21 @@ async def design_model_outputs(
     document = await service.load(document_id)
     record = await course_service.get_course_record(course_id)
     return design_outputs(document, record.input)
+
+
+@router.get("/{document_id}/companions")
+async def companion_outputs(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """Job-aid / quick-reference / manager-guide content for whichever companion
+    deliverables the brief requested. Built with no AI call; {} when none were requested."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    document = await service.load(document_id)
+    record = await course_service.get_course_record(course_id)
+    return companion_deliverables(document, record.input)
 
 
 @router.post("/{document_id}/export/pdf")
@@ -253,6 +309,46 @@ async def export_pdf(
             "pdf_path": path.as_posix(),
             "size_bytes": path.stat().st_size,
         }
+    return FileResponse(
+        path=str(path),
+        media_type="application/pdf",
+        filename=f"{slugify(document.course_title)}.pdf",
+    )
+
+
+@router.get("/{document_id}/export/pdf/download")
+async def download_exported_pdf(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> FileResponse:
+    """Serve the already-exported PDF (written by `export_pdf` above) as a
+    plain GET, for the frontend to trigger as a native browser download
+    (an `<a href>`/`window.open` navigation) instead of a `fetch().blob()`.
+
+    A real, confirmed bug this exists to work around: this project's own
+    course PDFs run 10+ MB, and `fetch()`'s `.blob()` needs the ENTIRE
+    response body to arrive as one unbroken stream before it resolves - a
+    connection hiccup partway through a large transfer over a local Docker
+    port-forward (seen reproducibly, not just once) throws a bare, generic
+    error client-side even though the server had already finished writing
+    every byte (its own logs show 200 OK every time). A native browser
+    download doesn't have that all-or-nothing requirement - the OS/browser
+    download manager streams straight to disk and is far more resilient to
+    exactly this kind of mid-transfer blip. POST .../export/pdf (above)
+    still does the actual rendering (and still works as a direct download
+    for a caller that doesn't need this extra resilience, e.g. a script);
+    this endpoint only serves what's already on disk, never regenerates it,
+    so GETting it before an export has ever run is a 404, not silent
+    nonsense."""
+    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    path = service.storage.pdf_path(course_id)
+    if not path.exists():
+        from app.core.errors import NotFoundError
+
+        raise NotFoundError("No exported PDF yet for this document - call export/pdf first")
+    document = await service.load(document_id)
     return FileResponse(
         path=str(path),
         media_type="application/pdf",

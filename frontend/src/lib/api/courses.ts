@@ -6,10 +6,12 @@ import type {
   CourseBlueprint,
   CourseDetail,
   CourseInput,
+  CoursePhase,
   CourseRecord,
   CourseReview,
   ImproveTocRequest,
   ImproveTocResponse,
+  QualityReportResponse,
   WorkspaceActivityListResponse,
 } from "@/lib/types/course";
 
@@ -55,6 +57,13 @@ export function approveOutline(courseId: string): Promise<CourseRecord> {
   return request<CourseRecord>(`/api/courses/${courseId}/approve-outline`, { method: "POST" });
 }
 
+/** Content Studio Phase 3/5 - approve one ADDIE phase. */
+export function approvePhase(courseId: string, phase: CoursePhase): Promise<CourseRecord> {
+  return request<CourseRecord>(`/api/courses/${courseId}/phases/${phase}/approve`, {
+    method: "POST",
+  });
+}
+
 export function listCourses(): Promise<CourseListResponse> {
   return request<CourseListResponse>("/api/courses");
 }
@@ -72,6 +81,10 @@ export function improveToc(payload: ImproveTocRequest): Promise<ImproveTocRespon
 
 export function getCourse(courseId: string, signal?: AbortSignal): Promise<CourseDetail> {
   return request<CourseDetail>(`/api/courses/${courseId}`, { signal });
+}
+
+export function getQualityReport(courseId: string): Promise<QualityReportResponse> {
+  return request<QualityReportResponse>(`/api/courses/${courseId}/quality`);
 }
 
 export function getBlueprint(courseId: string): Promise<CourseBlueprint> {

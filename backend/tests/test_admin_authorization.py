@@ -442,6 +442,85 @@ def test_admin_courses_search_filters_pagination_and_detail(admin_client, monkey
     assert body["warnings"] == ["Reviewed by admin test"]
 
 
+def test_admin_course_responses_expose_quality_outcome_from_the_persisted_snapshot(
+    admin_client, monkeypatch
+):
+    """Phase 3 audit follow-up: the admin-schema unit tests in
+    test_quality_outcome_exposure.py call `_to_admin_course_response()`
+    directly - this instead drives the real, authenticated
+    `/admin/courses` and `/admin/courses/{id}` HTTP endpoints against a
+    course whose `metadata_json["quality_snapshot"]` was persisted through
+    the exact same path `CourseService._finalise` writes it through (see
+    `_insert_admin_course`'s `metadata` param), proving the real route
+    handler's metadata extraction - not just the pure function - actually
+    works end to end."""
+    admin_email = _email("quality-outcome-admin")
+    title_prefix = f"Quality Outcome Course {uuid4().hex}"
+    monkeypatch.setenv("INITIAL_ADMIN_EMAIL", admin_email)
+    reset_settings_cache()
+
+    _register(admin_client, admin_email)
+
+    failed = _insert_admin_course(
+        admin_client,
+        title=f"{title_prefix} Failed",
+        status="ready",
+        metadata={
+            "quality_snapshot": {
+                "standards_version": "2026.1",
+                "standards_status": "proposed",
+                "evaluated_at": "2026-01-01T00:00:00Z",
+                "outcome": "failed",
+                "hard_failure_count": 1,
+                "warning_count": 2,
+            }
+        },
+    )
+    passed = _insert_admin_course(
+        admin_client,
+        title=f"{title_prefix} Passed",
+        status="ready",
+        metadata={
+            "quality_snapshot": {
+                "standards_version": "2026.1",
+                "standards_status": "proposed",
+                "evaluated_at": "2026-01-01T00:00:00Z",
+                "outcome": "passed",
+                "hard_failure_count": 0,
+                "warning_count": 0,
+            }
+        },
+    )
+    never_evaluated = _insert_admin_course(
+        admin_client, title=f"{title_prefix} Never Evaluated", status="ready"
+    )
+
+    failed_detail = admin_client.get(f"/admin/courses/{failed['id']}")
+    assert failed_detail.status_code == 200, failed_detail.text
+    assert failed_detail.json()["quality_outcome"] == "failed"
+    # Status is the existing CourseStatus vocabulary, completely
+    # independent of the quality outcome - never repurposed or relabeled.
+    assert failed_detail.json()["status"] == "ready"
+
+    passed_detail = admin_client.get(f"/admin/courses/{passed['id']}")
+    assert passed_detail.status_code == 200, passed_detail.text
+    assert passed_detail.json()["quality_outcome"] == "passed"
+
+    never_evaluated_detail = admin_client.get(f"/admin/courses/{never_evaluated['id']}")
+    assert never_evaluated_detail.status_code == 200, never_evaluated_detail.text
+    assert never_evaluated_detail.json()["quality_outcome"] is None
+
+    # The list endpoint uses the same `_to_admin_course_response` - confirm
+    # it carries the field too, reusing these same three courses rather
+    # than inserting a fourth set.
+    listed = admin_client.get("/admin/courses", params={"search": title_prefix})
+    assert listed.status_code == 200, listed.text
+    outcomes_by_id = {course["id"]: course["quality_outcome"] for course in listed.json()["courses"]}
+    assert outcomes_by_id[failed["id"]] == "failed"
+    assert outcomes_by_id[passed["id"]] == "passed"
+    assert outcomes_by_id[never_evaluated["id"]] is None
+
+
 def test_admin_course_detail_validation(admin_client, monkeypatch):
     admin_email = _email("step5-validation-admin")
     monkeypatch.setenv("INITIAL_ADMIN_EMAIL", admin_email)

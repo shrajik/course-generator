@@ -43,6 +43,21 @@ def test_two_overlapping_node_boxes_are_caught():
     assert any(i.kind == "node_overlap" for i in issues)
 
 
+def test_venn_circles_overlapping_is_exempt_from_node_overlap():
+    """Unlike every other kind, a venn's own circles are SUPPOSED to
+    overlap - that's the entire semantic point of the diagram
+    (app.render.diagram_renderer._layout_venn) - so this kind alone is
+    exempt from the generic overlap check (see validate_rendered_svg's own
+    `if kind != "venn"` guard)."""
+    body = (
+        '<circle class="diagram-box" cx="100" cy="100" r="80"/>'
+        '<circle class="diagram-box" cx="160" cy="100" r="80"/>'
+    )
+    assert validate_rendered_svg(_svg(body=body), kind="venn") == []
+    # The same two circles, any OTHER kind, are still a real overlap bug.
+    assert any(i.kind == "node_overlap" for i in validate_rendered_svg(_svg(body=body), kind="concept_map"))
+
+
 def test_non_overlapping_node_boxes_are_clean():
     body = (
         '<rect class="diagram-box" x="10" y="10" width="100" height="60"/>'
@@ -200,6 +215,23 @@ def test_two_arrowheads_on_different_sides_of_the_same_node_are_clean():
     assert not any(i.kind == "duplicate_arrowhead_side" for i in issues)
 
 
+def test_two_arrowheads_on_the_same_side_but_well_apart_are_clean():
+    """A real, confirmed false positive: this check used to flag ANY two
+    connectors landing on the same categorical side of a box, even when
+    they landed far apart along it (e.g. an ER entity's own attribute
+    ovals fanning out across its top edge - standard notation, not an
+    overlap). Only landings genuinely CLOSE together (see
+    _DUPLICATE_LANDING_TOLERANCE) are a real duplicate; two points 100px
+    apart on the same wide box's top edge are clearly distinguishable."""
+    body = (
+        '<rect class="diagram-box" x="0" y="100" width="300" height="60"/>'
+        '<line x1="50" y1="20" x2="50" y2="100"/>'
+        '<line x1="250" y1="20" x2="250" y2="100"/>'
+    )
+    issues = validate_rendered_svg(_svg(width=400, height=200, body=body))
+    assert not any(i.kind == "duplicate_arrowhead_side" for i in issues)
+
+
 def test_title_text_below_the_14px_floor_after_scaling_is_caught():
     """A flow_chart/process node's own title, rendered small enough that
     once scaled to the page's real display width it drops under the
@@ -253,20 +285,26 @@ def test_edge_label_below_the_12px_floor_after_scaling_is_caught():
     assert any(i.kind == "font_below_minimum" and "edge label" in i.detail for i in issues)
 
 
-def test_font_size_issues_is_scoped_to_flow_chart_and_process_kinds():
-    """A concept_map/hierarchy diagram can legitimately grow wide for
-    benign structural reasons (see MIN_READABLE_PX's own docstring) -
-    this stricter per-role floor only applies when `kind` is
-    "flow_chart"/"process", whose own font-size constants are
-    specifically calibrated to clear it (see LABEL_SIZE's docstring)."""
+def test_font_size_issues_no_longer_applies_to_any_live_kind():
+    """font_size_issues checks the role-specific floors _node_block's box
+    title/subtitle structure used to be calibrated against - flow_chart/
+    process were the only kinds that ever drew that structure, and they no
+    longer do (see app.render.diagram_renderer._layout_ring_process - both
+    now route to the circle-based ring/wheel instead, at their own smaller
+    RING_LABEL_SIZE, covered by readability_issues instead - see
+    validate_rendered_svg's own docstring). This hand-built, rect-based
+    SVG (the shape that check was built for) is never flagged by ANY kind
+    any more - confirming the check is correctly dormant, not silently
+    broken, now that nothing real produces its input shape."""
     body = (
         '<g class="diagram-node"><rect class="diagram-box" x="10" y="10" width="200" height="60"/>'
         '<text x="20" y="40" font-size="15" font-weight="600">A Node Title</text></g>'
     )
     svg_bytes = _svg(width=880, body=body)
-    assert any(i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes, kind="flow_chart"))
-    assert not any(i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes, kind="concept_map"))
-    assert not any(i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes))
+    for kind in ("flow_chart", "process", "concept_map", ""):
+        assert not any(
+            i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes, kind=kind)
+        ), f"kind={kind!r} unexpectedly flagged"
 
 
 # ---------------------------------------------------------------------------
@@ -404,16 +442,26 @@ def test_a_wide_eight_child_hierarchy_has_no_collisions_but_is_flagged_unreadabl
     assert {issue.kind for issue in issues} == {"text_too_small_after_scaling"}
 
 
-def test_an_eight_spoke_concept_map_with_long_labels_renders_clean():
+def test_a_five_spoke_concept_map_with_long_labels_renders_clean():
+    """Was an 8-spoke case - the textbook-style wheel (see
+    app.render.diagram_renderer._layout_concept_wheel) genuinely cannot
+    hold that many spokes cleanly any more: unlike the old box-stack
+    layout (which just grew TALLER for more nodes, leaving canvas WIDTH
+    - and therefore on-page font legibility - unaffected by count), a
+    wheel's own circumference grows with node count, so its canvas grows
+    WIDER, which shrinks the SAME absolute font size once scaled down to
+    the page's real display width. Confirmed empirically: 8 spokes (plus
+    the focal node) measurably fails readability; 5 is comfortably clean.
+    This is also exactly the ceiling the new design brief itself asks
+    for ("don't make more than ~6 nodes; split into multiple diagrams
+    instead") - not an arbitrary number chosen just to make this pass.
+    """
     labels = [
         "Greenhouse gas emissions from fossil fuels",
         "Rising sea levels threaten coastal cities",
         "Extreme weather events increase in frequency",
         "Deforestation reduces carbon absorption capacity",
         "Ocean acidification harms marine ecosystems",
-        "Melting polar ice caps and glaciers",
-        "Biodiversity loss across many ecosystems",
-        "Agricultural disruption and food insecurity",
     ]
     nodes = [DiagramNode(id="c", label="Climate Change", level=0)]
     edges = []
@@ -421,21 +469,289 @@ def test_an_eight_spoke_concept_map_with_long_labels_renders_clean():
         nodes.append(DiagramNode(id=f"n{i}", label=label, level=1))
         edges.append(DiagramEdge(source="c", target=f"n{i}", label="affects" if i % 2 == 0 else "caused by"))
     spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
-    assert validate_rendered_svg(_render(spec)) == []
+    # kind must be passed explicitly here (not left to validate_rendered_svg's
+    # own kind="" default) so readability_issues judges this against
+    # RING_LABEL_SIZE (concept_map's own, smaller wheel-node font size) and
+    # not LABEL_SIZE, the unrelated box-renderer constant it would
+    # otherwise fall back to - see validate_rendered_svg's own docstring.
+    assert validate_rendered_svg(_render(spec), kind="concept_map") == []
 
 
-def test_a_maximum_fourteen_node_flow_chart_renders_clean():
+def test_a_six_node_flow_chart_renders_clean():
+    """Was a 14-node case - the textbook-style ring (see
+    app.render.diagram_renderer._layout_ring_process) has the same
+    circumference-grows-canvas-width-grows-text-shrinks ceiling as the
+    concept wheel (see test_a_five_spoke_concept_map's own docstring for
+    the full explanation) - confirmed empirically clean through 8 nodes
+    with THIS label set, well past the design brief's own "~6 nodes,
+    split into multiple diagrams beyond that" guidance, which 6 already
+    respects. The 14-node ceiling this test used to check belonged to the
+    OLD box-stack renderer (DiagramSpec.max_nodes_for's own 14-node cap
+    for sequential kinds predates this rendering change) - whether that
+    spec-level cap should also come down to match the new rendering is a
+    real, separate follow-up (touches app.schemas.diagram /
+    app.services.diagram_service, not just rendering), not done here.
+    """
     labels = [
-        "User query + goal", "Optional retrieve", "Empty retrieval error", "Prompt assembly",
-        "Decide whether to use a tool", "Deterministic chain LLM", "Agent LLM", "Call tool",
-        "Bad tool parameters error", "Observe tool response", "Parse and return final answer",
-        "Iterate or finish", "Finish", "End",
+        "User query + goal", "Optional retrieve", "Empty retrieval error",
+        "Prompt assembly", "Decide whether to use a tool", "Deterministic chain LLM",
     ]
     nodes = [DiagramNode(id=f"n{i}", label=label) for i, label in enumerate(labels)]
     edges = [DiagramEdge(source=f"n{i - 1}", target=f"n{i}") for i in range(1, len(nodes))]
     spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
-    assert len(nodes) == 14
+    assert len(nodes) == 6
     assert validate_rendered_svg(_render(spec), kind="flow_chart") == []
+
+
+def test_a_five_layer_pyramid_with_long_labels_renders_clean():
+    labels = [
+        "Self-actualization and reaching full potential",
+        "Esteem, respect and recognition from others",
+        "Belonging, friendship and family relationships",
+        "Safety, security and long-term employment",
+        "Physiological needs: food, water and shelter",
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=label) for i, label in enumerate(labels)]
+    spec = DiagramSpec(kind="pyramid", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="pyramid") == []
+
+
+def test_a_four_quadrant_matrix_with_axis_labels_renders_clean():
+    nodes = [
+        DiagramNode(id="n0", label="Quick wins", detail="High impact, low effort - do these first"),
+        DiagramNode(id="n1", label="Major projects", detail="High impact, high effort - plan carefully"),
+        DiagramNode(id="n2", label="Fill-ins", detail="Low impact, low effort - low priority"),
+        DiagramNode(id="n3", label="Thankless tasks", detail="Low impact, high effort - avoid"),
+    ]
+    spec = DiagramSpec(
+        kind="matrix", nodes=nodes, matrix_x_label="Effort", matrix_y_label="Impact",
+        matrix_x_low="Low", matrix_x_high="High", matrix_y_low="Low", matrix_y_high="High",
+    )
+    assert validate_rendered_svg(_render(spec), kind="matrix") == []
+
+
+def test_a_five_branch_radial_mindmap_with_long_labels_renders_clean():
+    """Was a 6-branch case - radial_mindmap has the exact same circumference-
+    grows-canvas-width-grows-text-shrinks ceiling as the ring/wheel (see
+    test_a_five_spoke_concept_map's own docstring for the full explanation);
+    confirmed empirically clean through 5 branches with THIS label length,
+    6 already fails readability. This also matches concept_map's own
+    established "5 is clean, 8 fails" ceiling for the same reason - both
+    kinds place circles on a growing ring."""
+    nodes = [DiagramNode(id="center", label="Launching a New Product", level=0)]
+    for i, label in enumerate([
+        "Market research and competitive analysis",
+        "Product design and feature specification",
+        "Marketing strategy and channel selection",
+        "Pricing model and revenue projections",
+        "Distribution channels and logistics",
+    ]):
+        nodes.append(DiagramNode(id=f"b{i}", label=label))
+    spec = DiagramSpec(kind="radial_mindmap", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="radial_mindmap") == []
+
+
+def test_four_branch_radial_mindmap_is_clean_despite_the_90_degree_box_overlap_trap():
+    """A real, measured bug: at exactly 4 branches (90 degrees apart,
+    starting from the top), two adjacent branch circles' axis-aligned
+    bounding SQUARES touched even though the circles themselves cleared
+    each other with 96px to spare (diagram_render_qa's node_overlap check
+    compares bounding boxes, not true circle distance - see
+    _layout_radial_mindmap's own comment on the sqrt(2) safety factor this
+    fixes). 4 is exactly the worst case for this gap (every other branch
+    count needs proportionally less extra clearance) - a real regression
+    test for the specific count that caught it, not a stand-in."""
+    nodes = [DiagramNode(id="center", label="Launching a New Product", level=0)]
+    for i, label in enumerate([
+        "Market research and competitive analysis",
+        "Product design and feature specification",
+        "Marketing strategy and channel selection",
+        "Pricing model and revenue projections",
+    ]):
+        nodes.append(DiagramNode(id=f"b{i}", label=label))
+    spec = DiagramSpec(kind="radial_mindmap", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="radial_mindmap") == []
+
+
+def test_a_three_circle_venn_with_long_labels_renders_clean():
+    nodes = [
+        DiagramNode(id="a", label="Mammals", detail="Warm-blooded, give live birth, have fur"),
+        DiagramNode(id="b", label="Birds", detail="Feathers, beaks, lay eggs"),
+        DiagramNode(id="c", label="Reptiles", detail="Cold-blooded, scales, lay eggs"),
+    ]
+    edges = [
+        DiagramEdge(source="a", target="b", label="Both can be warm-blooded (endothermic)"),
+        DiagramEdge(source="b", target="c", label="Both lay eggs"),
+    ]
+    spec = DiagramSpec(kind="venn", nodes=nodes, edges=edges)
+    assert validate_rendered_svg(_render(spec), kind="venn") == []
+
+
+def test_a_four_step_chevron_process_renders_clean():
+    """chevron_process has the same circumference/row-grows-canvas-width-
+    grows-text-shrinks ceiling as the ring/wheel (see
+    test_a_five_spoke_concept_map's own docstring) - confirmed empirically
+    clean through 4 steps with labels matching the writer prompt's own
+    "2-6 words" node-label convention (this kind's own guidance caps it at
+    3-6 steps in the first place, a short strip by design)."""
+    labels = ["Market Research", "Product Design", "Development", "Go-to-Market"]
+    nodes = [
+        DiagramNode(id=f"n{i}", label=label, detail="A short supporting detail for this phase.")
+        for i, label in enumerate(labels)
+    ]
+    spec = DiagramSpec(kind="chevron_process", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="chevron_process") == []
+
+
+def test_a_six_milestone_timeline_with_long_labels_renders_clean():
+    labels = [
+        "1991 - First public release of Python",
+        "2000 - Python 2.0 adds list comprehensions",
+        "2008 - Python 3.0 major redesign",
+        "2015 - Type hints introduced in Python 3.5",
+        "2020 - Python 2 officially reaches end of life",
+        "2023 - Python 3.12 performance improvements",
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=label) for i, label in enumerate(labels)]
+    spec = DiagramSpec(kind="timeline", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="timeline") == []
+
+
+def test_a_five_step_staircase_process_renders_clean():
+    labels = ["Beginner", "Intermediate", "Advanced", "Expert", "Master"]
+    nodes = [
+        DiagramNode(id=f"n{i}", label=label, detail="A short supporting detail for this level.")
+        for i, label in enumerate(labels)
+    ]
+    spec = DiagramSpec(kind="staircase_process", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="staircase_process") == []
+
+
+def test_a_cost_value_balance_comparison_with_long_detail_renders_clean():
+    nodes = [
+        DiagramNode(id="n0", label="Variable costs", detail="Scale directly with usage - cloud compute, API calls, storage."),
+        DiagramNode(id="n1", label="Fixed costs", detail="Flat monthly spend regardless of usage - licensing and hosting."),
+        DiagramNode(id="n2", label="Value for the client", detail="Faster delivery, fewer errors, measurable return on investment."),
+        DiagramNode(id="n3", label="Value for us", detail="Recurring revenue, a strong case study, referral potential."),
+    ]
+    spec = DiagramSpec(
+        kind="balance_comparison", balance_left_label="Cost", balance_right_label="Value", nodes=nodes,
+    )
+    assert validate_rendered_svg(_render(spec), kind="balance_comparison") == []
+
+
+def test_a_four_ring_nested_circles_renders_clean():
+    labels = ["Vision", "Mission", "Strategy", "Tactics"]
+    nodes = [
+        DiagramNode(id=f"n{i}", label=label, detail="A short supporting detail for this scope.")
+        for i, label in enumerate(labels)
+    ]
+    spec = DiagramSpec(kind="nested_circles", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="nested_circles") == []
+
+
+def test_a_dense_six_node_network_mesh_renders_clean():
+    """A real, confirmed bug: a straight chord between two non-adjacent
+    nodes on the circle cut through nodes positioned between them (this
+    exact 6-node/9-edge topology measured 200+ node-crossing hits before
+    the fix - see _layout_network_mesh's own comment on the outward-bow +
+    boundary-pullback fix). This is the regression test for exactly that
+    dense case."""
+    labels = [
+        "API Gateway", "Auth Service", "User Service", "Order Service", "Payment Service", "Notification Service",
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=label) for i, label in enumerate(labels)]
+    pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3), (3, 4), (4, 5), (1, 4), (2, 5)]
+    edges = [DiagramEdge(source=f"n{a}", target=f"n{b}") for a, b in pairs]
+    spec = DiagramSpec(kind="network_mesh", nodes=nodes, edges=edges)
+    assert validate_rendered_svg(_render(spec), kind="network_mesh") == []
+
+
+def test_a_three_level_decision_tree_renders_clean():
+    nodes = [
+        DiagramNode(id="root", label="Is it causing bugs?", level=0),
+        DiagramNode(id="q2", label="Is it slowing the team?", level=1),
+        DiagramNode(id="refactor", label="Refactor now", level=1),
+        DiagramNode(id="q3", label="Is a deadline close?", level=2),
+        DiagramNode(id="monitor", label="Monitor and revisit", level=2),
+        DiagramNode(id="wait", label="Wait, refactor after release", level=3),
+        DiagramNode(id="refactor2", label="Refactor this sprint", level=3),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="q2", label="No"),
+        DiagramEdge(source="root", target="refactor", label="Yes"),
+        DiagramEdge(source="q2", target="q3", label="Yes"),
+        DiagramEdge(source="q2", target="monitor", label="No"),
+        DiagramEdge(source="q3", target="wait", label="Yes"),
+        DiagramEdge(source="q3", target="refactor2", label="No"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", nodes=nodes, edges=edges)
+    assert validate_rendered_svg(_render(spec), kind="decision_tree") == []
+
+
+def test_a_four_category_fishbone_renders_clean():
+    nodes = [
+        DiagramNode(id="head", label="Production Outage"),
+        DiagramNode(id="people", label="People", detail="Insufficient on-call training; unclear escalation path"),
+        DiagramNode(id="process", label="Process", detail="No pre-deploy checklist; skipped code review"),
+        DiagramNode(id="tech", label="Technology", detail="Unpatched dependency; no circuit breaker"),
+        DiagramNode(id="env", label="Environment", detail="Config drift between staging and prod"),
+    ]
+    spec = DiagramSpec(kind="fishbone", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="fishbone") == []
+
+
+def test_fishbone_same_row_categories_never_overlap_with_long_category_names():
+    """A real, confirmed bug: evenly dividing a FIXED spine length by
+    category count let two SAME-ROW categories (2 attach-slots apart, not
+    1) overlap once their real box widths grew past the generic minimum -
+    see _layout_fishbone's own comment on the fix (the spine's own length
+    now grows to guarantee clearance instead). Deliberately long category
+    names here to actually exercise that growth path; only checked against
+    the geometry issues this test is actually about (overlap/crossing) -
+    readability-at-scale is this kind's own separate, expected ceiling
+    (see test_a_four_category_fishbone_renders_clean for that, with
+    realistic category-name lengths instead of this test's deliberately
+    long ones)."""
+    nodes = [
+        DiagramNode(id="head", label="System Failure"),
+        DiagramNode(id="a", label="Infrastructure and Networking"),
+        DiagramNode(id="b", label="Application Configuration"),
+        DiagramNode(id="c", label="Third Party Dependencies"),
+        DiagramNode(id="d", label="Monitoring and Alerting"),
+    ]
+    spec = DiagramSpec(kind="fishbone", nodes=nodes)
+    issues = validate_rendered_svg(_render(spec), kind="fishbone")
+    assert not [i for i in issues if i.kind in ("node_overlap", "edge_crosses_node")]
+
+
+def test_a_seven_layer_osi_stack_renders_clean():
+    labels = [
+        "Application Layer", "Presentation Layer", "Session Layer", "Transport Layer",
+        "Network Layer", "Data Link Layer", "Physical Layer",
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=label) for i, label in enumerate(labels)]
+    spec = DiagramSpec(kind="layered_diagram", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="layered_diagram") == []
+
+
+def test_a_five_task_gantt_chart_renders_clean():
+    """A real, confirmed false positive: gantt_chart's own tick gridlines
+    are decorative <line> elements deliberately drawn full-height, behind
+    every task bar (the standard Gantt reference-grid convention) - the
+    generic edge_crosses_node/border_collinear_issues checks previously
+    flagged ~40 issues against this intentional geometry before both call
+    sites gained a gantt_chart exemption (see validate_rendered_svg's own
+    comments on each). This is the regression test for that fix."""
+    nodes = [
+        DiagramNode(id="n0", label="Research", gantt_start=0, gantt_duration=2),
+        DiagramNode(id="n1", label="Design", gantt_start=1, gantt_duration=2),
+        DiagramNode(id="n2", label="Development", gantt_start=3, gantt_duration=4),
+        DiagramNode(id="n3", label="Testing", gantt_start=6, gantt_duration=2),
+        DiagramNode(id="n4", label="Launch", gantt_start=8, gantt_duration=1),
+    ]
+    spec = DiagramSpec(kind="gantt_chart", nodes=nodes)
+    assert validate_rendered_svg(_render(spec), kind="gantt_chart") == []
 
 
 # ---------------------------------------------------------------------------

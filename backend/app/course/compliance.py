@@ -24,9 +24,24 @@ from app.course.pedagogy import ARCHETYPES, BANNED_OBJECTIVE_VERBS
 from app.schemas.blocks import BlockType
 from app.schemas.document import Block, CourseDocument
 from app.schemas.learner import AGE_GROUP_LABELS, LearnerProfile
+from app.schemas.standards import (
+    ACCESSIBILITY_TARGET_LABELS,
+    AUTHORING_TOOL_LABELS,
+    EXTRA_ACCESSIBILITY_LABELS,
+    PACKAGING_STANDARD_LABELS,
+    AccessibilitySettings,
+    AccessibilityTarget,
+    ExtraAccessibilityRequirement,
+    MetadataSchema,
+    MetadataSettings,
+    PackagingSettings,
+)
 
 Status = Literal["pass", "fail", "review"]
-MetadataSchema = Literal["lom", "dublin_core"]
+# MetadataSchema's real definition now lives in app.schemas.standards
+# (alongside AccessibilitySettings/MetadataSettings, which need it too) -
+# imported above, which already re-exports it for any existing importer
+# doing `from app.course.compliance import MetadataSchema`.
 
 COMPLIANCE_TARGET = "WCAG 2.1/2.2 AA"
 READING_WORDS_PER_MINUTE = 200
@@ -196,7 +211,11 @@ def contrast_ratio(foreground: str, background: str) -> float | None:
 # --- accessibility -----------------------------------------------------------
 
 
-def _accessibility(document: CourseDocument) -> tuple[list[AccessibilityFlag], list[AssetRequirement]]:
+def _accessibility(
+    document: CourseDocument,
+    extra: list[ExtraAccessibilityRequirement] | None = None,
+    brand_colors: list[str] | None = None,
+) -> tuple[list[AccessibilityFlag], list[AssetRequirement]]:
     flags: list[AccessibilityFlag] = []
     assets: list[AssetRequirement] = []
 
@@ -271,6 +290,25 @@ def _accessibility(document: CourseDocument) -> tuple[list[AccessibilityFlag], l
                 )
             )
 
+    # Content Studio Phase 2 - additional brand colours the creator wants
+    # checked, beyond the document's own theme colours above. Checked
+    # against white (the common case: a logo/brand colour used as text on a
+    # white page/slide) via the SAME contrast_ratio() the theme check uses -
+    # a minimum ratio of 4.5:1 ("fails text" in the UI's own language) rather
+    # than treating every brand colour as decorative/large text, since that
+    # is the stricter, safer default when the actual usage isn't known.
+    for colour in brand_colors or []:
+        ratio = contrast_ratio(colour, "#ffffff")
+        if ratio is not None and ratio < 4.5:
+            flags.append(
+                AccessibilityFlag(
+                    "Color/contrast",
+                    "fail",
+                    f"Brand colour {colour} on white is {ratio:.1f}:1; 4.5:1 is required for text "
+                    "(it may still be usable for decoration or large text).",
+                )
+            )
+
     flags.append(
         AccessibilityFlag(
             "PDF",
@@ -279,14 +317,48 @@ def _accessibility(document: CourseDocument) -> tuple[list[AccessibilityFlag], l
             "generation; flag for technical remediation before publishing.",
         )
     )
+    # Content Studio Phase 2 - additional regulatory requirements the
+    # creator selected. "pdf_ua" is deliberately excluded here - it's
+    # already unconditionally flagged above regardless of this selection,
+    # so including it too would duplicate that same flag.
+    for requirement in extra or []:
+        if requirement == "pdf_ua":
+            continue
+        flags.append(
+            AccessibilityFlag(
+                "Regulatory",
+                "review",
+                f"{EXTRA_ACCESSIBILITY_LABELS[requirement]} cannot be fully verified by content "
+                "generation; confirm with the responsible team before publishing.",
+            )
+        )
     return flags, assets
+
+
+# --- packaging (Content Studio Phase 1) ---------------------------------------
+
+
+def _packaging_label(packaging: PackagingSettings | None) -> str:
+    """'xAPI via Articulate Storyline' (authoring tool appended when set), or
+    'none' when no packaging standard is selected - the one shared fragment
+    the Course Technology QA check and the metadata Source field each wrap
+    in their own existing sentence, so both describe the same real choice."""
+    if packaging is None or packaging.standard is None:
+        return "none"
+    label = PACKAGING_STANDARD_LABELS[packaging.standard]
+    if packaging.authoring_tool is not None:
+        label = f"{label} via {AUTHORING_TOOL_LABELS[packaging.authoring_tool]}"
+    return label
 
 
 # --- QA checks ---------------------------------------------------------------
 
 
 def _qa_checks(
-    document: CourseDocument, chapters: list[_Chapter], flags: list[AccessibilityFlag]
+    document: CourseDocument,
+    chapters: list[_Chapter],
+    flags: list[AccessibilityFlag],
+    packaging: PackagingSettings | None = None,
 ) -> list[Check]:
     checks: list[Check] = []
 
@@ -361,10 +433,25 @@ def _qa_checks(
         f"Only passive reading in {names(passive)}." if passive
         else "Every chapter includes active practice.")
 
-    # 6. Course technology: we can build it, but no packaging standard exists yet.
-    add(6, *_QA_DEFINITIONS[5], "review",
-        "Delivered as an editable course document and PDF. No LMS packaging standard "
-        "(SCORM, xAPI, cmi5) is selected or exportable yet.")
+    # 6. Course technology: we can build it, but there's no real export for
+    # whatever packaging standard is chosen yet (see PackagingSettings' own
+    # docstring - this phase only records the choice, never exports it).
+    packaging_label = _packaging_label(packaging)
+    if packaging_label == "none":
+        tech_note = (
+            "Delivered as an editable course document and PDF. No LMS packaging standard "
+            "(SCORM, xAPI, cmi5) is selected or exportable yet."
+        )
+    else:
+        tech_note = f"Delivered as an editable course document and PDF. Packaged for {packaging_label}."
+        if packaging.track_beyond_lms:  # type: ignore[union-attr]  # packaging is not None here
+            tech_note += (
+                " LRS confirmed."
+                if packaging.lrs_confirmed  # type: ignore[union-attr]
+                else " Off-LMS tracking requested; delivery to a Learning Record Store is not "
+                "yet confirmed."
+            )
+    add(6, *_QA_DEFINITIONS[5], "review", tech_note)
 
     # 7. Learner support
     everything = " ".join(_text(b) for _, b in document.iter_blocks())
@@ -421,6 +508,8 @@ def _metadata(
     language: str,
     profile: LearnerProfile | None,
     now: str,
+    packaging: PackagingSettings | None = None,
+    tagging_conventions: str = "",
 ) -> dict[str, Any]:
     total_words = sum(_words(_text(b)) for _, b in document.iter_blocks())
     minutes = max(1, round(total_words / READING_WORDS_PER_MINUTE))
@@ -433,7 +522,12 @@ def _metadata(
         else "No third-party media detected."
     )
     model = ARCHETYPES[profile.age_group].instructional_model if profile else "not specified"
-    source = f"Instructional model: {model}. Packaging standard: none (PDF / editable course document)."
+    packaging_label = _packaging_label(packaging)
+    source = (
+        f"Instructional model: {model}. Packaging standard: none (PDF / editable course document)."
+        if packaging_label == "none"
+        else f"Instructional model: {model}. Packaging standard: {packaging_label}."
+    )
     description = (
         f"{document.course_title}: a {len(chapters)}-chapter course"
         + (f" for {AGE_GROUP_LABELS[profile.age_group].lower()}." if profile else ".")
@@ -476,6 +570,10 @@ def _metadata(
             "Last generated": now,
             "Owner/requester": owner or "not recorded",
             "Source standard": source,
+            # Content Studio Phase 2 - additive key, never replaces anything
+            # above, so a report built before this field existed is still a
+            # strict subset of one built after.
+            "Organisation tagging conventions": tagging_conventions.strip() or "not recorded",
         }
     )
     return core
@@ -492,11 +590,30 @@ def build_report(
     language: str = "en",
     profile: LearnerProfile | None = None,
     now: str | None = None,
+    packaging: PackagingSettings | None = None,
+    accessibility: AccessibilitySettings | None = None,
+    metadata_settings: MetadataSettings | None = None,
 ) -> ComplianceReport:
     stamp = now or datetime.now(timezone.utc).isoformat(timespec="seconds")
     chapters = _chapters(document)
-    flags, assets = _accessibility(document)
-    checks = _qa_checks(document, chapters, flags)
+    flags, assets = _accessibility(
+        document,
+        extra=accessibility.extra_requirements if accessibility else None,
+        brand_colors=accessibility.brand_colors if accessibility else None,
+    )
+    checks = _qa_checks(document, chapters, flags, packaging)
+
+    # An explicit owner/requester (Content Studio Phase 2) wins over whichever
+    # user happens to be signed in when the report is requested - `owner`
+    # keeps its pre-existing "signed-in user" meaning when no override is set.
+    resolved_owner = (
+        metadata_settings.owner_override.strip()
+        if metadata_settings and metadata_settings.owner_override.strip()
+        else owner
+    )
+    resolved_target = (
+        ACCESSIBILITY_TARGET_LABELS[accessibility.compliance_target] if accessibility else COMPLIANCE_TARGET
+    )
 
     unresolved = [f"{check.name}: {check.note}" for check in checks if check.status != "pass"]
     return ComplianceReport(
@@ -506,10 +623,13 @@ def build_report(
         qa_checks=checks,
         unresolved_flags=unresolved,
         accessibility_flags=flags,
+        accessibility_target=resolved_target,
         asset_requirements=assets,
         metadata_schema=schema,
         metadata=_metadata(
-            document, chapters, schema, owner=owner, language=language, profile=profile, now=stamp
+            document, chapters, schema, owner=resolved_owner, language=language, profile=profile, now=stamp,
+            packaging=packaging,
+            tagging_conventions=metadata_settings.tagging_conventions if metadata_settings else "",
         ),
     )
 

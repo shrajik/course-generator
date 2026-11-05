@@ -59,3 +59,35 @@ class CodeExecutionUnavailableError(CourseCreatorError):
 
     status_code = 503
     code = "code_execution_unavailable"
+
+
+class IncompleteChapterInventoryError(ConflictError):
+    """Raised by `submit_for_review`/`approve_course` (and their override
+    paths) when a course's blueprint-expected chapter set
+    (`CourseRecord.chapters`) is not fully present and loadable on disk -
+    distinct from `QualityApprovalBlockedError` (a complete course with a
+    real quality finding) and from `QualityEvaluationFailedError` (the
+    report computation itself crashing). See
+    `StorageService.verify_chapter_inventory`."""
+
+    code = "incomplete_chapter_inventory"
+
+
+class QualityApprovalBlockedError(ConflictError):
+    """Raised by `approve_course` when the course's quality report contains
+    at least one hard failure whose `verification_status` is not
+    "unverified" (see the approval predicate in
+    app.services.quality_framework) - a confirmed or verification-failed
+    blocker, never a merely-unverified reviewer-model opinion."""
+
+    code = "quality_approval_blocked"
+
+
+class QualityEvaluationFailedError(CourseCreatorError):
+    """Raised when the quality-report computation itself crashed while
+    evaluating a course for approval - distinct from a complete report that
+    contains a real finding. Never implies the course is clean or that any
+    specific finding is true or false."""
+
+    status_code = 500
+    code = "quality_evaluation_failed"

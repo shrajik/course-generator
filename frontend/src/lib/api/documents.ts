@@ -1,10 +1,12 @@
-import { apiUrl, request, requestBlob } from "./client";
+import { apiUrl, request } from "./client";
 import type {
   AiEditRequest,
   AiEditResponse,
   ConceptVisualSpec,
   CourseDocument,
+  FlowchartSpec,
   UpdateConceptVisualSpecResponse,
+  VisualSpecPreviewResponse,
 } from "@/lib/types/document";
 
 export function getDocument(documentId: string, signal?: AbortSignal): Promise<CourseDocument> {
@@ -68,6 +70,22 @@ export function getDesignOutputs(documentId: string): Promise<DesignOutputs> {
   return request<DesignOutputs>(`/api/documents/${documentId}/design-outputs`);
 }
 
+/** Companion-deliverable content (job aid, quick-reference card, manager
+ * guide) for whichever were requested in the brief. */
+export type CompanionDeliverables = {
+  job_aid?: { title: string; sections: { chapter: string; checklist: string[]; watch_outs: string[] }[] };
+  quick_ref?: { title: string; sections: { chapter: string; key_points: string[] }[] };
+  manager_guide?: {
+    title: string;
+    note: string;
+    sections: { chapter: string; coaching_prompts: string[]; scenario_notes: string[] }[];
+  };
+};
+
+export function getCompanionDeliverables(documentId: string): Promise<CompanionDeliverables> {
+  return request<CompanionDeliverables>(`/api/documents/${documentId}/companions`);
+}
+
 export function getCourseDocument(courseId: string): Promise<CourseDocument> {
   return request<CourseDocument>(`/api/courses/${courseId}/document`);
 }
@@ -111,9 +129,66 @@ export function updateConceptVisualSpec(
   );
 }
 
-/** The backend renders the PDF (HTML -> CSS -> Playwright). We only download it. */
-export function exportPdf(documentId: string): Promise<Blob> {
-  return requestBlob(`/api/documents/${documentId}/export/pdf`, { method: "POST" });
+/** Edit Visuals (flowchart editor) - fix a node/edge/label/color inside a
+ * flow_chart/process/etc. diagram and get back the re-rendered block. No AI
+ * call; same PUT endpoint `updateConceptVisualSpec` already hits, since the
+ * request/response shape was never kind-specific - this is the same call
+ * under the clearer name the flowchart editor uses. */
+export function updateDiagramSpec(
+  documentId: string,
+  blockId: string,
+  spec: FlowchartSpec,
+): Promise<UpdateConceptVisualSpecResponse> {
+  return request<UpdateConceptVisualSpecResponse>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec`,
+    { method: "PUT", body: { spec } },
+  );
+}
+
+/** Renders a draft spec exactly as Save would, without persisting anything -
+ * the live-preview call the flowchart/concept editor makes on every edit
+ * (debounce this client-side). */
+export function previewVisualSpec(
+  documentId: string,
+  blockId: string,
+  spec: FlowchartSpec | ConceptVisualSpec,
+): Promise<VisualSpecPreviewResponse> {
+  return request<VisualSpecPreviewResponse>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec/preview`,
+    { method: "POST", body: { spec } },
+  );
+}
+
+/** For a diagram block generated before spec persistence existed: one AI
+ * call reconstructing a real, editable spec from the block's own stored
+ * brief - never auto-saved, the editor seeds itself from the result. */
+export function reconstructDiagramSpec(documentId: string, blockId: string): Promise<FlowchartSpec> {
+  return request<FlowchartSpec>(
+    `/api/documents/${documentId}/blocks/${blockId}/visual-spec/reconstruct`,
+    { method: "POST" },
+  );
+}
+
+/** Triggers the render without transferring the PDF body - a small JSON
+ * response (`{ size_bytes, ... }`), reliable even for a 10+ MB course where
+ * downloading the body straight through `fetch()` can have its connection
+ * drop mid-transfer (CourseEditor's handleExport pairs this with
+ * `exportedPdfDownloadUrl` below for a native, far-more-resilient browser
+ * download instead of buffering the whole file through JS). */
+export function generateExportedPdf(documentId: string): Promise<{ size_bytes: number }> {
+  return request(`/api/documents/${documentId}/export/pdf`, {
+    method: "POST",
+    query: { download: false },
+  });
+}
+
+/** The already-exported PDF (see generateExportedPdf, which must be called
+ * first - this never regenerates it) as a plain GET URL, meant for a
+ * native browser download (an `<a href>` click/`window.open`), not fetch -
+ * the OS/browser download manager streams straight to disk and tolerates a
+ * mid-transfer connection hiccup fetch().blob() cannot. */
+export function exportedPdfDownloadUrl(documentId: string): string {
+  return apiUrl(`/api/documents/${documentId}/export/pdf/download`);
 }
 
 /** API-relative path for a document-relative asset such as "assets/image_001.png". */

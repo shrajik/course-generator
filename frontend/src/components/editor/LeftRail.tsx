@@ -5,6 +5,7 @@ import {
   Blocks,
   Image as ImageIcon,
   LayoutGrid,
+  ShieldCheck,
   Shapes,
   Type,
   Upload,
@@ -12,7 +13,7 @@ import {
 import { useEditor } from "@/lib/editor/store";
 import { cn } from "@/lib/utils/cn";
 
-export type RailPanel = "pages" | "blocks" | "uploads" | "sources";
+export type RailPanel = "pages" | "blocks" | "uploads" | "sources" | "quality";
 
 interface LeftRailProps {
   panel: RailPanel;
@@ -72,6 +73,13 @@ export function LeftRail({ panel, onPanelChange }: LeftRailProps) {
       Icon: BookMarked,
       active: panel === "sources",
       onClick: () => onPanelChange("sources"),
+    },
+    {
+      id: "quality",
+      label: "Quality",
+      Icon: ShieldCheck,
+      active: panel === "quality",
+      onClick: () => onPanelChange("quality"),
     },
   ];
 

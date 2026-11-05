@@ -11,7 +11,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from app.api.course_authorization import get_course_for_author_action, get_owned_course
-from app.api.dependencies import get_current_user, get_current_user_if_db_enabled, require_roles
+from app.api.dependencies import (
+    get_current_admin,
+    get_current_user,
+    get_current_user_if_db_enabled,
+    require_roles,
+)
 from app.core.errors import NotFoundError, ValidationFailedError
 from app.core.logging import get_logger
 from app.core.generation_stream import get_stream_hub
@@ -37,6 +42,7 @@ from app.schemas.course import (
     ApproveCourseRequest,
     CourseActivityListResponse,
     CourseInput,
+    CoursePhase,
     CourseRecord,
     CourseReviewResponse,
     CreateCourseRequest,
@@ -44,6 +50,7 @@ from app.schemas.course import (
     GenerateResponse,
     ImproveTocRequest,
     ImproveTocResponse,
+    OverrideApprovalRequest,
     RequestChangesRequest,
 )
 from app.schemas.document import CourseDocument
@@ -352,8 +359,15 @@ async def review_brief(
     where the open findings are. Built from the saved course, with no AI call."""
     record = await get_owned_course(course_id, current_user, service)
     document = await documents.load(record.document_id)
+    metadata_settings = record.input.metadata
     compliance = build_report(
-        document, language=record.input.language, profile=record.input.learner_profile
+        document,
+        schema=(metadata_settings.schema_preference if metadata_settings else None) or "lom",  # type: ignore[arg-type]
+        language=record.input.language,
+        profile=record.input.learner_profile,
+        packaging=record.input.packaging,
+        accessibility=record.input.accessibility,
+        metadata_settings=metadata_settings,
     )
     return build_review_brief(
         document=document,
@@ -377,6 +391,25 @@ async def approve_outline(
     record = await service.approve_outline(course_id, actor)
     if current_user is not None:
         await service.record_activity(course_id, actor, current_user.email, "outline_approved")
+    return record
+
+
+@router.post("/{course_id}/phases/{phase}/approve", response_model=CourseRecord)
+async def approve_phase(
+    course_id: str,
+    phase: CoursePhase,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> CourseRecord:
+    """Content Studio Phase 3: sign off one ADDIE phase so the next may
+    proceed - only active for a course whose design_models selected
+    "addie" without "sam" at creation time. Author (or admin) only, same
+    authorization as `approve-outline`."""
+    await get_course_for_author_action(course_id, current_user, service)
+    actor = str(current_user.id) if current_user is not None else None
+    record = await service.approve_phase(course_id, phase, actor)
+    if current_user is not None:
+        await service.record_activity(course_id, actor, current_user.email, f"phase_approved:{phase}")
     return record
 
 
@@ -469,6 +502,36 @@ async def get_course_document(
     """The source of truth for this course."""
     await get_owned_course(course_id, current_user, service)
     return await service.load_document(course_id)
+
+
+@router.get("/{course_id}/quality")
+async def get_course_quality_report(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """MOM Phase 9/10 - the unified quality report (app.services.quality_framework),
+    computed on demand from already-persisted data (no AI calls). Same owner
+    gate as the document/chapters endpoints above - this is course-detail
+    information for whoever can already see the course, not admin-only
+    (provider/model metadata is the thing that stays admin-only, via
+    app.api.admin's own model-usage endpoint).
+
+    Returns both the LIVE report (`report`, always freshly recomputed from
+    current data) and `historical_snapshot` (TASK 2, quality audit follow-up)
+    - the audit-trail record saved at the moment generation last finished,
+    which can legitimately differ from the live report if the document was
+    hand-edited since, or if QUALITY_STANDARDS_VERSION has changed. `null`
+    when the course has never finished generating, or its evaluation failed
+    at that time - never fabricated to match the live report."""
+    record = await get_owned_course(course_id, current_user, service)
+    report = await service.get_quality_report(course_id)
+    return {
+        "report": report.model_dump(mode="json"),
+        "historical_snapshot": (
+            record.quality_snapshot.model_dump(mode="json") if record.quality_snapshot else None
+        ),
+    }
 
 
 @router.get("/{course_id}/chapters/{chapter_id}")
@@ -579,6 +642,114 @@ async def approve_course(
     record = await service.approve_course(course_id, str(current_user.id), comment)
     await service.record_activity(
         course_id, str(current_user.id), current_user.email, "approved", comment
+    )
+    return _to_review_response(record)
+
+
+def _override_activity_message(action: str, comment: str) -> str:
+    return f"[{action}] {comment}"
+
+
+@router.post("/{course_id}/approve/override/blockers", response_model=CourseReviewResponse)
+async def override_approve_blockers(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve past CONFIRMED (independently-verified) blocking
+    quality findings. Lifts only that one gate - the course must still be
+    `in_review` and have a complete, readable chapter inventory, and any
+    verification-failed or whole-report-evaluation-failure blocker still
+    stops this path (use the matching override for those instead)."""
+    record = await service.approve_course_override_blockers(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_blockers", request.comment),
+    )
+    return _to_review_response(record)
+
+
+@router.post(
+    "/{course_id}/approve/override/verification-failed", response_model=CourseReviewResponse
+)
+async def override_approve_verification_failed(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve past a blocker whose own verifier failed to run
+    (uncertainty, never a confirmed defect - see QualityFinding.verification_error).
+    Every other gate (inventory, confirmed blockers, evaluation failure)
+    still applies normally."""
+    record = await service.approve_course_override_verification_failed(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_verification_failed", request.comment),
+    )
+    return _to_review_response(record)
+
+
+@router.post(
+    "/{course_id}/approve/override/evaluation-failure", response_model=CourseReviewResponse
+)
+async def override_approve_evaluation_failure(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve a course whose quality-report COMPUTATION itself
+    crashed (distinct from a complete report with a real finding - see
+    QualityEvaluationFailedError). Every other gate still applies."""
+    record = await service.approve_course_override_evaluation_failure(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_evaluation_failure", request.comment),
+    )
+    return _to_review_response(record)
+
+
+@router.post(
+    "/{course_id}/approve/override/incomplete-chapters", response_model=CourseReviewResponse
+)
+async def override_approve_incomplete_chapters(
+    course_id: str,
+    request: OverrideApprovalRequest,
+    service: CourseService = Depends(_service),
+    current_user: User = Depends(get_current_admin),
+) -> CourseReviewResponse:
+    """Admin-only: approve a course with a missing/unreadable expected
+    chapter (see StorageService.verify_chapter_inventory). Does NOT
+    implicitly authorize approving a course whose generation lifecycle is
+    otherwise incomplete - every other gate (confirmed blockers,
+    verification failure, evaluation failure) still applies to whatever
+    content IS readable."""
+    record = await service.approve_course_override_incomplete_chapters(
+        course_id, str(current_user.id), request.comment
+    )
+    await service.record_activity(
+        course_id,
+        str(current_user.id),
+        current_user.email,
+        "approved",
+        _override_activity_message("override_approved_incomplete_chapters", request.comment),
     )
     return _to_review_response(record)
 

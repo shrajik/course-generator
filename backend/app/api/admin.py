@@ -18,13 +18,16 @@ from app.schemas.admin import (
     AdminCourseListResponse,
     AdminCourseResponse,
     AdminDashboardResponse,
+    AdminModelUsageResponse,
     AdminUserListResponse,
     AdminUserResponse,
+    ModelUsageRecord,
     UpdateUserStatusRequest,
     UpdateUserRoleRequest,
     UserRole,
 )
 from app.schemas.course import CourseStatus
+from app.services.course_service import CourseService, get_course_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -168,6 +171,37 @@ async def admin_course_detail(
         return _to_admin_course_response(course)
 
 
+# --- AI model usage (MOM Phase 2.2/2.3) ---------------------------------------
+# Admin-only, enforced here (`get_current_admin`) rather than left to the
+# frontend to hide - a non-admin calling this endpoint directly still gets
+# 403. Separate from GET /api/courses/{id}/runs (owner-or-admin), which
+# deliberately never exposes payload_json internals - see GenerationRunEntry.
+
+
+@router.get("/courses/{course_id}/model-usage", response_model=AdminModelUsageResponse)
+async def admin_course_model_usage(
+    course_id: str,
+    current_admin: User = Depends(get_current_admin),
+    service: CourseService = Depends(get_course_service),
+) -> AdminModelUsageResponse:
+    """The full per-call AI model usage (provider/model/purpose/tokens/
+    retries/fallback) for this course's most recent generation run - see
+    CallRecord/CourseService._finalise. `calls` is empty (not missing) when
+    a run exists but made no real AI calls (e.g. a resume with nothing left
+    to generate); the whole response is still returned with `job_id=None`
+    only when NO run has ever been recorded for this course at all."""
+    usage = await service.get_latest_model_usage(course_id)
+    if usage is None:
+        return AdminModelUsageResponse(course_id=course_id)
+    return AdminModelUsageResponse(
+        course_id=course_id,
+        job_id=usage["job_id"],
+        run_state=usage["state"],
+        run_created_at=usage["created_at"],
+        calls=[ModelUsageRecord.model_validate(call) for call in usage["model_usage"]],
+    )
+
+
 def _to_admin_user_response(user: User) -> AdminUserResponse:
     return AdminUserResponse(
         id=user.id,
@@ -191,6 +225,12 @@ def _to_admin_course_response(course: Course) -> AdminCourseResponse:
     run_state = run.get("state") if isinstance(run, dict) and isinstance(run.get("state"), str) else None
     chapters = metadata.get("chapters")
     warnings = metadata.get("warnings")
+    quality_snapshot = metadata.get("quality_snapshot")
+    quality_outcome = (
+        quality_snapshot.get("outcome")
+        if isinstance(quality_snapshot, dict) and quality_snapshot.get("outcome") in ("passed", "failed")
+        else None
+    )
     return AdminCourseResponse(
         id=course.id,
         course_id=course.course_id,
@@ -208,6 +248,7 @@ def _to_admin_course_response(course: Course) -> AdminCourseResponse:
         has_document=bool(metadata.get("has_document")),
         last_error=metadata.get("last_error") if isinstance(metadata.get("last_error"), str) else None,
         warnings=warnings if isinstance(warnings, list) else [],
+        quality_outcome=quality_outcome,
         run_state=run_state,
         metadata=metadata,
         created_at=course.created_at,

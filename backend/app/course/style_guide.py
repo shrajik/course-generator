@@ -70,11 +70,14 @@ def style_guide_brief(style: StyleGuide | None) -> str:
             lines.append(
                 "- Never use these words or phrases, in any form: " + "; ".join(style.banned_words) + "."
             )
-        lines.append(
-            "- If an override conflicts with a base-guide rule, follow the override and say so in "
-            "one short note, so a person can confirm it rather than the conflict being resolved "
-            "silently."
-        )
+        if style.flag_voice_conflicts:
+            lines.append(
+                "- If an override conflicts with a base-guide rule, follow the override and say so in "
+                "one short note, so a person can confirm it rather than the conflict being resolved "
+                "silently."
+            )
+        else:
+            lines.append("- If an override conflicts with a base-guide rule, follow the override.")
     return "\n".join(lines)
 
 

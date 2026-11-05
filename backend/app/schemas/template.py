@@ -98,6 +98,17 @@ class TemplateTheme(BaseModel):
     # PAGE field); True an explicit yes.
     show_page_numbers: bool | None = None
 
+    # Which of app.render.diagram_renderer's named cycling colour palettes
+    # a diagram's own generically-coloured shapes (pyramid layers, matrix
+    # cells, wheel/mindmap/network nodes, chevron/staircase/timeline steps
+    # - anywhere a shape's colour is just "the Nth one in a cycle", not a
+    # fixed meaning like flow_chart's start/end) draw from - "" (default)
+    # or an unrecognised value keeps today's exact palette unchanged. Never
+    # affects a kind's own SEMANTIC colours (flow_chart roles, hierarchy
+    # depth, balance_comparison's cost/value red-green, venn/swimlane) -
+    # those carry real meaning that shouldn't shift with a style choice.
+    diagram_palette: str = ""
+
     # None = "use the layout engine's built-in page box".
     page: PageGeometry | None = None
 

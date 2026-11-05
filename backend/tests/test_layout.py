@@ -7,9 +7,11 @@ import pytest
 from app.course.document.layout import (
     MAX_DIAGRAM_IMAGE_HEIGHT,
     MAX_IMAGE_HEIGHT,
+    MISSING_IMAGE_BOX_HEIGHT,
     estimate_height,
     flow_blocks,
     image_box_height,
+    image_generation_failed,
     page_visual_fraction,
     split_block,
     text_height,
@@ -20,6 +22,7 @@ from app.schemas.document import (
     CONTENT_HEIGHT,
     CONTENT_WIDTH,
     PAGE_MARGIN_TOP,
+    PAGE_MARGIN_X,
     Block,
     BlockStyle,
 )
@@ -255,6 +258,82 @@ def test_keep_together_rule_never_fires_when_the_visual_already_fits():
     assert len(pages) == 1
 
 
+def _heading(text: str, *, level: int = 2) -> Block:
+    return Block(type=BlockType.HEADING, content={"text": text, "level": level})
+
+
+def test_two_visuals_placed_back_to_back_move_together_not_split_across_pages():
+    """Reproduces the reported bug exactly: a diagram-only template slot
+    (technical_v1.json's visual_explanation section) pairs a small
+    section_intro icon with the section's real diagram image, back-to-back,
+    with no paragraph between them. Images aren't splittable, so if the
+    second one alone didn't fit the remaining page space, it used to get
+    bumped to a fresh page by itself, stranding the first - often just a
+    heading + a tiny icon - behind on an otherwise near-empty page. The two
+    images must always land on the same page as each other - whether that
+    takes moving them to a fresh page together (the original fix) or a
+    gentle, still-legible narrowing of the diagram that lets both fit right
+    where they already are (try_shrink_trailing_visual, a later addition) -
+    either is a valid way to honour the same guarantee, so this only asserts
+    the guarantee itself, not which mechanism delivered it.
+
+    Sized (confirmed empirically) so heading+icon+diagram genuinely don't
+    fit one page at full size - without the fix, this exact scenario put
+    the heading and icon on page 1 and the diagram alone on page 2."""
+    heading = _heading("Visual Explanation")
+    small_icon = _section_intro_image()
+    large_diagram = _image_block("diagram", width=666, height=750)
+
+    pages = flow_blocks([heading, small_icon, large_diagram])
+    assert len(pages) > 1 or large_diagram.layout.width < 666, (
+        "scenario didn't actually force anything (no split, no shrink) - test isn't exercising anything"
+    )
+
+    icon_page = next(page for page in pages if small_icon in page)
+    diagram_page = next(page for page in pages if large_diagram in page)
+    assert icon_page is diagram_page, "the two back-to-back images were split across pages"
+
+
+def test_a_near_miss_diagram_is_gently_narrowed_to_fit_instead_of_wasting_a_page():
+    """A real, measured bug: a diagram only a LITTLE too tall for what's
+    left on the page used to forfeit that entire remaining space (confirmed
+    via a real generated course, pages up to 80%+ blank) by moving whole to
+    a fresh page - even though previously-excluded-from-shrinking diagrams
+    don't need to be: a few percent narrower keeps node/axis labels legible
+    (see shrink_image_width_to_fit's _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION,
+    capped at a ~15% reduction) while reclaiming the page instead of
+    wasting it."""
+    heading = _heading("Visual Explanation")
+    small_icon = _section_intro_image()
+    near_miss_diagram = _image_block("diagram", width=666, height=750)
+
+    pages = flow_blocks([heading, small_icon, near_miss_diagram])
+
+    assert len(pages) == 1
+    assert 0.70 * 666 <= near_miss_diagram.layout.width < 666
+    # A real, confirmed bug: a narrowed block left at its old full-width x
+    # (margin_x) renders pinned to the page's left edge instead of centered
+    # - .figure-box's own flex centering (course.html.j2) only centers
+    # WITHIN the block's own (now too-narrow, left-pinned) box, not within
+    # the page. x must move inward by half of whatever width was trimmed.
+    expected_x = CONTENT_WIDTH / 2 + PAGE_MARGIN_X - near_miss_diagram.layout.width / 2
+    assert near_miss_diagram.layout.x == pytest.approx(expected_x)
+
+
+def test_a_near_miss_diagram_bridged_by_pending_visual_run_is_also_centered():
+    """Same bug, the OTHER code path that can apply a preset shrink width
+    (_pending_visual_run, via a text lead-in rather than a back-to-back
+    visual pair - see try_shrink_trailing_visual's own two call sites)."""
+    lead_in = _paragraph(200)
+    near_miss_diagram = _image_block("diagram", width=666, height=800)
+
+    flow_blocks([_paragraph(110), lead_in, near_miss_diagram])
+
+    assert near_miss_diagram.layout.width < 666  # shrink actually happened
+    expected_x = CONTENT_WIDTH / 2 + PAGE_MARGIN_X - near_miss_diagram.layout.width / 2
+    assert near_miss_diagram.layout.x == pytest.approx(expected_x)
+
+
 def test_page_visual_fraction_of_an_all_text_page_is_zero():
     pages = flow_blocks([_paragraph(30), _paragraph(30)])
     assert page_visual_fraction(pages[0]) == 0.0
@@ -369,6 +448,56 @@ def _heading_block(text: str) -> Block:
     return Block(type=BlockType.HEADING, content={"text": text, "level": 2})
 
 
+def test_estimate_height_of_an_unplaced_section_intro_image_uses_its_narrow_width():
+    """A real, confirmed bug: `estimate_height` on a section_intro image
+    whose `layout.width` hasn't been narrowed yet by `flow_blocks` (i.e. a
+    lookahead peek at an upcoming block, before it's actually placed) used
+    to fall back to the full CONTENT_WIDTH - nearly 3x wider than the
+    SECTION_INTRO_IMAGE_WIDTH it actually renders at - wildly overestimating
+    its height. `_pending_visual_run`/`_is_visual_pair` (flow_blocks) rely on
+    exactly this lookahead to decide whether an upcoming heading+icon pair
+    fits the current page; the inflated estimate made them wrongly conclude
+    it wouldn't, forcing an unnecessary early page break that stranded the
+    heading alone on an otherwise near-empty fresh page. A freshly
+    constructed Block's `layout.width` already defaults to CONTENT_WIDTH
+    (see BlockLayout), so this is the exact unplaced state a lookahead
+    actually sees."""
+    from app.course.document.layout import SECTION_INTRO_IMAGE_WIDTH
+
+    intro = _section_intro_image()
+    assert intro.layout.width == CONTENT_WIDTH  # still unplaced/default
+
+    unplaced_estimate = estimate_height(intro)
+
+    placed = _section_intro_image()
+    placed.layout.width = SECTION_INTRO_IMAGE_WIDTH
+    placed_estimate = estimate_height(placed)
+
+    assert unplaced_estimate == pytest.approx(placed_estimate)
+
+
+def test_a_heading_and_its_icon_stay_with_preceding_content_when_they_genuinely_fit():
+    """Reproduces the real bug end-to-end, tuned (empirically, against this
+    page geometry) so the preceding paragraph leaves just enough remaining
+    room for the true, narrow-width heading+icon height but NOT enough for
+    the old inflated full-width estimate - confirmed by running this exact
+    scenario against the pre-fix code, which splits it across 2 pages
+    (heading+icon stranded alone on the second, near-empty one); this is
+    the same shape of bug a real generated course hit (a "Common mistakes"
+    heading+icon landing alone on a 20%-full page, see
+    page_content_density's own docstring). With the fix, all three
+    genuinely fit together in the space available and must land on one
+    page."""
+    filler = _paragraph(180)
+    heading = _heading_block("Common mistakes - and the early signs")
+    icon = _section_intro_image()
+
+    pages = flow_blocks([filler, heading, icon])
+
+    assert len(pages) == 1, "the heading+icon pair was unnecessarily bumped to a fresh page"
+    assert pages[0] == [filler, heading, icon]
+
+
 # --- failed images and section_intro layout -----------------------------------
 
 
@@ -387,6 +516,41 @@ def test_a_failed_image_does_not_leave_a_blank_box_between_blocks():
     pages = flow_blocks([_paragraph(10), _image(error="x"), _paragraph(10)])
     blocks = pages[0]
     assert blocks[2].layout.y - (blocks[1].layout.y + blocks[1].layout.height) < 30
+
+
+def test_a_qa_omitted_image_reserves_only_a_strip():
+    """Layout-defect follow-up: a CONFIRMED QA failure (text/relevance),
+    omitted by ImageService rather than published, must get the same
+    compact placeholder a technical failure gets - not the full image-sized
+    box reserved for "simply not generated yet". Real, confirmed defect
+    this guards against: before `omitted_after_qa_failure` existed, this
+    case measured ~382pt (same as a normal image) instead of ~36-44pt."""
+    omitted = estimate_height(_image(error=None, generated=False, omitted_after_qa_failure=True))
+    pending = estimate_height(_image())
+    done = estimate_height(_image(path="a.png", width=1024, height=1024))
+    assert omitted < 80 < pending < done
+
+
+def test_a_qa_omitted_image_does_not_leave_a_blank_box_between_blocks():
+    pages = flow_blocks([_paragraph(10), _image(error=None, omitted_after_qa_failure=True), _paragraph(10)])
+    blocks = pages[0]
+    assert blocks[2].layout.y - (blocks[1].layout.y + blocks[1].layout.height) < 30
+
+
+def test_image_generation_failed_is_true_for_a_qa_omission_not_just_a_technical_failure():
+    technical_failure = _image(error="Azure 429", generated=False)
+    qa_omission = _image(error=None, generated=False, omitted_after_qa_failure=True)
+    pending = _image()  # neither error nor omitted_after_qa_failure set
+    successful = _image(path="a.png", width=1024, height=1024)
+    assert image_generation_failed(technical_failure) is True
+    assert image_generation_failed(qa_omission) is True
+    assert image_generation_failed(pending) is False
+    assert image_generation_failed(successful) is False
+
+
+def test_image_box_height_gives_the_qa_omitted_strip_not_a_full_box():
+    qa_omission = _image(error=None, generated=False, omitted_after_qa_failure=True)
+    assert image_box_height(qa_omission) == MISSING_IMAGE_BOX_HEIGHT
 
 
 def test_a_section_intro_picture_with_no_paragraph_beside_it_stays_small():

@@ -20,6 +20,7 @@ const BLANK: StyleGuide = {
   citation_system: "author_date",
   brand_terms: [],
   banned_words: [],
+  flag_voice_conflicts: true,
 };
 
 const fieldClass =
@@ -34,7 +35,12 @@ interface Props {
 
 /** Back to "not chosen" when nothing differs from the defaults. */
 function isDefault(style: StyleGuide): boolean {
-  return style.base === "mstp" && style.brand_terms.length === 0 && style.banned_words.length === 0;
+  return (
+    style.base === "mstp" &&
+    style.brand_terms.length === 0 &&
+    style.banned_words.length === 0 &&
+    style.flag_voice_conflicts === true
+  );
 }
 
 export function StyleGuidePanel({ value, onChange }: Props) {
@@ -121,10 +127,20 @@ export function StyleGuidePanel({ value, onChange }: Props) {
             terms={style.banned_words}
             onChange={(banned_words) => patch({ banned_words })}
           />
-          <p className="text-[11.5px] text-ink-400">
-            Client overrides take precedence over the base guide. Where one conflicts with a base-guide
-            rule, the writer is asked to say so, so a person can confirm it.
-          </p>
+          <div>
+            <p className="text-[11.5px] text-ink-400">
+              Client overrides take precedence over the base guide.
+            </p>
+            <label className="mt-2 flex items-center gap-2 text-[12.5px] text-ink-700">
+              <input
+                type="checkbox"
+                checked={style.flag_voice_conflicts}
+                onChange={(event) => patch({ flag_voice_conflicts: event.target.checked })}
+              />
+              Flag brand-voice conflicts — where client voice and the base guide disagree, ask the
+              writer to say so rather than resolve it silently
+            </label>
+          </div>
         </div>
       ) : null}
     </div>

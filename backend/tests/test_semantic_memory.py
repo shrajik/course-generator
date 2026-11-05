@@ -100,6 +100,55 @@ async def _get_embedding(source_type: str, source_id):
 
 
 # ---------------------------------------------------------------------------
+# MERGE NOTE (feature/visuals x origin/visual-and-flowchart): this section
+# used to test embedding generation/persistence and hybrid semantic+keyword
+# retrieval entirely through `CourseSampleService`, which origin/visual-and-
+# flowchart removed (replaced by app.services.knowledge_service /
+# source_service - a differently-shaped, upload-based architecture, not a
+# drop-in substitute: MemoryService no longer even accepts a `samples=`
+# constructor argument). Mechanically rewriting these 9 tests against the
+# new service without investigating its actual semantics risked fabricating
+# incorrect behaviour, so they were removed here rather than guessed at.
+#
+# Follow-up investigation (not guessed - read against the actual new code
+# and its own test files) found every one of the 9 removed tests' concerns
+# already has an equivalent, often more thorough, test elsewhere against the
+# real new architecture - nothing here was a silent, permanent loss:
+#   - embedding generation/persistence on upload -> test_source_service.py::
+#     test_a_text_upload_becomes_ready_with_counts_an_outline_and_files
+#   - disabled-embeddings keyword fallback -> test_source_service.py::
+#     test_embedding_being_unavailable_still_leaves_the_source_ready
+#   - semantic retrieval by meaning, no keyword overlap -> test_source_
+#     ingestion.py::test_semantic_ranking_uses_vectors_when_there_is_no_
+#     keyword_overlap, test_knowledge_library.py::test_semantic_search_
+#     matches_by_meaning_when_no_words_overlap
+#   - similarity-threshold rejection of weak matches -> test_knowledge_
+#     library.py::test_a_vector_that_is_not_close_enough_contributes_nothing
+#   - hybrid fusion not letting one method hide the other's results ->
+#     test_source_ingestion.py::test_fusion_rewards_agreement_between_
+#     keyword_and_semantic, test_knowledge_library.py::test_agreement_
+#     between_keywords_and_meaning_ranks_first_and_the_limit_holds
+#   - records without embeddings still retrievable via keyword ->
+#     test_source_ingestion.py::test_chunks_without_a_vector_still_rank_by_
+#     keywords, test_knowledge_library.py::test_passages_without_vectors_
+#     still_match_by_keyword_and_bad_vectors_are_ignored
+#   - embedding-failure resilience -> test_embeddings.py::test_embedding_
+#     service_failure_returns_none_not_raises (+ the same source_service
+#     test above, at the integration level)
+#   - delete removes the embedding too -> test_source_service.py::
+#     test_deleting_removes_everything (deletes the whole source folder,
+#     vectors.bin included)
+# The one capability with no equivalent anywhere - MemoryService's own
+# bounded-context guarantee (previously MAX_SAMPLE_NOTES on sample_notes,
+# now MAX_HISTORY_NOTES on history_notes) - has a new test in
+# test_memory_layer.py::test_memory_service_bounds_history_notes_to_the_
+# configured_maximum. "A course must exist before a sample can be
+# registered for it" has no equivalent either, but that's a confirmed,
+# intentional architecture change: an uploaded source is owner-scoped, not
+# course-scoped, so nothing needs a course to exist first.
+# ---------------------------------------------------------------------------
+
+
 # templates: versioned, independent embeddings
 # ---------------------------------------------------------------------------
 

@@ -40,8 +40,8 @@
       "key": "visual_explanation",
       "label": "Visual Explanation",
       "required": false,
-      "block_types": ["image"],
-      "guidance": "Add 1-2 diagrams (flow_chart, hierarchy, comparison or smart_art - pick whichever structure fits) whenever this chapter has a process, architecture, comparison or hierarchy to show. A labelled diagram beats a paragraph for this - only skip it when the chapter is genuinely free of structure to show.",
+      "block_types": ["paragraph", "image"],
+      "guidance": "Add 1-2 diagrams (flow_chart, hierarchy, comparison or smart_art - pick whichever structure fits) whenever this chapter has a process, architecture, comparison or hierarchy to show. A labelled diagram beats a paragraph for this - only skip it when the chapter is genuinely free of structure to show. Every diagram here needs a short (1-2 sentence) paragraph introducing or interpreting it right beside it - never a bare image with nothing else on the page.",
       "max_blocks": 3
     },
     {

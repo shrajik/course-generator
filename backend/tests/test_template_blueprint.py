@@ -364,7 +364,10 @@ async def test_d_an_aspect_ratio_sets_the_requested_picture_shape(settings):
     service = ImageService(ai=images)
     block = _block(BlockType.IMAGE, "how_it_works", kind="illustration", prompt="volunteers sorting boxes", aspect="landscape")
     assert await service.generate_for_block(course_id="c1", block=block, template=_md_template(), course_title="T")
-    assert images.sizes == ["1536x1024"]
+    # The template's landscape shape is what is requested. (Text-free pictures are now verified and retried
+    # when the check is inconclusive, which this stub cannot answer, so more than one request is expected;
+    # every attempt but the last-resort fallback keeps the requested shape.)
+    assert images.sizes[0] == "1536x1024" and images.sizes.count("1536x1024") >= 1
     assert block.content["generated"] is True
 
 

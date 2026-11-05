@@ -20,7 +20,7 @@ import { AlertCircle, ChevronDown, ChevronRight, RotateCcw } from "lucide-react"
 import { getPedagogyDefaults } from "@/lib/api/pedagogy";
 import type { ArchetypeDefaults, PedagogyDefaults } from "@/lib/api/pedagogy";
 import { useAuth } from "@/lib/auth/auth-provider";
-import type { AgeGroup, EduLevel, LearnerProfile } from "@/lib/types/course";
+import type { AgeGroup, LearnerProfile, ProfessionalProfile, Seniority } from "@/lib/types/course";
 
 /** Matches the backend field defaults in app/schemas/learner.py. Used only
  * until the archetype baselines arrive, and as the shape for a fresh profile. */
@@ -34,9 +34,46 @@ const BLANK_PROFILE: LearnerProfile = {
   gamification_index: 0.2,
   chunk_word_cap: 450,
   manual_override: false,
+  professional_profile: null,
+  seniority: null,
 };
 
-const EDU_LEVELS: EduLevel[] = ["PRIMARY", "SECONDARY", "BACHELORS", "MASTERS_PHD"];
+// MOM Phase 3 - only meaningful (and only shown) for age_group ===
+// "PROFESSIONAL", mirroring backend/app/course/pedagogy.py's own gate.
+// "" represents "no opinion" (null on the wire - see the onChange handlers
+// below), not a third real value.
+const PROFESSIONAL_PROFILE_OPTIONS: { value: ProfessionalProfile | ""; label: string; help: string }[] = [
+  { value: "", label: "No preference", help: "" },
+  {
+    value: "generalist",
+    label: "Generalist",
+    help: "Broad understanding across related topics, cross-functional context, minimal unnecessary jargon.",
+  },
+  {
+    value: "specialist",
+    label: "Specialist",
+    help: "Deep technical/domain detail, precise terminology, rigorous domain-specific examples.",
+  },
+];
+
+const SENIORITY_OPTIONS: { value: Seniority | ""; label: string; help: string }[] = [
+  { value: "", label: "No preference", help: "" },
+  {
+    value: "junior",
+    label: "Junior",
+    help: "Foundational concepts, step-by-step worked examples, common-mistake guidance.",
+  },
+  {
+    value: "middle",
+    label: "Middle",
+    help: "Independent application, trade-offs and debugging, realistic moderately-complex situations.",
+  },
+  {
+    value: "senior",
+    label: "Senior",
+    help: "Architecture-level and strategic decisions, risk/governance, complex scenarios with incomplete information.",
+  },
+];
 
 const selectClass =
   "w-full rounded-lg border border-line bg-white px-3 py-2 text-[13px] text-ink-800 " +
@@ -155,56 +192,94 @@ export function LearnerProfilePanel({ value, onChange }: Props) {
             </div>
           ) : null}
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div>
-              <label htmlFor="age-group" className={labelClass}>
-                Age Bracket
-              </label>
-              <select
-                id="age-group"
-                className={selectClass}
-                value={profile.age_group}
-                disabled={!defaults}
-                onChange={(event) => handleAgeGroup(event.target.value as AgeGroup)}
-              >
-                {(defaults?.age_groups ?? []).map((item) => (
-                  <option key={item.age_group} value={item.age_group}>
-                    {item.label}
-                  </option>
-                ))}
-                {/* Disabled above, so this placeholder can never be mistaken
-                    for a working control that simply has one option. */}
-                {defaults ? null : (
-                  <option value={profile.age_group}>
-                    {pending ? "Loading…" : "Unavailable"}
-                  </option>
-                )}
-              </select>
-              {archetype ? (
-                <p className="mt-1.5 text-[11.5px] text-ink-400">
-                  {archetype.instructional_model} · {archetype.session_length}
-                </p>
-              ) : null}
-            </div>
-
-            <div>
-              <label htmlFor="edu-level" className={labelClass}>
-                Educational Attainment
-              </label>
-              <select
-                id="edu-level"
-                className={selectClass}
-                value={profile.edu_level}
-                onChange={(event) => patch({ edu_level: event.target.value as EduLevel })}
-              >
-                {EDU_LEVELS.map((level) => (
-                  <option key={level} value={level}>
-                    {defaults?.edu_levels[level] ?? level}
-                  </option>
-                ))}
-              </select>
-            </div>
+          <div>
+            <label htmlFor="age-group" className={labelClass}>
+              Age Bracket
+            </label>
+            <select
+              id="age-group"
+              className={selectClass}
+              value={profile.age_group}
+              disabled={!defaults}
+              onChange={(event) => handleAgeGroup(event.target.value as AgeGroup)}
+            >
+              {(defaults?.age_groups ?? []).map((item) => (
+                <option key={item.age_group} value={item.age_group}>
+                  {item.label}
+                </option>
+              ))}
+              {/* Disabled above, so this placeholder can never be mistaken
+                  for a working control that simply has one option. */}
+              {defaults ? null : (
+                <option value={profile.age_group}>
+                  {pending ? "Loading…" : "Unavailable"}
+                </option>
+              )}
+            </select>
+            {archetype ? (
+              <p className="mt-1.5 text-[11.5px] text-ink-400">
+                {archetype.instructional_model} · {archetype.session_length}
+              </p>
+            ) : null}
           </div>
+
+          {profile.age_group === "PROFESSIONAL" ? (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <label htmlFor="professional-profile" className={labelClass}>
+                  Professional Profile
+                </label>
+                <select
+                  id="professional-profile"
+                  className={selectClass}
+                  value={profile.professional_profile ?? ""}
+                  onChange={(event) =>
+                    patch({
+                      professional_profile: (event.target.value || null) as ProfessionalProfile | null,
+                    })
+                  }
+                >
+                  {PROFESSIONAL_PROFILE_OPTIONS.map((option) => (
+                    <option key={option.value || "none"} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                {profile.professional_profile ? (
+                  <p className="mt-1.5 text-[11.5px] text-ink-400">
+                    {
+                      PROFESSIONAL_PROFILE_OPTIONS.find((o) => o.value === profile.professional_profile)
+                        ?.help
+                    }
+                  </p>
+                ) : null}
+              </div>
+              <div>
+                <label htmlFor="seniority" className={labelClass}>
+                  Corporate Seniority
+                </label>
+                <select
+                  id="seniority"
+                  className={selectClass}
+                  value={profile.seniority ?? ""}
+                  onChange={(event) =>
+                    patch({ seniority: (event.target.value || null) as Seniority | null })
+                  }
+                >
+                  {SENIORITY_OPTIONS.map((option) => (
+                    <option key={option.value || "none"} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                {profile.seniority ? (
+                  <p className="mt-1.5 text-[11.5px] text-ink-400">
+                    {SENIORITY_OPTIONS.find((o) => o.value === profile.seniority)?.help}
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
 
           <div className="grid gap-4 sm:grid-cols-2">
             <div>

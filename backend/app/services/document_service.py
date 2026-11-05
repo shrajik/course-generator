@@ -17,6 +17,7 @@ from app.schemas.visual_review import VisualReviewReport
 from app.services.visual_review import VisualReviewService
 from app.db.service import get_database_service
 from app.render.concept_experience_renderer import estimate_pixel_size, render_concept_experience_html
+from app.render.diagram_renderer import render_diagram_svg
 from app.schemas.blocks import BlockType, merge_content
 from app.schemas.course import CourseRecord
 from app.schemas.diagram import DiagramSpec
@@ -289,18 +290,18 @@ class DocumentService:
         )
 
     # --- editable diagram text (no AI call) --------------------------------
-    async def update_concept_visual_spec(
+    # Edit Visuals (flowchart editor, Part 1): generalized from a prior,
+    # concept_experience-only version of this method. Covers both families
+    # that render from a structured DiagramSpec with no AI call - the
+    # node/edge diagram family (flow_chart/process/cycle/hierarchy/
+    # comparison/smart_art/concept_map/data_flow_diagram/er_diagram/
+    # swimlane - never "graph", which has no discrete nodes/edges to edit
+    # this way, or "schematic", permanently retired) and concept_experience.
+    _EDITABLE_KINDS = ("concept_experience", "diagram")
+
+    async def _load_editable_block(
         self, document_id: str, block_id: str, spec_update: dict
-    ) -> UpdateConceptVisualSpecResponse:
-        """Re-render a `concept_experience` block from an edited copy of its
-        own spec - a typo/wording fix, not a new concept, so this never
-        calls the AI planner. Same renderer + estimator
-        `ConceptVisualService.generate_for_block` uses, so the result is
-        exactly as reliable (no overflow, no overlap - see
-        `render_concept_experience_html`'s own cap-and-scale contract);
-        `reflow_document` repositions any later block if this one's height
-        changed, the same way a regenerated image already does today.
-        """
+    ) -> tuple[CourseDocument, object, object, str, DiagramSpec]:
         document = await self.load(document_id)
         await ensure_template_loaded(document.template_id)
         template = load_template(document.template_id)
@@ -309,19 +310,43 @@ class DocumentService:
         if found is None:
             raise NotFoundError(f"Block '{block_id}' not found in document '{document_id}'")
         _, block = found
-        if block.type is not BlockType.IMAGE or block.content.get("kind") != "concept_experience":
-            raise ValidationFailedError(
-                f"Block '{block_id}' is not an editable concept_experience visual"
-            )
+        kind = block.content.get("kind")
+        if block.type is not BlockType.IMAGE or kind not in self._EDITABLE_KINDS:
+            raise ValidationFailedError(f"Block '{block_id}' is not an editable visual")
 
         try:
             spec = DiagramSpec.model_validate(spec_update)
         except Exception as exc:  # noqa: BLE001 - surfaced as a 422, not a 500
             raise ValidationFailedError(f"Invalid visual spec: {exc}") from exc
 
-        html_bytes = render_concept_experience_html(spec, template.theme)
-        relative = self.storage.save_asset(document.course_id, html_bytes, extension="html")
-        width, height = estimate_pixel_size(spec)
+        return document, template, block, kind, spec
+
+    def _render_spec(self, kind: str, spec: DiagramSpec, template) -> tuple[str, bytes, int, int]:
+        """(extension, raw_bytes, width, height) - rendering only, never
+        touches storage; the two callers below decide whether to persist
+        (update_visual_spec) or just hand the bytes back (preview_visual_spec)."""
+        if kind == "concept_experience":
+            html_bytes = render_concept_experience_html(spec, template.theme)
+            width, height = estimate_pixel_size(spec)
+            return "html", html_bytes, width, height
+        svg_bytes, width, height = render_diagram_svg(spec, template.theme)
+        return "svg", svg_bytes, width, height
+
+    async def update_visual_spec(
+        self, document_id: str, block_id: str, spec_update: dict
+    ) -> UpdateConceptVisualSpecResponse:
+        """Re-render a `concept_experience` or `diagram` block from an
+        edited copy of its own spec - a label/color/node-order fix, not a
+        new concept, so this never calls the AI planner. Same renderer each
+        kind's own generation path already uses (`render_concept_experience_
+        html`/`render_diagram_svg`), so the result is exactly as reliable;
+        `reflow_document` repositions any later block if this one's height
+        changed, the same way a freshly generated visual already does."""
+        document, template, block, kind, spec = await self._load_editable_block(
+            document_id, block_id, spec_update
+        )
+        extension, raw_bytes, width, height = self._render_spec(kind, spec, template)
+        relative = self.storage.save_asset(document.course_id, raw_bytes, extension=extension)
         block.content = merge_content(
             block.type,
             block.content,
@@ -338,11 +363,65 @@ class DocumentService:
         reflow_document(document, template)
         document.touch()
         await self._save_document(document)
-        log.info("Updated concept_visual spec for block %s in %s", block_id, document_id)
+        log.info("Updated %s spec for block %s in %s", kind, block_id, document_id)
 
         return UpdateConceptVisualSpecResponse(
             document_id=document.document_id, version=document.version, block=block
         )
+
+    async def preview_visual_spec(
+        self, document_id: str, block_id: str, spec_update: dict
+    ) -> dict[str, str]:
+        """Render `spec_update` exactly as `update_visual_spec` would,
+        WITHOUT persisting anything - no saved asset file, no document
+        write, no reflow. The live-preview call a flowchart/concept editor
+        makes on every edit (debounced client-side); the document's own
+        saved version is guaranteed untouched by this call."""
+        _document, template, _block, kind, spec = await self._load_editable_block(
+            document_id, block_id, spec_update
+        )
+        extension, raw_bytes, _width, _height = self._render_spec(kind, spec, template)
+        key = "html" if extension == "html" else "svg"
+        return {key: raw_bytes.decode("utf-8")}
+
+    async def reconstruct_diagram_spec(self, document_id: str, block_id: str) -> dict:
+        """For a `kind=="diagram"` block generated before spec persistence
+        existed (no `content["spec"]` yet - every course generated before
+        this feature): reconstruct a real, editable spec from the block's
+        own already-stored brief (`purpose`/`prompt`/`caption`/
+        `diagram_kind`), via the exact same one-shot structured-spec
+        request every first-time diagram generation already makes
+        (`DiagramService._request_spec`, `pin_kind=True` so the
+        reconstructed spec keeps today's diagram kind) - deliberately NOT a
+        literal parse of the rendered SVG's geometry, which has no reliable
+        way to recover node ids, edge directions or roles from drawn shapes
+        alone, whereas the original brief is already a richer, already-
+        trusted source for this exact call. Returns the spec WITHOUT saving
+        it - the editor seeds itself from the result and only persists via
+        `update_visual_spec` once reviewed, same as a fresh spec."""
+        document = await self.load(document_id)
+        found = document.find_block(block_id)
+        if found is None:
+            raise NotFoundError(f"Block '{block_id}' not found in document '{document_id}'")
+        _, block = found
+        if block.type is not BlockType.IMAGE or block.content.get("kind") != "diagram":
+            raise ValidationFailedError(f"Block '{block_id}' is not a diagram visual")
+
+        existing_spec = block.content.get("spec")
+        if existing_spec:
+            return existing_spec
+
+        spec = await self.images.diagrams._request_spec(
+            purpose=str(block.content.get("purpose") or ""),
+            prompt=str(block.content.get("prompt") or ""),
+            caption=str(block.content.get("caption") or ""),
+            course_title=document.course_title,
+            memory="",
+            kind_hint=str(block.content.get("diagram_kind") or ""),
+            pin_kind=True,
+            block_id=block_id,
+        )
+        return spec.model_dump(mode="json")
 
     # --- export -----------------------------------------------------------
     async def export_pdf(self, document_id: str) -> tuple[Path, CourseDocument]:

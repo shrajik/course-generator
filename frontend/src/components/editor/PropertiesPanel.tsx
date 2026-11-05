@@ -15,9 +15,11 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { IconButton } from "@/components/ui/IconButton";
+import { FlowchartEditor } from "./FlowchartEditor";
 import { BLOCK_LABELS, isTextBlock } from "@/lib/editor/blocks";
+import { blankLabel, nextLabelId } from "@/lib/editor/overlayLabels";
 import { useEditor } from "@/lib/editor/store";
-import type { ConceptVisualSpec, TextAlign, VisualEntitySpec, VisualStepSpec } from "@/lib/types/document";
+import type { ConceptVisualSpec, OverlayLabel, TextAlign, VisualEntitySpec, VisualStepSpec } from "@/lib/types/document";
 import { cn } from "@/lib/utils/cn";
 
 const FONTS = ["Inter", "Georgia", "Segoe UI", "Helvetica", "JetBrains Mono"];
@@ -203,6 +205,76 @@ function ConceptVisualFieldsEditor({
   );
 }
 
+const OVERLAY_STYLE_OPTIONS: { value: OverlayLabel["style"]; label: string }[] = [
+  { value: "label", label: "Label" },
+  { value: "callout", label: "Callout" },
+  { value: "title", label: "Title" },
+];
+
+/** Add/delete/restyle an illustration's overlay labels - dragging to
+ * reposition happens directly on the canvas (ImageBlock.tsx), both acting
+ * on the same `overlay_labels` content field, so they always stay in sync.
+ * Every change applies immediately (no Save button) - same as every other
+ * field already in this panel (style/layout/caption), since this is a
+ * plain local edit, not a server round trip. */
+function OverlayLabelsEditor({
+  labels,
+  onChange,
+}: {
+  labels: OverlayLabel[];
+  onChange: (next: OverlayLabel[]) => void;
+}) {
+  const update = (index: number, patch: Partial<OverlayLabel>) => {
+    const next = [...labels];
+    next[index] = { ...next[index], ...patch };
+    onChange(next);
+  };
+  const remove = (index: number) => onChange(labels.filter((_, i) => i !== index));
+  const add = () => onChange([...labels, blankLabel(nextLabelId(labels))]);
+
+  return (
+    <div className="space-y-2">
+      {labels.map((label, index) => (
+        <div key={label.id} className="rounded-[7px] border border-line p-2">
+          <div className="flex items-start gap-1.5">
+            <input
+              className={cn(inputClass, "flex-1")}
+              value={label.text}
+              onChange={(event) => update(index, { text: event.target.value })}
+            />
+            <IconButton tone="danger" aria-label="Delete label" onClick={() => remove(index)}>
+              <Trash2 size={13} />
+            </IconButton>
+          </div>
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <select
+              className={inputClass}
+              value={label.style}
+              onChange={(event) => update(index, { style: event.target.value as OverlayLabel["style"] })}
+            >
+              {OVERLAY_STYLE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <input
+              type="color"
+              className="h-[30px] w-10 shrink-0 cursor-pointer rounded-[6px] border border-line bg-white p-0.5"
+              value={/^#[0-9a-fA-F]{6}$/.test(label.color ?? "") ? (label.color as string) : "#111827"}
+              onChange={(event) => update(index, { color: event.target.value })}
+              title="Custom color (overrides the style default)"
+            />
+          </div>
+        </div>
+      ))}
+      <Button size="sm" variant="outline" className="w-full" onClick={add}>
+        Add label
+      </Button>
+    </div>
+  );
+}
+
 interface PropertiesPanelProps {
   onReplaceImage: (blockId: string, description: string) => void;
   busy: boolean;
@@ -221,6 +293,7 @@ export function PropertiesPanel({
   const editor = useEditor();
   const block = editor.selectedBlocks[0] ?? null;
   const [imagePrompt, setImagePrompt] = useState("");
+  const [flowchartEditorOpen, setFlowchartEditorOpen] = useState(false);
 
   if (!block) {
     return (
@@ -433,6 +506,42 @@ export function PropertiesPanel({
           {visualSpecError ? (
             <p className="mt-2 text-[11px] leading-snug text-red-600">{visualSpecError}</p>
           ) : null}
+        </Section>
+      ) : null}
+
+      {block.type === "image" &&
+      block.content.kind === "diagram" &&
+      block.content.diagram_kind !== "graph" ? (
+        <Section title="Diagram content">
+          <p className="mb-2 text-[11px] leading-snug text-ink-400">
+            Edit this flowchart's nodes, edges, roles and colors - re-rendered instantly, no AI
+            call. The exported PDF renders it the same static way it always has.
+          </p>
+          <Button size="sm" className="w-full" onClick={() => setFlowchartEditorOpen(true)}>
+            Edit diagram
+          </Button>
+          {editor.document ? (
+            <FlowchartEditor
+              documentId={editor.document.document_id}
+              blockId={block.id}
+              hasStoredSpec={Boolean(block.content.spec)}
+              open={flowchartEditorOpen}
+              onClose={() => setFlowchartEditorOpen(false)}
+            />
+          ) : null}
+        </Section>
+      ) : null}
+
+      {block.type === "image" && block.content.kind === "illustration" ? (
+        <Section title="Overlay labels">
+          <p className="mb-2 text-[11px] leading-snug text-ink-400">
+            Positioned text over the picture - drag a label on the canvas to move it. The image
+            itself is never regenerated to add, edit or move one.
+          </p>
+          <OverlayLabelsEditor
+            labels={(block.content.overlay_labels as OverlayLabel[] | undefined) ?? []}
+            onChange={(next) => editor.updateContent(block.id, { overlay_labels: next })}
+          />
         </Section>
       ) : null}
 

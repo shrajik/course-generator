@@ -31,10 +31,12 @@ from app.schemas.blocks import merge_content
 from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
+from app.services.diagram_content_qa import evaluate_content
 from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
 from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
+from app.services.quality_framework import visual_qa_finding_entries
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
@@ -74,20 +76,24 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   `level: 1`. Every edge must carry a short, precise relationship `label`
   naming what happens between the two nodes - a direction, a force, a cause,
   a flow (e.g. "moving toward", "induces", "opposes", "flows into").
-- The brief describes something with a real, recognisable physical shape and
-  arrangement - not just abstract relationships between ideas - where seeing
-  that arrangement is what actually teaches the concept -> schematic. This
-  applies just as much to a chemistry reaction (two reactants combining into
-  a product), a biology structure (a cell and its organelles, an organ), an
-  astronomy scene (a planet and its orbit) or a mechanical device as it does
-  to an electrical apparatus - use whichever domain the brief is actually
-  about, never default to an electrical/physics scene just because that's a
-  common example. Often pairs with a "before/after", "at rest/in motion" or
-  "reactant/product" comparison. Use the small illustrated-shape vocabulary
-  below instead of nodes/edges - this is the right choice whenever the brief
-  describes a drawing with real parts and positions, not just a relationship
-  between labelled ideas; never substitute concept_map for a brief that
-  clearly wants an illustration, regardless of subject.
+- `schematic` is PERMANENTLY RETIRED - never produce it, regardless of what
+  the brief describes. A real, recognisable physical shape/arrangement (a
+  chemistry reaction, a biology structure, an astronomy scene, a mechanical
+  device or an electrical apparatus) is never diagrammed here at all - that
+  whole category belongs to `image_kind: illustration` with
+  `illustration_style: "textbook"` instead (a different pipeline, decided by
+  the writer before this call), a real depiction rather than a labelled-box
+  drawing. If a brief like this still reaches you, the caller already
+  rejects a `schematic` answer unconditionally and falls back to that
+  illustration path anyway - so treat this prompt's remaining kinds
+  (concept_map, hierarchy, comparison, flow_chart/process/cycle,
+  data_flow_diagram, er_diagram, swimlane, smart_art, graph, pyramid,
+  matrix, radial_mindmap, venn, chevron_process, timeline,
+  staircase_process, balance_comparison, nested_circles, network_mesh,
+  decision_tree, fishbone, layered_diagram, gantt_chart) as the complete
+  list; none of them is
+  "physical shape and arrangement," and that's fine - this call was
+  reached in error for that brief.
 - The brief describes a strict parent/child breakdown (an org chart, a
   taxonomy, a category tree) -> hierarchy. Set every node's `level` (0 =
   root, 1 = its children, ...) and add one edge per parent -> child link.
@@ -129,6 +135,171 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   each step is itself part of what the brief needs to teach.
 - Anything else - a short list of steps, pillars, principles or ideas with
   no real relationships between them -> smart_art. Leave `edges` empty.
+- The brief describes LEVELS of importance, priority or foundation (a
+  base/foundation that supports what's above it, a hierarchy of needs, a
+  "most fundamental at the bottom" structure) -> pyramid. Order `nodes`
+  narrowest-first (the apex/top layer) to widest-last (the base/bottom
+  layer); leave `pyramid_inverted` false. The SAME shape, but the brief
+  instead describes a NARROWING STAGE process (a sales/conversion funnel,
+  a filtering/elimination process where each stage has fewer items than
+  the last) -> also `pyramid`, same node order (widest-first this time -
+  the top/entry stage - narrowing to the last), but set
+  `pyramid_inverted: true`. Leave `edges` empty either way; add a short
+  `detail` per layer only when it adds real information.
+- The brief classifies or compares things across exactly two independent
+  axes/dimensions (impact vs. effort, urgency vs. importance, a SWOT-style
+  strengths/weaknesses/opportunities/threats grid, a priority matrix)
+  -> matrix. Produce exactly 4 nodes, one per quadrant, in reading order
+  (top-left, top-right, bottom-left, bottom-right). Set `matrix_x_label`/
+  `matrix_y_label` to what each axis measures (e.g. "Effort" / "Impact")
+  and `matrix_x_low`/`matrix_x_high`/`matrix_y_low`/`matrix_y_high` to each
+  axis's own endpoint words (e.g. "Low" / "High") - leave all six blank
+  only for a SWOT-style grid with no real continuous axes, which still
+  renders as a clean 2x2 grid. A classification into more than 4 groups
+  with no real 2-axis structure is still `matrix` - just more nodes (up to
+  9), which renders as a plain grid instead of an axis cross. Leave `edges`
+  empty.
+- The brief has ONE clear central topic with several distinct branching
+  sub-ideas (a brainstorm, a topic broken into its main themes, each
+  theme standing on its own rather than being parts/properties of a single
+  whole) -> radial_mindmap. Put the central topic as the node with
+  `level: 0`; every branch is another node, `level: 1`. This differs from
+  concept_map: concept_map's edges each carry a precise relationship label
+  (a force, a cause, a flow) between the centre and ITS OWN surrounding
+  parts; radial_mindmap's branches are independent sub-topics in their own
+  right, connected to the centre with no relationship label needed - leave
+  `edges` empty unless a branch genuinely has its own child idea (then add
+  one edge, branch -> child, no label).
+- The brief is specifically about what two or three things SHARE versus
+  what's unique to each of them (overlapping categories, a Venn-style
+  "things common to both X and Y" comparison) -> venn. Produce exactly 2 or
+  3 nodes, one per set, each a short name; `detail` is what's UNIQUE to
+  that set. For what two sets share, add an edge between them with `label`
+  set to the shared idea (e.g. source="Mammals", target="Egg-laying
+  animals", label="Warm-blooded"); only add an edge between two sets that
+  truly do share something named in the brief - omit it otherwise.
+- The brief describes a SHORT linear sequence (3-6 steps, no branches or
+  decisions) that reads well as a horizontal strip rather than a tall
+  column (a short onboarding flow, a product-launch phase strip, "the 4
+  stages of X") -> chevron_process. Order `nodes` left to right the way
+  the steps happen; leave `edges` empty (the chevron shape itself already
+  shows direction). For a LONGER sequence, or one with any decision/
+  branch, still use flow_chart/process instead - chevron_process has no
+  decision shape.
+- The brief is a chronological/historical sequence of DATED events, eras
+  or milestones (a country's history, a technology's evolution, a
+  project's roadmap) -> timeline, not flow_chart. Each node's `label`
+  should carry the date/era (e.g. "1947 - Independence"), `detail` the
+  event itself; order `nodes` chronologically. Leave `edges` empty (the
+  timeline's own axis already shows order). Only for genuinely dated
+  content - an undated step-by-step procedure is still flow_chart/process/
+  chevron_process, not timeline.
+- The brief describes something that genuinely GROWS or BUILDS in scope,
+  scale or difficulty at each step (a skill-building progression, a
+  maturity model, a staged rollout where each stage is bigger than the
+  last) -> staircase_process. Order `nodes` smallest/earliest first - the
+  renderer draws each step's own bar visibly longer than the one before
+  it, so the ordering itself IS the growth being shown. Leave `edges`
+  empty. Do not use this just because a sequence has several steps - only
+  when the brief itself frames it as growing/building, not merely
+  happening in order (an ordinary multi-step procedure with no growth
+  framing is still flow_chart/process/chevron_process).
+- The brief weighs TWO SIDES of one decision or tradeoff against each
+  other (cost vs. value, pros vs. cons, risks vs. benefits) ->
+  balance_comparison, not comparison (that's for N things compared flatly
+  side by side, not a two-sided judgement). List every LEFT-side (cost/
+  con/risk) node first, then every RIGHT-side (value/pro/benefit) node -
+  the renderer splits `nodes` by position into the two columns, unless you
+  set `shape_role` to exactly "left" or "right" on each node for an
+  uneven split. Set `balance_left_label`/`balance_right_label` to what
+  each column actually is (e.g. "Cost" / "Value", "Risks" / "Benefits").
+  Each node's `label` is the short point itself; `detail`, when it adds
+  real information, is a brief elaboration - both are shown directly on
+  the row (this is the one kind in this list where `detail` is NOT
+  limited to a short qualifying phrase the way the general node rule
+  below says - write a real sentence or two here, since this kind's rows
+  ARE the main content, not a label needing a tooltip).
+- The brief describes a SCOPE or CONTAINMENT hierarchy - each thing fully
+  CONTAINS the next, narrower one (Vision > Mission > Strategy > Tactics;
+  Global > Regional > Local; an atom's nucleus inside the atom inside the
+  element) -> nested_circles. Order `nodes` broadest/outermost first,
+  narrowest/innermost last. Leave `edges` empty. Different from hierarchy
+  (a branching parent/child TREE, not a single nested sequence) and from
+  pyramid (levels of importance stacked, not literal containment).
+- The brief is genuinely about MANY things connecting to MANY others, not
+  one central hub or a strict hierarchy (a microservice topology, an
+  organisational network, a social/relationship network) -> network_mesh.
+  Add one edge per real connection - unlike every other node/edge kind,
+  network_mesh edges carry no label (leave `edge.label` blank; the
+  connection existing IS the information). Do not use this for a simple
+  hub-and-spoke (one central thing, others only connect to IT, never to
+  each other) - that's radial_mindmap instead.
+- The brief describes a CASCADE of decisions/questions, each branch
+  leading to a further decision or a final outcome (a troubleshooting
+  guide, "which plan is right for you", eligibility logic) ->
+  decision_tree. Not the same as a single flow_chart decision diamond (one
+  branch point inside an otherwise linear procedure) - this is a WHOLE
+  TREE of them. Give every decision node `level` = its depth from the
+  root (0 = root) and one edge per branch, `edge.label` the condition
+  ("Yes"/"No", a threshold) - a node with outgoing edges is automatically
+  drawn as a decision diamond, a node with none as a rounded outcome box;
+  only set `role` to "decision"/"outcome" explicitly if that auto-
+  detection would ever be wrong for a leaf that still happens to need an
+  edge for some other reason.
+- The brief is a root-cause analysis - what are the different CATEGORIES
+  of causes behind one effect/problem (a fishbone/Ishikawa diagram - "why
+  did X happen", a postmortem, a quality/defect investigation) ->
+  fishbone. `nodes[0]` is the effect/problem itself; every other node is
+  one CAUSE CATEGORY (e.g. "People", "Process", "Technology",
+  "Environment" - the classic "4M/6M" categories are a good default when
+  the brief doesn't name its own). Leave `edges` empty. A category's own
+  `detail` lists its real sub-causes from the brief (a short comma- or
+  semicolon-separated list reads well) - never invent causes the brief
+  didn't give you. Keep this to 3-5 categories - a real fishbone stays
+  scannable; split a genuinely bigger investigation into more than one
+  diagram instead of cramming extra categories into one.
+- The brief describes a STACK of distinct LAYERS/TIERS that sit on top of
+  each other with no containment and no importance ranking - each layer is
+  simply a separate level in a technical stack (a network protocol stack,
+  an architecture's tiers, rock strata, atmosphere layers) -> layered_diagram.
+  Order `nodes` top-to-bottom exactly as the brief describes the stack
+  (e.g. application layer first, physical layer last, for a networking
+  stack). Leave `edges` empty. Different from pyramid (importance/priority
+  narrowing to a point) and nested_circles (literal containment, one fully
+  inside the next) - a layered stack is neither; it's simply distinct,
+  equal-width bands stacked in a fixed technical order.
+- The brief is specifically about a SCHEDULE over time - which tasks run
+  when, how long each takes, and which overlap (a project plan, a sprint/
+  launch schedule, a Gantt chart) -> gantt_chart. Each node is one task:
+  `label` the task name, `gantt_start` the task's start offset (a plain
+  number - days/weeks/whatever unit the brief uses, 0 = the schedule's own
+  start) and `gantt_duration` how long it runs in that same unit. Order
+  `nodes` the way they first start. Leave `edges` empty (overlap/sequencing
+  is shown by each bar's own position, not connectors). Only use this when
+  the brief gives real relative timing for each task - when it only lists
+  steps with no timing at all, that's flow_chart/process/chevron_process
+  instead.
+- The brief is specifically about a mathematical function, a quantitative
+  trend, or a comparison of real numeric values across categories -> graph.
+  This kind does NOT use `nodes`/`edges` at all - leave both empty. Set
+  `graph_type` to exactly one of:
+  * `"function"` - plot one or more curves. Each entry in `functions` is a
+    Python-style expression of `x` (e.g. `"x**2"`, `"sin(x)"`, `"2*x + 1"`)
+    with a short `label` (e.g. "y = x^2"); set `x_min`/`x_max` to a sensible
+    domain for the concept.
+  * `"bar"` or `"line"` - set `categories` (the x-axis groups, e.g. a list
+    of approaches, time periods or options) and one or more `series`, each
+    a `label` and exactly one numeric value per category, in the same order
+    as `categories`. Use `"bar"` to compare discrete categories, `"line"`
+    for a trend over an ordered sequence (time, steps).
+  Always set `x_label`/`y_label` to what each axis actually represents.
+  Base every function/value only on the brief - a genuine illustrative or
+  pedagogical example (e.g. "plot y = x^2 to show a parabola", "three
+  example speed/risk scores to illustrate a tradeoff") is fine; a fabricated
+  real-world statistic, measurement or dataset presented as fact is not -
+  when the brief gives no real numbers and none would be honestly
+  illustrative, choose a different kind instead (or `image_kind:
+  illustration`, decided by the writer before this call).
 
 For `flow_chart`/`process` specifically: if the sequence has a genuine
 bounded start and end (a bounded procedure, not an ongoing pipeline), add
@@ -142,18 +313,29 @@ its own `label` ("Yes"/"No" or whatever the two outcomes are called); a
 loop is a branch whose edge points back at the decision node's own `id`.
 
 Rules for flow_chart/process/cycle/concept_map/hierarchy/comparison/smart_art/
-data_flow_diagram/er_diagram/swimlane:
+data_flow_diagram/er_diagram/swimlane/pyramid/matrix/radial_mindmap/venn/
+chevron_process/timeline/staircase_process/balance_comparison/
+nested_circles/network_mesh/decision_tree/fishbone/layered_diagram/gantt_chart:
 - Produce between 2 and 8 `nodes` for concept_map/hierarchy/comparison/
-  smart_art - those are meant to stay a small, scannable set of
-  relationships. For flow_chart/process/cycle/data_flow_diagram/swimlane
-  you may go up to 14 nodes when the brief genuinely describes that many
-  distinct steps (e.g. a real request pipeline with its error branches, an
-  agent's decide/call-tool/observe loop) - never pad a simple sequence with
-  extra steps just to look more thorough, but never compress a genuinely
-  multi-stage technical process down to 8 boxes either; a rejected,
-  too-small diagram falls back to a raster illustration that cannot
-  reliably render that many text labels, which is worse than a few extra
-  boxes. Give each node a short, unique `id`, a
+  smart_art/pyramid/matrix/radial_mindmap/balance_comparison/
+  nested_circles/network_mesh/decision_tree/layered_diagram/gantt_chart
+  (venn is always exactly 2 or 3 - see its own section above; fishbone's
+  own 3-5-category guidance is in its own section above too) - those are
+  meant to stay a small, scannable set of relationships (nested_circles
+  especially - realistically 3-5 levels, never more than a reader can
+  visually nest; layered_diagram similarly - realistically 3-7 layers).
+  chevron_process/staircase_process are meant to stay even smaller - 3-6
+  nodes, a short strip, not a long column (use flow_chart/process instead
+  for anything longer). For flow_chart/process/cycle/data_flow_diagram/
+  swimlane/timeline you may go up to 14 nodes when the
+  brief genuinely describes that many distinct steps/milestones (e.g. a
+  real request pipeline with its error branches, an agent's decide/call-
+  tool/observe loop, a long historical timeline) - never pad a simple
+  sequence with extra steps just to look more thorough, but never compress
+  a genuinely multi-stage technical process down to 8 boxes either; a
+  rejected, too-small diagram falls back to a raster illustration that
+  cannot reliably render that many text labels, which is worse than a few
+  extra boxes. Give each node a short, unique `id`, a
   `label` (2-6 words - the concept/action/decision itself, e.g. "Check
   saturation current", never "Screen hard limits (Isat, SRF)" with the
   reasoning folded in) and, only when it adds real information, a `detail`
@@ -169,121 +351,6 @@ data_flow_diagram/er_diagram/swimlane:
 - Base every label and detail only on the brief below. Do not invent facts,
   numbers or names that were not given to you. No markdown, no quotes.
 
-Rules for `schematic` - fill `shapes` (or `states` for a before/after
-comparison) instead of `nodes`/`edges`. This is a small, generic drawing kit,
-not physics-specific - it is exactly as appropriate for a chemistry reaction,
-a biology structure or a mechanical device as it is for an electrical one:
-- Each shape has a `type`:
-  * "block" - a labelled rectangle: a magnet, a battery, a beaker/flask, a
-    reactant/product, a machine part - any rectangular object. Set both
-    `label` and `sublabel` for a two-part object (a magnet's N/S poles, a
-    battery's +/- terminals, a reactant turning into a product).
-  * "circle" - a labelled round object: a cell, an atom, a seed, a planet,
-    a droplet - any round object. Set `sublabel` to draw a smaller labelled
-    circle inside it (a cell's nucleus, an atom's core, an embryo).
-  * "coil" - a wound coil, spring, or coiled tube (an induction coil, an
-    intestine, a spring).
-  * "gauge" - a dial/meter reading (`rotation` degrees = needle angle, 0 =
-    resting/vertical; `sublabel` = its caption, e.g. "Ammeter", "pH meter").
-  * "arrow" - a straight motion/direction/reaction-progress arrow
-    (`rotation` degrees = the direction it points, 0 = east, 90 = south,
-    180 = west, 270 = north, only used if `target_id` is unset).
-  * "label" - a standalone text annotation for anything the other shapes
-    don't cover.
-  Pick whichever combination fits the actual subject - e.g. two "block"
-  reactants connected by an "arrow" for a chemical reaction; a "circle" cell
-  with a "circle" nucleus inside plus "label" shapes for other organelles for
-  a biology diagram; "block"/"coil"/"gauge" for an electrical or mechanical
-  apparatus. There is deliberately no shape for field lines, current flow,
-  airflow or any other multi-line "fan" of movement radiating from a point -
-  that geometry has no single correct position for its own label once
-  anything else sits nearby, so it reads as accurate for exactly one layout
-  and overlapping/garbled for every other. A field/flux/current-direction/
-  wave visualization belongs to `image_kind: illustration` with
-  `illustration_style: textbook` instead (an actual picture, not a labelled
-  shape) - describe the exact field/flow pattern in `image_prompt`.
-- Do NOT set `x`/`y`/`width`/`height` yourself - a layout engine positions
-  every shape automatically from the semantic fields below, the same way you
-  never compute pixel coordinates for any other diagram kind. Describe the
-  diagram's *structure*, not its geometry:
-  * `role`: exactly one shape per state is `"primary"` - the single focal
-    object the whole diagram is about (the rotor, the cell, the main
-    reactant). Every other shape is `"secondary"`.
-  * `anchor`: where a shape sits *relative to another shape*, using its
-    `id`. One of `"orbit:<id>"` (arranged around that shape - the default
-    for anything without a stronger spatial reason), `"above:<id>"`,
-    `"below:<id>"`, `"left_of:<id>"`, `"right_of:<id>"` (a clear directional
-    relationship - current flowing left-to-right, a label sitting above what
-    it names), or `"inside:<id>"` (nested content - a nucleus inside a cell,
-    a core inside an atom; use `sublabel` on the parent shape instead
-    whenever that's simpler). Leave `anchor` blank to mean "orbit the
-    primary shape" - the default for most secondary objects.
-  * `priority`: `"critical"` (must always be visible - the primary object
-    always counts as critical), `"important"` (show if the diagram has
-    room), or `"optional"` (the first thing to drop if there are too many
-    annotations). Be honest about this - not every labelled detail is
-    equally important to the learning objective.
-  * `size`: `"small"`, `"medium"` (default), or `"large"` - relative to
-    other shapes, not a measurement. The primary object is usually
-    `"large"` or `"medium"`; a minor annotation is usually `"small"`.
-  * `target_id`: for an "arrow" shape, the `id` of the shape it points
-    at - this both draws the connection and tells the layout engine these
-    two shapes are related, so keep using it exactly as before.
-- One learning objective per diagram. Set `learning_objective` to the single
-  sentence a student should take away. If the brief genuinely contains
-  several independent things to learn with no shared primary object, cover
-  only the most important one here well (the writer can request a second,
-  separate diagram for the rest) rather than cramming every idea into one
-  overloaded panel.
-- Set `max_annotations` (default 5) to how many secondary shapes this
-  diagram can clearly show at once - lower it (e.g. 3-4) for a simple
-  concept, raise it only when the subject genuinely has that many
-  co-equally important parts. Shapes beyond the budget are dropped by
-  priority automatically, so mark the ones that must survive as `critical`.
-- Produce 2 to 8 shapes per state (or in `shapes` for a single static
-  illustration). Every shape needs a `label` naming exactly what it is - no
-  unlabelled decoration.
-- Use `states` (2 or more) only when the brief genuinely describes a
-  before/after, at-rest/in-motion or cause/effect comparison - each state is
-  one snapshot with its own `caption` (e.g. "No current" / "Current flows")
-  and its own `shapes` (repeat the shapes that don't change, move/adjust the
-  ones that do - keep the same `id`s and `role`/`anchor` across states so
-  the layout stays consistent). Leave `states` empty and use the top-level
-  `shapes` for a single static illustration.
-- If the subject is a well-known textbook visual (an electric motor,
-  electromagnetic induction, a fixed pulley, the human heart, an animal or
-  plant cell, a nephron, a convex/concave lens ray diagram, a transformer, a
-  simple electric circuit, or similar), set `visual_type` to its canonical
-  snake_case name (e.g. "electric_motor", "animal_cell"). This lets a
-  canonical blueprint fill in any component you omit and validates your
-  structure against it - prefer matching the real textbook structure for
-  that visual over inventing your own arrangement. Leave `visual_type` blank
-  for anything else; the diagram still renders normally.
-- Use the *minimum* set of components a textbook diagram of this subject
-  actually needs to teach the learning objective - do not add extra shapes
-  just to fill space or make the diagram look busier. Never invent a
-  decorative component (a random gear, an unrelated label, a made-up part)
-  that isn't a real part of the thing being depicted.
-- Set `color_role` on a shape to one of the semantic color roles ("primary",
-  "secondary", "accent", "structure", "current", "magnetic_field",
-  "positive", "negative", "fluid", "highlight", "annotation", "neutral") to
-  give it deliberate, consistent educational color instead of the plain
-  default - e.g. current-carrying parts get "current", a magnet/field gets
-  "magnetic_field", the single focal/primary object usually gets "primary"
-  or "accent". Leave it blank when no particular color meaning applies. This
-  is always a semantic role name, never a hex code. Reuse the same role for
-  every shape that shares the same meaning so the color language stays
-  consistent across the diagram - don't scatter many different roles just to
-  look colorful.
-- Optionally set `relationships` (each with `source`, `type`, `target` shape
-  ids) to state real structural facts using exactly one of: inside,
-  contains, connected_to, attached_to, above, below, left_of, right_of,
-  passes_through, surrounds, contacts, points_to, flows_into, rotates_around,
-  between. This documents *what is true* for validation - it does not affect
-  layout (that's still `anchor`'s job), so a relationship and its matching
-  anchor are independent and both may be set.
-- Base every label, relationship and state only on the brief below. Do not
-  invent facts, numbers or components that were not implied by it.
 """
 
 _KIND_PIN_INSTRUCTION = """
@@ -363,10 +430,48 @@ def _kind_conflicts(hint: str, actual: str) -> bool:
     if hint in SEQUENTIAL_KINDS:
         return actual not in SEQUENTIAL_KINDS
     if hint in RELATIONSHIP_KINDS:
-        return actual in SEQUENTIAL_KINDS
+        # smart_art's own renderer deliberately never draws edges ("numbered
+        # list, no connecting arrows" - see diagram_renderer.py) - it can
+        # never satisfy a relationship brief by construction, exactly like a
+        # sequential answer can't, confirmed via a real generated course
+        # sample where a "concept_map" hint came back as "smart_art" and
+        # this check let it through silently.
+        return actual in SEQUENTIAL_KINDS or actual == "smart_art"
     if hint in ("comparison", "smart_art"):
         return actual in SEQUENTIAL_KINDS or (hint == "comparison" and actual != "comparison")
     return False
+
+
+# Kinds the new textbook-style ring/wheel renderer draws (see
+# app.render.diagram_renderer's dispatch in render_diagram_svg) - these are
+# the only ones that get the "Fig. N: " caption prefix below; every other
+# kind's title is left exactly as the model wrote it, unchanged.
+_RING_OR_WHEEL_KINDS = ("flow_chart", "process", "cycle", "concept_map", "conceptual")
+
+
+def _with_figure_caption(spec: DiagramSpec, block: Block) -> DiagramSpec:
+    """Prefixes a ring/wheel diagram's own title with "Fig. {chapter
+    number}: " - the textbook-style caption the new circular rendering
+    draws as its big heading above the diagram (see render_diagram_svg's
+    existing title handling; no renderer change needed, it already draws
+    whatever `spec.title` says). `block.meta.chapter_number` is already
+    set by the time any diagram generates (app.course.document.builder
+    assigns it during the initial document build, well before
+    ImageService.generate_missing runs) - no new parameter needed on this
+    method. A true "Fig. {chapter}.{sequence within chapter}" numbering
+    would need a document-wide view this per-block method doesn't have
+    (and calls can run concurrently - see ImageService.generate_missing's
+    own asyncio.gather) - deliberately simplified to the chapter number
+    alone rather than risk an inconsistent/racy sub-number. Idempotent:
+    does nothing if the title already starts with "Fig. " (the connectivity
+    retry path can call this twice on the same spec)."""
+    if spec.normalised_kind() not in _RING_OR_WHEEL_KINDS:
+        return spec
+    chapter_number = block.meta.chapter_number
+    if not chapter_number or spec.title.strip().startswith("Fig. "):
+        return spec
+    spec.title = f"Fig. {chapter_number}: {spec.title.strip()}" if spec.title.strip() else f"Fig. {chapter_number}"
+    return spec
 
 
 def _flow_chart_connectivity_issues(spec: DiagramSpec) -> list[str]:
@@ -648,6 +753,12 @@ class DiagramService:
         # fix the spec, so a persistent issue is logged and rendered
         # anyway rather than discarded for the unreliable raster fallback.
         connectivity_issues = _flow_chart_connectivity_issues(spec)
+        # Carries over into the final, successful save below (see its own
+        # merge_content call) ONLY if the retry fails to resolve them -
+        # starts at whatever the first attempt found; replaced with [] the
+        # moment a clean `reconnected` spec is accepted, so a since-resolved
+        # problem is never persisted as if it still shipped.
+        unresolved_connectivity_issues = connectivity_issues
         if connectivity_issues:
             log.info(
                 "Diagram for %s has connectivity problems (%s) - retrying with targeted feedback",
@@ -668,6 +779,7 @@ class DiagramService:
                 reconnected = self._normalise(reconnected)
                 if reconnected.normalised_kind() == "flow_chart" and not _flow_chart_connectivity_issues(reconnected):
                     spec = reconnected
+                    unresolved_connectivity_issues = []
                 else:
                     log.warning(
                         "Diagram for %s still has connectivity problems after retry (%s) - rendering anyway; "
@@ -684,12 +796,66 @@ class DiagramService:
             )
             return False
 
+        # Structural usability (right number of labelled nodes/edges) says
+        # nothing about whether the content is actually ABOUT the brief -
+        # the gap behind "a flowchart with boxes but no meaningful
+        # information". One bounded content-relevance retry, same shape as
+        # every other QA step here; unlike the connectivity check above,
+        # there's no renderer-level safety net for wrong CONTENT, so a
+        # persistent failure falls back to the raster illustration path
+        # rather than shipping it, same as a persistent render-QA failure.
+        brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
+        content_result = await evaluate_content(spec, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings)
+        if not content_result.passed:
+            log.info(
+                "Diagram content QA failed for %s (%s) - retrying with targeted feedback",
+                block.id, [issue.reason for issue in content_result.issues],
+            )
+            try:
+                retried = await self._request_spec(
+                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
+                    memory=memory_text, kind_hint=spec.normalised_kind(), pin_kind=True, block_id=block.id,
+                    qa_feedback=(
+                        "The previous attempt's content was rejected for these reasons: "
+                        + "; ".join(issue.detail for issue in content_result.issues)
+                        + ". Make every label specific and genuinely about this exact brief - "
+                        "never a generic placeholder - and cover every concept the brief named."
+                    ),
+                )
+                retried = self._normalise(retried)
+                if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
+                    retried_result = await evaluate_content(
+                        retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
+                    )
+                    if retried_result.passed or len(retried_result.issues) < len(content_result.issues):
+                        spec, content_result = retried, retried_result
+            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
+                log.warning("Diagram content-QA retry failed for %s: %s", block.id, exc)
+
+            if not content_result.passed:
+                log.info(
+                    "Diagram for %s still has content issues after retry - falling back to illustration",
+                    block.id,
+                )
+                block.content = merge_content(
+                    block.type,
+                    block.content,
+                    {
+                        "visual_qa_findings": visual_qa_finding_entries(
+                            [(issue.reason, issue.detail, issue.deterministic) for issue in content_result.issues],
+                            resolution="fell_back_to_illustration",
+                        )
+                    },
+                )
+                return False
+
         if spec.normalised_kind() == "schematic":
             spec = await self._resolve_and_check_schematic(
                 spec, purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
                 memory_text=memory_text, kind_hint=kind_hint, block_id=block.id,
             )
 
+        spec = _with_figure_caption(spec, block)
         try:
             svg_bytes, width, height = render_diagram_svg(spec, template.theme)
         except Exception as exc:  # noqa: BLE001 - rendering must not fail the block
@@ -715,7 +881,35 @@ class DiagramService:
         # assumes. Running it on schematic produced real false positives
         # (confirmed: several passing electric-motor/pulley tests started
         # failing) rather than catching anything real.
-        issues = [] if spec.normalised_kind() == "schematic" else validate_rendered_svg(svg_bytes, kind=spec.normalised_kind())
+        #
+        # Graph is exempt too: this check's overlap/clipping/"shared edge
+        # segment" heuristics are built around discrete node boxes and the
+        # arrows connecting them - a plotted axis/curve/bar has none of
+        # those, and a confirmed real case showed it flagging a plotted
+        # function's own curve as a "shared edge segment" with the x-axis
+        # line, falling the graph back to an unreliable raster illustration
+        # for no real defect. Graph gets its own geometry discipline
+        # instead (real auto-computed axis ranges, nice_ticks spacing) - see
+        # app.render.diagram_renderer._layout_graph.
+        #
+        # flow_chart/process/cycle/concept_map/conceptual are NOT exempt -
+        # an earlier version of this comment claimed `_shape_bbox` couldn't
+        # recognise the new ring/wheel rendering's `<circle>` node shapes;
+        # that was never true (diagram_render_qa.py's `_shape_bbox` already
+        # handled `circle`/`ellipse`/`polygon`, not just `rect`) - the two
+        # REAL gaps were `text_overflow_issues` assuming left-anchored
+        # text (every ring/wheel label uses `text-anchor="middle"`,
+        # double-counting half the text as overflow) and
+        # `readability_issues` hardcoding the old box renderer's
+        # LABEL_SIZE instead of RING_LABEL_SIZE, the new, smaller size
+        # these kinds actually use - both fixed directly in
+        # diagram_render_qa.py, confirmed against real ring/wheel output
+        # (app/render/diagram_renderer.py's own "renders_clean" test
+        # suite). Real QA coverage for these kinds is worth having - it
+        # catches a genuinely broken diagram the same way it always did
+        # for the box-based kinds.
+        _exempt_kinds = ("schematic", "graph")
+        issues = [] if spec.normalised_kind() in _exempt_kinds else validate_rendered_svg(svg_bytes, kind=spec.normalised_kind())
         if issues:
             log.info(
                 "Rendered diagram QA failed for %s (%s) - retrying with targeted feedback",
@@ -734,6 +928,7 @@ class DiagramService:
                 )
                 retried = self._normalise(retried)
                 if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
+                    retried = _with_figure_caption(retried, block)
                     retried_svg, retried_w, retried_h = render_diagram_svg(retried, template.theme)
                     retried_issues = validate_rendered_svg(retried_svg, kind=retried.normalised_kind())
                     if len(retried_issues) < len(issues):
@@ -745,6 +940,30 @@ class DiagramService:
             log.info(
                 "Diagram for %s still has %s rendered layout issue(s) after retry - falling back",
                 block.id, len(issues),
+            )
+            # TASK 3 (quality audit follow-up) - persist the real structured
+            # issues onto the block BEFORE falling back, so the quality
+            # report can later show what happened here instead of this being
+            # visible only in this log line. The caller (ImageService) still
+            # owns this block and will overwrite its content with the
+            # fallback illustration's own fields - visual_qa_findings
+            # deliberately survives that (see merge_content/ImageContent,
+            # extra="allow" + an explicit field), since it describes this
+            # attempt, not the fallback's own result.
+            block.content = merge_content(
+                block.type,
+                block.content,
+                {
+                    "visual_qa_findings": visual_qa_finding_entries(
+                        # True (literal, quality-governance follow-up Phase
+                        # 3.7): RenderQAIssue (app.services.diagram_render_qa)
+                        # is pure SVG/geometry parsing - no AIClient import
+                        # anywhere in that module, so every issue here is
+                        # genuinely deterministic, never an LLM judgment call.
+                        [(issue.kind, issue.detail, True) for issue in issues],
+                        resolution="fell_back_to_illustration",
+                    )
+                },
             )
             return False
 
@@ -762,6 +981,33 @@ class DiagramService:
                 # What was actually drawn, so a later review can check the
                 # diagram against the text it sits beside.
                 "diagram_outline": diagram_outline(spec),
+                # Edit Visuals (flowchart editor): persist the structured spec
+                # itself, not just the rendered SVG - without this there is
+                # nothing for a later edit to load (see
+                # DocumentService.update_visual_spec/preview_visual_spec,
+                # which read/write this exact key, same as
+                # concept_visual_service.py already does for
+                # concept_experience). A course generated before this field
+                # existed simply has no "spec" key here - see
+                # DocumentService.reconstruct_diagram_spec for that case.
+                "spec": spec.model_dump(mode="json"),
+                # Quality-governance follow-up: previously this state (retry
+                # exhausted, shipping anyway) was visible only in the log
+                # warning above - a real reviewer or the quality report had
+                # no way to see it. Set explicitly on every successful save
+                # (including the clean "[]" case), same reasoning as
+                # concept_visual_service.py's identical comment: a re-render
+                # that resolves the problem must never leave a STALE finding
+                # from an earlier, worse attempt (merge_content is a shallow
+                # merge - an omitted key here would silently keep whatever
+                # was already on the block). Same resolution string as that
+                # module's own "rendered anyway, unresolved" case;
+                # `deterministic=True` because `_flow_chart_connectivity_
+                # issues` is pure in/out-degree counting, no AI judgment call.
+                "visual_qa_findings": visual_qa_finding_entries(
+                    [("flow_chart_connectivity", detail, True) for detail in unresolved_connectivity_issues],
+                    resolution="rendered_with_unresolved_issues",
+                ) if unresolved_connectivity_issues else [],
             },
         )
         log.info(

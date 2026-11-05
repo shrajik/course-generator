@@ -51,6 +51,13 @@ class StyleGuide(BaseModel):
     brand_terms: list[str] = Field(default_factory=list, max_length=MAX_TERMS)
     # Words or phrases that must never appear.
     banned_words: list[str] = Field(default_factory=list, max_length=MAX_TERMS)
+    # Content Studio Phase 2 - whether the writer is told to narrate (in a
+    # short inline note) when a client override conflicts with the base
+    # guide's own rules, rather than resolving the conflict silently. True
+    # (the pre-existing, only-ever behaviour before this field existed)
+    # keeps every course that doesn't touch it generating byte-identical
+    # prompts - see style_guide_brief in app/course/style_guide.py.
+    flag_voice_conflicts: bool = True
 
     @field_validator("brand_terms", "banned_words")
     @classmethod

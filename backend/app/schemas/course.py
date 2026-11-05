@@ -8,7 +8,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.learner import LearnerProfile
 from app.schemas.design import DesignModels
+from app.schemas.standards import AccessibilitySettings, MetadataSettings, PackagingSettings
 from app.schemas.style import StyleGuide
+
+# Content Studio Phase 1 - companion deliverables a course can request
+# alongside the course itself (schema only for now: selecting one of these
+# does not yet produce a job-aid/quick-reference/manager-guide document -
+# that generation step is deliberately a separate, later phase. See
+# CourseInput.companions below.
+CompanionDeliverable = Literal["job_aid", "quick_ref", "manager_guide"]
 
 TemplateKind = Literal["technical", "non_technical"]
 
@@ -16,6 +24,22 @@ TEMPLATE_IDS: dict[str, str] = {
     "technical": "technical_v1",
     "non_technical": "non_technical_v1",
 }
+
+# MOM Phase 5 - learning approaches: HOW a concept is taught, independent of
+# content_level (WHICH presentation assets accompany it) and of
+# learner_profile (WHO it's tailored for) - see learning_approaches_brief in
+# app/agents/prompts.py for exactly what each value asks the writer for, and
+# which existing block types it reuses (never a new block type). A course
+# can select several; the writer is asked to combine them coherently rather
+# than produce one generic section per approach.
+LearningApproach = Literal[
+    "explanatory",
+    "example_driven",
+    "scenario_based",
+    "situation_based",
+    "hands_on",
+    "conversational",
+]
 
 
 class TocItem(BaseModel):
@@ -61,6 +85,31 @@ class CourseInput(BaseModel):
     # it is None the generation prompts are byte-identical to what they were.
     # See app/course/pedagogy.py for how it becomes a constraints brief.
     learner_profile: LearnerProfile | None = None
+    # MOM Phase 4 - content level, independent of learner_profile/learning
+    # approach (MOM 4.4: these are separate dimensions, never forced into one
+    # rigid mode). 2 (the existing default behaviour: text + diagrams/images
+    # where the writer judges them useful) keeps every pre-existing course's
+    # prompts byte-identical - see content_level_brief in app/agents/prompts.py
+    # for the "" it returns at level 2. 1 = text-only, no generated visual
+    # assets at all (also enforced structurally, not just by prompt - see
+    # CourseService.generate's own generate_images override). 3 is the MOM's
+    # own provisional/not-yet-finalised experiential-learning mode (realistic
+    # scenarios, hands-on exercises, decisions under incomplete information) -
+    # implemented as a prompt-level framing shift for now, not a separate
+    # generation pipeline; see content_level_brief's own docstring for exactly
+    # what it does and does not yet do.
+    content_level: Literal[1, 2, 3] = 2
+    # MOM Phase 5 - [] (the pre-existing default: the writer judges which
+    # approach fits each section on its own, exactly as before this field
+    # existed) keeps every pre-existing course's prompts byte-identical -
+    # see learning_approaches_brief in app/agents/prompts.py for the "" it
+    # returns for an empty list. Independent of content_level/
+    # presentation - a Level 1 (text-only) course can still be
+    # conversational or example-driven; selecting "hands_on" doesn't force
+    # Level 3 or disable diagrams. A plain list, not a single value -
+    # multiple approaches can be combined (see learning_approaches_brief's
+    # own "combine coherently, do not repeat" instruction).
+    learning_approaches: list[LearningApproach] = Field(default_factory=list)
     # Which instructional-design models to apply (app/schemas/design.py). Also
     # optional: None or an empty list changes nothing about the prompts.
     design_models: DesignModels | None = None
@@ -70,6 +119,40 @@ class CourseInput(BaseModel):
     # Uploaded source documents (see app/services/source_service.py) whose text
     # is the ground truth for this course. Ids of sources the creator owns.
     source_ids: list[str] = Field(default_factory=list, max_length=50)
+    # --- Content Studio Phase 1 (backend data-model foundation) -------------
+    # [] (the pre-existing default) keeps every pre-existing course's prompts
+    # byte-identical - see _brief_details_brief in app/agents/prompts.py for
+    # the "" it returns when none of these three fields are set. One task per
+    # line, in the UI's own words: "each task becomes at least one learning
+    # objective" - never validated against the toc/chapters shape, since a
+    # task is a learner outcome, not a content-structure constraint.
+    tasks: list[str] = Field(default_factory=list, max_length=20)
+    # The business/performance goal the course exists to move - independent
+    # of `DesignModels.business_goal` (that field is Kirkpatrick-specific and
+    # required only when Kirkpatrick is selected; this one is general-purpose
+    # and always optional, left untouched here to avoid any risk to that
+    # already-tested validator).
+    business_goal: str = Field(default="", max_length=500)
+    # Optional: the UI's own placeholder is "left blank, the Analysis phase
+    # drafts one" - see _brief_details_brief, which tells the model to draft
+    # a gap statement (explicitly flagged as drafted, never stated as fact)
+    # only when this is blank.
+    performance_gap: str = Field(default="", max_length=1000)
+    # Schema only this phase - selecting one does not yet generate the actual
+    # companion document (see CompanionDeliverable's own docstring above).
+    companions: list[CompanionDeliverable] = Field(default_factory=list)
+    # Packaging/delivery-tracking standard (app/schemas/standards.py) - None
+    # keeps app.course.compliance's existing "no packaging standard selected"
+    # behaviour exactly.
+    packaging: PackagingSettings | None = None
+    # --- Content Studio Phase 2 (standards & compliance step) ---------------
+    # Accessibility target/extra-requirements/brand-colors - None keeps
+    # app.course.compliance's existing fixed-target, theme-colors-only
+    # behaviour exactly.
+    accessibility: AccessibilitySettings | None = None
+    # Metadata schema preference/org-tagging/owner override - None keeps the
+    # existing "lom" default and no org-tagging/owner-override behaviour.
+    metadata: MetadataSettings | None = None
 
     @field_validator("toc", mode="before")
     @classmethod
@@ -160,15 +243,122 @@ class RunInfo(BaseModel):
 ReviewStatus = Literal["draft", "in_review", "changes_requested", "approved"]
 
 
-class ReviewHistoryEntry(BaseModel):
-    """One entry in a course's review audit trail (append-only)."""
+class OverrideEvidence(BaseModel):
+    """Structured audit evidence for one of the four admin-only quality-gate
+    override actions (see ReviewHistoryEntry.action and
+    app.services.course_service's `_approve_with_override`). Only the
+    fields relevant to the specific override action taken are populated;
+    the rest keep their safe (empty) defaults - never fabricated.
+
+    Wording note: `verification_error`/`evaluation_error` describe a check
+    that could not be completed, never a confirmed content defect - see the
+    override policy's explicit wording requirement."""
 
     model_config = ConfigDict(extra="allow")
 
-    action: Literal["submitted", "approved", "changes_requested"]
+    # override_approved_blockers
+    standards_version: str | None = None
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    # override_approved_verification_failed
+    verifier: str | None = None
+    verification_error: str | None = None
+    # override_approved_evaluation_failure
+    evaluation_error: str | None = None
+    # override_approved_incomplete_chapters
+    affected_chapters: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ReviewHistoryEntry(BaseModel):
+    """One entry in a course's review audit trail (append-only).
+
+    The four `override_approved_*` actions (MOM quality-governance
+    follow-up) are admin-only, server-enforced bypasses of one specific
+    quality gate each - see `CourseService._approve_with_override` for the
+    exact policy each one is scoped to, and `OverrideEvidence` for the
+    structured evidence `override_evidence` carries. They are deliberately
+    distinct from plain "approved": never collapse one into another, and
+    never let a different override action's absence be read as "nothing
+    was wrong"."""
+
+    model_config = ConfigDict(extra="allow")
+
+    action: Literal[
+        "submitted",
+        "approved",
+        "changes_requested",
+        "override_approved_blockers",
+        "override_approved_verification_failed",
+        "override_approved_evaluation_failure",
+        "override_approved_incomplete_chapters",
+    ]
     by: str | None = None  # user id of whoever performed the action
     at: str
     comment: str | None = None
+    override_evidence: OverrideEvidence | None = None
+
+
+class QualitySnapshot(BaseModel):
+    """The audit-trail record of the last time this course's quality was
+    evaluated (see `CourseRecord.quality_snapshot` below, and
+    `app.services.quality_framework.quality_snapshot_from_report`, which is
+    the only place that ever constructs one - this module stays a plain
+    schema with no app/services dependency, matching every other schema
+    file). Distinct from the LIVE `QualityReport` a caller gets from
+    `get_quality_report()`, which always reflects the course's CURRENT state
+    under whatever standards version the code currently defines - this
+    snapshot instead answers "what did evaluation conclude back when this
+    course finished generating."
+
+    `outcome` is this COURSE's pass/fail against the (proposed) standards at
+    that time - never a claim that the standards themselves are formally
+    approved; `standards_status` carries that distinction through unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    standards_version: str
+    standards_status: str
+    evaluated_at: str
+    outcome: str  # "passed" | "failed"
+    hard_failure_count: int
+    warning_count: int
+
+
+# --- phase-gated approval (Content Studio Phase 3, ADDIE only) --------------
+# 3 real phases, not a literal 5-tab split - Analysis and Design are both
+# produced by the existing blueprint/outline step; Implementation and
+# Evaluation are both computed instantly as a derived summary once the
+# document is built (app.course.design_models.design_outputs, no separate
+# generation call). See CoursePhases' own docstring for the full reasoning.
+CoursePhase = Literal["analysis_design", "development", "implementation_evaluation"]
+PhaseStatus = Literal["pending", "in_review", "approved"]
+
+
+class PhaseApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: PhaseStatus = "pending"
+    approved_at: str | None = None
+    approved_by: str | None = None
+
+
+class CoursePhases(BaseModel):
+    """ADDIE phase-gated approval state (Content Studio Phase 3) - 3 real
+    phases: `analysis_design` is approved via the EXISTING `approve_outline`
+    Gate 1 (the blueprint already carries both); `development` is approved
+    once chapter generation genuinely completes (the real inventory, not
+    just `status == "ready"` - see CourseService._finalise); approving
+    `development` cascades `implementation_evaluation` straight to
+    "in_review", since computing it costs nothing. Only ever set (non-None)
+    for a course whose design_models selects "addie" and not "sam" at
+    creation time - every other course has `phases is None` and generates/
+    approves exactly as it always has, the same backward-compatible
+    contract as `outline_approved`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_design: PhaseApproval = Field(default_factory=PhaseApproval)
+    development: PhaseApproval = Field(default_factory=PhaseApproval)
+    implementation_evaluation: PhaseApproval = Field(default_factory=PhaseApproval)
 
 
 class CourseRecord(BaseModel):
@@ -198,6 +388,9 @@ class CourseRecord(BaseModel):
     outline_approved: bool | None = None
     outline_approved_at: str | None = None
     outline_approved_by: str | None = None
+    # ADDIE phase-gated approval state (Content Studio Phase 3) - None for
+    # every course that doesn't select ADDIE-without-SAM at creation time.
+    phases: CoursePhases | None = None
     created_at: str
     updated_at: str
     chapters: list[ChapterProgress] = Field(default_factory=list)
@@ -206,6 +399,19 @@ class CourseRecord(BaseModel):
     pdf_path: str | None = None
     last_error: str | None = None
     warnings: list[str] = Field(default_factory=list)
+    # MOM Phase 9 follow-up (quality audit TASK 2) - the audit-trail snapshot
+    # from the LAST time `CourseService._finalise` evaluated this course's
+    # quality (see QualitySnapshot's own docstring in
+    # app.services.quality_framework for why this is distinct from the LIVE
+    # report `get_quality_report()` recomputes). `None` for a course that
+    # has never finished generating, or whose evaluation itself failed -
+    # never fabricated. Not in COURSE_RECORD_COLUMN_FIELDS (app/db/service.py),
+    # so it flows through the existing generic `metadata_json` sweep in DB
+    # mode with no migration, and through the existing whole-record JSON
+    # write in filesystem mode - a course saved before this field existed
+    # simply has it as None on load, same contract as every other optional
+    # CourseRecord field.
+    quality_snapshot: QualitySnapshot | None = None
 
 
 # --- API payloads -----------------------------------------------------------
@@ -284,6 +490,14 @@ class GenerateResponse(BaseModel):
     course_id: str
     document_id: str
     status: CourseStatus
+    # Additive, read-only reflection of `record.quality_snapshot.outcome`
+    # (see QualitySnapshot) - deliberately NOT a new CourseStatus value and
+    # never written back anywhere: `status` keeps its existing meaning
+    # ("the pipeline ran and a document exists"), this just answers the
+    # separate question "did it pass the configured quality gate." `None`
+    # when no snapshot exists yet (evaluation itself failed, or - for an
+    # older course record - this field didn't exist when it last finished).
+    quality_outcome: Literal["passed", "failed"] | None = None
     chapters_generated: list[str] = Field(default_factory=list)
     chapters_failed: list[str] = Field(default_factory=list)
     images_generated: int = 0
@@ -309,6 +523,19 @@ class ApproveCourseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     comment: str | None = Field(default=None, max_length=4000)
+
+
+class OverrideApprovalRequest(BaseModel):
+    """Body for each of the four admin-only override-approve endpoints.
+    Deliberately has no field selecting WHICH quality gate to bypass - that
+    is fixed by which endpoint/action is called, never a client-supplied
+    parameter (see the four `override_approved_*` actions on
+    ReviewHistoryEntry) - so the ordinary `/approve` endpoint and its
+    `ApproveCourseRequest` stay free of any override parameter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    comment: str = Field(min_length=1, max_length=4000, description="Why this override is justified.")
 
 
 class CourseReviewResponse(BaseModel):

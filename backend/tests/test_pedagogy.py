@@ -21,6 +21,8 @@ from app.course.pedagogy import (
     is_cross_domain,
     learner_brief,
     pedagogy_rules_brief,
+    professional_profile_brief,
+    seniority_brief,
     slider_defaults,
 )
 from app.course.templates.registry import load_template
@@ -103,6 +105,72 @@ def test_brief_renders_for_every_archetype(age_group: str) -> None:
     assert "LEARNER PROFILE" in brief
 
 
+# --- professional personalization (MOM Phase 3) -------------------------------
+
+
+def test_professional_profile_and_seniority_briefs_are_empty_when_unset() -> None:
+    profile = _profile(age_group="PROFESSIONAL")
+    assert professional_profile_brief(profile) == []
+    assert seniority_brief(profile) == []
+    brief = learner_brief(profile)
+    assert "PROFESSIONAL AUDIENCE TYPE" not in brief
+    assert "CORPORATE SENIORITY LEVEL" not in brief
+
+
+@pytest.mark.parametrize("age_group", [ag for ag in ARCHETYPES if ag != "PROFESSIONAL"])
+def test_professional_profile_and_seniority_are_ignored_outside_the_professional_archetype(
+    age_group: str,
+) -> None:
+    """Set on a KG_PRIMARY/MIDDLE_SECONDARY/HIGHER_ED course, these fields
+    must have no effect - they're defined relative to the PROFESSIONAL
+    archetype's own instructional model, which doesn't apply here."""
+    profile = _profile(age_group=age_group, professional_profile="specialist", seniority="senior")
+    assert professional_profile_brief(profile) == []
+    assert seniority_brief(profile) == []
+    brief = learner_brief(profile)
+    assert "PROFESSIONAL AUDIENCE TYPE" not in brief
+    assert "CORPORATE SENIORITY LEVEL" not in brief
+
+
+def test_generalist_and_specialist_produce_different_guidance() -> None:
+    generalist = learner_brief(_profile(age_group="PROFESSIONAL", professional_profile="generalist"))
+    specialist = learner_brief(_profile(age_group="PROFESSIONAL", professional_profile="specialist"))
+    assert "PROFESSIONAL AUDIENCE TYPE (generalist)" in generalist
+    assert "cross-functional relationships" in generalist
+    assert "PROFESSIONAL AUDIENCE TYPE (specialist)" in specialist
+    assert "industry-native terminology" in specialist
+    assert generalist != specialist
+
+
+def test_generalist_is_not_framed_as_superficial() -> None:
+    """A real, explicit MOM requirement: "Do not interpret generalist as
+    superficial" - the guidance must ask for genuine breadth, never permission
+    to be shallow."""
+    brief = learner_brief(_profile(age_group="PROFESSIONAL", professional_profile="generalist"))
+    assert "superficial" not in brief.lower()
+    assert "shallow" not in brief.lower()
+    assert "broad understanding" in brief
+
+
+@pytest.mark.parametrize("seniority,expected", [
+    ("junior", "foundational concepts"),
+    ("middle", "independent application"),
+    ("senior", "architecture-level"),
+])
+def test_each_seniority_level_produces_distinct_guidance(seniority: str, expected: str) -> None:
+    brief = learner_brief(_profile(age_group="PROFESSIONAL", seniority=seniority))
+    assert f"CORPORATE SENIORITY LEVEL ({seniority})" in brief
+    assert expected in brief
+
+
+def test_professional_profile_and_seniority_combine_in_one_brief() -> None:
+    brief = learner_brief(
+        _profile(age_group="PROFESSIONAL", professional_profile="specialist", seniority="senior")
+    )
+    assert "PROFESSIONAL AUDIENCE TYPE (specialist)" in brief
+    assert "CORPORATE SENIORITY LEVEL (senior)" in brief
+
+
 @pytest.mark.parametrize("age_group", sorted(ARCHETYPES))
 def test_brief_never_trips_the_mock_ai_prompt_parsers(age_group: str) -> None:
     """The offline mock client pulls the course/chapter title and the TOC out
@@ -111,7 +179,12 @@ def test_brief_never_trips_the_mock_ai_prompt_parsers(age_group: str) -> None:
     content and silently corrupt every offline test.
     """
     profile = _profile(
-        age_group=age_group, source_domain="STEM", target_domain="FINANCE", manual_override=True
+        age_group=age_group,
+        source_domain="STEM",
+        target_domain="FINANCE",
+        manual_override=True,
+        professional_profile="specialist",
+        seniority="senior",
     )
     text = f"{learner_brief(profile)}\n{pedagogy_rules_brief(profile)}"
     for label in ("COURSE TITLE:", "CHAPTER TITLE:", "TEMPLATE KIND:", "VISUAL BRIEF:"):

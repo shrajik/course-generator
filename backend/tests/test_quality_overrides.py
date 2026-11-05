@@ -1,0 +1,503 @@
+"""MOM quality-governance follow-up - the four distinct, admin-only
+quality-gate override actions (service layer).
+
+All offline/mock (USE_DATABASE=false, see conftest.py) - these exercise
+`CourseService.approve_course_override_*` directly rather than through the
+HTTP layer, since the admin-only role check and the quality-gate logic are
+independent concerns; the role/403 wiring has its own DB-gated API-level
+coverage (see test_review_workflow.py's existing pattern) which this
+environment cannot run without TEST_DATABASE_URL.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import app.services.course_service as course_service_module
+import app.services.quality_framework as qf_module
+from app.core.errors import (
+    ConflictError,
+    IncompleteChapterInventoryError,
+    QualityApprovalBlockedError,
+    QualityEvaluationFailedError,
+    ValidationFailedError,
+)
+from app.schemas.audit import AuditFinding, AuditReport
+from app.schemas.blocks import BlockType
+from app.schemas.course import GenerateRequest
+from app.services.audit_service import get_audit_service
+
+
+async def _submitted_level_3_course(service, technical_input):
+    """A real, reliable confirmed-blocker fixture: the mock technical writer
+    never adds a case_study/story block (see test_content_level.py's own
+    equivalent), so this reliably produces an independently_verified
+    structural blocker, not a hand-built one."""
+    level_3_input = technical_input.model_copy(update={"content_level": 3})
+    record = await service.create_course(level_3_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+    return record
+
+
+# --- override_approved_blockers ---------------------------------------------
+
+
+async def test_normal_approval_is_blocked_by_a_confirmed_blocker(service, technical_input):
+    record = await _submitted_level_3_course(service, technical_input)
+    with pytest.raises(QualityApprovalBlockedError) as excinfo:
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    findings = excinfo.value.details["findings"]
+    assert findings
+    assert all(f["verification_status"] == "independently_verified" for f in findings)
+
+
+async def test_override_approved_blockers_succeeds_and_records_evidence(service, technical_input):
+    record = await _submitted_level_3_course(service, technical_input)
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+    )
+    assert approved.review_status == "approved"
+    entry = approved.review_history[-1]
+    assert entry.action == "override_approved_blockers"
+    assert entry.by == "admin-1"
+    assert entry.override_evidence.findings
+    assert entry.override_evidence.standards_version
+
+
+async def test_override_approved_blockers_rejects_an_empty_reason(service, technical_input):
+    record = await _submitted_level_3_course(service, technical_input)
+    with pytest.raises(ValidationFailedError):
+        await service.approve_course_override_blockers(record.course_id, "admin-1", "   ")
+
+
+async def test_override_approved_blockers_still_requires_in_review(service, technical_input):
+    record = await service.create_course(technical_input)  # still "draft"
+    with pytest.raises(ConflictError):
+        await service.approve_course_override_blockers(record.course_id, "admin-1", "reason")
+
+
+async def test_wrong_override_for_confirmed_blockers_does_not_silently_succeed(
+    service, technical_input
+):
+    """override_approved_incomplete_chapters must not approve past a
+    confirmed-blocker problem it isn't scoped to."""
+    record = await _submitted_level_3_course(service, technical_input)
+    with pytest.raises(ValidationFailedError):
+        # The inventory IS complete here - this override has nothing to do.
+        await service.approve_course_override_incomplete_chapters(
+            record.course_id, "admin-1", "reason"
+        )
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"  # never silently approved
+
+
+# --- override_approved_verification_failed ----------------------------------
+
+
+async def test_normal_approval_is_blocked_by_a_verification_failure(
+    service, technical_input, monkeypatch
+):
+    def _boom(document):
+        raise RuntimeError("document mid-rebuild")
+
+    # document_findings() now calls validate_document_structured() directly
+    # (Phase 3.3/3.4: structured layout findings) - patch that real call
+    # site, not the legacy validate_document() wrapper it no longer invokes.
+    monkeypatch.setattr(qf_module, "validate_document_structured", _boom)
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    with pytest.raises(QualityApprovalBlockedError) as excinfo:
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    findings = excinfo.value.details["findings"]
+    assert all(f["verification_status"] == "verification_failed" for f in findings)
+
+
+async def test_override_approved_verification_failed_succeeds_with_evidence(
+    service, technical_input, monkeypatch
+):
+    def _boom(document):
+        raise RuntimeError("document mid-rebuild")
+
+    monkeypatch.setattr(qf_module, "validate_document_structured", _boom)
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    approved = await service.approve_course_override_verification_failed(
+        record.course_id, "admin-1", "Layout verifier is flaky; content was reviewed manually."
+    )
+    assert approved.review_status == "approved"
+    entry = approved.review_history[-1]
+    assert entry.action == "override_approved_verification_failed"
+    assert entry.override_evidence.verifier == "layout_validator"
+    assert "document mid-rebuild" in (entry.override_evidence.verification_error or "")
+    # Wording discipline: never claims a confirmed defect.
+    assert "defect" not in approved.review_comment.lower()
+
+
+async def test_a_fresh_recomputation_after_the_verifier_recovers_approves_normally(
+    service, technical_input, monkeypatch
+):
+    """The verifier failing once must not permanently block the course -
+    once it succeeds again (a fresh approve_course call), normal approval
+    works with no override needed. The flakiness is injected only AROUND
+    the approve_course calls (generation itself runs unpatched), so this
+    isolates the verifier's own recovery rather than an unrelated earlier
+    call to it during generation's own advisory gate."""
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    calls = {"n": 0}
+    original = qf_module.validate_document_structured
+
+    def _flaky(document):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient failure")
+        return original(document)
+
+    # document_findings() now calls validate_document_structured() directly
+    # (Phase 3.3/3.4: structured layout findings) - patch that real call
+    # site, not the legacy validate_document() wrapper it no longer invokes.
+    monkeypatch.setattr(qf_module, "validate_document_structured", _flaky)
+
+    with pytest.raises(QualityApprovalBlockedError):
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+
+    approved = await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    assert approved.review_status == "approved"
+    assert approved.review_history[-1].action == "approved"  # no override needed
+
+
+async def test_a_reviewer_call_failure_during_generation_is_overridable_as_verification_failed(
+    service, technical_input, monkeypatch
+):
+    """Quality-governance follow-up (Phase 3.8A): a chapter whose reviewer
+    call failed DURING generation (not during approval's own evaluation,
+    unlike the layout-verifier-flakiness test above) must still reach
+    `approve_course` as a real, overridable verification_failed blocker -
+    proving the existing override mechanism needs no change to handle this
+    new failure category, exactly as app.agents.reviewer.review_chapter's
+    own fix intends."""
+    from app.services.mock_ai import MockAIClient
+
+    original_structured = MockAIClient.structured
+
+    async def _fails_for_chapter_review(self, *, schema, **kwargs):
+        if schema.__name__ == "ChapterReview":
+            raise RuntimeError("synthetic reviewer outage")
+        return await original_structured(self, schema=schema, **kwargs)
+
+    # Only the reviewer's own structured() call fails - every other caller
+    # during the same generation run (planner, writer, ...) uses this same
+    # MockAIClient with a different schema and must keep working normally,
+    # so this patches the one schema, never the whole client.
+    monkeypatch.setattr(MockAIClient, "structured", _fails_for_chapter_review)
+
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    with pytest.raises(QualityApprovalBlockedError) as excinfo:
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    findings = excinfo.value.details["findings"]
+    assert any(f["reason"] == "reviewer_call_failed" for f in findings)
+    assert all(f["verification_status"] == "verification_failed" for f in findings)
+
+    approved = await service.approve_course_override_verification_failed(
+        record.course_id, "admin-1", "Reviewer outage confirmed resolved; content reviewed manually."
+    )
+    assert approved.review_status == "approved"
+    entry = approved.review_history[-1]
+    assert entry.action == "override_approved_verification_failed"
+    assert entry.override_evidence.verifier == "reviewer_call"
+    assert "synthetic reviewer outage" in (entry.override_evidence.verification_error or "")
+
+
+# --- override_approved_evaluation_failure -----------------------------------
+
+
+async def test_normal_approval_is_blocked_by_a_whole_report_evaluation_failure(
+    service, technical_input, monkeypatch
+):
+    def _boom(**kwargs):
+        raise RuntimeError("synthetic quality-evaluation failure")
+
+    monkeypatch.setattr(course_service_module, "build_course_quality_report", _boom)
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    with pytest.raises(QualityEvaluationFailedError):
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+
+
+async def test_override_approved_evaluation_failure_succeeds_with_evidence(
+    service, technical_input, monkeypatch
+):
+    def _boom(**kwargs):
+        raise RuntimeError("synthetic quality-evaluation failure")
+
+    monkeypatch.setattr(course_service_module, "build_course_quality_report", _boom)
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    approved = await service.approve_course_override_evaluation_failure(
+        record.course_id, "admin-1", "Evaluated manually while the gate is broken."
+    )
+    assert approved.review_status == "approved"
+    entry = approved.review_history[-1]
+    assert entry.action == "override_approved_evaluation_failure"
+    assert "synthetic quality-evaluation failure" in entry.override_evidence.evaluation_error
+
+
+async def test_override_approved_evaluation_failure_rejects_a_clean_course(
+    service, non_technical_input
+):
+    """This override is scoped to a crashed computation - calling it when
+    evaluation actually succeeded must not silently approve."""
+    record = await service.create_course(non_technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    with pytest.raises(ValidationFailedError):
+        await service.approve_course_override_evaluation_failure(
+            record.course_id, "admin-1", "reason"
+        )
+
+
+# --- override_approved_incomplete_chapters ----------------------------------
+
+
+async def test_override_approved_incomplete_chapters_succeeds_with_evidence(
+    service, non_technical_input
+):
+    record = await service.create_course(non_technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    stored = await service.get_course_record(record.course_id)
+    target = stored.chapters[-1].chapter_id
+    service.storage.chapter_path(record.course_id, target).unlink()
+
+    approved = await service.approve_course_override_incomplete_chapters(
+        record.course_id, "admin-1", "Chapter file lost after submission; re-generating separately."
+    )
+    assert approved.review_status == "approved"
+    entry = approved.review_history[-1]
+    assert entry.action == "override_approved_incomplete_chapters"
+    affected = entry.override_evidence.affected_chapters
+    assert affected and affected[0]["chapter_id"] == target
+    assert affected[0]["status"] == "missing"
+    # Wording discipline: unreadable/missing, never "confirmed defect".
+    assert "defect" not in approved.review_comment.lower()
+
+
+async def test_override_approved_incomplete_chapters_does_not_bypass_other_blockers(
+    service, technical_input
+):
+    """The override lifts ONLY the inventory gate - if the remaining,
+    readable content also has a confirmed blocker, that still blocks."""
+    record = await _submitted_level_3_course(service, technical_input)
+    stored = await service.get_course_record(record.course_id)
+    target = stored.chapters[-1].chapter_id
+    service.storage.chapter_path(record.course_id, target).unlink()
+
+    with pytest.raises(QualityApprovalBlockedError):
+        await service.approve_course_override_incomplete_chapters(
+            record.course_id, "admin-1", "reason"
+        )
+    stored_after = await service.get_course_record(record.course_id)
+    assert stored_after.review_status == "in_review"  # never silently approved
+
+
+async def test_override_approved_incomplete_chapters_rejects_an_already_complete_course(
+    service, non_technical_input
+):
+    record = await service.create_course(non_technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    with pytest.raises(ValidationFailedError):
+        await service.approve_course_override_incomplete_chapters(
+            record.course_id, "admin-1", "reason"
+        )
+
+
+# --- cross-cutting: the four actions stay genuinely distinct ----------------
+
+
+async def test_the_four_override_actions_are_genuinely_distinct_values():
+    actions = {
+        "override_approved_blockers",
+        "override_approved_verification_failed",
+        "override_approved_evaluation_failure",
+        "override_approved_incomplete_chapters",
+    }
+    assert len(actions) == 4  # sanity: no accidental collision in this test file's own usage
+
+
+# --- release-readiness audit: a confirmed-wrong formula must actually block
+# approve_course, not just appear as an easy-to-miss advisory warning --------
+
+
+async def test_a_confirmed_wrong_formula_actually_blocks_approve_course(service, technical_input):
+    """End-to-end proof that app.services.quality_framework's severity fix
+    works through the REAL approve_course path, not just in isolation (see
+    the matching report-level test in test_quality_verification.py). This
+    is exactly the "can a critical QA failure silently publish" risk a
+    release-readiness audit must rule out: before this fix, a formula_qa
+    mismatch/malformed finding was severity="major", which QualityReport.
+    hard_failures/approval_blocking_findings ignore entirely (severity ==
+    "blocker" only) - so a confirmed-wrong equation could reach a learner
+    with nothing but an easy-to-miss warning, never actually blocking
+    approval the way a structural quality blocker already does."""
+    record = await service.create_course(technical_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+
+    document = service.storage.load_document(record.course_id)
+    image_block = next(block for _, block in document.iter_blocks() if block.type is BlockType.IMAGE)
+    image_block.content = {
+        **image_block.content,
+        "generated": True,
+        "error": None,
+        "formula_expression": "F = m / a",
+        "visual_qa_findings": [
+            {
+                "type": "formula_mismatch",
+                "detail": "uses the same symbols as Newton's second law but divides instead of multiplying",
+                "resolution": "formula_verification_failed",
+                "deterministic": True,
+            }
+        ],
+    }
+    service.storage.save_document(document)
+
+    with pytest.raises(QualityApprovalBlockedError) as excinfo:
+        await service.approve_course(record.course_id, reviewer_id="reviewer-1")
+    findings = excinfo.value.details["findings"]
+    assert any(f["reason"] == "visual_qa_formula_mismatch" for f in findings)
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"  # never silently approved
+
+    # The existing, already-tested override mechanism picks this up
+    # automatically - no new override category needed, same as any other
+    # confirmed, independently-verified blocker.
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Formula corrected manually; verified against the textbook."
+    )
+    assert approved.review_status == "approved"
+
+
+# --- interaction with the source/fact-check audit gate ----------------------
+# origin/visual-and-flowchart's `approval_blockers` gate (course_service.py's
+# plain `approve_course`) predates none of the four overrides above - none of
+# them is scoped to lift it, so per this module's own stated contract ("an
+# override for one category never silently waves through a different,
+# unrelated problem") each must still enforce it exactly like plain
+# `approve_course` does. These pin that down directly, since no test before
+# this exercised an override and the audit gate together.
+
+
+def _audit_finding(severity="high", status="open") -> AuditFinding:
+    return AuditFinding(
+        finding_id=f"f-{severity}-{status}", block_id="b", chapter="Chapter 1", sentence="S",
+        kind="invalid_citation", severity=severity, status=status,
+    )
+
+
+def _audit_report(course_id: str, *findings: AuditFinding) -> AuditReport:
+    return AuditReport(
+        course_id=course_id, document_id=f"doc_{course_id}", generated_at="t", source_count=1,
+        findings=list(findings), sentences_checked=10, supported_sentences=4, cited_sentences=3,
+    )
+
+
+async def _submitted_level_3_course_with_a_source(service, technical_input):
+    """Same guaranteed confirmed-blocker fixture as `_submitted_level_3_course`
+    above, plus a source id so `has_sources` is true and the audit gate
+    engages. The id does not need to resolve to a real uploaded source:
+    `SourceService.load_library`/`excerpts_for` already skip a missing one
+    (NotFoundError -> warning -> continue), and generation's own auto-audit
+    (`CourseService._audit_after_generation`) never lets an audit failure
+    fail the course - it logs a warning and leaves no audit.json. Each test
+    below saves its own `AuditReport` directly afterward, the same technique
+    test_review_screen.py's approval-rule tests already use."""
+    level_3_input = technical_input.model_copy(
+        update={"content_level": 3, "source_ids": ["src_does_not_exist"]}
+    )
+    record = await service.create_course(level_3_input)
+    await service.generate(record.course_id, GenerateRequest(mode="sync"))
+    await service.submit_for_review(record.course_id, actor_id=None)
+    return record
+
+
+async def test_override_approved_blockers_is_still_blocked_by_an_unresolved_audit_finding(
+    service, technical_input
+):
+    """The override lifts ONLY the confirmed-blocker gate - an unresolved,
+    unrelated source/fact-check finding must still block it, exactly as it
+    already blocks plain approve_course (test_review_screen.py's
+    test_final_approval_is_blocked_until_high_findings_are_decided)."""
+    record = await _submitted_level_3_course_with_a_source(service, technical_input)
+    get_audit_service()._save(_audit_report(record.course_id, _audit_finding()))
+
+    with pytest.raises(ConflictError, match="Final approval is blocked.*high-severity"):
+        await service.approve_course_override_blockers(
+            record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+        )
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"  # never silently approved
+
+
+async def test_override_approved_blockers_succeeds_once_the_audit_finding_is_resolved(
+    service, technical_input
+):
+    record = await _submitted_level_3_course_with_a_source(service, technical_input)
+    get_audit_service()._save(_audit_report(record.course_id, _audit_finding(status="dismissed")))
+
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+    )
+    assert approved.review_status == "approved"
+
+
+async def test_override_approved_blockers_without_sources_is_unaffected_by_the_audit_gate(
+    service, technical_input
+):
+    """Regression anchor for the structural-quality override behaviour this
+    fix must leave unchanged: a course with no uploaded sources never
+    engages the audit gate (`approval_blockers(has_sources=False, ...)` is
+    always `[]`), sourced or not, before or after this fix."""
+    record = await _submitted_level_3_course(service, technical_input)
+    approved = await service.approve_course_override_blockers(
+        record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+    )
+    assert approved.review_status == "approved"
+
+
+async def test_an_unreadable_audit_report_fails_closed_not_crashed_for_an_override(
+    service, technical_input
+):
+    """AuditService.load() returns None - never raises - for a corrupt
+    audit.json (see its own try/except ValueError). `approval_blockers`
+    treats a None audit on a sourced course as "not run yet" and blocks,
+    exactly the safe-failure policy plain approve_course already relies on.
+    The override must fail closed the same way, never crash with a raw
+    parse error and never silently approve past an audit that could not be
+    read."""
+    record = await _submitted_level_3_course_with_a_source(service, technical_input)
+    get_audit_service()._path(record.course_id).write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(ConflictError, match="fact check has not been run"):
+        await service.approve_course_override_blockers(
+            record.course_id, "admin-1", "Accepting known level-3 gap for this release."
+        )
+    stored = await service.get_course_record(record.course_id)
+    assert stored.review_status == "in_review"

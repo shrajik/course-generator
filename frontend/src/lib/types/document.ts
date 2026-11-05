@@ -95,12 +95,22 @@ export interface Page {
   blocks: Block[];
 }
 
+/** Mirrors backend/app/schemas/document.py's SourceRecord - one deduplicated
+ * external source, with every chapter that cited it. */
+export interface DocumentSource {
+  title: string;
+  url: string;
+  note: string;
+  chapter_ids: string[];
+}
+
 export interface DocumentMeta {
   audience: string;
   template_name: string;
   chapter_ids: string[];
   theme: Record<string, unknown>;
   generated_with: string;
+  sources: DocumentSource[];
 }
 
 export interface CourseDocument {
@@ -228,4 +238,67 @@ export interface UpdateConceptVisualSpecResponse {
   document_id: string;
   version: number;
   block: Block;
+}
+
+// --- Edit Visuals (flowchart editor) - the node/edge diagram family --------
+// Mirrors backend/app/schemas/diagram.py's DiagramNode/DiagramEdge/DiagramSpec.
+// Covers flow_chart/process/cycle/hierarchy/comparison/smart_art/concept_map/
+// data_flow_diagram/er_diagram/swimlane - never "graph" (no discrete nodes/
+// edges to edit this way) or "schematic" (permanently retired).
+
+export interface DiagramNode {
+  id: string;
+  label: string;
+  detail?: string;
+  level?: number;
+  shape_role?: string;
+  parent_id?: string;
+  lane?: string;
+  /** "" (default) = auto-detected from in/out-degree + label text, same as
+   * before this field existed. One of "start"/"process"/"decision"/"end"
+   * overrides it explicitly. Ignored (decision always wins) for a node with
+   * 2+ outgoing edges - see diagram_renderer.role_of's own ordering. */
+  role?: string;
+  /** "" (default, or anything that isn't a real "#rgb"/"#rrggbb" hex)
+   * keeps the role's fixed default colour pair. */
+  color?: string;
+}
+
+export interface DiagramEdge {
+  source: string;
+  target: string;
+  label?: string;
+}
+
+export interface FlowchartSpec {
+  kind: string;
+  title?: string;
+  nodes: DiagramNode[];
+  edges: DiagramEdge[];
+  [key: string]: unknown;
+}
+
+export interface VisualSpecPreviewResponse {
+  svg?: string;
+  html?: string;
+}
+
+// --- Edit Visuals (image text-overlay editor) -------------------------------
+// Mirrors backend/app/schemas/blocks.py's OverlayLabel. A separate, client-
+// rendered layer over a text-free "illustration" block - never baked into
+// the picture itself, edited through the same block-content mechanism as
+// any other field (see ImageBlock.tsx's existing caption `onEdit` call),
+// not a dedicated API call like the flowchart editor needs.
+
+export interface OverlayLabel {
+  id: string;
+  text: string;
+  /** 0-100, percentage of the image's own rendered rect (not the outer,
+   * possibly letterboxed block box - see ImageBlock.tsx's aspect-ratio
+   * wrapper for why these always land on the same picture pixel). */
+  x_pct: number;
+  y_pct: number;
+  style: "title" | "callout" | "label";
+  /** "" (default) = the style's own default colour. */
+  color?: string;
 }

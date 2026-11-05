@@ -70,6 +70,7 @@ class MockAIClient(AIClient):
                     purpose=purpose or kind,
                     model="mock",
                     seconds=time.perf_counter() - started,
+                    provider="mock",
                 )
             )
         return started
@@ -152,7 +153,7 @@ class MockAIClient(AIClient):
         )
 
     async def image(
-        self, *, prompt: str, size: str | None = None, phase: str = "image"
+        self, *, prompt: str, size: str | None = None, phase: str = "image", provider: str | None = None
     ) -> bytes:
         self.calls.append({"kind": "image"})
         await self._simulate("image", "image")
@@ -1127,6 +1128,13 @@ def _diagram_spec(user: str) -> dict[str, Any]:
 
     if requested == "schematic":
         return _schematic_spec(title, brief)
+
+    if requested == "graph":
+        return {
+            "kind": "graph", "title": title, "graph_type": "function",
+            "x_label": "x", "y_label": "y", "x_min": -10, "x_max": 10,
+            "functions": [{"expression": "x**2", "label": title or "y = x^2"}],
+        }
 
     if "concept_experience" in user:
         return _concept_experience_spec(title, brief)

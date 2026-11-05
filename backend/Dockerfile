@@ -8,7 +8,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# --default-timeout/--retries: pip's default 15s read timeout is too short
+# for a slow/throttled connection to files.pythonhosted.org and was causing
+# `ReadTimeoutError` build failures; this makes the install resilient to a
+# slow network without changing any pinned dependency.
+RUN pip install --no-cache-dir --default-timeout=120 --retries 5 -r /app/requirements.txt
 
 # Chromium + the system libraries it needs for PDF rendering. Installed through
 # Playwright itself so the browser build always matches the installed client.

@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import Link from "next/link";
+import { PhaseApprovalButton } from "./PhaseApprovalButton";
 import { ReportButton } from "./ReportButton";
 import { SamIterationButton } from "./SamIterationButton";
 import { IconButton } from "@/components/ui/IconButton";
@@ -198,10 +199,10 @@ export function EditorToolbar({
         </div>
       ) : null}
 
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex min-w-0 items-center gap-2 overflow-x-auto py-0.5 [scrollbar-width:thin]">
         {reviewError ? (
           <span
-            className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
+            className="shrink-0 whitespace-nowrap rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
             title={reviewError}
           >
             Review action failed
@@ -209,7 +210,13 @@ export function EditorToolbar({
         ) : null}
 
         {canSubmitForReview ? (
-          <Button variant="outline" size="sm" onClick={onSubmitForReview} disabled={reviewBusy}>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={onSubmitForReview}
+            disabled={reviewBusy}
+          >
             {reviewBusy ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
             Submit for Review
           </Button>
@@ -217,11 +224,17 @@ export function EditorToolbar({
 
         {canReviewNow ? (
           <>
-            <Button variant="outline" size="sm" onClick={onRequestChanges} disabled={reviewBusy}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={onRequestChanges}
+              disabled={reviewBusy}
+            >
               <ThumbsDown size={13} />
               Request Changes
             </Button>
-            <Button size="sm" onClick={onApproveCourse} disabled={reviewBusy}>
+            <Button size="sm" className="shrink-0" onClick={onApproveCourse} disabled={reviewBusy}>
               {reviewBusy ? <Loader2 size={13} className="animate-spin" /> : <ThumbsUp size={13} />}
               Approve
             </Button>
@@ -230,20 +243,20 @@ export function EditorToolbar({
 
         {saveError ? (
           <span
-            className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
+            className="shrink-0 whitespace-nowrap rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10.5px] font-medium text-red-700"
             title={saveError}
           >
             Save failed
           </span>
         ) : editor.dirty ? (
           <span
-            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10.5px] font-medium text-amber-800"
+            className="shrink-0 whitespace-nowrap rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10.5px] font-medium text-amber-800"
             title="You have unsaved manual edits. Click Save to persist them - Export PDF saves automatically first."
           >
             Unsaved changes
           </span>
         ) : justSaved ? (
-          <span className="flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10.5px] font-medium text-emerald-800">
+          <span className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10.5px] font-medium text-emerald-800">
             <Check size={11} />
             Saved
           </span>
@@ -252,6 +265,7 @@ export function EditorToolbar({
         <Button
           variant="outline"
           size="sm"
+          className="shrink-0"
           onClick={onSave}
           disabled={!editor.dirty || saving || exporting}
         >
@@ -259,7 +273,7 @@ export function EditorToolbar({
           Save
         </Button>
 
-        <div className="flex items-center rounded-[8px] border border-line">
+        <div className="flex shrink-0 items-center rounded-[8px] border border-line">
           <IconButton
             aria-label="Undo"
             disabled={!editor.canUndo}
@@ -281,27 +295,36 @@ export function EditorToolbar({
 
         <SamIterationButton />
 
+        <PhaseApprovalButton />
+
         <ReportButton />
 
         <Link
           href={`/review/${doc?.document_id ?? ""}`}
-          className="inline-flex h-8 items-center gap-1.5 rounded-[8px] border border-line bg-white px-3 text-[12.5px] text-ink hover:border-brand-200 hover:bg-brand-50"
+          className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[8px] border border-line bg-white px-3 text-[12.5px] text-ink hover:border-brand-200 hover:bg-brand-50"
         >
           Review screen
         </Link>
 
-        <Button variant="outline" size="sm" onClick={onPreview}>
+        <Link
+          href={`/workspace/${doc?.document_id ?? ""}`}
+          className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-[8px] border border-line bg-white px-3 text-[12.5px] text-ink hover:border-brand-200 hover:bg-brand-50"
+        >
+          Output workspace
+        </Link>
+
+        <Button variant="outline" size="sm" className="shrink-0" onClick={onPreview}>
           <Eye size={13} />
           Preview
         </Button>
 
-        <Button size="sm" onClick={onExport} disabled={exporting || saving}>
+        <Button size="sm" className="shrink-0" onClick={onExport} disabled={exporting || saving}>
           {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
           Export PDF
         </Button>
 
         {activity ? (
-          <div className="relative">
+          <div className="relative shrink-0">
             <IconButton
               aria-label="Activity history"
               active={activityOpen}
@@ -346,7 +369,7 @@ export function EditorToolbar({
           </div>
         ) : null}
 
-        <div className="relative">
+        <div className="relative shrink-0">
           <IconButton
             aria-label="More options"
             active={menuOpen}

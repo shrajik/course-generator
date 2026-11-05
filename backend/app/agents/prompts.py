@@ -140,6 +140,37 @@ def source_grounding_guidance(course_input: CourseInput) -> str:
     )
 
 
+def _brief_details_brief(course_input: CourseInput) -> str:
+    """Content Studio Phase 1 - the brief's own task list / business goal /
+    performance gap. "" when none of the three is set, so a course that
+    never used this feature gets a byte-identical prompt to before it
+    existed - same contract as every other optional brief in this module."""
+    has_tasks = bool(course_input.tasks)
+    has_goal = bool(course_input.business_goal.strip())
+    has_gap = bool(course_input.performance_gap.strip())
+    if not (has_tasks or has_goal or has_gap):
+        return ""
+    lines = ["BRIEF DETAILS:"]
+    if has_tasks:
+        lines.append(
+            "Tasks the learner must be able to do after this course (each is at least one "
+            "learning objective):"
+        )
+        lines.append(_bullets(course_input.tasks))
+    if has_goal:
+        lines.append(f"Business/performance goal: {course_input.business_goal.strip()}")
+    if has_gap:
+        lines.append(f"Performance gap: {course_input.performance_gap.strip()}")
+    else:
+        lines.append(
+            "Performance gap: not stated by the creator - draft a short, plausible gap "
+            "statement from the brief and tasks above for the Analysis summary, and say "
+            "plainly that it is drafted/inferred, never presented as a fact the creator "
+            "confirmed."
+        )
+    return "\n".join(lines)
+
+
 def _design_brief(course_input: CourseInput) -> str:
     """Rules for the selected instructional-design models ("" when none is)."""
     return design_model_brief(
@@ -186,6 +217,183 @@ def code_cell_guidance(template: CourseTemplate) -> str:
 """
 
 
+def content_level_brief(content_level: int) -> str:
+    """MOM Phase 4 - "" at level 2 (the existing default/only behaviour
+    before this feature existed), which is what keeps every pre-existing
+    course's prompts byte-identical, same contract as `learner_brief`
+    returning "" for `profile=None`.
+
+    Level 1 is enforced in TWO places, not just here: this prompt line
+    tells the writer not to plan/request any image block in the first
+    place (so the document never contains an empty/ungenerated visual
+    placeholder - a real, confirmed failure mode this avoids), and
+    CourseService.generate separately forces `generate_images=False`
+    regardless of the request's own override, as a structural backstop in
+    case the model asks for one anyway.
+
+    Level 3 is explicitly the MOM's own PROVISIONAL interpretation, not a
+    finalised spec - this is a prompt-level framing shift only (ask for
+    realistic scenarios/decisions/hands-on activities where the topic
+    supports them), not a separate generation pipeline or a new block type;
+    it still goes through the exact same block types (exercise/challenge/
+    case_study/story) the writer already has, just asked for more
+    deliberately and more often."""
+    if content_level == 1:
+        return (
+            "CONTENT LEVEL 1 - TEXT ONLY: do not plan or request any `image` "
+            "block of any kind (no diagrams, no flowcharts, no illustrations, "
+            "no section-intro icons) for this course. Every concept must be "
+            "explained in text alone - use headings, definitions, examples, "
+            "tables and code blocks as needed, but never an image block."
+        )
+    if content_level == 3:
+        return (
+            "CONTENT LEVEL 3 - EXPERIENTIAL LEARNING: beyond the course's "
+            "normal explanatory content, prioritise realistic scenarios, "
+            "situation-based decisions and hands-on practice wherever the "
+            "topic genuinely supports them - use `story`/`case_study` blocks "
+            "for realistic scenarios, `exercise`/`challenge` blocks for "
+            "hands-on activities with clear instructions and expected "
+            "outputs, and favour decisions made under realistic, sometimes "
+            "incomplete information over purely abstract explanation. This "
+            "is additive to the course's normal content, not a replacement "
+            "for explaining the underlying concepts clearly."
+        )
+    return ""
+
+
+# MOM Phase 5 - learning approaches: HOW a concept is taught. Each entry
+# names the EXISTING block type(s) it reuses (never invents a new one, per
+# the MOM's own "reuse existing content primitives" instruction) and states
+# the concrete content shape, not just a label - the MOM explicitly warns
+# against "merely inserting a heading such as 'Case Study' without
+# meaningful content", so every instruction below ties the approach to a
+# real structural requirement the reviewer can actually check for.
+_LEARNING_APPROACH_GUIDANCE: dict[str, str] = {
+    # The pre-existing default behaviour (conceptual explanation via
+    # paragraphs/definitions) - included for completeness and for when it's
+    # combined with other approaches, but adds no new instruction on its own.
+    "explanatory": (
+        "Explanatory: focus on conceptual understanding - what the concept is, "
+        "why it works, and how its parts relate. This is the baseline the "
+        "course already provides; when combined with other approaches below, "
+        "keep the conceptual explanation intact rather than replacing it."
+    ),
+    "example_driven": (
+        "Example-driven: include genuinely worked examples, not just a labelled "
+        "heading - show the concrete input, the step-by-step working, and the "
+        "resulting output (a `code`/`code_cell` block for a technical worked "
+        "example, a `callout` or `paragraph` walkthrough otherwise). Include at "
+        "least one common mistake and its correction where that is realistic "
+        "for the topic."
+    ),
+    "scenario_based": (
+        "Scenario-based: use `story`/`case_study` blocks to set up a realistic, "
+        "specific context with an explicit objective, real constraints, a "
+        "decision actually made, and the plausible consequences of that "
+        "decision - not a generic, interchangeable anecdote. State what was "
+        "decided and why, not just what happened."
+    ),
+    "situation_based": (
+        "Situation-based: use a `case_study` or `exercise` block to present ONE "
+        "specific situation that requires judgment, then evaluate at least two "
+        "plausible responses to it - explain concretely why each response is "
+        "suitable or unsuitable in this situation, not in the abstract."
+    ),
+    "hands_on": (
+        "Hands-on: use `exercise`/`challenge` blocks with everything the "
+        "learner actually needs to DO the activity - clear step-by-step "
+        "instructions, any required inputs/prerequisites, exactly what "
+        "deliverable is expected, and explicit criteria for judging whether "
+        "it was done correctly. For a technical topic, prefer a `code_cell` "
+        "the learner can actually run over a purely descriptive exercise."
+    ),
+    "conversational": (
+        "Conversational: present the explanation as a realistic dialogue or a "
+        "sequence of guided questions-and-answers (a learner's likely question, "
+        "followed by a direct answer, building progressively) rather than a "
+        "lecture-style block of prose. This is a STATIC, written dialogue "
+        "format (this application does not provide live interactive tutoring) "
+        "- never claim or imply the reader can actually ask a follow-up "
+        "question."
+    ),
+}
+
+
+def learning_approaches_brief(approaches: list[str]) -> str:
+    """"" for an empty list - the pre-existing default (the writer judges
+    which approach fits each section on its own) - same contract as
+    `content_level_brief` returning "" at level 2. For 2+ approaches, asks
+    the writer to combine them coherently within the same content rather
+    than generating one repetitive section per approach - a real, MOM-
+    flagged failure mode ("combine coherently, not repetitive content") this
+    line exists specifically to prevent."""
+    valid = [a for a in approaches if a in _LEARNING_APPROACH_GUIDANCE]
+    if not valid:
+        return ""
+    lines = ["LEARNING APPROACH(ES) FOR THIS COURSE - apply throughout, not just in one section:"]
+    lines.extend(f"- {_LEARNING_APPROACH_GUIDANCE[a]}" for a in valid)
+    if len(valid) > 1:
+        lines.append(
+            "- When combining the approaches above, weave them into the SAME "
+            "content coherently (e.g. a scenario that then poses a hands-on "
+            "exercise) rather than generating one repetitive, separate section "
+            "per approach."
+        )
+    return "\n".join(lines)
+
+
+def approach_review_brief(course_input: CourseInput) -> str:
+    """Quality-governance follow-up (Phase 3.10a) - gives the REVIEWER the
+    same facts the writer already received about which content level and
+    learning approach(es) were requested, so it can judge adherence instead
+    of being blind to the request entirely (previously `reviewer_user` never
+    passed this through at all, even though `course_input` was already a
+    parameter - confirmed by inspection, not assumed).
+
+    Deliberately reuses `content_level_brief`/`learning_approaches_brief`
+    verbatim rather than maintaining a second, review-framed copy of the
+    same guidance that could drift out of sync - this function only adds a
+    short header (reframing "what to write" as "what to check for") and one
+    instruction line, never new facts about what each approach requires.
+
+    "" when both underlying briefs are themselves "" (content_level == 2,
+    no approaches selected - the pre-existing default) - same contract as
+    every other `_brief` function in this module, so a course that never
+    opted into either feature gets a byte-identical reviewer prompt to
+    before this function existed.
+
+    This does NOT change how the resulting judgement is classified: like
+    every other reviewer opinion, whatever the model reports lands in
+    `review.issues` and app.services.quality_framework marks it
+    `verification_status="unverified"` unconditionally, regardless of the
+    severity text used - this prompt only gives the model something to
+    form an (still unverified) opinion about. Severity is explicitly
+    capped at major/minor below, mirroring `chapter_contract_brief`'s own
+    existing instruction, so this introduces no new severity-policy
+    precedent of its own."""
+    level = content_level_brief(course_input.content_level)
+    approaches = learning_approaches_brief(course_input.learning_approaches)
+    if not level and not approaches:
+        return ""
+    lines = [
+        "REQUESTED FOR THIS CHAPTER (the writer was asked for this - judge whether "
+        "the chapter's actual content delivers it, not just whether a matching block "
+        "type exists):"
+    ]
+    if level:
+        lines.append(level)
+    if approaches:
+        lines.append(approaches)
+    lines.append(
+        "- If a requested content level or learning approach above is not genuinely "
+        "reflected in this chapter's actual content, report it as an issue with "
+        "category 'approach_adherence' - severity 'major' if it is essentially "
+        "absent, 'minor' if it is present but weak. Never report this as 'blocker'."
+    )
+    return "\n".join(lines)
+
+
 def _course_context(course_input: CourseInput, template: CourseTemplate) -> str:
     toc_lines = []
     for index, item in enumerate(course_input.toc, start=1):
@@ -210,7 +418,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}"""
+{_appended(learner_brief(course_input.learner_profile))}{_appended(content_level_brief(course_input.content_level))}{_appended(learning_approaches_brief(course_input.learning_approaches))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}{_appended(_brief_details_brief(course_input))}"""
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +560,13 @@ Rules:
 - Use only what is present in the notes. Do not add new facts.
 - Copy source URLs exactly as they appear in the notes. Never guess a URL.
 - Leave a list empty rather than padding it with generic filler.
+- For each reference, fill `author`, `source_type` (e.g. "official
+  documentation", "textbook", "research paper", "university resource",
+  "educational platform") and `relevance` (one short sentence: what a
+  learner gets from this specific resource) ONLY when the notes actually
+  say so - leave any of them blank rather than inferring or guessing. Never
+  invent an author, a publication, or a relevance claim the notes don't
+  support.
 """
 
 
@@ -453,70 +668,160 @@ How to produce blocks:
   motion/force/current/flow, and what causes what. Prose describing a
   mechanism is not enough on its own; a reader needs to see the components
   and how they relate. Choose which shape fits:
-  * `diagram_kind: schematic` ONLY for a biology/life-science structure - a
-    cell and its organelles, a plant's parts, an organ - where a labelled
-    parts-diagram is genuinely what's needed. NEVER `schematic` for physics,
-    chemistry or math: a magnet and a coil, a titration setup, a molecule
-    forming from its atoms, an orbit, a mechanical assembly, any experimental
-    apparatus - all of these go through `image_kind: illustration` with
-    `illustration_style: textbook` instead (describe the exact setup/
-    components in `image_prompt`), never the labelled-shape schematic
-    renderer, full stop - this is a firm preference from real generated
-    courses, not just a style suggestion. This split is by SUBJECT, not by
-    whether something happens to have a physical shape: a cell (biology)
-    still gets `schematic`; a magnet, a beaker/flask, an orbit or a pulley
-    (physics/chemistry) always gets `illustration` instead, even for a
-    simple static object that would render fine as a schematic - use
-    illustration anyway.
+  * `diagram_kind: schematic` is PERMANENTLY RETIRED - never set it, for any
+    subject. A labelled-box schematic (a cell and its organelles, a magnet
+    and a coil, a titration setup, an orbit, a mechanical assembly, any
+    experimental apparatus) now ALWAYS goes through `image_kind:
+    illustration` with `illustration_style: textbook` instead (describe the
+    exact setup/components in `image_prompt`) - this applies to every
+    subject alike, biology/life-science included; there is no longer a
+    subject split here, `schematic` is simply never the right choice for
+    anything. The renderer itself now rejects any `schematic` spec
+    unconditionally regardless of what gets requested, so setting it only
+    wastes a generation attempt before falling back to illustration anyway -
+    go straight there. Routing it to `illustration` does NOT make its
+    labels optional - the rule above (every mechanism needs a labelled
+    diagram showing every relevant component and the direction of motion/
+    force/current/flow) still applies in full; `schematic` just isn't the
+    renderer that satisfies it here. A real, confirmed failure mode: an
+    illustration for "magnetic flux through a surface" shipped with
+    unlabelled arrows and no indication of which one was B, which was the
+    surface normal, or which direction was positive - technically a clean
+    picture, but useless for actually teaching the mechanism, since nothing
+    in the image itself says what anything is. Identify the 2-6 real labels
+    this specific apparatus needs (component names, vector/quantity symbols
+    like "B", "n̂", "+"/"-", direction arrows) and set them in
+    `image_expected_labels` (see below) - do not leave this picture
+    unlabelled just because it's going through `illustration` instead of
+    `schematic`. If the picture includes a formula block (one key governing
+    equation with its symbols defined below it, e.g. "ε = induced emf"),
+    list EVERY one of those definition phrases in `image_expected_labels`
+    too, not just the component labels - a real, confirmed case shipped a
+    formula block with "electromotive force" garbled into "electromotivie
+    oforce" because only the diagram's own component labels were listed,
+    leaving the formula's own text completely unverified even though it's
+    exactly as checkable. Also set `image_formula_expression` to the exact
+    equation in plain ASCII (letters/digits/Greek-as-words only - `*` for
+    multiply, `/` for divide, `^` for exponent, `_` for subscript,
+    parentheses as needed, exactly one `=`; e.g. "F = m * a", never "F=ma"
+    baked only into prose) - a real automated check compares this against
+    known reference formulas for mathematical correctness, something
+    `image_expected_labels` alone (spelling only) can never catch. Leave it
+    blank when the picture has no governing equation at all.
   * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
     the relationships is enough (an abstract system, an organisation, a
     reaction pathway) and there's no real physical arrangement to draw.
   * `diagram_kind: hierarchy` for a strict parent/child breakdown, and
     `diagram_kind: comparison` for two or more things compared side by side.
+  * `diagram_kind: pyramid` for LEVELS of importance/priority/foundation
+    (a base that supports what's above it, a "most fundamental at the
+    bottom" structure) or a NARROWING STAGE process (a funnel - fewer
+    items survive each stage, e.g. a sales pipeline or a filtering
+    process) - same shape either way, just which end tapers.
+  * `diagram_kind: matrix` when the content classifies or compares things
+    across exactly two independent axes/dimensions (impact vs. effort,
+    urgency vs. importance, a SWOT-style grid, a priority matrix) - a
+    classification into more than 4 groups with no real 2-axis structure
+    also fits here (renders as a plain grid instead).
+  * `diagram_kind: radial_mindmap` for ONE central topic with several
+    independent branching sub-ideas (a brainstorm, a topic broken into its
+    main themes) - distinct from `concept_map`, whose edges each name a
+    precise relationship between the centre and its parts; a mind map's
+    branches don't need a relationship label, just the branching structure
+    itself.
+  * `diagram_kind: venn` when the content is specifically about what two
+    or three things SHARE versus what's unique to each (overlapping
+    categories).
+  * `diagram_kind: chevron_process` for a SHORT linear sequence (3-6
+    steps, no decisions/branches) that reads better as a horizontal strip
+    than a tall column (a short onboarding flow, a product-launch phase
+    strip) - use `flow_chart`/`process` instead for anything longer or
+    with a decision point.
+  * `diagram_kind: staircase_process` for a short sequence that genuinely
+    GROWS or BUILDS in scope/scale at each step (a skill-building
+    progression, a maturity model) - not just an ordinary multi-step
+    procedure, only when the brief itself frames it as growing.
+  * `diagram_kind: balance_comparison` when the content weighs TWO SIDES
+    of one decision or tradeoff against each other (cost vs. value, pros
+    vs. cons, risks vs. benefits) - not `comparison`, which is for N
+    things compared flatly side by side, not a two-sided judgement.
+  * `diagram_kind: nested_circles` for a SCOPE/CONTAINMENT hierarchy where
+    each thing fully contains the next, narrower one (Vision > Mission >
+    Strategy > Tactics; Global > Regional > Local) - not `hierarchy`,
+    which is a branching parent/child tree, not a single nested sequence.
+  * `diagram_kind: network_mesh` when many things genuinely connect to
+    many others, not one central hub (a microservice topology, a social/
+    organisational network) - not `radial_mindmap`, which is one hub with
+    independent spokes that don't connect to each other.
+  * `diagram_kind: decision_tree` for a CASCADE of decisions/questions,
+    each branch leading to a further decision or a final outcome (a
+    troubleshooting guide, "which option is right for you", eligibility
+    logic) - not a single flow_chart decision diamond inside an otherwise
+    linear procedure, this is a whole tree of branch points.
+  * `diagram_kind: fishbone` for a root-cause analysis - what CATEGORIES
+    of causes sit behind one effect/problem (a postmortem, "why did X
+    happen", a quality/defect investigation).
+  * `diagram_kind: layered_diagram` for a STACK of distinct layers/tiers
+    sitting on top of each other with no containment and no importance
+    ranking (a network protocol stack, an architecture's tiers, rock
+    strata, atmosphere layers) - not `pyramid` (importance narrowing to a
+    point) and not `nested_circles` (literal containment, one fully
+    inside the next).
+  * `diagram_kind: gantt_chart` for a SCHEDULE over time - which tasks run
+    when, how long each takes, and which overlap (a project plan, a
+    sprint/launch schedule) - only when the brief gives real relative
+    timing for each task; a plain list of steps with no timing is
+    `flow_chart`/`process`/`chevron_process` instead.
   * NEVER `schematic`/`concept_map`/`hierarchy`/`comparison` for a
     coordinate-axis graph or curve - a supply-and-demand curve, a
     distance-time or velocity-time graph, a function's plot, any X-Y
     relationship with axes. That family is rendered from labelled boxes and
     connector lines; it has no notion of an axis or a curve, so forcing a
     graph into it produces boxes labelled "Axes: P (vertical), Q
-    (horizontal)" with crossing lines behind them - never draw one. A
-    coordinate-axis graph is a photographic/artistic scene as far as this
-    renderer is concerned: use `image_kind: illustration` and describe the
-    exact axes, labels, curves and any shift/movement in `image_prompt` so
-    the image model draws the graph directly, the same way it would draw
-    any other picture.
+    (horizontal)" with crossing lines behind them - never draw one. Use
+    `diagram_kind: graph` instead - a real, deterministically-rendered
+    axis/gridline/curve plot (never a raster image for this: an image model
+    routinely garbles axis numbers and tick labels, which a graph is
+    entirely made of). Set `image_prompt` to describe the function or
+    comparison in plain language (e.g. "plot y = x^2 for -10 to 10" or
+    "compare approach speed and risk across three options") - the diagram
+    service turns that into the real plotted function/data, not this call.
+    A bar/line chart of real categorical values also belongs here, same
+    `diagram_kind: graph` - never as an illustration either.
   * A chronological/historical timeline (a sequence of dated events, eras or
     milestones - a country's history, a technology's evolution, a person's
-    life) is a SEQUENCE, not a relationship - use `diagram_kind: flow_chart`
-    or `process`, with each node's label carrying the date/era (e.g. "1947 -
-    Independence") and its description the event itself. This applies to
-    every subject, not just technical ones: history, business, science -
-    anywhere a "what happened, in order" needs showing.
+    life) is a SEQUENCE, not a relationship - use `diagram_kind: timeline`
+    (a real horizontal roadmap with dated milestones - not `flow_chart`,
+    which has no notion of dates/chronology), with each node's label
+    carrying the date/era (e.g. "1947 - Independence") and its description
+    the event itself. This applies to every subject, not just technical
+    ones: history, business, science - anywhere a "what happened, in
+    order" needs showing.
 - A chapter with BOTH a process to walk through AND a phenomenon/structure to
-  show needs BOTH visuals (a flow_chart plus a schematic/concept_map/
-  illustration, per the subject rule above) - one does not replace the
-  other, and this is normal and expected, not redundant. This applies to
-  every subject: a chemistry chapter gets both a reaction-mechanism
-  flow_chart and an illustration of the molecules involved; a biology
-  chapter gets both a process flow_chart and a schematic of the organism/
-  structure; a physics chapter gets both a problem-solving flow_chart and an
-  illustration of the apparatus - do not stop at just the flowchart because
-  it feels like "enough".
+  show needs BOTH visuals (a flow_chart plus a concept_map/illustration, per
+  the subject rule above) - one does not replace the other, and this is
+  normal and expected, not redundant. This applies to every subject: a
+  chemistry chapter gets both a reaction-mechanism flow_chart and an
+  illustration of the molecules involved; a biology chapter gets both a
+  process flow_chart and an illustration of the organism/structure; a
+  physics chapter gets both a problem-solving flow_chart and an illustration
+  of the apparatus - do not stop at just the flowchart because it feels like
+  "enough".
 - Beyond the structured diagram/concept_experience visual above (which
   explains structure/steps/relationships through labelled shapes), some
   concepts ALSO genuinely benefit from a second, complementary illustrative
   picture alongside it - what the real thing actually looks like, not a
-  labelled-box abstraction of it (this is on top of the physics/chemistry/
-  math rule above, which already routes those subjects' own apparatus/
-  molecule/setup pictures through illustration as their ONLY diagram, not an
-  addition to one). Use this rarely and only when it adds further value: a
-  recognisable anatomical structure (a heart, a cell, an organ) alongside its
-  biology schematic, a well-known technical architecture illustration (a
-  neural network, a transformer, a RAG pipeline) alongside its
-  concept_experience diagram, a geographic or geological scene (a region's
-  terrain, a volcano's cross-section, a landform), or a historical scene
-  (what a place, event or artefact actually looked like) - where seeing it
-  helps as much as seeing its labelled parts does. When this applies, add a
+  labelled-box abstraction of it (this is on top of the apparatus rule
+  above, which already routes EVERY subject's own apparatus/structure/
+  molecule/setup pictures - physics, chemistry, math, biology/life-science
+  alike - through illustration as their ONLY diagram, not an addition to
+  one). Use this rarely and only when it adds further value: a well-known
+  technical architecture illustration (a neural network, a transformer, a
+  RAG pipeline) alongside its concept_experience diagram, a geographic or
+  geological scene (a region's terrain, a volcano's cross-section, a
+  landform), or a historical scene (what a place, event or artefact
+  actually looked like) - where seeing it helps as much as seeing its
+  labelled parts does. When this applies, add a
   SEPARATE
   `image` block right after the diagram/concept_experience block for that
   same concept, with `image_kind: illustration` and `illustration_style:
@@ -525,22 +830,32 @@ How to produce blocks:
   process, a comparison, or anything that has no real visual form to
   depict. Keep `image_prompt` precise about the actual subject (the accurate
   structure/components/setting) and note that only essential labels should
-  appear in the image itself - never a wall of text or captions baked in.
-  Image models frequently misspell or garble text they draw - if the
-  picture needs ANY specific words/labels rendered in it, list each one,
-  exactly as it must be spelled, in `image_expected_labels` - a real
-  automated check compares the finished image against this list before
-  it's accepted, so a labelled image without this list can't be verified
-  and might ship with garbled text. Leave it empty for a picture that
-  needs no text at all (often the better choice anyway - a label the
-  reader needs can just as well live in the caption or the paragraph
-  beside it).
+  appear in the image itself - a handful of short part/vector/quantity
+  names and directions, never a wall of text, paragraphs or captions baked
+  in. Default to labelling it: a technical/scientific illustration whose
+  whole job is showing a mechanism (per the labelled-diagram rule above)
+  almost always needs its key components and directions named directly on
+  the image, or a reader has no way to tell which arrow/part is which -
+  only skip labels for a genuinely non-technical, purely scene-setting
+  picture (a historical/geographic scene, a decorative mood image) where
+  nothing in the picture needs to be individually identified. Image models
+  frequently misspell or garble text they draw - if the picture needs ANY
+  specific words/labels rendered in it, list each one, exactly as it must
+  be spelled, in `image_expected_labels` - a real automated check compares
+  the finished image against this list before it's accepted, so a
+  labelled image without this list can't be verified and might ship with
+  garbled text, or silently ship with NO labels at all even though the
+  diagram needed them (a real, confirmed case: a magnetic-flux apparatus
+  illustration rendered with unlabelled arrows, leaving a reader unable to
+  tell which one was B, the surface normal, or the sign convention).
 - Set `diagram_kind` whenever you can tell which shape fits (flow_chart,
-  process, cycle, schematic, concept_map, hierarchy, comparison, smart_art,
-  data_flow_diagram, er_diagram, swimlane) - this is what the renderer
-  actually builds, so getting it right here is
-  what makes the diagram useful. Leave it blank only when you genuinely
-  cannot tell.
+  process, cycle, concept_map, hierarchy, comparison, smart_art,
+  data_flow_diagram, er_diagram, swimlane, pyramid, matrix, radial_mindmap,
+  venn, chevron_process, timeline, staircase_process, balance_comparison,
+  nested_circles, network_mesh, decision_tree, fishbone, layered_diagram,
+  gantt_chart - never `schematic`, permanently retired, see above) - this
+  is what the renderer actually builds, so getting it right here is what makes the
+  diagram useful. Leave it blank only when you genuinely cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a
   precise `image_prompt` (every component/label/direction the diagram needs,
   not just a style description) and a `caption`. Set `image_kind: diagram`
@@ -560,15 +875,26 @@ How to produce blocks:
   block that follows it must be that section's first paragraph - the
   ordering of the blocks list is itself what pairs the picture with the
   text it will appear beside in the finished page; never add any marker or
-  placeholder text inside a paragraph for this. This is separate from, and
+  placeholder text inside a paragraph for this.
+  EXCEPTION: a template section whose own `block_types` has no general
+  narrative block type (e.g. a diagram-only slot like "Visual Explanation")
+  is a sub-slot of its PARENT section, not a new top-level section in its
+  own right - skip the section_intro image there entirely. That slot's own
+  guidance already requires a short paragraph beside each diagram it adds;
+  piling a decorative opener icon in front of that too is redundant, and a
+  real, confirmed failure mode: with no paragraph allowed in that slot, the
+  icon ended up paired with nothing, stranded alone on an otherwise blank
+  page. This is separate from, and
   can sit alongside, any `diagram`/`concept_experience` visual or textbook
   companion picture the section also needs - they serve different purposes.
   For THIS block's `image_prompt`: at most 40 words, one single clear
   subject with no clutter or background detail, always in the style "clean
-  modern digital illustration, dark-blue/teal tones with soft glow accents"
-  (the exact same palette phrase every time, for every section_intro image
-  in this chapter), and the prompt text must end with the exact words "no
-  text, no letters, no labels". The SUBJECT must be genuinely tied to what
+  modern digital illustration" - but choose colors that fit what THIS
+  subject actually is (e.g. warm earth tones for a desert ecosystem, green
+  for plant biology, the sodium-glow orange of a streetlamp circuit) rather
+  than one fixed palette repeated for every section_intro image in the
+  course, and the prompt text must end with the exact words "no text, no
+  letters, no labels". The SUBJECT must be genuinely tied to what
   this specific section actually teaches, never the section's own NAME -
   "Learning Objectives"/"Summary"/"Concept"/"Overview" are headings, not
   visual subjects, and must never be illustrated literally (a trophy for
@@ -577,18 +903,35 @@ How to produce blocks:
   own content actually says (its real objectives/takeaways/steps, not the
   heading), (2) the 2-4 most concrete entities, components, stages or
   relationships that content actually names, and (3) which of those -
-  never a stand-in metaphor - to put in the picture. This applies to every
-  subject the chapter could be about, not just technical ones: a Python
-  setup section's objectives are about a terminal/interpreter, an isolated
-  project folder, installed dependency blocks and a smoke-test check, not
-  a target; a photosynthesis section is about sunlight reaching a
-  chloroplast with CO2/H2O becoming glucose/O2, not a leaf icon; an
-  economics section on supply and demand is about the two curves and
-  their equilibrium point, not coins; a history section's overview is the
-  actual sequence of events/figures involved, not a generic scroll. A
-  purely structural/meta section still needs one of ITS OWN chapter's real
-  anchors from step (2) above, never a universal stand-in for what the
-  heading is called in the abstract. Before finalizing, apply both checks:
+  never a stand-in metaphor for what KIND of section this is (a trophy for
+  any "objectives" section, a ribbon for any "summary") - to put in the
+  picture. This applies to every subject the chapter could be about, not
+  just technical ones: a Python setup section's objectives are about a
+  terminal/interpreter, an isolated project folder, installed dependency
+  blocks and a smoke-test check, not a target; a photosynthesis section is
+  about sunlight reaching a chloroplast with CO2/H2O becoming glucose/O2,
+  not a leaf icon; an economics section on supply and demand is about the
+  two curves and their equilibrium point, not coins; a history section's
+  overview is the actual sequence of events/figures involved, not a
+  generic scroll. A purely structural/meta section still needs one of ITS
+  OWN chapter's real anchors from step (2) above, never a universal
+  stand-in for what the heading is called in the abstract.
+  When step (2)'s real entities are themselves symbolic/abstract with no
+  physical form (a function, a data structure, an algorithm's behaviour, a
+  mathematical relationship - e.g. a decorator wrapping a function, a
+  generator yielding values lazily, a closure capturing a variable), a
+  raster image model cannot draw the entity itself, so translate its
+  EXACT mechanism - never the section heading - into ONE concrete,
+  physically renderable object or scene that behaves the same way: a
+  decorator wrapping a function becomes a package being wrapped in an
+  outer layer of paper that everything passing in or out must go through;
+  a generator yielding lazily becomes one item being drawn out of a
+  dispenser at a time while the rest sit inside, not yet formed; a closure
+  capturing a variable becomes a sealed container carrying one labelled
+  item away with it after the room around it is gone. This is still THIS
+  mechanism, made drawable - not a generic icon and not interchangeable
+  with any other chapter's abstract concept.
+  Before finalizing, apply both checks:
   would this image still look at home pasted in front of a completely
   different chapter (if yes, it's too generic - pick a more specific
   anchor), and could a student, shown only the picture with no caption or
@@ -773,6 +1116,11 @@ whether the right words appear:
   is wrong, `problem` to what is wrong in plain words, and `fix` to what the
   rewritten block must say instead.
 Do not mark a check true unless you actually judged it.
+When the prompt includes a CHAPTER CONTRACT, treat it as the planner's own
+definition of what this chapter must cover - check the written chapter against
+it and report any planned section, key point or key concept it doesn't
+actually address (in substance, not necessarily the exact wording) as an
+issue with category "completeness", per the severity rule stated there.
 
 Set `approved` to false only when something must change before publication.
 Report every problem as an issue with a severity of blocker, major or minor, the
@@ -842,6 +1190,54 @@ def chapter_projection(blocks: list[dict], limit: int = 20000) -> str:
     return rendered
 
 
+def chapter_contract_brief(chapter: BlueprintChapter) -> str:
+    """MOM Phase 7 - section completeness contract.
+
+    The planner already produces a real, per-chapter contract
+    (`BlueprintChapter.objective`/`sections[].key_points`/`key_concepts`/
+    `prerequisites`) - this is not a new schema, just the first thing that
+    actually SHOWS it to the reviewer so coverage can be judged against it.
+    Before this, the reviewer only ever saw the chapter title; it had no way
+    to know what topics the chapter was supposed to cover, so nothing could
+    ever flag a missing one. Topic/concept coverage is meaning-dependent
+    (a model can cover "memory layout" without using that exact phrase), so
+    this is deliberately handled by the reviewer's own semantic judgement
+    (see REVIEWER_SYSTEM's "CHAPTER CONTRACT" instruction) rather than a
+    brittle keyword-match - the deterministic half of completeness checking
+    (empty headings, abrupt endings, broken code) lives in
+    `_section_completeness_issues` instead, which doesn't need judgement.
+
+    Returns "" when the chapter carries none of this (e.g. a hand-built
+    chapter in a test, or a blueprint from before this field existed) so
+    the reviewer prompt is unchanged for those - same contract as every
+    other `_brief` function in this module.
+    """
+    sections = [s for s in chapter.sections if s.title.strip()]
+    has_content = bool(
+        chapter.objective.strip() or sections or chapter.key_concepts or chapter.prerequisites
+    )
+    if not has_content:
+        return ""
+    lines = ["CHAPTER CONTRACT (what the planner intended this chapter to cover):"]
+    if chapter.objective.strip():
+        lines.append(f"- Objective: {chapter.objective.strip()}")
+    if chapter.prerequisites:
+        lines.append(f"- Assumes the reader already knows: {', '.join(chapter.prerequisites)}")
+    for section in sections:
+        points = ", ".join(section.key_points) if section.key_points else "(no key points listed)"
+        lines.append(f"- Planned section \"{section.title}\": {points}")
+    if chapter.key_concepts:
+        lines.append(f"- Key concepts that must be covered: {', '.join(chapter.key_concepts)}")
+    lines.append(
+        "- Check the chapter against this contract: if a planned section, key point or key "
+        "concept above is not actually covered anywhere in the chapter (not just absent from "
+        "a heading - the content may cover it under different wording), report it as an issue "
+        "with category 'completeness' - severity 'major' if an entire planned section or key "
+        "concept is missing, 'minor' if it's present but only thinly covered."
+    )
+    return "\n".join(lines)
+
+
 def reviewer_user(
     blueprint: CourseBlueprint,
     chapter: BlueprintChapter,
@@ -869,7 +1265,7 @@ DO'S:
 
 DON'TS:
 {_bullets(course_input.donts)}
-{_appended(learner_brief(course_input.learner_profile))}{_appended(_rules_brief(course_input))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}
+{_appended(learner_brief(course_input.learner_profile))}{_appended(chapter_contract_brief(chapter))}{_appended(approach_review_brief(course_input))}{_appended(_rules_brief(course_input))}{_appended(_design_brief(course_input))}{_appended(_style_brief(course_input))}
 REQUIRED TEMPLATE SECTIONS: {", ".join(s.key for s in template.required_sections())}
 BLOCK TYPES THAT MUST APPEAR: {", ".join(bt.value for bt in template.required_block_types)}
 TEMPLATE REVIEW FOCUS:
@@ -1037,12 +1433,12 @@ Rules:
   "concept_experience" and leave `diagram_kind` blank - this is the right
   choice for that content, not a fallback. Otherwise set `kind` to
   "diagram" for a flow chart, process, hierarchy, comparison, concept
-  map/labelled relationship diagram, physical schematic or SmartArt-style
-  list (rendered from labelled shapes, so labels stay exact); also set
-  `diagram_kind` to the specific shape (flow_chart/process/cycle for a sequence,
-  schematic ONLY for a biology/life-science structure (a cell, a plant, an
-  organ) - NEVER for physics, chemistry or math (a magnet, an apparatus, a
-  molecule, an orbit, a mechanical assembly): those always get `kind:
+  map/labelled relationship diagram or SmartArt-style list (rendered from
+  labelled shapes, so labels stay exact); also set `diagram_kind` to the
+  specific shape (flow_chart/process/cycle for a sequence - never
+  `schematic`, permanently retired for every subject including biology/
+  life-science: a cell, a plant, an organ, a magnet, an apparatus, a
+  molecule, an orbit, a mechanical assembly all always get `kind:
   "illustration"` with `illustration_style: "textbook"` instead, even for a
   simple static object - this is a firm preference from real generated
   courses, not a style suggestion,
@@ -1075,12 +1471,12 @@ Rules:
   even if the user didn't mention "kind" at all. A block sitting on `kind:
   "diagram"` whose topic clearly qualifies for `concept_experience`, whose
   topic is actually a coordinate-axis graph wrongly rendered as boxes-and-
-  lines, or whose `diagram_kind` is "schematic" for a physics/chemistry/math
-  topic, is a bug to fix while you're there, not a choice to preserve - set
-  `kind` to "concept_experience" (diagram_kind clears itself), or to
-  "illustration" (with `illustration_style: "textbook"` for the schematic
-  case) instead of only swapping the prompt and reproducing the same wrong
-  output.
+  lines, or whose `diagram_kind` is "schematic" (permanently retired, for
+  any subject), is a bug to fix while you're there, not a choice to
+  preserve - set `kind` to "concept_experience" (diagram_kind clears
+  itself), or to "illustration" (with `illustration_style: "textbook"` for
+  the former-schematic case) instead of only swapping the prompt and
+  reproducing the same wrong output.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.
