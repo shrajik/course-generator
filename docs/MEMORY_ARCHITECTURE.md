@@ -13,7 +13,7 @@ permissions and trust. They meet in two controlled places only (see "How they co
 | Tables | `kb_*` (migration 0012) | `am_*` (migration 0013) |
 | Code | `app/kb`, `app/services/knowledge_*` | `app/artifacts` |
 | API | `/api/kb` (admin), `/api/knowledge` (legacy, kept) | `/api/artifacts` (reviewer / admin) |
-| Screen | Admin > Knowledge | `/review/artifacts` (SMEs), Admin > Approved artifacts |
+| Screen | Admin > Knowledge | none: captured and reused automatically when a course is approved |
 
 The existing `MemoryService` / `memory_embeddings` (template guidance and generation-history notes for the
 reviewer stage) is a third, older thing and is **not** either memory. It is untouched.
@@ -58,7 +58,7 @@ indexed > reusable.
   extracts its artifacts (`app/artifacts/extract.py`): a chapter artifact per chapter, plus its visuals,
   question sets, activities and case studies as independently reusable artifacts. Approving the course approves
   and locks them with it (after re-capturing the document, so what is approved is what the reviewer last saw);
-  sending it back returns them. Reviewers can also approve one artifact on its own (`/api/artifacts`).
+  sending it back returns them. There is no artifact review screen: the only decision is on the course. `/api/artifacts` stays as an admin API for inspection and archiving.
   Failures here are logged, never block the review.
 * **Identity is stable.** An artifact's key comes from the chapter or block id, so resubmitting finds the same
   artifacts. Content hashes ignore block ids: the same words are the same content.
@@ -123,8 +123,7 @@ actions that check the invariants after every step. Frontend: `npm test` (`src/l
   re-audited (the content was approved by an SME).
 * Artifact identity rests on block ids: if a chapter is regenerated with new block ids, its blocks become new
   artifacts (the chapter itself keeps its identity).
-* Artifacts are reviewed at `/review/artifacts` (reviewers and admins; archiving stays admin-only) and
-  managed at Admin > Approved artifacts. SMEs can still approve a whole course in the existing review screen.
+* Artifacts have no screen of their own. A reviewer approves the whole course in the existing review screen; capture, locking, indexing and reuse follow automatically.
 * Classifier thresholds (category assignment, section topics) are uncalibrated starting points.
 * Permanent purge of knowledge is implemented but disabled (`KB_PURGE_ENABLED`) while the cutover rollback
   window is open.

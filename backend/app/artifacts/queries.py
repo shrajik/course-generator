@@ -16,12 +16,13 @@ from app.core.errors import NotFoundError
 from app.db.session import get_session_factory
 
 _SUMMARY = """
-    SELECT a.id, a.number, a.public_id, a.artifact_type, a.title, a.description, a.course_id, a.chapter_id, a.course_title, a.status,
+    SELECT a.id, a.number, a.public_id, a.artifact_type, a.title, a.description, a.course_id, c.document_id, a.chapter_id, a.course_title, a.status,
            a.updated_at, v.id AS latest_version_id, v.version_no AS latest_version, v.review_status, v.review_comment, v.submitted_at,
            av.version_no AS active_version, (a.active_version_id IS NOT NULL) AS ever_approved
     FROM am_artifacts a
     JOIN am_artifact_versions v ON v.id = a.latest_version_id
     LEFT JOIN am_artifact_versions av ON av.id = a.active_version_id
+    LEFT JOIN courses c ON c.course_id = a.course_id
 """
 
 
