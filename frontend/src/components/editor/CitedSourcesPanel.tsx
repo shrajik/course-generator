@@ -1,13 +1,14 @@
 "use client";
 
 import { useContext, useEffect, useMemo, useState } from "react";
-import { BookOpen, ChevronDown, ChevronRight, FileText, Loader2 } from "lucide-react";
+import { BadgeCheck, BookOpen, ChevronDown, ChevronRight, FileText, Loader2 } from "lucide-react";
 import { getPassagesByRefs, type Passage } from "@/lib/api/review";
-import { collectCitations, groupBySource, originLabel } from "@/lib/editor/citations";
+import { ORIGIN_CLASSES, collectCitations, groupBySource, originLabel, type CitationOrigin } from "@/lib/editor/citations";
 import { useEditor } from "@/lib/editor/store";
 import { CitationContext } from "@/components/blocks/CitationBadge";
 import { cn } from "@/lib/utils/cn";
 
+const ORIGIN_ICON: Record<CitationOrigin, typeof BookOpen> = { knowledge: BookOpen, memory: BadgeCheck, upload: FileText };
 const BATCH = 50; // the passages endpoint takes at most 50 references at once
 
 function chapterLabel(chapterId: string): string {
@@ -54,6 +55,7 @@ export function CitedSourcesPanel() {
   const groups = useMemo(() => groupBySource(citations, passages), [citations, passages]);
   const total = groups.reduce((sum, group) => sum + group.citations, 0);
   const library = groups.filter((group) => group.origin === "knowledge" && group.filename).length;
+  const memory = groups.filter((group) => group.origin === "memory" && group.filename).length;
   const uploads = groups.filter((group) => group.origin === "upload" && group.filename).length;
 
   const goTo = (ref: string) => {
@@ -71,15 +73,18 @@ export function CitedSourcesPanel() {
         <p className="text-[12.5px] font-semibold text-ink">Sources</p>
         <p className="mt-0.5 text-[11px] leading-snug text-ink-400">
           {total
-            ? `${total} citation${total === 1 ? "" : "s"}: ${library} knowledge-library document${library === 1 ? "" : "s"}, ${uploads} uploaded document${uploads === 1 ? "" : "s"}.`
+            ? `${total} citation${total === 1 ? "" : "s"}: ${library} knowledge-library document${library === 1 ? "" : "s"}, ${memory} approved earlier item${memory === 1 ? "" : "s"}, ${uploads} uploaded document${uploads === 1 ? "" : "s"}.`
             : "Where this course's statements come from."}
         </p>
         <div className="mt-2 flex flex-wrap gap-2 text-[10.5px] text-ink-500">
           <span className="inline-flex items-center gap-1">
-            <span className="h-2.5 w-2.5 rounded-sm bg-teal-100 ring-1 ring-teal-300" /> Knowledge library
+            <span className={cn("h-2.5 w-2.5 rounded-sm", ORIGIN_CLASSES.knowledge.dot)} /> Knowledge library
           </span>
           <span className="inline-flex items-center gap-1">
-            <span className="h-2.5 w-2.5 rounded-sm bg-brand-50 ring-1 ring-brand-200" /> Your upload
+            <span className={cn("h-2.5 w-2.5 rounded-sm", ORIGIN_CLASSES.memory.dot)} /> Approved earlier material
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <span className={cn("h-2.5 w-2.5 rounded-sm", ORIGIN_CLASSES.upload.dot)} /> Your upload
           </span>
         </div>
       </div>
@@ -99,7 +104,7 @@ export function CitedSourcesPanel() {
         {groups.map((group) => {
           const key = `${group.origin}:${group.sourceId || group.refs[0]}`;
           const open = openKey === key;
-          const Icon = group.origin === "knowledge" ? BookOpen : FileText;
+          const Icon = ORIGIN_ICON[group.origin];
           return (
             <div key={key} className="rounded-[8px] border border-line bg-white">
               <button
@@ -107,12 +112,7 @@ export function CitedSourcesPanel() {
                 onClick={() => setOpenKey(open ? null : key)}
                 className="flex w-full items-start gap-2 px-2.5 py-2 text-left"
               >
-                <span
-                  className={cn(
-                    "mt-0.5 rounded p-1",
-                    group.origin === "knowledge" ? "bg-teal-50 text-teal-700" : "bg-brand-50 text-brand-700",
-                  )}
-                >
+                <span className={cn("mt-0.5 rounded p-1", ORIGIN_CLASSES[group.origin].chip)}>
                   <Icon size={12} />
                 </span>
                 <span className="min-w-0 flex-1">

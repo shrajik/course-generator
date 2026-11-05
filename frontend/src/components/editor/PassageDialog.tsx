@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BookOpen, FileText, Loader2 } from "lucide-react";
+import { BadgeCheck, BookOpen, FileText, Loader2 } from "lucide-react";
 import { ApiError } from "@/lib/api/client";
 import { getPassagesByRefs, type Passage } from "@/lib/api/review";
-import { originLabel, originOf } from "@/lib/editor/citations";
+import { ORIGIN_CLASSES, originLabel, originOf, type CitationOrigin } from "@/lib/editor/citations";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 
@@ -13,6 +13,18 @@ import { Modal } from "@/components/ui/Modal";
  * (the organisation's knowledge library or the creator's own upload), where
  * in that document, and the passage itself.
  */
+const ORIGIN_ICON: Record<CitationOrigin, typeof BookOpen> = { knowledge: BookOpen, memory: BadgeCheck, upload: FileText };
+const NOT_FOUND: Record<CitationOrigin, string> = {
+  knowledge: "This passage is no longer in the knowledge library - the document may have been switched off or removed.",
+  memory: "This approved item is no longer available - it may have been archived.",
+  upload: "This passage could not be found in the course's uploaded sources.",
+};
+const ORIGIN_NOTE: Record<CitationOrigin, string> = {
+  knowledge: "From the organisation's knowledge library, which every course searches while it is written.",
+  memory: "From material approved in an earlier course. It is locked: an expert signed it off, and it is offered to similar new courses.",
+  upload: "From a document uploaded for this course.",
+};
+
 export function PassageDialog({
   courseId,
   refId,
@@ -37,11 +49,7 @@ export function PassageDialog({
         if (cancelled) return;
         if (found.length) setPassage(found[0]);
         else
-          setError(
-            originOf(refId) === "knowledge"
-              ? "This passage is no longer in the knowledge library - the document may have been switched off or removed."
-              : "This passage could not be found in the course's uploaded sources.",
-          );
+          setError(NOT_FOUND[originOf(refId)]);
       })
       .catch((caught) => !cancelled && setError(caught instanceof ApiError ? caught.message : "The passage could not be loaded."))
       .finally(() => !cancelled && setLoading(false));
@@ -51,7 +59,7 @@ export function PassageDialog({
   }, [courseId, refId]);
 
   const origin = refId ? originOf(refId) : "knowledge";
-  const Icon = origin === "knowledge" ? BookOpen : FileText;
+  const Icon = ORIGIN_ICON[origin];
 
   return (
     <Modal
@@ -75,13 +83,7 @@ export function PassageDialog({
       ) : passage ? (
         <div className="space-y-3">
           <div className="flex items-start gap-2.5">
-            <span
-              className={
-                origin === "knowledge"
-                  ? "rounded-md bg-teal-50 p-1.5 text-teal-700"
-                  : "rounded-md bg-brand-50 p-1.5 text-brand-700"
-              }
-            >
+            <span className={`rounded-md p-1.5 ${ORIGIN_CLASSES[origin].chip}`}>
               <Icon size={15} />
             </span>
             <div>
@@ -97,9 +99,7 @@ export function PassageDialog({
             {passage.text}
           </blockquote>
           <p className="text-[11px] leading-4 text-ink-400">
-            {origin === "knowledge"
-              ? "From the organisation's knowledge library, which every course searches while it is written."
-              : "From a document uploaded for this course."}{" "}
+            {ORIGIN_NOTE[origin]}{" "}
             The AI was given this passage while writing and cited it here.
           </p>
         </div>

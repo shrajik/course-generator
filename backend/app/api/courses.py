@@ -345,6 +345,16 @@ async def course_passages(
     )
     # [G2.5] is a passage of the global knowledge library.
     found += await get_knowledge_service().apassages_by_refs([r for r in wanted if r.startswith("G")])
+    # [A7.2] is approved material from an earlier course (Memory 2). Best effort: a missing memory
+    # must not break opening the other citations.
+    artifact_refs = [r for r in wanted if r.startswith("A")]
+    if artifact_refs:
+        try:
+            from app.artifacts.retrieval import ArtifactMemory
+
+            found += await ArtifactMemory(log_retrievals=False).passages(artifact_refs)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not resolve artifact citations %s: %s", artifact_refs, exc)
     return [p.model_dump(mode="json") for p in found]
 
 

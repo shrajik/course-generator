@@ -318,3 +318,20 @@ async def test_identical_content_from_elsewhere_is_noted_and_never_merged(env):
     assert result.created == 3 and len(result.duplicates) == 3
     assert len(await _sql("SELECT 1 FROM am_artifacts")) == 6
     assert len(await _sql("SELECT 1 FROM am_activity WHERE action = 'duplicate_noted'")) == 3
+
+
+async def test_a_citation_opens_only_approved_material_in_the_shape_the_editor_shows(env):
+    from app.artifacts.retrieval import ArtifactMemory
+
+    memory = ArtifactMemory(get_settings(), log_retrievals=False)
+    await _submit(env)
+    numbers = await _sql("SELECT a.number, a.artifact_type FROM am_artifacts a ORDER BY 1")
+    refs = [f"A{r.number}.1" for r in numbers]
+    assert await memory.passages(refs) == []  # still waiting for review: never citable
+
+    await env.service.approve_course("course_1", REVIEWER)
+    found = await memory.passages([*refs, "A999.1", "not-a-ref", f"A{numbers[0].number}.9"])
+    assert sorted(p.ref for p in found) == sorted(refs)  # unknown, malformed and missing versions are left out
+    one = next(p for p in found if p.ref == refs[0])
+    assert one.source_id.startswith("art_") and one.filename and one.text
+    assert await memory.passages([]) == []

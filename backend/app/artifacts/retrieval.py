@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -30,6 +31,7 @@ from app.db.pgvector_check import use_iterative_scan
 from app.db.session import get_session_factory
 from app.ingestion.retrieval import tokenize
 from app.services import kb_ranking
+from app.schemas.source import SourceExcerpt
 from app.services.embedding_service import EmbeddingService, get_embedding_service
 
 log = get_logger(__name__)
@@ -261,3 +263,41 @@ class ArtifactMemory:
         if row is None or (row.review_status != "approved" and not include_unapproved):
             raise NotFoundError("No such approved artifact version.")
         return {**dict(row._mapping), "ref": f"A{row.number}.{row.version_no}", "superseded": row.review_status == "approved" and row.version_no != row.newest_approved}
+
+    async def passages(self, refs: Sequence[str], *, limit: int = 50) -> list[SourceExcerpt]:
+        """Approved artifact versions by citation, in the shape the course editor shows a cited passage in.
+
+        Unknown, malformed and not-yet-approved references are left out, not reported: this answers "what do
+        these citations point at", and an unapproved version is never something a course may cite."""
+        wanted = []
+        for ref in refs:
+            match = _REF_RE.match(ref.strip())
+            if match:
+                wanted.append((int(match.group(1)), int(match.group(2))))
+        wanted = list(dict.fromkeys(wanted))[:limit]
+        if not wanted:
+            return []
+        params: dict[str, Any] = {}
+        pairs = []
+        for index, (number, version) in enumerate(wanted):
+            params[f"n{index}"], params[f"v{index}"] = number, version
+            pairs.append(f"(:n{index}, :v{index})")
+        async with self.factory() as session:
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT a.number, v.version_no, a.public_id, a.artifact_type, a.title, a.course_title, v.search_text "
+                        "FROM am_artifacts a JOIN am_artifact_versions v ON v.artifact_id = a.id "
+                        f"WHERE v.review_status = 'approved' AND (a.number, v.version_no) IN ({', '.join(pairs)})"
+                    ),
+                    params,
+                )
+            ).all()
+        return [
+            SourceExcerpt(
+                ref=f"A{r.number}.{r.version_no}", source_id=r.public_id, filename=r.title or r.artifact_type,
+                heading=f"{r.artifact_type.replace('_', ' ')}" + (f" · from \"{r.course_title}\"" if r.course_title else ""),
+                text=r.search_text[:6000],
+            )
+            for r in rows
+        ]

@@ -47,3 +47,18 @@ test("citations are grouped by document, library first, and a lost passage stays
     ],
   );
 });
+
+test("an approved earlier item is its own origin, with its own label, and sorts between the library and uploads", () => {
+  assert.equal(originOf("A7.2"), "memory");
+  assert.equal(originLabel("memory"), "Approved earlier material");
+  const found = collectCitations({
+    pages: [{ blocks: [{ id: "b1", content: { text: "Reused [A7.2], library [G2.5], mine [S1.3]." }, meta: { chapter_id: "chapter_1" } }] }],
+  });
+  assert.deepEqual([...found.keys()], ["A7.2", "G2.5", "S1.3"]); // the marker pattern accepts A
+  const groups = groupBySource(found, [
+    { ref: "A7.2", source_id: "art_x", filename: "Refund rules", heading: "chapter", page: null, text: "..." },
+    { ref: "G2.5", source_id: "src_policy", filename: "Policy.pdf", heading: "", page: 3, text: "..." },
+    { ref: "S1.3", source_id: "src_mine", filename: "Notes.docx", heading: "", page: null, text: "..." },
+  ]);
+  assert.deepEqual(groups.map((g) => g.origin), ["knowledge", "memory", "upload"]);
+});

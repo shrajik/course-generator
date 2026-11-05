@@ -1,6 +1,7 @@
 "use client";
 
-import { BookOpen, FileText, Globe } from "lucide-react";
+import { BadgeCheck, BookOpen, FileText, Globe } from "lucide-react";
+import { ORIGIN_CLASSES, originLabel } from "@/lib/editor/citations";
 import type { ChapterProgress, SourceUse } from "@/lib/types/course";
 
 /**
@@ -14,9 +15,10 @@ export function SourcesUsed({ chapters }: { chapters: ChapterProgress[] }) {
 
   const library = new Set<string>();
   const uploads = new Set<string>();
+  const memory = new Set<string>();
   for (const chapter of checked) {
     for (const use of chapter.sources_offered ?? []) {
-      (use.origin === "knowledge" ? library : uploads).add(use.source_id);
+      (use.origin === "knowledge" ? library : use.origin === "artifact" ? memory : uploads).add(use.source_id);
     }
   }
 
@@ -24,8 +26,8 @@ export function SourcesUsed({ chapters }: { chapters: ChapterProgress[] }) {
     <div className="border-t border-line pt-5">
       <p className="text-[12.5px] font-semibold text-ink">Where the content comes from</p>
       <p className="mt-0.5 text-[11.5px] leading-4 text-ink-500">
-        {library.size || uploads.size
-          ? `${library.size} knowledge-library document${library.size === 1 ? "" : "s"} and ${uploads.size} uploaded document${uploads.size === 1 ? "" : "s"} matched. Statements taken from them are marked in the text, and you can open each one in the editor.`
+        {library.size || uploads.size || memory.size
+          ? `${library.size} knowledge-library document${library.size === 1 ? "" : "s"}, ${memory.size} approved item${memory.size === 1 ? "" : "s"} from earlier courses and ${uploads.size} uploaded document${uploads.size === 1 ? "" : "s"} matched. Statements taken from them are marked in the text, and you can open each one in the editor.`
           : "No knowledge-library document or upload matched these chapters, so they use web research."}
       </p>
       <ul className="mt-3 space-y-2.5">
@@ -55,14 +57,14 @@ export function SourcesUsed({ chapters }: { chapters: ChapterProgress[] }) {
 }
 
 function SourceLine({ use }: { use: SourceUse }) {
-  const library = use.origin === "knowledge";
-  const Icon = library ? BookOpen : FileText;
+  const origin = use.origin === "artifact" ? "memory" : use.origin;
+  const Icon = origin === "knowledge" ? BookOpen : origin === "memory" ? BadgeCheck : FileText;
   return (
     <li className="flex items-center gap-1.5 text-[11px] text-ink-500" title={use.refs.join(", ")}>
-      <Icon size={11} className={library ? "shrink-0 text-teal-600" : "shrink-0 text-brand-600"} />
+      <Icon size={11} className={`shrink-0 ${ORIGIN_CLASSES[origin].text}`} />
       <span className="truncate">
-        <span className={library ? "font-medium text-teal-700" : "font-medium text-brand-700"}>
-          {library ? "Knowledge library" : "Your upload"}
+        <span className={`font-medium ${ORIGIN_CLASSES[origin].text}`}>
+          {originLabel(origin)}
         </span>
         : {use.filename}
       </span>

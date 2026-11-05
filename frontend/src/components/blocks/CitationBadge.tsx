@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, createContext, useContext } from "react";
-import { originLabel, originOf } from "@/lib/editor/citations";
+import { ORIGIN_CLASSES, originLabel, originOf } from "@/lib/editor/citations";
 import { splitMarkers } from "@/lib/review/highlight";
 import { cn } from "@/lib/utils/cn";
 
@@ -18,7 +18,7 @@ export function CitationBadge({ refId, label }: { refId: string; label: string }
   const title = `${originLabel(origin)}, passage ${refId}${context ? " - click to see where this comes from" : ""}`;
   const className = cn(
     "mx-[1px] inline-flex items-center rounded-[4px] px-1 align-baseline text-[0.72em] font-semibold leading-[1.5]",
-    origin === "knowledge" ? "bg-teal-50 text-teal-700 ring-1 ring-teal-200" : "bg-brand-50 text-brand-700 ring-1 ring-brand-200",
+    ORIGIN_CLASSES[origin].badge,
   );
   if (!context) {
     return (

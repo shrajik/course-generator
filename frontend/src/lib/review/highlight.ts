@@ -46,7 +46,8 @@ export function segmentText<T extends Highlightable>(text: string, findings: rea
 
 export type MarkerPart = { kind: "text"; text: string } | { kind: "ref"; ref: string; label: string };
 
-const MARKER = /\[((?:[SG]\d+\.\d+)(?:\s*[,;]\s*[SG]\d+\.\d+)*)\]/g;
+// S = the creator's upload, G = knowledge library, A = approved material from earlier courses.
+const MARKER = /\[((?:[SGA]\d+\.\d+)(?:\s*[,;]\s*[SGA]\d+\.\d+)*)\]/g;
 
 /** Split text around source markers; each reference in a marker becomes a part. */
 export function splitMarkers(text: string): MarkerPart[] {

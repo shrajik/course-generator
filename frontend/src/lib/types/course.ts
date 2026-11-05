@@ -248,7 +248,7 @@ export type CourseStatus =
 
 /** A document a chapter was given passages from while it was written. */
 export interface SourceUse {
-  origin: "knowledge" | "upload";
+  origin: "knowledge" | "upload" | "artifact";
   source_id: string;
   filename: string;
   passages: number;
