@@ -61,6 +61,11 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
+/** "Nov 5, 2026": a table cell should not wrap; the full date and time is in the tooltip and the details. */
+function formatDay(value: string): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+}
+
 function StatusBadge({ status }: { status: string }) {
   const ready = status === "ready";
   const failed = status === "failed";
@@ -104,22 +109,22 @@ function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
   const summary = summarizeModelUsage(usage.calls);
   return (
     <>
-      <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-[#D8D0C7]">
+      <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-ink">
         <span>
           {summary.totalCalls} call{summary.totalCalls === 1 ? "" : "s"}
         </span>
         <span>{summary.totalInputTokens.toLocaleString()} input tokens</span>
         <span>{summary.totalOutputTokens.toLocaleString()} output tokens</span>
-        <span className={summary.failedCount > 0 ? "text-[#F0C4A6]" : undefined}>
+        <span className={summary.failedCount > 0 ? "text-ink-500" : undefined}>
           {summary.failedCount} failed
         </span>
         <span>
           {summary.fallbackCount} fallback{summary.fallbackCount === 1 ? "" : "s"}
         </span>
       </div>
-      <div className="overflow-x-auto rounded-[8px] border border-[#34312D]">
+      <div className="overflow-x-auto rounded-[8px] border border-line">
         <table className="w-full min-w-[640px] text-left text-[12px]">
-          <thead className="bg-[#201C18] text-[10px] uppercase tracking-[0.08em] text-[#8E8780]">
+          <thead className="bg-surface-muted text-[10px] uppercase tracking-[0.08em] text-ink-400">
             <tr>
               <th className="px-3 py-2 font-medium">Purpose</th>
               <th className="px-3 py-2 font-medium">Kind</th>
@@ -133,9 +138,9 @@ function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
               <th className="px-3 py-2 font-medium">Timestamp</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-[#2A2520]">
+          <tbody className="divide-y divide-line">
             {usage.calls.map((call, index) => (
-              <tr key={`${call.purpose}-${call.timestamp}-${index}`} className="text-[#D8D0C7]">
+              <tr key={`${call.purpose}-${call.timestamp}-${index}`} className="text-ink">
                 <td className="max-w-[220px] truncate px-3 py-2 font-mono text-[11px]" title={call.purpose}>
                   {call.purpose}
                 </td>
@@ -154,7 +159,7 @@ function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
                     ) : null}
                   </div>
                 </td>
-                <td className="whitespace-nowrap px-3 py-2 text-[11px] text-[#8E8780]">
+                <td className="whitespace-nowrap px-3 py-2 text-[11px] text-ink-400">
                   {call.timestamp ? formatDate(call.timestamp) : "—"}
                 </td>
               </tr>
@@ -322,7 +327,7 @@ export default function AdminCoursesPage() {
           <div className="relative">
             <Search
               size={15}
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#8E8780]"
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-400"
             />
             <input
               value={searchInput}
@@ -334,7 +339,7 @@ export default function AdminCoursesPage() {
           <div className="relative">
             <FileText
               size={15}
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#8E8780]"
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-400"
             />
             <input
               value={ownerInput}
@@ -377,9 +382,9 @@ export default function AdminCoursesPage() {
           <div className="flex items-center gap-2">
             <Button
               type="submit"
-              variant="ghost"
+              variant="outline"
               size="sm"
-              className="h-9 border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              className="h-9"
               title="Apply filters"
             >
               <Search size={14} />
@@ -387,10 +392,10 @@ export default function AdminCoursesPage() {
             </Button>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               onClick={clearFilters}
-              className="h-9 border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              className="h-9"
               title="Reset filters"
             >
               <RefreshCcw size={14} />
@@ -401,30 +406,30 @@ export default function AdminCoursesPage() {
       </AdminPanel>
 
       <AdminPanel>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#302D29] px-4 py-3">
-          <div className="text-[13px] text-[#BEB6AD]">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
+          <div className="text-[13px] text-ink-500">
             {total.toLocaleString()} course{total === 1 ? "" : "s"}
           </div>
           <div className="flex items-center gap-2">
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               disabled={!canGoBack || isLoading}
               onClick={() => setPage((value) => Math.max(0, value - 1))}
-              className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              
               title="Previous page"
             >
               <ChevronLeft size={14} />
             </Button>
-            <span className="text-[12px] text-[#8E8780]">Page {page + 1}</span>
+            <span className="text-[12px] text-ink-400">Page {page + 1}</span>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               disabled={!canGoForward || isLoading}
               onClick={() => setPage((value) => value + 1)}
-              className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              
               title="Next page"
             >
               <ChevronRight size={14} />
@@ -438,72 +443,60 @@ export default function AdminCoursesPage() {
           <AdminEmpty><BookOpenEmpty /><span>No courses match the current filters.</span></AdminEmpty>
         ) : (
           <div className="overflow-x-auto">
-            <table className="admin-table w-full min-w-[1180px] text-left text-[13px]">
-              <thead className="bg-[#181614] text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">
+            <table className="admin-table w-full min-w-[860px] text-left text-[13px]">
+              <thead className="bg-surface-muted text-[11px] uppercase tracking-[0.08em] text-ink-500">
                 <tr>
-                  <th className="px-4 py-3 font-medium">Course</th>
-                  <th className="px-4 py-3 font-medium">Course ID</th>
-                  <th className="px-4 py-3 font-medium">Owner</th>
-                  <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3 font-medium">Document</th>
-                  <th className="px-4 py-3 font-medium">Created</th>
-                  <th className="px-4 py-3 font-medium">Updated</th>
-                  <th className="px-4 py-3 font-medium">Actions</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">Course</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">Owner</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">Status</th>
+                  <th scope="col" className="whitespace-nowrap px-4 py-3 font-semibold">Last updated</th>
+                  <th scope="col" className="px-4 py-3 text-right font-semibold">
+                    <span className="sr-only">Actions</span>
+                  </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#302D29]">
+              <tbody className="divide-y divide-line">
                 {courses.map((item) => (
-                  <tr key={item.id} className="text-[#D8D0C7]">
-                    <td className="max-w-[280px] px-4 py-3 font-medium text-[#F4EFE7]">
-                      <span className="block truncate">{item.title}</span>
-                      <span className="mt-1 block text-[12px] font-normal text-[#8E8780]">
-                        {item.template_id} / {item.toc_count} chapter{item.toc_count === 1 ? "" : "s"}
+                  <tr key={item.id} className="align-top text-ink">
+                    <td className="max-w-[340px] px-4 py-3.5">
+                      <span className="block truncate font-medium" title={item.title}>{item.title}</span>
+                      <span className="mt-0.5 block truncate font-mono text-[11.5px] text-ink-400" title={item.course_id}>
+                        {item.course_id}
+                      </span>
+                      <span className="mt-0.5 block text-[12px] text-ink-500">
+                        {item.template_id} · {item.toc_count} chapter{item.toc_count === 1 ? "" : "s"}
                       </span>
                     </td>
-                    <td className="max-w-[190px] truncate px-4 py-3 font-mono text-[12px] text-[#A9A29A]">
-                      {item.course_id}
-                    </td>
-                    <td className="max-w-[220px] truncate px-4 py-3 text-[#A9A29A]">
-                      {item.owner ?? "Not tracked"}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex flex-wrap items-center gap-1.5">
+                    <td className="max-w-[200px] truncate px-4 py-3.5 text-ink-500">{item.owner ?? "Not tracked"}</td>
+                    <td className="px-4 py-3.5">
+                      <div className="flex flex-col items-start gap-1.5">
                         <StatusBadge status={item.status} />
-                        <QualityOutcomeBadge outcome={item.quality_outcome} />
                         <ReviewBadge state={item.review_status} />
+                        <QualityOutcomeBadge outcome={item.quality_outcome} />
                       </div>
                     </td>
-                    <td className="max-w-[170px] truncate px-4 py-3 font-mono text-[12px] text-[#A9A29A]">
-                      {item.document_id}
+                    <td className="whitespace-nowrap px-4 py-3.5 text-ink-500" title={formatDate(item.updated_at)}>
+                      {formatDay(item.updated_at)}
                     </td>
-                    <td className="px-4 py-3 text-[#A9A29A]">{formatDate(item.created_at)}</td>
-                    <td className="px-4 py-3 text-[#A9A29A]">{formatDate(item.updated_at)}</td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                      {item.review_status === "in_review" ? (
-                        <a
-                          href={`/review/${item.document_id}`}
-                          className="inline-flex h-8 items-center gap-1.5 rounded-[8px] bg-brand-600 px-3 text-[12.5px] font-medium text-white hover:bg-brand-700"
-                        >
-                          <ShieldCheck size={14} />
-                          Review
-                        </a>
-                      ) : null}
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => viewDetails(item)}
-                        className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
-                        title="View details"
-                      >
-                        {loadingDetailsId === item.id ? (
-                          <Loader2 size={14} className="animate-spin" />
-                        ) : (
-                          <Eye size={14} />
-                        )}
-                        Details
-                      </Button>
+                    <td className="px-4 py-3.5">
+                      <div className="flex flex-col items-end gap-2">
+                        {item.review_status === "in_review" ? (
+                          <a
+                            href={`/review/${item.document_id}`}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-[8px] bg-brand-600 px-3 text-[12.5px] font-medium text-white transition-colors hover:bg-brand-700"
+                          >
+                            <ShieldCheck size={14} aria-hidden />
+                            Review
+                          </a>
+                        ) : null}
+                        <Button type="button" variant="outline" size="sm" onClick={() => viewDetails(item)} title="View details">
+                          {loadingDetailsId === item.id ? (
+                            <Loader2 size={14} className="animate-spin" aria-hidden />
+                          ) : (
+                            <Eye size={14} aria-hidden />
+                          )}
+                          Details
+                        </Button>
                       </div>
                     </td>
                   </tr>
@@ -518,14 +511,14 @@ export default function AdminCoursesPage() {
         <AdminPanel className="p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
+              <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-brand-600">
                 Course Details
               </p>
-              <h3 className="mt-2 text-[18px] font-semibold text-[#F7EEE2]">{selectedCourse.title}</h3>
+              <h3 className="mt-2 text-[18px] font-semibold text-ink">{selectedCourse.title}</h3>
             </div>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               onClick={() => {
                 setSelectedCourse(null);
@@ -534,13 +527,13 @@ export default function AdminCoursesPage() {
                 setModelUsageError(null);
                 modelUsageGuard.invalidate();
               }}
-              className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              
             >
               Close
             </Button>
           </div>
           {detailsError ? (
-            <div className="mt-4 flex items-center gap-2 rounded-[8px] border border-[#5A3529] bg-[#2A1D19] p-3 text-sm text-[#F0C4A6]">
+            <div className="mt-4 flex items-center gap-2 rounded-[8px] border border-brand-200 bg-surface-clay p-3 text-sm text-ink-500">
               <AlertCircle size={16} />
               {detailsError}
             </div>
@@ -581,19 +574,19 @@ export default function AdminCoursesPage() {
             <DetailRow label="Updated date" value={formatDate(selectedCourse.updated_at)} />
           </dl>
 
-          <div className="mt-5 border-t border-[#34312D] pt-4">
+          <div className="mt-5 border-t border-line pt-4">
             <button
               type="button"
               onClick={() => void toggleModelUsage()}
               className="flex w-full items-center justify-between text-left"
             >
-              <span className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
+              <span className="text-[12px] font-semibold uppercase tracking-[0.14em] text-brand-600">
                 Model Usage
               </span>
               {modelUsageOpen ? (
-                <ChevronUp size={16} className="text-[#D8D0C7]" />
+                <ChevronUp size={16} className="text-ink" />
               ) : (
-                <ChevronDown size={16} className="text-[#D8D0C7]" />
+                <ChevronDown size={16} className="text-ink" />
               )}
             </button>
 
@@ -602,17 +595,17 @@ export default function AdminCoursesPage() {
                 {modelUsageLoading ? (
                   <AdminLoading label="Loading model usage" />
                 ) : modelUsageError ? (
-                  <div className="flex items-center gap-2 rounded-[8px] border border-[#5A3529] bg-[#2A1D19] p-3 text-sm text-[#F0C4A6]">
+                  <div className="flex items-center gap-2 rounded-[8px] border border-brand-200 bg-surface-clay p-3 text-sm text-ink-500">
                     <AlertCircle size={16} />
                     {modelUsageError}
                   </div>
                 ) : modelUsage ? (
                   modelUsage.job_id === null ? (
-                    <p className="text-[13px] text-[#D8D0C7]">
+                    <p className="text-[13px] text-ink">
                       No generation run recorded yet for this course.
                     </p>
                   ) : modelUsage.calls.length === 0 ? (
-                    <p className="text-[13px] text-[#D8D0C7]">
+                    <p className="text-[13px] text-ink">
                       The latest run ({modelUsage.run_state ?? "unknown"}) made no real AI calls.
                     </p>
                   ) : (

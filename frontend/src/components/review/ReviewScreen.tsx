@@ -509,6 +509,18 @@ function BriefCard({ brief }: { brief: ReviewBrief }) {
         {blocked ? <ShieldAlert size={15} className="mt-0.5 shrink-0" /> : <CheckCircle2 size={15} className="mt-0.5 shrink-0" />}
         {brief.headline}
       </p>
+      {blocked ? (
+        <div className="mt-2 space-y-1.5 text-[12px] text-red-900">
+          {brief.blockers.length > 1 ? (
+            <ul className="list-disc space-y-1 pl-5">
+              {brief.blockers.slice(1).map((line) => <li key={line}>{line}</li>)}
+            </ul>
+          ) : null}
+          <p className="text-red-800/90">
+            Final approval stays off until this is resolved. Use <span className="font-medium">Request changes</span> to send the course back to its author.
+          </p>
+        </div>
+      ) : null}
       {brief.advisories.length > 0 ? (
         <ul className="mt-2 list-disc space-y-1 pl-5 text-[12px] text-ink-700">
           {brief.advisories.map((line) => <li key={line}>{line}</li>)}

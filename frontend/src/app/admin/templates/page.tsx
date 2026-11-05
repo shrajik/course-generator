@@ -161,7 +161,7 @@ export default function AdminTemplatesPage() {
   return (
     <div className="admin-page mx-auto flex w-full max-w-[1240px] flex-col gap-5">
       <AdminPageHeader
-        eyebrow="AI memory layer"
+        eyebrow="Course templates"
         title="Templates"
         description="Create, edit and version course templates. Editing never changes a course that already used an earlier version."
       />
@@ -169,7 +169,7 @@ export default function AdminTemplatesPage() {
       {error ? <AdminAlert>{error}</AdminAlert> : null}
 
       <AdminPanel className="flex flex-wrap items-center justify-between gap-3 p-4">
-        <label className="flex items-center gap-2 text-[13px] text-[#BEB6AD]">
+        <label className="flex items-center gap-2 text-[13px] text-ink-500">
           <input
             type="checkbox"
             checked={includeArchived}
@@ -194,7 +194,7 @@ export default function AdminTemplatesPage() {
         ) : (
           <div className="overflow-x-auto">
             <table className="admin-table w-full min-w-[900px] text-left text-[13px]">
-              <thead className="bg-[#181614] text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">
+              <thead className="bg-canvas text-[12px] uppercase tracking-[0.08em] text-ink-400">
                 <tr>
                   <th className="px-4 py-3 font-medium">Name</th>
                   <th className="px-4 py-3 font-medium">Kind</th>
@@ -205,52 +205,52 @@ export default function AdminTemplatesPage() {
                   <th className="px-4 py-3 font-medium">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#302D29]">
+              <tbody className="divide-y divide-line">
                 {templates.map((template) => (
-                  <tr key={template.id} className="text-[#D8D0C7]">
-                    <td className="px-4 py-3 font-medium text-[#F4EFE7]">
+                  <tr key={template.id} className="text-ink">
+                    <td className="px-4 py-3 font-medium text-ink">
                       <span className="block truncate">{template.name}</span>
-                      <span className="mt-1 block text-[12px] font-normal text-[#8E8780]">
+                      <span className="mt-1 block text-[12px] font-normal text-ink-400">
                         {template.description || "No description"}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-[#A9A29A]">{template.kind}</td>
-                    <td className="px-4 py-3 font-mono text-[12px] text-[#A9A29A]">{template.template_id}</td>
-                    <td className="px-4 py-3 text-[#A9A29A]">v{template.version}</td>
+                    <td className="px-4 py-3 text-ink-500">{template.kind}</td>
+                    <td className="px-4 py-3 font-mono text-[12px] text-ink-500">{template.template_id}</td>
+                    <td className="px-4 py-3 text-ink-500">v{template.version}</td>
                     <td className="px-4 py-3">
                       <AdminStatusBadge tone={template.is_archived ? "danger" : "success"}>
                         {template.is_archived ? "archived" : "current"}
                       </AdminStatusBadge>
                     </td>
-                    <td className="px-4 py-3 text-[#A9A29A]">{formatDate(template.updated_at)}</td>
+                    <td className="px-4 py-3 text-ink-500">{formatDate(template.updated_at)}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
                         <Button
                           type="button"
-                          variant="ghost"
+                          variant="outline"
                           size="sm"
                           onClick={() => openEdit(template)}
-                          className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+                          
                           title="Edit (creates a new version)"
                         >
                           <FileText size={14} />
                         </Button>
                         <Button
                           type="button"
-                          variant="ghost"
+                          variant="outline"
                           size="sm"
                           onClick={() => showVersions(template.slug)}
-                          className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+                          
                           title="Version history"
                         >
                           <History size={14} />
                         </Button>
                         <Button
                           type="button"
-                          variant="ghost"
+                          variant="outline"
                           size="sm"
                           onClick={() => toggleArchive(template)}
-                          className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+                          
                           title={template.is_archived ? "Unarchive" : "Archive"}
                         >
                           {template.is_archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
@@ -268,19 +268,19 @@ export default function AdminTemplatesPage() {
       {versions ? (
         <AdminPanel className="p-5">
           <div className="flex items-center justify-between">
-            <h3 className="text-[15px] font-semibold text-[#F7EEE2]">Versions of &apos;{versions.slug}&apos;</h3>
+            <h3 className="text-[15px] font-semibold text-ink">Versions of &apos;{versions.slug}&apos;</h3>
             <Button type="button" variant="ghost" size="sm" onClick={() => setVersions(null)}>
               <X size={14} />
             </Button>
           </div>
           <ul className="mt-3 space-y-2">
             {versions.items.map((v) => (
-              <li key={v.id} className="flex items-center justify-between border-b border-[#302D29] py-2 text-[13px] text-[#D8D0C7]">
+              <li key={v.id} className="flex items-center justify-between border-b border-line py-2 text-[13px] text-ink">
                 <span className="font-mono text-[12px]">{v.template_id}</span>
                 <span>{v.description || "No description"}</span>
                 <span className="flex items-center gap-2">
                   {v.is_current ? <AdminStatusBadge tone="success">current</AdminStatusBadge> : null}
-                  <span className="text-[#8E8780]">{formatDate(v.created_at)}</span>
+                  <span className="text-ink-400">{formatDate(v.created_at)}</span>
                 </span>
               </li>
             ))}
@@ -291,7 +291,7 @@ export default function AdminTemplatesPage() {
       {form ? (
         <AdminPanel className="p-5">
           <div className="flex items-center justify-between">
-            <h3 className="text-[15px] font-semibold text-[#F7EEE2]">
+            <h3 className="text-[15px] font-semibold text-ink">
               {form.mode === "create" ? "New template" : `Edit '${form.slug}' (creates a new version)`}
             </h3>
             <Button type="button" variant="ghost" size="sm" onClick={() => setForm(null)}>

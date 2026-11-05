@@ -48,6 +48,11 @@ const selectClass =
 const inputClass =
   "h-10 w-full rounded-[8px] border border-line bg-white px-3 pl-9 text-[13px] text-ink outline-none placeholder:text-ink-400 transition-colors focus:border-brand-500";
 
+/** "Nov 5, 2026": a table cell should not wrap; the full date and time is in the tooltip and the details. */
+function formatDay(value: string): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
+}
+
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: "medium",
@@ -212,7 +217,7 @@ export default function AdminUsersPage() {
           <form onSubmit={applySearch} className="relative flex gap-2">
             <Search
               size={15}
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#8E8780]"
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-400"
             />
             <input
               value={searchInput}
@@ -222,9 +227,9 @@ export default function AdminUsersPage() {
             />
             <Button
               type="submit"
-              variant="ghost"
+              variant="outline"
               size="sm"
-              className="h-9 border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              className="h-9"
               title="Search"
             >
               <Search size={14} />
@@ -274,10 +279,10 @@ export default function AdminUsersPage() {
           </select>
           <Button
             type="button"
-            variant="ghost"
+            variant="outline"
             size="sm"
             onClick={clearFilters}
-            className="h-9 border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+            className="h-9"
             title="Reset filters"
           >
             <RefreshCcw size={14} />
@@ -287,30 +292,30 @@ export default function AdminUsersPage() {
       </AdminPanel>
 
       <AdminPanel>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#302D29] px-4 py-3">
-          <div className="text-[13px] text-[#BEB6AD]">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
+          <div className="text-[13px] text-ink-500">
             {total.toLocaleString()} user{total === 1 ? "" : "s"}
           </div>
           <div className="flex items-center gap-2">
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               disabled={!canGoBack || isLoading}
               onClick={() => setPage((value) => Math.max(0, value - 1))}
-              className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              
               title="Previous page"
             >
               <ChevronLeft size={14} />
             </Button>
-            <span className="text-[12px] text-[#8E8780]">Page {page + 1}</span>
+            <span className="text-[12px] text-ink-400">Page {page + 1}</span>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               disabled={!canGoForward || isLoading}
               onClick={() => setPage((value) => value + 1)}
-              className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              
               title="Next page"
             >
               <ChevronRight size={14} />
@@ -324,10 +329,9 @@ export default function AdminUsersPage() {
           <AdminEmpty><UsersIcon /><span>No users match the current filters.</span></AdminEmpty>
         ) : (
           <div className="overflow-x-auto">
-            <table className="admin-table w-full min-w-[1120px] text-left text-[13px]">
-              <thead className="bg-[#181614] text-[12px] uppercase tracking-[0.08em] text-[#8E8780]">
+            <table className="admin-table w-full min-w-[900px] text-left text-[13px]">
+              <thead className="bg-canvas text-[12px] uppercase tracking-[0.08em] text-ink-400">
                 <tr>
-                  <th className="px-4 py-3 font-medium">User ID</th>
                   <th className="px-4 py-3 font-medium">Email</th>
                   <th className="px-4 py-3 font-medium">Role</th>
                   <th className="px-4 py-3 font-medium">Active</th>
@@ -337,16 +341,13 @@ export default function AdminUsersPage() {
                   <th className="px-4 py-3 font-medium">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#302D29]">
+              <tbody className="divide-y divide-line">
                 {users.map((item) => {
                   const isSelf = item.id === currentUser?.id;
                   const busy = updatingUserId === item.id;
                   return (
-                    <tr key={item.id} className="text-[#D8D0C7]">
-                      <td className="max-w-[230px] truncate px-4 py-3 font-mono text-[12px] text-[#A9A29A]">
-                        {item.id}
-                      </td>
-                      <td className="px-4 py-3 font-medium text-[#F4EFE7]">{item.email}</td>
+                    <tr key={item.id} className="text-ink">
+                      <td className="px-4 py-3 font-medium text-ink" title={`User ID ${item.id}`}>{item.email}</td>
                       <td className="px-4 py-3">
                         <RoleBadge role={item.role} />
                       </td>
@@ -360,16 +361,17 @@ export default function AdminUsersPage() {
                           inactiveLabel="Unverified"
                         />
                       </td>
-                      <td className="px-4 py-3 text-[#A9A29A]">{formatDate(item.created_at)}</td>
-                      <td className="px-4 py-3 text-[#A9A29A]">{formatDate(item.updated_at)}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-ink-500" title={formatDate(item.created_at)}>{formatDay(item.created_at)}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-ink-500" title={formatDate(item.updated_at)}>{formatDay(item.updated_at)}</td>
                       <td className="px-4 py-3">
-                        <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex items-center gap-2">
                           <Button
                             type="button"
-                            variant="ghost"
+                            variant="outline"
                             size="sm"
+                            aria-label={`View details for ${item.email}`}
                             onClick={() => viewDetails(item)}
-                            className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+                            
                             title="View details"
                           >
                             {loadingDetailsId === item.id ? (
@@ -382,7 +384,7 @@ export default function AdminUsersPage() {
                             value={item.role}
                             disabled={isSelf || busy}
                             onChange={(event) => changeRole(item, event.target.value as Role)}
-                            className="h-8 rounded-[8px] border border-[#34312D] bg-[#181614] px-2 text-[12px] text-[#E8DED3] outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                            className="h-8 rounded-[8px] border border-line bg-canvas px-2 text-[12px] text-ink outline-none disabled:cursor-not-allowed disabled:opacity-50"
                             aria-label={`Role for ${item.email}`}
                             title={isSelf ? "Your own role cannot be changed here" : "Change role"}
                           >
@@ -394,11 +396,11 @@ export default function AdminUsersPage() {
                           </select>
                           <Button
                             type="button"
-                            variant="ghost"
+                            variant="outline"
                             size="sm"
                             disabled={isSelf || busy}
                             onClick={() => changeStatus(item)}
-                            className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+                            
                             title={isSelf ? "Current admin cannot be deactivated here" : "Change status"}
                           >
                             {busy ? (
@@ -425,23 +427,23 @@ export default function AdminUsersPage() {
         <AdminPanel className="p-5">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#D88445]">
+              <p className="text-[12px] font-semibold uppercase tracking-[0.14em] text-brand-600">
                 User Details
               </p>
-              <h3 className="mt-2 text-[18px] font-semibold text-[#F7EEE2]">{selectedUser.email}</h3>
+              <h3 className="mt-2 text-[18px] font-semibold text-ink">{selectedUser.email}</h3>
             </div>
             <Button
               type="button"
-              variant="ghost"
+              variant="outline"
               size="sm"
               onClick={() => setSelectedUser(null)}
-              className="border-[#34312D] text-[#D8D0C7] hover:bg-[#2A2520] hover:text-[#F4EFE7]"
+              
             >
               Close
             </Button>
           </div>
           {detailsError ? (
-            <div className="mt-4 flex items-center gap-2 rounded-[8px] border border-[#5A3529] bg-[#2A1D19] p-3 text-sm text-[#F0C4A6]">
+            <div className="mt-4 flex items-center gap-2 rounded-[8px] border border-brand-200 bg-surface-clay p-3 text-sm text-ink-500">
               <AlertCircle size={16} />
               {detailsError}
             </div>
