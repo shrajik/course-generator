@@ -104,8 +104,6 @@ export interface CourseDraft {
   /** Content Studio Phase 1/4 - companion deliverables requested alongside
    * the course (schema only - does not yet generate the document). */
   companions: CompanionDeliverable[];
-  /** Uploaded source documents to ground the course in. */
-  sourceIds: string[];
   toc: TocItem[];
   /** Null means `toc` was never AI-drafted (e.g. built by hand, or stale from
    * a previous course) - see CreateCourseForm's regeneration check. */
@@ -148,7 +146,6 @@ export const EMPTY_DRAFT: CourseDraft = {
   businessGoal: "",
   performanceGap: "",
   companions: [],
-  sourceIds: [],
   toc: [],
   tocDraftedFor: null,
   courseId: null,

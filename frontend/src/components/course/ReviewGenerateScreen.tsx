@@ -128,7 +128,6 @@ export function ReviewGenerateScreen() {
           tone: "",
           learner_profile: draft.learnerProfile,
           style_guide: draft.styleGuide,
-          source_ids: draft.sourceIds ?? [],
           design_models:
             draft.designModels && draft.designModels.models.length > 0 ? draft.designModels : null,
           template_id_override: draft.selectedTemplate?.templateId ?? null,
