@@ -43,6 +43,8 @@ export interface AdminCourse {
   document_id: string;
   title: string;
   status: string;
+  /** Expert review state: draft | in_review | changes_requested | approved. */
+  review_status: string;
   template_id: string;
   owner: string | null;
   target_audience: string | null;
@@ -75,6 +77,7 @@ export interface AdminCourseListResponse {
 export interface AdminCourseListOptions {
   search?: string;
   status?: string;
+  review_status?: string;
   owner?: string;
   limit?: number;
   offset?: number;

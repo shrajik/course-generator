@@ -136,6 +136,7 @@ async def update_admin_user_status(
 async def admin_courses(
     search: str | None = Query(default=None, max_length=320),
     status: CourseStatus | None = Query(default=None),
+    review_status: str | None = Query(default=None, max_length=32, pattern="^(draft|in_review|changes_requested|approved)$"),
     owner: str | None = Query(default=None, max_length=320),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -147,6 +148,7 @@ async def admin_courses(
             "search": search,
             "status": status,
             "owner": owner,
+            "review_statuses": [review_status] if review_status else None,
         }
         course_rows = await courses.list(limit=limit, offset=offset, **filters)
         statuses = sorted(set(get_args(CourseStatus)) | set(await courses.distinct_statuses()))
@@ -237,6 +239,7 @@ def _to_admin_course_response(course: Course) -> AdminCourseResponse:
         document_id=course.document_id,
         title=course.title,
         status=course.status,
+        review_status=course.review_status or "draft",
         template_id=course.template_id,
         owner=owner,
         target_audience=input_data.get("target_audience") if isinstance(input_data, dict) else None,

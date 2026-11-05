@@ -13,6 +13,7 @@ import {
   Loader2,
   RefreshCcw,
   Search,
+  ShieldCheck,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
@@ -73,6 +74,14 @@ function StatusBadge({ status }: { status: string }) {
 function QualityOutcomeBadge({ outcome }: { outcome: "passed" | "failed" | null }) {
   if (outcome !== "failed") return null;
   return <AdminStatusBadge tone="warning">Quality attention</AdminStatusBadge>;
+}
+
+/** Expert-review state. Nothing is shown for a course that was never submitted. */
+function ReviewBadge({ state }: { state: string }) {
+  if (state === "in_review") return <AdminStatusBadge tone="warning">Awaiting review</AdminStatusBadge>;
+  if (state === "changes_requested") return <AdminStatusBadge tone="danger">Changes requested</AdminStatusBadge>;
+  if (state === "approved") return <AdminStatusBadge tone="success">Approved</AdminStatusBadge>;
+  return null;
 }
 
 function DetailRow({ label, value }: { label: string; value: React.ReactNode }) {
@@ -164,6 +173,7 @@ export default function AdminCoursesPage() {
   const [search, setSearch] = useState("");
   const [owner, setOwner] = useState("");
   const [status, setStatus] = useState("all");
+  const [reviewStatus, setReviewStatus] = useState("all");
   const [data, setData] = useState<AdminCourseListResponse | null>(null);
   const [selectedCourse, setSelectedCourse] = useState<AdminCourse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -191,10 +201,11 @@ export default function AdminCoursesPage() {
       search: trimmedSearch || undefined,
       owner: trimmedOwner || undefined,
       status: status === "all" ? undefined : status,
+      review_status: reviewStatus === "all" ? undefined : reviewStatus,
       limit: PAGE_SIZE,
       offset: page * PAGE_SIZE,
     };
-  }, [owner, page, search, status]);
+  }, [owner, page, search, status, reviewStatus]);
 
   const loadCourses = useCallback(() => {
     let active = true;
@@ -291,6 +302,7 @@ export default function AdminCoursesPage() {
     setSearch("");
     setOwner("");
     setStatus("all");
+    setReviewStatus("all");
     setPage(0);
   };
 
@@ -346,6 +358,21 @@ export default function AdminCoursesPage() {
                 {item}
               </option>
             ))}
+          </select>
+          <select
+            value={reviewStatus}
+            onChange={(event) => {
+              setReviewStatus(event.target.value);
+              setPage(0);
+            }}
+            className={selectClass}
+            aria-label="Review filter"
+          >
+            <option value="all">Any review state</option>
+            <option value="in_review">Awaiting review</option>
+            <option value="changes_requested">Changes requested</option>
+            <option value="approved">Approved</option>
+            <option value="draft">Not submitted</option>
           </select>
           <div className="flex items-center gap-2">
             <Button
@@ -443,6 +470,7 @@ export default function AdminCoursesPage() {
                       <div className="flex flex-wrap items-center gap-1.5">
                         <StatusBadge status={item.status} />
                         <QualityOutcomeBadge outcome={item.quality_outcome} />
+                        <ReviewBadge state={item.review_status} />
                       </div>
                     </td>
                     <td className="max-w-[170px] truncate px-4 py-3 font-mono text-[12px] text-[#A9A29A]">
@@ -451,6 +479,16 @@ export default function AdminCoursesPage() {
                     <td className="px-4 py-3 text-[#A9A29A]">{formatDate(item.created_at)}</td>
                     <td className="px-4 py-3 text-[#A9A29A]">{formatDate(item.updated_at)}</td>
                     <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                      {item.review_status === "in_review" ? (
+                        <a
+                          href={`/review/${item.document_id}`}
+                          className="inline-flex h-8 items-center gap-1.5 rounded-[8px] bg-brand-600 px-3 text-[12.5px] font-medium text-white hover:bg-brand-700"
+                        >
+                          <ShieldCheck size={14} />
+                          Review
+                        </a>
+                      ) : null}
                       <Button
                         type="button"
                         variant="ghost"
@@ -466,6 +504,7 @@ export default function AdminCoursesPage() {
                         )}
                         Details
                       </Button>
+                      </div>
                     </td>
                   </tr>
                 ))}

@@ -51,6 +51,8 @@ class AdminCourseResponse(BaseModel):
     document_id: str
     title: str
     status: str
+    # Where the course is in expert review: draft | in_review | changes_requested | approved.
+    review_status: str = "draft"
     template_id: str
     owner: str | None = None
     target_audience: str | None = None
