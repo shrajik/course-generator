@@ -74,7 +74,7 @@ export function LiveDocumentPreview({
       <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-10">
         {!hasAnyContent ? (
           <div className="flex h-full min-h-[280px] flex-col items-center justify-center gap-2 text-center text-ink-400">
-            <Loader2 size={18} className="animate-spin text-brand-500" />
+            <Loader2 size={18} className="animate-spin text-brand-600" />
             <p className="text-[12.5px]">{emptyMessage}</p>
           </div>
         ) : (

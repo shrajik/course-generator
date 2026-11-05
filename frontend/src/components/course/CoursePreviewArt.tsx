@@ -52,7 +52,7 @@ export function CoursePreviewArt() {
         AI will research, write and create an interactive course based on your inputs.
       </p>
 
-      <Sparkles size={16} className="mt-6 text-brand-500" />
+      <Sparkles size={16} className="mt-6 text-brand-600" />
     </div>
   );
 }

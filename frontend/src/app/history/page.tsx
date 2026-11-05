@@ -35,7 +35,7 @@ export default function HistoryPage() {
             Review generation and editing activity from your courses.
           </p>
         </div>
-        <Clock3 size={22} className="text-brand-500" />
+        <Clock3 size={22} className="text-brand-600" />
       </div>
 
       <section className="creator-content-panel mt-5">

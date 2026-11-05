@@ -67,7 +67,7 @@ export function ItemDrawer({ itemId, categories, onClose, onChanged }: Props) {
   if (!item) {
     return (
       <Shell onClose={onClose}>
-        {error ? <AdminAlert>{error}</AdminAlert> : <Loader2 className="animate-spin text-brand-500" size={18} />}
+        {error ? <AdminAlert>{error}</AdminAlert> : <Loader2 className="animate-spin text-brand-600" size={18} />}
       </Shell>
     );
   }
@@ -272,7 +272,7 @@ function Content({ item }: { item: kb.KbItemDetail }) {
     if (version) kb.itemChunks(item.id, version).then((c) => !cancelled && setChunks(c)).catch(() => !cancelled && setChunks([]));
     return () => { cancelled = true; };
   }, [item.id, version]);
-  if (chunks === null) return <Loader2 className="animate-spin text-brand-500" size={16} />;
+  if (chunks === null) return <Loader2 className="animate-spin text-brand-600" size={16} />;
   if (chunks.length === 0) return <p className="text-[12.5px] text-ink-500">Nothing to show yet.</p>;
   return (
     <ul className="space-y-2">
@@ -336,7 +336,7 @@ function Relations({ item, act }: { item: kb.KbItemDetail; act: Act }) {
 function Activity({ itemId }: { itemId: string }) {
   const [rows, setRows] = useState<kb.KbActivity[] | null>(null);
   useEffect(() => { kb.itemActivity(itemId).then(setRows).catch(() => setRows([])); }, [itemId]);
-  if (rows === null) return <Loader2 className="animate-spin text-brand-500" size={16} />;
+  if (rows === null) return <Loader2 className="animate-spin text-brand-600" size={16} />;
   return (
     <ul className="space-y-1 text-[12px]">
       {rows.map((r) => (

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 
@@ -23,14 +23,51 @@ export function Modal({
   footer,
   width = "max-w-2xl",
 }: ModalProps) {
+  const dialog = useRef<HTMLDivElement>(null);
+  // Callers often pass a fresh `onClose` each render; reading it through a ref keeps the effect below
+  // running only when the dialog opens or closes, so focus is never pulled back while someone types.
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  // Keyboard behaviour of a modal dialog: focus moves into it when it opens, Tab stays inside it,
+  // Escape closes it, and focus goes back to whatever opened it.
   useEffect(() => {
     if (!open) return;
+    const opener = document.activeElement as HTMLElement | null;
+    const focusable = () =>
+      Array.from(
+        dialog.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+    (focusable()[0] ?? dialog.current)?.focus();
     const handler = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [open, onClose]);
+    return () => {
+      window.removeEventListener("keydown", handler);
+      opener?.focus?.();
+    };
+  }, [open]);
 
   if (!open) return null;
 
@@ -42,9 +79,11 @@ export function Modal({
         aria-hidden
       />
       <div
+        ref={dialog}
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        tabIndex={-1}
         className={cn(
           "relative flex max-h-[86vh] w-full flex-col overflow-hidden rounded-panel border border-line bg-white shadow-pop",
           width,

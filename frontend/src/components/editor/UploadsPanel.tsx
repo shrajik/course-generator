@@ -58,7 +58,7 @@ export function UploadsPanel() {
 
       <div className="border-t border-line p-2.5">
         <p className="flex items-start gap-1.5 text-[10.5px] leading-snug text-ink-400">
-          <Sparkles size={11} className="mt-[1px] shrink-0 text-brand-500" />
+          <Sparkles size={11} className="mt-[1px] shrink-0 text-brand-600" />
           Select an image block and use Replace Image to regenerate it.
         </p>
       </div>

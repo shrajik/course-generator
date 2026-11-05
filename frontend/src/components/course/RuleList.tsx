@@ -78,7 +78,7 @@ export function RuleList({ label, tone, items, onChange, placeholder }: RuleList
           }}
           placeholder={placeholder}
           aria-label={`Add ${label} item`}
-          className="min-w-0 flex-1 bg-transparent text-[12.5px] text-ink-700 placeholder:text-ink-300 outline-none"
+          className="min-w-0 flex-1 bg-transparent text-[12.5px] text-ink-700 placeholder:text-ink-400 outline-none"
         />
         <IconButton onClick={add} aria-label={`Add to ${label}`} disabled={!draft.trim()}>
           <Plus size={14} />

@@ -16,9 +16,9 @@ function AdminAccessMessage({ denied }: { denied?: boolean }) {
     <main className="flex min-h-screen items-center justify-center bg-canvas px-4 text-ink">
       <div className="flex w-full max-w-[420px] items-center gap-3 rounded-[10px] border border-line bg-white p-4 text-sm text-ink-500 shadow-card">
         {denied ? (
-          <ShieldAlert size={18} className="shrink-0 text-brand-500" />
+          <ShieldAlert size={18} className="shrink-0 text-brand-600" />
         ) : (
-          <Loader2 size={18} className="shrink-0 animate-spin text-brand-500" />
+          <Loader2 size={18} className="shrink-0 animate-spin text-brand-600" />
         )}
         {denied ? "Admin access is not available for this account." : "Checking admin access"}
       </div>
@@ -69,7 +69,7 @@ export function AdminLayout({ children }: { children: React.ReactNode }) {
         <AdminSidebar />
         <div className="flex min-w-0 flex-1 flex-col">
           <AdminHeader />
-          <main className="flex-1 px-4 py-6 sm:px-6 lg:px-8">{children}</main>
+          <main id="main-content" tabIndex={-1} className="flex-1 px-4 py-6 sm:px-6 lg:px-8">{children}</main>
         </div>
       </div>
     </div>

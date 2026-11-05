@@ -16,7 +16,7 @@ export function AdminSidebar() {
   return (
     <aside className="hidden min-h-screen w-[248px] shrink-0 border-r border-line bg-white px-4 py-5 md:block">
       <Link href="/admin" className="flex items-center gap-2.5 px-2 text-ink">
-        <span className="flex h-9 w-9 items-center justify-center rounded-[10px] border border-brand-200 bg-brand-50 text-brand-500">
+        <span className="flex h-9 w-9 items-center justify-center rounded-[10px] border border-brand-200 bg-brand-50 text-brand-600">
           <ShieldCheck size={17} />
         </span>
         <span>
@@ -40,7 +40,7 @@ export function AdminSidebar() {
                   : "border-transparent text-ink-500 hover:border-line hover:bg-canvas hover:text-ink",
               )}
             >
-              <Icon size={16} className={active ? "text-brand-500" : "text-ink-400"} />
+              <Icon size={16} className={active ? "text-brand-600" : "text-ink-400"} />
               {item.label}
             </Link>
           );

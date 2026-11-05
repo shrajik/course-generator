@@ -37,14 +37,14 @@ export function AdminHeader() {
           </div>
         </div>
         <div className="min-w-0 md:hidden">
-          <p className="text-2xs font-semibold uppercase tracking-[0.12em] text-brand-500">
+          <p className="text-2xs font-semibold uppercase tracking-[0.12em] text-brand-600">
             Admin
           </p>
           <h1 className="truncate text-[18px] font-semibold text-ink">{title}</h1>
         </div>
 
         <div className="flex min-w-0 items-center gap-3">
-          <button type="button" className="relative hidden h-9 w-9 items-center justify-center rounded-full text-ink-500 transition-colors hover:bg-brand-50 hover:text-brand-500 sm:flex" aria-label="Notifications">
+          <button type="button" className="relative hidden h-9 w-9 items-center justify-center rounded-full text-ink-500 transition-colors hover:bg-brand-50 hover:text-brand-600 sm:flex" aria-label="Notifications">
             <Bell size={17} />
             <span className="absolute right-[8px] top-[7px] h-1.5 w-1.5 rounded-full bg-brand-500" />
           </button>
@@ -88,7 +88,7 @@ export function AdminHeader() {
                 active ? "border-brand-200 bg-brand-50 text-ink" : "border-line text-ink-500",
               )}
             >
-              <Icon size={14} className={active ? "text-brand-500" : "text-ink-400"} />
+              <Icon size={14} className={active ? "text-brand-600" : "text-ink-400"} />
               {item.label}
             </Link>
           );

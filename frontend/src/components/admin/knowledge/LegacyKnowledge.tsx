@@ -267,7 +267,7 @@ function DocumentRow({
           {ready ? (
             <input
               aria-label={`Description of ${document.filename}`}
-              className="mt-1.5 w-full max-w-[560px] rounded-[6px] border border-transparent px-1.5 py-1 text-[12px] text-ink-600 outline-none hover:border-line focus:border-brand-400"
+              className="mt-1.5 w-full max-w-[560px] rounded-[6px] border border-transparent px-1.5 py-1 text-[12px] text-ink-600 placeholder:text-ink-400 outline-none hover:border-line focus:border-brand-400"
               value={description}
               placeholder="Add a description"
               onChange={(event) => setDescription(event.target.value)}

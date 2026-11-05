@@ -46,7 +46,7 @@ export function AdminAlert({ children }: { children: React.ReactNode }) {
 export function AdminLoading({ label }: { label: string }) {
   return (
     <div className="admin-state">
-      <Loader2 size={18} className="animate-spin text-brand-500" />
+      <Loader2 size={18} className="animate-spin text-brand-600" />
       <span>{label}</span>
     </div>
   );

@@ -329,7 +329,7 @@ export function Canvas() {
 
           {activePage.blocks.length === 0 ? (
             <p
-              className="absolute text-[13px] text-ink-300"
+              className="absolute text-[13px] text-ink-400"
               style={{ left: 64, top: 72, width: CONTENT_WIDTH }}
             >
               This page is empty. Use “Blocks” in the left rail to add content.

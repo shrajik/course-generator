@@ -38,7 +38,7 @@ export default function MyCoursesPage() {
     {error ? <AdminAlert>{error}</AdminAlert> : null}
     <section className="creator-content-panel mt-5">
       <div className="flex items-center justify-between border-b border-line px-5 py-4"><div><h2 className="text-[15px] font-semibold text-ink">Your course library</h2><p className="mt-1 text-[12px] text-ink-500">{courses.length} course{courses.length === 1 ? "" : "s"} available</p></div><RefreshCcw size={16} className="text-ink-400" /></div>
-      {loading ? <div className="creator-loading"><Loader2 size={18} className="animate-spin text-brand-500" /> Loading courses</div> : courses.length === 0 ? <AdminEmpty><BookOpen size={24} className="text-brand-300" /><span>No courses yet. Start with your first course.</span><Link href="/" className="creator-text-link">Create a course <ArrowRight size={13} /></Link></AdminEmpty> : <div className="divide-y divide-line">{courses.map((course) => <CourseRow key={course.course_id} course={course} />)}</div>}
+      {loading ? <div className="creator-loading"><Loader2 size={18} className="animate-spin text-brand-600" /> Loading courses</div> : courses.length === 0 ? <AdminEmpty><BookOpen size={24} className="text-brand-300" /><span>No courses yet. Start with your first course.</span><Link href="/" className="creator-text-link">Create a course <ArrowRight size={13} /></Link></AdminEmpty> : <div className="divide-y divide-line">{courses.map((course) => <CourseRow key={course.course_id} course={course} />)}</div>}
     </section>
   </div>;
 }

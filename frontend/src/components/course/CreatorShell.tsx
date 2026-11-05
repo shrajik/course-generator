@@ -38,7 +38,7 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       {NAV_ITEMS.map((item) => {
         const Icon = item.icon;
         const active = activeFor(pathname, item.href);
-        return <Link key={item.href} href={item.href} onClick={onNavigate} className={cn("flex h-10 items-center gap-3 rounded-[9px] px-3 text-[13px] font-medium transition-colors duration-200", active ? "bg-brand-50 text-brand-500" : "text-ink-500 hover:bg-canvas hover:text-ink")}><Icon size={17} strokeWidth={active ? 2.2 : 1.8} />{item.label}</Link>;
+        return <Link key={item.href} href={item.href} onClick={onNavigate} className={cn("flex h-10 items-center gap-3 rounded-[9px] px-3 text-[13px] font-medium transition-colors duration-200", active ? "bg-brand-50 text-brand-600" : "text-ink-500 hover:bg-canvas hover:text-ink")}><Icon size={17} strokeWidth={active ? 2.2 : 1.8} />{item.label}</Link>;
       })}
     </nav>
   );
@@ -58,6 +58,6 @@ export function CreatorShell({ children }: { children: React.ReactNode }) {
     <div className="creator-mobile-header"><Brand /><button type="button" onClick={() => setMobileOpen(true)} className="creator-icon-button" aria-label="Open navigation"><Menu size={19} /></button></div>
     <Sidebar />
     {mobileOpen ? <><button type="button" className="creator-mobile-backdrop" onClick={() => setMobileOpen(false)} aria-label="Close navigation" /><Sidebar mobile onClose={() => setMobileOpen(false)} /></> : null}
-    <main className="creator-main-content">{children}</main>
+    <main id="main-content" tabIndex={-1} className="creator-main-content">{children}</main>
   </div>;
 }

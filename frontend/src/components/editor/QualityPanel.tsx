@@ -110,7 +110,7 @@ export function QualityPanel() {
             </p>
           ) : !report || report.findings.length === 0 ? (
             <p className="flex items-center gap-1.5 px-1 text-[11.5px] text-ink-400">
-              <CheckCircle2 size={12} className="text-brand-500" />
+              <CheckCircle2 size={12} className="text-brand-600" />
               No findings.
             </p>
           ) : (

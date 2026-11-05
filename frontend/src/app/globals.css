@@ -104,20 +104,20 @@ body {
 
 .creator-page { animation: creator-fade-in 200ms ease-out both; }
 .creator-page-heading { display: flex; min-height: 112px; align-items: center; justify-content: space-between; gap: 20px; border: 1px solid #e5e0da; border-radius: 14px; background: #ffffff; padding: 24px 28px; box-shadow: 0 1px 2px rgba(58, 45, 35, 0.04); }
-.creator-eyebrow { color: #c15f3c; font-size: 11px; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
-.creator-page-title { margin-top: 7px; color: #1f2937; font-size: 28px; font-weight: 700; letter-spacing: -.025em; }
+.creator-eyebrow { color: #b25030; font-size: 11px; font-weight: 700; letter-spacing: .13em; text-transform: uppercase; }
+.creator-page-title { margin-top: 7px; color: #1f2937; font-family: "Source Serif 4", Georgia, Cambria, "Times New Roman", serif; font-size: 28px; font-weight: 600; letter-spacing: -.015em; }
 .creator-page-description { margin-top: 6px; color: #5f6368; font-size: 13px; }
 .creator-content-panel { overflow: hidden; border: 1px solid #e5e0da; border-radius: 14px; background: #fff; box-shadow: 0 1px 2px rgba(58,45,35,.04); }
 .creator-loading { display: flex; min-height: 220px; align-items: center; justify-content: center; gap: 9px; color: #5f6368; font-size: 13px; }
 .creator-course-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 17px 20px; transition: background-color 180ms ease; }
 .creator-course-row:hover { background: #fffaf7; }
 .creator-list-icon { display: inline-flex; height: 34px; width: 34px; flex-shrink: 0; align-items: center; justify-content: center; border-radius: 9px; background: #f7e9e3; color: #c15f3c; }
-.creator-primary-button { display: inline-flex; height: 36px; align-items: center; gap: 7px; border-radius: 8px; background: #c15f3c; padding: 0 14px; color: white; font-size: 12px; font-weight: 600; transition: background-color 180ms ease; }
-.creator-primary-button:hover { background: #a94f32; }
+.creator-primary-button { display: inline-flex; height: 36px; align-items: center; gap: 7px; border-radius: 8px; background: #b25030; padding: 0 14px; color: white; font-size: 12px; font-weight: 600; transition: background-color 180ms ease; }
+.creator-primary-button:hover { background: #98452a; }
 .creator-outline-button { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #e5e0da; border-radius: 7px; padding: 6px 9px; color: #5f6368; font-size: 11px; font-weight: 600; transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease; }
 .creator-outline-button:hover { border-color: #e8b7a5; background: #f7e9e3; color: #c15f3c; }
-.creator-text-link { display: inline-flex; align-items: center; gap: 5px; color: #c15f3c; font-size: 12px; font-weight: 600; }
-.creator-text-link:hover { color: #a94f32; }
+.creator-text-link { display: inline-flex; align-items: center; gap: 5px; color: #b25030; font-size: 12px; font-weight: 600; }
+.creator-text-link:hover { color: #98452a; }
 .creator-template-card { border: 1px solid #e5e0da; border-radius: 14px; background: #fff; padding: 20px; box-shadow: 0 1px 2px rgba(58,45,35,.04); transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease; }
 .creator-template-card:hover { border-color: #e8b7a5; box-shadow: 0 10px 24px -18px rgba(58,45,35,.3); transform: translateY(-2px); }
 .creator-empty-icon { display: flex; height: 42px; width: 42px; align-items: center; justify-content: center; border-radius: 11px; background: #f7e9e3; color: #c15f3c; }
@@ -156,7 +156,7 @@ body {
 @layer components {
   .field {
     @apply w-full rounded-[10px] border border-line bg-white px-3.5 py-2.5 text-sm text-ink
-      placeholder:text-ink-300 outline-none transition
+      placeholder:text-ink-400 outline-none transition
       focus:border-brand-400 focus:ring-4 focus:ring-brand-100;
   }
 
@@ -224,7 +224,7 @@ body {
   .admin-eyebrow {
     position: relative;
     z-index: 1;
-    color: #c15f3c;
+    color: #b25030;
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.14em;
@@ -236,9 +236,10 @@ body {
     z-index: 1;
     margin-top: 8px;
     color: #1f2937;
+    font-family: "Source Serif 4", Georgia, Cambria, "Times New Roman", serif;
     font-size: clamp(24px, 3vw, 32px);
-    font-weight: 700;
-    letter-spacing: -0.02em;
+    font-weight: 600;
+    letter-spacing: -0.015em;
   }
 
   .admin-description {
@@ -355,38 +356,6 @@ body {
   }
 }
 
-/* Keep the legacy admin utility classes aligned with the shared light theme. */
-[class~="bg-[#1B1A18]"], [class~="bg-[#1B1A18]/95"] { background-color: #F7F5F2 !important; }
-[class~="bg-[#151413]"] { background-color: #F3F0EC !important; }
-[class~="bg-[#201E1B]"] { background-color: #FFFFFF !important; }
-[class~="bg-[#181614]"] { background-color: #F7F5F2 !important; }
-[class~="bg-[#211E1A]"] { background-color: #F3F0EC !important; }
-[class~="bg-[#2B221B]"] { background-color: #F7E9E3 !important; }
-[class~="bg-[#2A1D19]"] { background-color: #F7E9E3 !important; }
-[class~="bg-[#2A2119]"] { background-color: #FFF8EA !important; }
-[class~="bg-[#24211E]"] { background-color: #F3F0EC !important; }
-[class~="bg-[#1C281F]"] { background-color: #F3FAF5 !important; }
-[class~="bg-[#1E2A21]"] { background-color: #F3FAF5 !important; }
-[class~="hover:bg-[#2A2520]"]:hover { background-color: #F3F0EC !important; }
-[class~="border-[#2A2825]"], [class~="border-[#26231F]"],
-[class~="border-[#302D29]"], [class~="border-[#34312D]"],
-[class~="border-[#3A342D]"] { border-color: #E5E0DA !important; }
-[class~="border-[#4C392A]"], [class~="border-[#5A3529]"],
-[class~="border-[#614126]"] { border-color: #E8B7A5 !important; }
-[class~="border-[#34523B]"], [class~="border-[#315640]"] { border-color: #B8DCC5 !important; }
-[class~="text-[#D88445]"] { color: #C15F3C !important; }
-[class~="text-[#F4EFE7]"], [class~="text-[#F7EEE2]"],
-[class~="text-[#E8DED3]"], [class~="text-[#D8D0C7]"] { color: #1F2937 !important; }
-[class~="text-[#BEB6AD]"], [class~="text-[#A9A29A]"],
-[class~="text-[#F0C4A6]"], [class~="text-[#F0B59A]"] { color: #5F6368 !important; }
-[class~="text-[#8E8780]"], [class~="text-[#77716A]"],
-[class~="text-[#786F66]"], [class~="text-[#C9C0B7]"] { color: #8A8F98 !important; }
-[class~="text-[#F1B273]"] { color: #9A6A22 !important; }
-[class~="text-[#A8D4AD]"], [class~="text-[#9BE0AC]"] { color: #3F8F68 !important; }
-[class~="divide-[#302D29]"] > :not([hidden]) ~ :not([hidden]) { border-color: #ECE8E3 !important; }
-[class~="placeholder:text-[#786F66]"]::placeholder { color: #8A8F98 !important; }
-[class~="focus:border-[#D88445]"]:focus { border-color: #C15F3C !important; }
-
 /* Editable text inside the canvas keeps the document's own typography. */
 [contenteditable="true"] {
   outline: none;
@@ -450,8 +419,11 @@ body {
 .login-visual-content {
   position: relative;
   z-index: 1;
-  height: 100%;
-  padding: 28px clamp(34px, 5vw, 72px);
+  box-sizing: border-box;
+  /* Grows with its content instead of being clamped to the window, and keeps room under it for the
+     quote that sits at the bottom of the panel, so a short window no longer makes them collide. */
+  min-height: 100%;
+  padding: 28px clamp(34px, 5vw, 72px) 124px;
 }
 
 .login-brand,
@@ -537,7 +509,7 @@ body {
 
 .login-features p { display: grid; gap: 2px; }
 .login-features strong { color: #34302d; font-size: 12px; font-weight: 700; }
-.login-features small { color: #6f716f; font-size: 11px; }
+.login-features small { color: #5f6368; font-size: 11px; }
 
 .login-visual-quote {
   position: absolute;
@@ -572,21 +544,22 @@ body {
 }
 
 .login-form-brand { display: grid; grid-template-columns: auto 1fr; column-gap: 9px; font-size: 16px; }
-.login-form-brand > span:last-child { grid-column: 2; color: #c15f3c; font-size: 8px; letter-spacing: .2em; }
+.login-form-brand > span:last-child { grid-column: 2; color: #b25030; font-size: 10px; letter-spacing: .16em; }
 .login-form-heading { margin-top: 44px; text-align: center; }
-.login-form-heading h2 { color: #1f2937; font-size: 28px; font-weight: 700; letter-spacing: -.03em; }
-.login-form-heading p { margin-top: 8px; color: #7b7d80; font-size: 13px; }
+.login-form-heading h2 { color: #1f2937; font-family: "Source Serif 4", Georgia, Cambria, "Times New Roman", serif; font-size: 30px; font-weight: 600; letter-spacing: -.015em; }
+.login-form-heading p { margin-top: 8px; color: #5f6368; font-size: 13px; }
 .login-form { display: grid; gap: 21px; margin-top: 34px; }
 .login-form label { display: block; margin-bottom: 8px; color: #1f2937; font-size: 12px; font-weight: 600; }
-.login-input { width: 100%; height: 42px; border: 1px solid #e5e0da; border-radius: 9px; background: #fff; padding: 0 13px; color: #1f2937; font-size: 13px; outline: none; transition: border-color 180ms ease, box-shadow 180ms ease; }
-.login-input::placeholder { color: #a2a3a5; }
+.login-input { width: 100%; height: 42px; border: 1px solid #8b8680; border-radius: 9px; background: #fff; padding: 0 13px; color: #1f2937; font-size: 13px; outline: none; transition: border-color 180ms ease, box-shadow 180ms ease; }
+.login-input::placeholder { color: #656a72; }
 .login-input:focus { border-color: #c15f3c; box-shadow: 0 0 0 3px #f7e9e3; }
+.login-input:hover { border-color: #5f6368; }
 .login-error { border: 1px solid #efc2b5; border-radius: 9px; background: #fff4f1; padding: 9px 11px; color: #a94f32; font-size: 12px; }
-.login-submit { width: 100%; height: 42px; margin-top: 2px; border-radius: 9px; background: #c15f3c; font-size: 13px; transition: background-color 180ms ease, transform 180ms ease; }
-.login-submit:hover { background: #a94f32; transform: translateY(-1px); }
-.login-alternate { margin-top: 28px; color: #7b7d80; font-size: 12px; text-align: center; }
-.login-alternate a { color: #c15f3c; font-weight: 600; }
-.login-alternate a:hover { color: #a94f32; }
+.login-submit { width: 100%; height: 42px; margin-top: 2px; border-radius: 9px; background: #b25030; font-size: 13px; transition: background-color 180ms ease, transform 180ms ease; }
+.login-submit:hover { background: #98452a; transform: translateY(-1px); }
+.login-alternate { margin-top: 28px; color: #5f6368; font-size: 12px; text-align: center; }
+.login-alternate a { color: #b25030; font-weight: 600; text-decoration: underline; text-underline-offset: 3px; }
+.login-alternate a:hover { color: #98452a; }
 
 @keyframes login-card-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
@@ -637,4 +610,39 @@ body {
   justify-content: space-between;
   border-top: 1px solid var(--doc-border, #e5e7eb);
   padding-top: 8px;
+}
+
+/* --- accessibility foundations --------------------------------------------
+   Keyboard focus. Many controls remove the browser outline (`outline-none`) and drew a
+   near-invisible ring in brand-100 (1.2:1). This rule comes last, so it wins over those utilities:
+   a 2px clay outline (4.2:1 on white, 3.9:1 on the canvas) with a gap, only for keyboard focus. */
+*:focus-visible {
+  outline: 2px solid #c15f3c;
+  outline-offset: 2px;
+}
+
+/* A link that is the first thing a keyboard user reaches, to jump past the navigation. */
+.skip-link {
+  position: fixed;
+  left: 12px;
+  top: 8px;
+  z-index: 100;
+  transform: translateY(-200%);
+  border-radius: 8px;
+  background: #1f2937;
+  padding: 8px 14px;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 600;
+}
+.skip-link:focus { transform: translateY(0); }
+
+/* Respect the operating-system setting: no fades, slides, shimmer or smooth scrolling. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
