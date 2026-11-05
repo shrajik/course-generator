@@ -385,6 +385,8 @@ async def review_brief(
         compliance=compliance,
         has_sources=bool(record.input.source_ids),
         review_status=record.review_status,
+        # Only a course awaiting a decision has a gate to pass.
+        quality_blockers=await service.approval_quality_blockers(record) if record.review_status == "in_review" else (),
     )
 
 

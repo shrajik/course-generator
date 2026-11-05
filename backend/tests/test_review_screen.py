@@ -394,3 +394,30 @@ def test_the_review_brief_for_a_course_without_sources_is_ready(client):
 def test_an_unknown_course_is_a_404_on_every_reviewer_endpoint(client):
     for path in ("sources", "sources/1/passages", "passages?refs=S1.1", "review-brief"):
         assert client.get(f"/api/courses/crs_aaaaaaaaaaaa/{path}").status_code == 404
+
+
+def test_the_quality_gates_refusals_reach_the_reviewer_before_the_approve_button():
+    """Approval is refused when a required block is missing, so the brief must not show a green light."""
+    from types import SimpleNamespace
+
+    from app.course.review_brief import quality_gate_blockers
+
+    finding = SimpleNamespace(artifact="chapter:chapter_2", reason="missing_required_block", description="block type 'summary'")
+    reasons = quality_gate_blockers([], [finding], None)
+    assert reasons == ["Chapter 2: missing required block - block type 'summary'."]
+
+    document = _document([])
+    brief = build_review_brief(
+        document=document, audit=None, compliance=build_report(document), has_sources=False,
+        review_status="in_review", quality_blockers=reasons,
+    )
+    assert brief["ready_to_approve"] is False
+    assert brief["blockers"] == reasons and brief["headline"] == reasons[0]
+
+    clear = build_review_brief(document=document, audit=None, compliance=build_report(document), has_sources=False, review_status="in_review")
+    assert clear["ready_to_approve"] is True and clear["blockers"] == []  # nothing changes for a course with no refusals
+
+    assert quality_gate_blockers([object(), object()], [], RuntimeError("x")) == [
+        "2 expected chapters missing or unreadable.",
+        "The quality check could not be completed, so the course cannot be approved yet.",
+    ]

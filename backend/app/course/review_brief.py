@@ -15,6 +15,8 @@ or a statement the sources contradict), or while no fact check exists at all.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
 from typing import Any
 
 from app.course.compliance import ComplianceReport, split_chapters
@@ -36,6 +38,29 @@ def approval_blockers(*, has_sources: bool, audit: AuditReport | None) -> list[s
     return []
 
 
+def _where(artifact: str) -> str:
+    """'chapter:chapter_2' -> 'Chapter 2'; anything else is shown as it is."""
+    match = re.fullmatch(r"chapter:chapter_(\d+)", artifact or "")
+    return f"Chapter {match.group(1)}" if match else (artifact or "The course")
+
+
+def quality_gate_blockers(inventory_issues: Sequence[Any], blocking_findings: Sequence[Any], eval_error: Exception | None) -> list[str]:
+    """The quality gate's refusals, in words a reviewer can act on.
+
+    Final approval is refused for these (see CourseService.approve_course), so the brief must say so up
+    front instead of showing a green light that the server then contradicts."""
+    reasons: list[str] = []
+    if inventory_issues:
+        reasons.append(f"{_plural(len(inventory_issues), 'expected chapter')} missing or unreadable.")
+    if eval_error is not None:
+        reasons.append("The quality check could not be completed, so the course cannot be approved yet.")
+    for finding in blocking_findings:
+        what = str(getattr(finding, "reason", "") or "").replace("_", " ")
+        detail = str(getattr(finding, "description", "") or "")
+        reasons.append(f"{_where(str(getattr(finding, 'artifact', '')))}: {what}" + (f" - {detail}." if detail else "."))
+    return reasons
+
+
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
@@ -47,8 +72,9 @@ def build_review_brief(
     compliance: ComplianceReport,
     has_sources: bool,
     review_status: str,
+    quality_blockers: Sequence[str] = (),
 ) -> dict[str, Any]:
-    blockers = approval_blockers(has_sources=has_sources, audit=audit)
+    blockers = [*quality_blockers, *approval_blockers(has_sources=has_sources, audit=audit)]
     advisories: list[str] = []
 
     open_findings = [f for f in (audit.findings if audit else []) if f.status == "open"]

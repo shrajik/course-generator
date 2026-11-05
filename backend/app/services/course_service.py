@@ -560,6 +560,19 @@ class CourseService:
             eval_error = exc
         return inventory_issues, report, eval_error
 
+    async def approval_quality_blockers(self, record: CourseRecord) -> list[str]:
+        """What the quality gate would refuse approval for, as sentences: the same check `approve_course`
+        runs, so the review screen can show it before anyone clicks Approve. Never raises."""
+        from app.course.review_brief import quality_gate_blockers
+
+        try:
+            inventory_issues, report, eval_error = await self._evaluate_quality_for_approval(record)
+            blocking = report.approval_blocking_findings if report is not None else []
+            return quality_gate_blockers(inventory_issues, blocking, eval_error)
+        except Exception as exc:  # noqa: BLE001 - the brief still renders without it
+            log.warning("Could not evaluate approval blockers for %s: %s", record.course_id, exc)
+            return []
+
     # --- admin-only quality-gate overrides ----------------------------------
     # Four distinct, server-enforced bypasses (MOM quality-governance
     # follow-up) - each lifts exactly ONE gate and no other. All four still
