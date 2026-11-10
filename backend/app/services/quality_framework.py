@@ -439,6 +439,14 @@ _CONTENT_QA_FINDING_TYPES = frozenset(
 )
 _FORMULA_QA_FINDING_TYPES = frozenset({"malformed_expression", "formula_mismatch"})
 _IMAGE_RELEVANCE_FINDING_TYPES = frozenset({"off_topic_image", "decorative_not_educational"})
+# Fallback-cascade root-cause fix: an illustration that failed every bounded
+# text/relevance QA attempt, with no suitable Wikimedia match either, is now
+# withheld (no image at all) rather than replaced with an unrelated generic
+# AI picture - see ImageService.generate_for_block's own comment. This is
+# ImageService's own cascade decision, not a diagram/concept_experience QA
+# layer's judgment, so it gets its own source rather than falling into the
+# resolution-based legacy inference below.
+_IMAGE_WITHHELD_FINDING_TYPES = frozenset({"image_withheld_after_qa_failure"})
 
 
 def _visual_qa_source(entry_type: str, resolution: str) -> str:
@@ -450,6 +458,8 @@ def _visual_qa_source(entry_type: str, resolution: str) -> str:
         return "formula_qa"
     if entry_type in _IMAGE_RELEVANCE_FINDING_TYPES:
         return "image_relevance_qa"
+    if entry_type in _IMAGE_WITHHELD_FINDING_TYPES:
+        return "image_service"
     # Legacy inference, unchanged for every entry type this already covered
     # correctly: diagram_render_qa's geometry kinds ("fell_back_to_
     # illustration") and concept_qa's own reason codes ("rendered_with_
@@ -555,6 +565,13 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
         # silently "minor") already ensures.
         entry_type = str(entry.get("type") or "")
         if resolution == "formula_verification_failed" and entry_type == "formula_mismatch":
+            severity = "blocker"
+        elif resolution == "image_withheld_after_qa_failure":
+            # No image was published at all (same end state as a technical
+            # generation failure, which the `error` check above already
+            # treats as "blocker") - this deliberately mirrors that, rather
+            # than defaulting to "minor", since a page missing its image
+            # needs the same reviewer attention either way.
             severity = "blocker"
         elif resolution in (
             "rendered_with_unresolved_issues", "image_relevance_unverified", "formula_verification_failed",

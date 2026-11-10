@@ -34,6 +34,7 @@ import {
   submitForReview,
 } from "@/lib/api/courses";
 import { useAuth } from "@/lib/auth/auth-provider";
+import { locateBlock } from "@/lib/editor/blocks";
 import { useEditor } from "@/lib/editor/store";
 import type { ConceptVisualSpec, CourseDocument } from "@/lib/types/document";
 import type { CourseActivityEntry, CourseReview } from "@/lib/types/course";
@@ -249,10 +250,34 @@ export function CourseEditor({ documentId }: { documentId: string }) {
 
         const result = editor.applyDocumentPatch(response.patch);
 
+        // The patch applied above is only the STRUCTURAL edit (e.g. a
+        // `replace_image` op pointing at a new prompt) - the actual image
+        // generation the backend runs right after persisting that patch
+        // (DocumentService.ai_edit's `generate_missing` call) is never part
+        // of `response.patch`, so the locally-applied copy never carries
+        // the real generated `path`/`asset_id`, even on success. Root cause
+        // of a real, confirmed bug: with unsaved local edits elsewhere on
+        // the page, this used to skip reconciling entirely, so a
+        // successfully regenerated image (confirmed persisted server-side)
+        // stayed invisible in the editor - and a later manual Save, built
+        // from that stale local copy, could even overwrite the server's
+        // successful regeneration with the old "withheld" state.
+        const authoritative = await getDocument(documentId);
         if (!hadLocalEdits) {
           // Safe to adopt the server copy verbatim.
-          const authoritative = await getDocument(documentId);
           reconcile(authoritative);
+        } else {
+          // Other unsaved edits must survive - merge in just the content of
+          // the block(s) this edit targeted (the real generated image among
+          // them), the same scope DocumentService.ai_edit itself persists
+          // for a `replace_image` operation, without touching anything else
+          // the user is mid-editing.
+          for (const blockId of ids) {
+            const found = locateBlock(authoritative, blockId);
+            if (found) {
+              editor.updateContent(blockId, found.block.content);
+            }
+          }
         }
 
         const appliedCount = result?.applied.length ?? response.applied_operations.length;

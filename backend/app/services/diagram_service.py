@@ -14,12 +14,31 @@ doesn't actually match gets one corrective retry before being accepted, so a
 requested conceptual/relationship diagram never silently turns into a
 flowchart just because that's what the model defaulted to.
 
-Any failure here (bad/unusable spec, rendering error) is left to the caller
-(`ImageService`) to fall back to the raster illustration path - a diagram is a
-*preference*, not a requirement, and a block must never end up with nothing.
+Any failure here (bad/unusable spec, rendering error, garbled/misspelled
+text) is left to the caller (`ImageService`) to fall back to the raster
+illustration path - a diagram is a *preference*, not a requirement, and a
+block must never end up with nothing. The one deliberate exception
+(fallback cascade root-cause fix): a spec that is structurally sound and
+has real, legible, correctly-spelled labels, but whose content-relevance
+LLM critique still finds it under-specific/off-topic/missing a concept
+after every bounded retry, is rendered and shipped anyway, flagged `major`
+for human review - see `generate_for_block`'s own comment on why. Discarding
+a real, topic-grounded, correctly-spelled diagram for the raster
+illustration fallback is a worse outcome than shipping it flagged: that
+fallback has no structured content of its own to fall back on again, and a
+real, confirmed production case showed it frequently ALSO failing its own
+relevance check and ending up shipping an unrelated, generic AI picture -
+exactly the "generic decorative placeholder" this pipeline must never use
+as a substitute for real educational content. Mirrors
+`concept_visual_service.py`'s own already-established "no fallback on
+content-QA failure" contract, which this diagram path did not share until
+this fix.
 """
 
 from __future__ import annotations
+
+import json
+import re
 
 from app.agents import prompts
 from app.core.config import Settings, get_settings
@@ -31,7 +50,11 @@ from app.schemas.blocks import merge_content
 from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
-from app.services.diagram_content_qa import evaluate_content
+from app.services.diagram_content_qa import (
+    MISSPELLED_OR_GARBLED_TEXT,
+    STRUCTURALLY_GARBLED_TEXT,
+    evaluate_content,
+)
 from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
 from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
@@ -42,6 +65,13 @@ from app.services.storage_service import StorageService, get_storage
 log = get_logger(__name__)
 
 MAX_BRIEF_CHARS = 2000
+
+# How many corrective attempts `evaluate_content`'s own content-relevance
+# check gets before `generate_for_block` falls back to the raster
+# illustration path - see that call site's own comment on why one retry
+# wasn't always enough. Bounded, not unlimited: a persistently-failing spec
+# still falls back after this many tries, same as before.
+_MAX_CONTENT_QA_RETRIES = 2
 
 DIAGRAM_SYSTEM = """\
 You are two experts working as one: a professor who is a genuine
@@ -60,6 +90,28 @@ afterwards - so the only things that matter are (1) choosing the structure a
 textbook illustrator would choose for this exact concept, and (2) writing
 precise, short, unambiguous labels a professor would stand behind.
 
+When the brief includes a "CURRENT DIAGRAM" section, this is a CORRECTION of
+an existing diagram, not a fresh one - the reader already approved its
+overall subject and structure and is asking you to fix specific, named
+problems with it (garbled symbols, overlapping/cut-off text, a wrong
+connection, cramped spacing, missing content), not to redesign it. Reuse
+the exact same `kind`, the exact same set of nodes/edges with the exact
+same ids/labels/detail, and the exact same structure, UNLESS the brief
+explicitly asks to add, remove, rename or reconnect something - copy every
+node and edge you are not asked to change verbatim rather than
+paraphrasing or reinventing it, even if your own phrasing would read
+slightly better. A brief that only describes a rendering problem (spacing,
+overlap, a cramped label, a wrong symbol) needs ZERO structural change at
+all - correct only the specific label/symbol/detail text named, nothing
+else; this specification is rendered by the SAME layout engine either way,
+so a spacing/overlap complaint is about what the text needs to fit well
+(a label genuinely too long to lay out cleanly may need shortening), never
+a reason to drop or rewrite content the brief didn't flag. Only when the
+brief clearly asks for a broader redesign (a different kind, a
+reorganised structure, substantially different content) should you depart
+from the current diagram more freely - and even then, preserve every fact
+it got right.
+
 First decide what the brief actually needs, then pick exactly one `kind`:
 
 - The brief describes STEPS that happen in order (a procedure, a sequence of
@@ -68,6 +120,52 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   `label` only when the transition needs one (e.g. "if valid").
 - The steps repeat with no fixed end -> cycle. Order `nodes` around the loop;
   the renderer closes it back to the first node automatically.
+- The brief describes a procedure with one explicit "revise and go back"
+  step partway through (the scientific method, an Agile sprint, an
+  editorial review cycle) rather than a clean full loop back to the very
+  first step -> feedback_loop_process. Order `nodes` the way the steps
+  happen (same as flow_chart/process) and add one edge per consecutive
+  forward pair PLUS one extra edge for the return step itself, from the
+  later node back to the earlier one it revises, with a short `label`
+  naming the condition (e.g. "if it fails", "if rejected").
+- The brief is about factors that drive each other in a feedback system -
+  more of one thing causing more (or less) of another, which can itself
+  loop back - a population/resource dynamic, a market feedback effect, an
+  ecosystem interaction -> causal_loop. Each node is one factor; each edge
+  is a causal link, its `label` starting with "+" (more of the source
+  causes MORE of the target - a reinforcing link) or "-" (more of the
+  source causes LESS of it - a balancing link), optionally followed by a
+  short phrase (e.g. "+ drives up", "- reduces"). Keep this one SPARSE - a
+  single loop around the ring plus at most one or two real cross-links,
+  never a dense web connecting most factors to most others (the ring
+  layout only has room to route a handful of curved edges cleanly).
+- The brief describes positions along a single continuum or scale with no
+  real structure beyond where each one sits (a political spectrum, a pH
+  scale, an introvert-extrovert scale) -> spectrum. Leave `edges` empty;
+  set `matrix_x_low`/`matrix_x_high` to the two end labels (e.g. "Acidic"/
+  "Basic") and optionally `matrix_x_label` for a short title above the
+  line. Give every node a `value_pct` (0-100) for its own position along
+  the line - never leave it unset when the brief states or implies a real
+  position.
+- The brief is specifically a "visible vs. hidden" structure - the small
+  part everyone notices vs. the much larger set of root causes/drivers
+  underneath it (an iceberg of conflict, a competency iceberg, an
+  incident's visible symptom vs. its underlying causes) -> iceberg. The
+  visible item(s) get `level: 0`; each hidden layer gets `level: 1, 2, 3...`
+  from least to most fundamental - leave `edges` empty.
+- The brief is specifically the classic "black box" systems view - what
+  goes IN, what processing happens, what comes OUT (an algorithm's
+  input/processing/output, a function's signature, a system boundary) ->
+  input_process_output. Give every node a `shape_role` of "input",
+  "process" or "output" (processing steps default to "process" when left
+  blank); leave `edges` empty, the renderer connects each zone
+  automatically.
+- The brief ranks or sizes a set of factors by magnitude - importance,
+  frequency, a score, a survey result (top causes of X, most common
+  reasons for Y) - rather than describing a sequence or structure between
+  them -> ranked_bars. Leave `edges` empty; give every node a `value_pct`
+  (0-100, whatever scale the brief's own ranking uses) - the renderer
+  sorts and sizes the bars automatically, never pre-sort `nodes` yourself.
 - The brief describes a THING made of parts, or a phenomenon/mechanism whose
   components relate to or act on each other, and a labelled-boxes-and-arrows
   diagram communicates it well enough (an organisation, a reaction pathway,
@@ -87,10 +185,14 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   rejects a `schematic` answer unconditionally and falls back to that
   illustration path anyway - so treat this prompt's remaining kinds
   (concept_map, hierarchy, comparison, flow_chart/process/cycle,
-  data_flow_diagram, er_diagram, swimlane, smart_art, graph, pyramid,
-  matrix, radial_mindmap, venn, chevron_process, timeline,
+  feedback_loop_process, causal_loop, data_flow_diagram, er_diagram,
+  swimlane, smart_art, graph, pyramid, funnel, honeycomb, puzzle_pieces,
+  gears_process, matrix, radial_mindmap, venn, chevron_process, timeline,
   staircase_process, balance_comparison, nested_circles, network_mesh,
-  decision_tree, fishbone, layered_diagram, gantt_chart) as the complete
+  decision_tree, fishbone, layered_diagram, gantt_chart, donut_segments,
+  pie_wedge, wavy_journey_path, progress_rings, orbit_diagram,
+  bridge_process, chain_links, flower_petal, hourglass_diagram, org_chart,
+  spectrum, iceberg, input_process_output, ranked_bars) as the complete
   list; none of them is
   "physical shape and arrangement," and that's fine - this call was
   reached in error for that brief.
@@ -139,13 +241,38 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   base/foundation that supports what's above it, a hierarchy of needs, a
   "most fundamental at the bottom" structure) -> pyramid. Order `nodes`
   narrowest-first (the apex/top layer) to widest-last (the base/bottom
-  layer); leave `pyramid_inverted` false. The SAME shape, but the brief
-  instead describes a NARROWING STAGE process (a sales/conversion funnel,
-  a filtering/elimination process where each stage has fewer items than
-  the last) -> also `pyramid`, same node order (widest-first this time -
-  the top/entry stage - narrowing to the last), but set
-  `pyramid_inverted: true`. Leave `edges` empty either way; add a short
+  layer); leave `pyramid_inverted` false. Leave `edges` empty; add a short
   `detail` per layer only when it adds real information.
+- The brief instead describes a NARROWING STAGE process (a sales/
+  conversion funnel, a filtering/elimination process where each stage has
+  fewer items than the last, a "top of funnel to bottom of funnel"
+  pipeline) -> funnel, its own dedicated kind (the SAME wide-top/narrow-
+  bottom shape `pyramid`+`pyramid_inverted` used to require - prefer this
+  simpler, more discoverable name). Order `nodes` widest-first (the top/
+  entry stage) to narrowest-last (the final stage). Leave `edges` empty;
+  add a short `detail` per stage only when it adds real information.
+- The brief is a SET of related categories, pillars or components with no
+  inherent order and no deeper relationship worth naming as an edge (the
+  brief would otherwise be smart_art, but reads well as a connected
+  cluster rather than a plain list - "the 5 pillars of X", "core
+  components of Y") -> honeycomb. Each node is one category; leave
+  `edges` empty. Produce 3-9 nodes - fewer reads as a sparse single row,
+  which is fine; more starts to feel cramped.
+- The brief describes components that only make sense TOGETHER, as
+  interlocking parts of one whole strategy/solution/framework (content
+  that would naturally be illustrated as literal jigsaw-puzzle pieces
+  fitting together) -> puzzle_pieces. Each node is one component; leave
+  `edges` empty. Produce at most 6 nodes - this kind draws as a single
+  growing-wider row (like chevron_process), so it must stay short to stay
+  legible.
+- The brief describes a short MECHANISM whose steps genuinely work
+  together as one system, each step driving the next the way gears
+  literally mesh (not just an ordinary sequence - the brief itself should
+  frame it as interdependent/interlocking parts of one machine, e.g. "the
+  moving parts of X", a short automated pipeline where each stage directly
+  drives the next) -> gears_process. Order `nodes` the way the steps
+  drive each other; leave `edges` empty. Produce at most 5 nodes - like
+  puzzle_pieces, this draws as a single growing-wider row.
 - The brief classifies or compares things across exactly two independent
   axes/dimensions (impact vs. effort, urgency vs. importance, a SWOT-style
   strengths/weaknesses/opportunities/threats grid, a priority matrix)
@@ -300,6 +427,68 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   when the brief gives no real numbers and none would be honestly
   illustrative, choose a different kind instead (or `image_kind:
   illustration`, decided by the writer before this call).
+- The brief is a set of CATEGORIES that together make up one whole - a
+  budget's spending categories, a framework's pillars shown as PROPORTIONS
+  of a total rather than just a list (if there's no real "parts of 100%"
+  framing, that's honeycomb instead) -> donut_segments. Each node is one
+  category; leave `edges` empty. Produces equal-width bands by default (this
+  kind doesn't carry real percentage DATA - for that, use `graph` with
+  `graph_type: "bar"` instead).
+- The brief is the same "parts of a whole" idea as donut_segments but reads
+  better as a classic filled pie (no open centre) - typically when there are
+  fewer, larger categories -> pie_wedge. Same node/edge rules as
+  donut_segments.
+- The brief describes a sequential NARRATIVE journey or roadmap with real
+  milestones, told as a story arc rather than a plain procedure (a customer
+  journey, a product roadmap, "the path from awareness to advocacy") ->
+  wavy_journey_path, not timeline (timeline is for DATED historical events)
+  or flow_chart (which is for a procedure, not a narrative arc). Order
+  `nodes` the way the journey happens; leave `edges` empty.
+- The brief gives a real PERCENTAGE/STAT for each of several named items (a
+  satisfaction score, a completion rate, an adoption percentage) ->
+  progress_rings. Set each node's `value_pct` to that exact number from the
+  brief (0-100) - never invent one; leave a node's `value_pct` unset only
+  when the brief genuinely gives no number for that specific item. Leave
+  `edges` empty.
+- The brief has ONE central concept with items at DIFFERENT, MEANINGFUL
+  DISTANCES or tiers from it (layers of the atmosphere around a planet,
+  concentric rings of influence, "closer" vs "further" related ideas from
+  one core) -> orbit_diagram. This differs from radial_mindmap, where every
+  branch is an equally-independent sub-topic with no distance meaning -
+  orbit_diagram is specifically for when WHICH RING/TIER a node sits in is
+  itself part of what the brief teaches. Put nodes in the order they sit
+  from innermost tier to outermost. Leave `edges` empty.
+- The brief explicitly frames a short, bounded sequence as CROSSING from one
+  state to another - "bridging the gap", a migration, a transformation
+  journey with a clear before/after framing -> bridge_process. Order `nodes`
+  the way the steps happen; leave `edges` empty. Produce at most 5 nodes.
+- The brief describes items that form a DEPENDENCY CHAIN - each one follows
+  from and depends on the one before it (a supply chain, a chain of custody,
+  a chain of causation) -> chain_links. This differs from honeycomb/
+  puzzle_pieces (no inherent order) - chain_links IS ordered, like funnel.
+  Order `nodes` the way the chain runs; leave `edges` empty.
+- The brief has ONE central theme with several related sub-topics orbiting
+  it, and a softer, more decorative presentation suits the content better
+  than radial_mindmap's plain spokes (core values around a central mission,
+  themes radiating from one idea) -> flower_petal. Put the central theme's
+  own node first if it needs its own label (otherwise leave it implicit);
+  every other node is one petal. Leave `edges` empty. Produce 4-7 nodes.
+- The brief weighs TWO OPPOSING FRAMINGS against each other where each side
+  itself has multiple layers (cost broken into several cost types vs. value
+  broken into several value types; a detailed before broken into stages vs.
+  a detailed after broken into stages) -> hourglass_diagram. This differs
+  from balance_comparison (a flat list of points on each side) - use
+  hourglass_diagram specifically when each side has its own internal
+  LAYERS/LEVELS worth showing as a stack, not just a bullet list. List every
+  node for the FIRST (narrowing/top) framing before every node for the
+  SECOND (widening/bottom) one. Leave `edges` empty.
+- The brief is literally about an ORGANISATION'S reporting structure - real
+  roles/titles and who reports to whom, not a generic category tree ->
+  org_chart, not hierarchy (hierarchy is for a generic parent/child
+  breakdown - a taxonomy, a category tree - where the nodes aren't people/
+  roles in an org). Each node's `label` is the role/title, `detail` the
+  person's name or a one-line scope note. Set every node's `level` (0 =
+  top of the org) and add one edge per reporting line.
 
 For `flow_chart`/`process` specifically: if the sequence has a genuine
 bounded start and end (a bounded procedure, not an ongoing pipeline), add
@@ -313,20 +502,29 @@ its own `label` ("Yes"/"No" or whatever the two outcomes are called); a
 loop is a branch whose edge points back at the decision node's own `id`.
 
 Rules for flow_chart/process/cycle/concept_map/hierarchy/comparison/smart_art/
-data_flow_diagram/er_diagram/swimlane/pyramid/matrix/radial_mindmap/venn/
-chevron_process/timeline/staircase_process/balance_comparison/
-nested_circles/network_mesh/decision_tree/fishbone/layered_diagram/gantt_chart:
+data_flow_diagram/er_diagram/swimlane/pyramid/funnel/honeycomb/puzzle_pieces/
+gears_process/matrix/radial_mindmap/venn/chevron_process/timeline/
+staircase_process/balance_comparison/nested_circles/network_mesh/
+decision_tree/fishbone/layered_diagram/gantt_chart/donut_segments/
+pie_wedge/wavy_journey_path/progress_rings/orbit_diagram/bridge_process/
+chain_links/flower_petal/hourglass_diagram/org_chart:
 - Produce between 2 and 8 `nodes` for concept_map/hierarchy/comparison/
-  smart_art/pyramid/matrix/radial_mindmap/balance_comparison/
-  nested_circles/network_mesh/decision_tree/layered_diagram/gantt_chart
+  smart_art/pyramid/funnel/honeycomb/matrix/radial_mindmap/
+  balance_comparison/nested_circles/network_mesh/decision_tree/
+  layered_diagram/gantt_chart/donut_segments/pie_wedge/wavy_journey_path/
+  progress_rings/chain_links/hourglass_diagram/org_chart
   (venn is always exactly 2 or 3 - see its own section above; fishbone's
-  own 3-5-category guidance is in its own section above too) - those are
-  meant to stay a small, scannable set of relationships (nested_circles
-  especially - realistically 3-5 levels, never more than a reader can
-  visually nest; layered_diagram similarly - realistically 3-7 layers).
+  own 3-5-category guidance, and flower_petal's own 4-7, are in their own
+  sections above too) - those are meant to stay a small, scannable set of
+  relationships (nested_circles especially - realistically 3-5 levels,
+  never more than a reader can visually nest; layered_diagram similarly -
+  realistically 3-7 layers).
   chevron_process/staircase_process are meant to stay even smaller - 3-6
   nodes, a short strip, not a long column (use flow_chart/process instead
-  for anything longer). For flow_chart/process/cycle/data_flow_diagram/
+  for anything longer); puzzle_pieces is capped even tighter - at most 6,
+  gears_process/orbit_diagram/bridge_process at most 5, see their own
+  sections above. For
+  flow_chart/process/cycle/data_flow_diagram/
   swimlane/timeline you may go up to 14 nodes when the
   brief genuinely describes that many distinct steps/milestones (e.g. a
   real request pipeline with its error branches, an agent's decide/call-
@@ -350,6 +548,37 @@ nested_circles/network_mesh/decision_tree/fishbone/layered_diagram/gantt_chart:
   overflowing, wrapping badly or crowding its neighbours.
 - Base every label and detail only on the brief below. Do not invent facts,
   numbers or names that were not given to you. No markdown, no quotes.
+- For smart_art/chevron_process/funnel/honeycomb/puzzle_pieces specifically,
+  optionally set a node's `icon` to ONE of these exact keywords when it
+  genuinely fits that node's own concept - a small pictogram badge draws
+  next to the label: person, people, gear, lock, shield, chart, chart_line,
+  idea, check, warning, clock, target, arrow, document, database, cloud,
+  globe, mail, search, flag, star, money, calendar, link. Leave `icon`
+  blank rather than forcing a poor match - a blank icon still draws a
+  normal numbered badge instead, never a broken or missing one. Never
+  invent a keyword outside this exact list; an unrecognised one silently
+  draws no icon at all. Ignored by every other kind.
+
+Rules for spectrum/iceberg/feedback_loop_process/causal_loop/
+input_process_output/ranked_bars (see each kind's own section above for its
+exact field usage):
+- Keep labels just as short as every other kind (2-6 words) - these kinds
+  are NOT an exemption, and some are tighter still: `spectrum`'s cards and
+  `causal_loop`'s ring circles have real, measured geometry limits that a
+  long label pushes past (a too-wide spectrum card gets nudged/shrunk to
+  fit more positions; a too-big causal_loop circle can crowd a neighbour
+  the curved edges have to route around) - short wins over descriptive
+  every time here.
+- Node counts: spectrum up to 8, causal_loop up to 6 (and keep its EDGE
+  count sparse too - a single loop around the ring plus at most one or two
+  real cross-links, see its own section above), input_process_output up to
+  9, iceberg/ranked_bars up to 9, feedback_loop_process up to 14 (same
+  sequential-kind allowance as flow_chart/process).
+- `edges` stays EMPTY for spectrum/iceberg/input_process_output/
+  ranked_bars - none of them draw connectors between nodes at all (spectrum
+  positions by `value_pct`, iceberg by `level`, input_process_output by
+  `shape_role`, ranked_bars by `value_pct`); only feedback_loop_process and
+  causal_loop use `edges`, exactly as their own sections above describe.
 
 """
 
@@ -374,6 +603,7 @@ def _diagram_user_prompt(
     kind_hint: str = "",
     pin_kind: bool = False,
     qa_feedback: str = "",
+    existing_outline: dict | None = None,
 ) -> str:
     brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
     section = prompts.memory_section(memory)
@@ -381,12 +611,26 @@ def _diagram_user_prompt(
     requested = f"\nREQUESTED DIAGRAM TYPE: {kind_hint}\n" if kind_hint else ""
     pin = _KIND_PIN_INSTRUCTION.format(hint=kind_hint) if pin_kind and kind_hint else ""
     feedback_block = f"\n{qa_feedback}\n" if qa_feedback else ""
+    # Set only on a correction (replace_image on a block that already has a
+    # rendered spec - see DiagramService.generate_for_block) - see
+    # DIAGRAM_SYSTEM's own "CURRENT DIAGRAM" instructions for what this
+    # means. `diagram_outline`'s own compact kind/parts/arrows shape (also
+    # what app.services.visual_review already shows a reviewer) is reused
+    # here rather than the full DiagramSpec JSON - everything a correction
+    # needs to reproduce verbatim, without the geometry/style fields that
+    # would only bloat the prompt and are re-derived by the renderer anyway.
+    current_block = (
+        f"\nCURRENT DIAGRAM (this is a correction - see the system prompt's "
+        f"own instructions on what to preserve):\n{json.dumps(existing_outline, ensure_ascii=False)}\n"
+        if existing_outline
+        else ""
+    )
     return f"""\
 COURSE: {course_title}
 
 VISUAL BRIEF:
 {brief or "(not specified)"}
-{requested}{memory_block}{feedback_block}
+{requested}{memory_block}{feedback_block}{current_block}
 Produce the diagram specification for this visual.{pin}
 """
 
@@ -436,7 +680,26 @@ def _kind_conflicts(hint: str, actual: str) -> bool:
         # sequential answer can't, confirmed via a real generated course
         # sample where a "concept_map" hint came back as "smart_art" and
         # this check let it through silently.
-        return actual in SEQUENTIAL_KINDS or actual == "smart_art"
+        #
+        # "comparison" is the SAME kind of silent escape hatch, and a real,
+        # confirmed production case shows it: a block pinned to a specific
+        # relationship kind (e.g. a wiring/apparatus request hinted
+        # "schematic") came back as a flat "comparison" card grid instead -
+        # structurally valid (comparison is a real DIAGRAM_KINDS member, so
+        # is_usable() never caught it) but a strictly WORSE answer than the
+        # relationship kind actually asked for, which this check previously
+        # let through for every one of the 20+ RELATIONSHIP_KINDS members
+        # (concept_map, hierarchy, er_diagram, decision_tree, fishbone,
+        # network_mesh, matrix, radial_mindmap, org_chart, ...) - "comparison"
+        # was the one substitution this branch never flagged as a conflict,
+        # even though the sibling `hint in ("comparison", "smart_art")`
+        # branch right below already treats a "comparison"-hint request
+        # being answered with something else as exactly this kind of
+        # conflict. A hint that IS itself "comparison" never reaches this
+        # branch (RELATIONSHIP_KINDS doesn't contain "comparison"), so this
+        # can't fire a false "conflict" when comparison genuinely was asked
+        # for and delivered.
+        return actual in SEQUENTIAL_KINDS or actual == "smart_art" or actual == "comparison"
     if hint in ("comparison", "smart_art"):
         return actual in SEQUENTIAL_KINDS or (hint == "comparison" and actual != "comparison")
     return False
@@ -472,6 +735,47 @@ def _with_figure_caption(spec: DiagramSpec, block: Block) -> DiagramSpec:
         return spec
     spec.title = f"Fig. {chapter_number}: {spec.title.strip()}" if spec.title.strip() else f"Fig. {chapter_number}"
     return spec
+
+
+_CORRECTION_DRIFT_MIN_LABELS = 2
+_CORRECTION_DRIFT_RATIO_FLOOR = 0.4
+
+
+def _correction_drift_issue(existing_outline: dict | None, spec: DiagramSpec) -> str | None:
+    """Deterministic, zero-AI-call sanity check for a `replace_image`
+    correction (see `generate_for_block`'s own `existing_outline` - this
+    whole fix's root-cause closure): when the model was given the existing
+    diagram as context, how much of its labelled content survived into the
+    regenerated spec? A correction asked to fix one small thing but coming
+    back with almost none of the original labels is a measurable signal
+    the instruction was followed as a redesign, not a correction - the
+    exact "generates a completely different image" failure this feature
+    exists to close. Surfaced as a visible, inspectable finding (never a
+    retry, never an extra AI call, never a reason to reject the result - a
+    human reviewer decides what to do with it, same as every other finding
+    this module already records, e.g. `_flow_chart_connectivity_issues`).
+    `None` when there's nothing to compare (a fresh generation) or too few
+    labels to measure meaningfully without one coincidental match skewing
+    the ratio."""
+    if not existing_outline:
+        return None
+    old_labels = {
+        str(part.get("label", "")).strip().lower()
+        for part in existing_outline.get("parts", []) or []
+        if str(part.get("label", "")).strip()
+    }
+    if len(old_labels) < _CORRECTION_DRIFT_MIN_LABELS:
+        return None
+    new_labels = {node.label.strip().lower() for node in spec.nodes if node.label.strip()}
+    kept = old_labels & new_labels
+    ratio = len(kept) / len(old_labels)
+    if ratio >= _CORRECTION_DRIFT_RATIO_FLOOR:
+        return None
+    return (
+        f"This regenerated a diagram that was meant to be CORRECTED, but only "
+        f"{len(kept)}/{len(old_labels)} of its original labels survived - it may be a "
+        f"different diagram rather than the same one with the requested fix."
+    )
 
 
 def _flow_chart_connectivity_issues(spec: DiagramSpec) -> list[str]:
@@ -570,6 +874,7 @@ class DiagramService:
         pin_kind: bool,
         block_id: str,
         qa_feedback: str = "",
+        existing_outline: dict | None = None,
     ) -> DiagramSpec:
         return await self.ai.structured(
             schema=DiagramSpec,
@@ -583,6 +888,7 @@ class DiagramService:
                 kind_hint=kind_hint,
                 pin_kind=pin_kind,
                 qa_feedback=qa_feedback,
+                existing_outline=existing_outline,
             ),
             model=self.settings.diagram_model,
             purpose=f"diagram:{block_id}",
@@ -669,6 +975,120 @@ class DiagramService:
             log.warning("Diagram block %s has no purpose/prompt - skipped", block.id)
             return False
 
+        # Root-cause fix (Phase 2 card-grid audit): `schematic` is PERMANENTLY
+        # RETIRED at this layer - DIAGRAM_SYSTEM above explicitly instructs
+        # the model to never produce it, "regardless of what the brief
+        # describes". A stale `diagram_kind: "schematic"` hint (written by an
+        # older/non-compliant writer pass - see app.agents.prompts's own
+        # "PERMANENTLY RETIRED... go straight to illustration" guidance,
+        # which assumes the writer never reaches this call with it) used to
+        # be sent through to `_request_spec` anyway, where the model - torn
+        # between "REQUESTED DIAGRAM TYPE: schematic" and "never produce
+        # schematic" - would pick some OTHER kind as its best guess, almost
+        # always "comparison" (the one kind generic enough to describe
+        # anything as a flat list of things). `_kind_conflicts` used to miss
+        # this substitution entirely (see its own comment on the fix), and
+        # even with that fixed, retrying a "schematic" hint just repeats the
+        # exact same contradiction. A real, confirmed case: a bench-wiring
+        # apparatus request (DC rail, shunt resistor, Kelvin sense taps,
+        # oscilloscope channels) shipped as 3 dense text cards instead of a
+        # labelled picture. Short-circuiting here - before any model call -
+        # and setting `illustration_style: "textbook"` directly on the block
+        # is what actually delivers the "goes straight to illustration"
+        # behaviour DIAGRAM_SYSTEM's own comment already claimed happened.
+        # Best-effort label recovery: the original diagram-authoring prompt
+        # routinely names exact quoted labels ('label "R_shunt (low-side
+        # shunt)"') - pulling those into `expected_labels` lets the raster
+        # illustration path's existing text-verification machinery
+        # (ImageService._generate_with_text_check) actually confirm this
+        # picture's labels are legible and correct, instead of shipping an
+        # unverified wall of text baked into pixels on faith. Bounded (at
+        # most 10, under 40 chars each) so a prose brief with many
+        # incidental quote marks can't flood expected_labels with junk.
+        if kind_hint == "schematic":
+            brief_text = f"{purpose}\n{prompt}\n{caption}"
+            # Authors quote labels with either mark inconsistently (confirmed
+            # across real blocks: one used `"Kelvin sense+: S+"`, another
+            # `'C = 100 μF'`) - matching both, not just double quotes, is
+            # part of what makes this recovery reliable. The OTHER half:
+            # only a quote preceded by some form of "label" within the
+            # nearby text counts - a real, confirmed case shows why a bare
+            # "any quoted substring" scan is too eager: one brief's prompt
+            # used quotes loosely for descriptive emphasis ('slow droop -
+            # fit tau to measured data'), not as a literal on-image text
+            # requirement, and treating that full clause as a REQUIRED exact
+            # label sent an impossible-to-render phrase through text
+            # verification, which correctly (if unhelpfully) withheld the
+            # image rather than ship it wrong - a worse outcome than simply
+            # never having claimed that phrase as a label in the first
+            # place. Requiring a nearby "label(ed/led)" cue is what the
+            # bench-wiring case (the confirmed, fixed report) actually relied
+            # on throughout ('label "...""', 'labeled exactly "..."') and
+            # correctly excludes the looser, advisory-only quoting style.
+            label_cue = re.compile(r"labell?ed?", re.IGNORECASE)
+            quoted = [
+                m.group(1)
+                for m in re.finditer(r'["\']([^"\']{1,40})["\']', brief_text)
+                if label_cue.search(brief_text[max(0, m.start() - 30):m.start()])
+            ]
+            seen: list[str] = []
+            for label in quoted:
+                label = label.strip()
+                if label and label not in seen:
+                    seen.append(label)
+                if len(seen) >= 10:
+                    break
+            log.info(
+                "Diagram block %s requested the retired 'schematic' kind - routing directly to a "
+                "textbook illustration instead of asking the model for a kind it's told never to "
+                "produce (%s label(s) recovered from the prompt)", block.id, len(seen),
+            )
+            block.content = merge_content(
+                block.type, block.content,
+                {
+                    # Reclassified for good, not just this one render - a
+                    # LATER regeneration (e.g. a "Replace Image" click) must
+                    # land straight on the illustration path next time too,
+                    # never loop back through this same retired-kind
+                    # contradiction again. Harmless for THIS call: ImageService
+                    # .generate_for_block already captured its own `kind`
+                    # local variable before invoking this method, so this
+                    # mutation can't change which branch the CURRENT call
+                    # takes (that's `illustration_style`'s job, checked
+                    # separately after this returns - see its own comment
+                    # there).
+                    "kind": "illustration",
+                    "diagram_kind": "",
+                    "illustration_style": "textbook",
+                    **({"expected_labels": seen} if seen else {}),
+                },
+            )
+            return False
+
+        # A real, confirmed bug this closes: `replace_image` (the editor's
+        # "fix this diagram" workflow - see app.course.document.patcher's
+        # own replace_image handling) clears `content["path"]` so this
+        # block gets regenerated, but NEVER cleared `content["spec"]` - the
+        # existing, already-rendered structure just sat there unused while
+        # this call built a request from `purpose`/`prompt`/`caption`
+        # ALONE, with zero awareness the old diagram (its exact nodes,
+        # edges and labels) ever existed. The model then had no choice but
+        # to invent a brand-new diagram from the editor's text description,
+        # which is why a "fix the overlapping numbers" correction came back
+        # as a different diagram instead of the same one with that one
+        # thing fixed. Feeding the existing structure back in (see
+        # DIAGRAM_SYSTEM's own "CURRENT DIAGRAM" instructions on what this
+        # means) turns this into a genuine correction - a fresh first-time
+        # generation (no `spec` in content yet) is completely unaffected,
+        # `existing_outline` is simply empty/falsy for it.
+        existing_outline: dict | None = None
+        raw_existing_spec = content.get("spec")
+        if isinstance(raw_existing_spec, dict) and raw_existing_spec:
+            try:
+                existing_outline = diagram_outline(DiagramSpec.model_validate(raw_existing_spec))
+            except Exception as exc:  # noqa: BLE001 - a malformed old spec must never block regeneration
+                log.warning("Could not reuse the existing spec for %s as correction context: %s", block.id, exc)
+
         memory = await self.memory.build_context(
             stage="visual", course_title=course_title, chapter_title=purpose or prompt, template=template
         )
@@ -678,6 +1098,7 @@ class DiagramService:
             spec = await self._request_spec(
                 purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
                 memory=memory_text, kind_hint=kind_hint, pin_kind=False, block_id=block.id,
+                existing_outline=existing_outline,
             )
         except Exception as exc:  # noqa: BLE001 - caller falls back to illustration
             log.warning("Diagram spec generation failed for %s: %s", block.id, exc)
@@ -685,109 +1106,86 @@ class DiagramService:
 
         spec = self._normalise(spec)
 
-        # A genuinely complex technical topic can legitimately need more
-        # nodes than this diagram kind's cap allows (see max_nodes_for) -
-        # rather than immediately giving up on the structured path (which
-        # falls back to an unreliable raster illustration - see
-        # ImageService._generate_illustration), ask the model to consolidate
-        # closely related steps into the budget it actually has, once.
+        # Three independent structural checks against the SAME initial spec -
+        # too many nodes, the wrong shape, and (for a flow chart) broken
+        # Start/End connectivity. These used to each fire their own
+        # sequential corrective retry (up to 3 extra AI calls before content
+        # QA even ran); now every issue found is collected up front and
+        # folded into a SINGLE retry call, cutting the worst case from 3
+        # extra calls to 1 without dropping any of the three checks.
         labelled_count = len([n for n in spec.nodes if n.label.strip()])
         cap = max_nodes_for(spec.normalised_kind())
-        if labelled_count > cap:
-            log.info(
-                "Diagram for %s has %s nodes (max %s for %s) - retrying with a consolidation request",
-                block.id, labelled_count, cap, spec.normalised_kind(),
-            )
-            try:
-                consolidated = await self._request_spec(
-                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
-                    memory=memory_text, kind_hint=spec.normalised_kind(), pin_kind=True, block_id=block.id,
-                    qa_feedback=(
-                        f"Your previous attempt had {labelled_count} nodes, more than a "
-                        f"{spec.normalised_kind()} diagram can clearly show (maximum {cap}). "
-                        "Consolidate closely related steps so the total is at most "
-                        f"{cap} nodes, while keeping the sequence faithful to the brief - "
-                        "merge an action with its immediate follow-up rather than dropping "
-                        "any genuinely distinct stage."
-                    ),
-                )
-                consolidated = self._normalise(consolidated)
-                consolidated_count = len([n for n in consolidated.nodes if n.label.strip()])
-                if consolidated.normalised_kind() == spec.normalised_kind() and consolidated_count <= cap:
-                    spec = consolidated
-                # Still over budget after asking nicely - is_usable() below
-                # will reject it and the caller falls back, same as before.
-            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
-                log.warning("Diagram consolidation retry failed for %s: %s", block.id, exc)
-
+        needs_consolidation = labelled_count > cap
         # The writer asked for a specific shape (e.g. a relationship diagram)
-        # but the model reached for a sequential one anyway - one corrective
-        # retry with the kind pinned explicitly, never a silent flowchart.
-        if _kind_conflicts(kind_hint, spec.normalised_kind()):
-            log.info(
-                "Diagram for %s requested '%s' but got '%s' - retrying with the kind pinned",
-                block.id, kind_hint, spec.normalised_kind(),
-            )
-            try:
-                corrected = await self._request_spec(
-                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
-                    memory=memory_text, kind_hint=kind_hint, pin_kind=True, block_id=block.id,
-                )
-                corrected = self._normalise(corrected)
-                if not _kind_conflicts(kind_hint, corrected.normalised_kind()):
-                    spec = corrected
-                # A persistent mismatch after pinning means the brief itself
-                # doesn't fit the requested kind - keep the original rather
-                # than looping; is_usable() below still gets the final say.
-            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
-                log.warning("Diagram kind-correction retry failed for %s: %s", block.id, exc)
-
+        # but the model reached for a sequential one anyway.
+        needs_kind_correction = _kind_conflicts(kind_hint, spec.normalised_kind())
         # A bounded procedure needs exactly one Start and one shared End -
         # a real, confirmed case: a spec with three separate terminal nodes
         # (Close, Escalate, Keep Task) none of which pointed at a single
-        # shared End left one path with nothing to connect to. One retry,
-        # feeding back exactly which nodes are disconnected, before
-        # rendering ever sees it - render_diagram_svg's own connectivity
-        # repairs (connect_real / the final sweep) still guarantee no REAL
-        # edge is ever silently dropped even if this retry doesn't fully
-        # fix the spec, so a persistent issue is logged and rendered
-        # anyway rather than discarded for the unreliable raster fallback.
+        # shared End left one path with nothing to connect to.
         connectivity_issues = _flow_chart_connectivity_issues(spec)
         # Carries over into the final, successful save below (see its own
         # merge_content call) ONLY if the retry fails to resolve them -
         # starts at whatever the first attempt found; replaced with [] the
-        # moment a clean `reconnected` spec is accepted, so a since-resolved
-        # problem is never persisted as if it still shipped.
+        # moment a clean corrected spec is accepted, so a since-resolved
+        # problem is never persisted as if it still shipped. render_diagram_
+        # svg's own connectivity repairs still guarantee no REAL edge is
+        # ever silently dropped even if a persistent issue ships anyway.
         unresolved_connectivity_issues = connectivity_issues
-        if connectivity_issues:
+
+        if needs_consolidation or needs_kind_correction or connectivity_issues:
+            feedback_parts: list[str] = []
+            retry_kind_hint = spec.normalised_kind()
+            if needs_consolidation:
+                feedback_parts.append(
+                    f"Your previous attempt had {labelled_count} nodes, more than a "
+                    f"{spec.normalised_kind()} diagram can clearly show (maximum {cap}). "
+                    "Consolidate closely related steps so the total is at most "
+                    f"{cap} nodes, while keeping the sequence faithful to the brief - "
+                    "merge an action with its immediate follow-up rather than dropping "
+                    "any genuinely distinct stage."
+                )
+            if needs_kind_correction:
+                feedback_parts.append(
+                    f"You produced a '{spec.normalised_kind()}' diagram, but this brief needs "
+                    f"a '{kind_hint}' one - use that shape instead."
+                )
+                retry_kind_hint = kind_hint
+            if connectivity_issues:
+                feedback_parts.append(
+                    "The rendered flowchart had structural problems: " + "; ".join(connectivity_issues) + ". "
+                    "Every node except the single Start must have at least one real incoming edge; every "
+                    "node except the single End must have at least one real outgoing edge (or loop back to "
+                    "an earlier step). Route every terminal outcome (closing, escalating, keeping, etc.) "
+                    "to the SAME single End node rather than leaving it as its own separate dead end."
+                )
+                if not needs_kind_correction:
+                    retry_kind_hint = "flow_chart"
             log.info(
-                "Diagram for %s has connectivity problems (%s) - retrying with targeted feedback",
-                block.id, connectivity_issues,
+                "Diagram for %s needs correction (consolidation=%s, kind=%s, connectivity=%s) - "
+                "retrying once with combined feedback",
+                block.id, needs_consolidation, needs_kind_correction, bool(connectivity_issues),
             )
             try:
-                reconnected = await self._request_spec(
+                corrected = await self._request_spec(
                     purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
-                    memory=memory_text, kind_hint="flow_chart", pin_kind=True, block_id=block.id,
-                    qa_feedback=(
-                        "The rendered flowchart had structural problems: " + "; ".join(connectivity_issues) + ". "
-                        "Every node except the single Start must have at least one real incoming edge; every "
-                        "node except the single End must have at least one real outgoing edge (or loop back to "
-                        "an earlier step). Route every terminal outcome (closing, escalating, keeping, etc.) "
-                        "to the SAME single End node rather than leaving it as its own separate dead end."
-                    ),
+                    memory=memory_text, kind_hint=retry_kind_hint, pin_kind=True, block_id=block.id,
+                    qa_feedback=" ".join(feedback_parts), existing_outline=existing_outline,
                 )
-                reconnected = self._normalise(reconnected)
-                if reconnected.normalised_kind() == "flow_chart" and not _flow_chart_connectivity_issues(reconnected):
-                    spec = reconnected
-                    unresolved_connectivity_issues = []
-                else:
-                    log.warning(
-                        "Diagram for %s still has connectivity problems after retry (%s) - rendering anyway; "
-                        "real edges are still guaranteed to reach the page, just not necessarily a single End",
-                        block.id, connectivity_issues,
+                corrected = self._normalise(corrected)
+                corrected_count = len([n for n in corrected.nodes if n.label.strip()])
+                kind_ok = not needs_kind_correction or not _kind_conflicts(kind_hint, corrected.normalised_kind())
+                count_ok = not needs_consolidation or corrected_count <= cap
+                if kind_ok and count_ok:
+                    spec = corrected
+                    unresolved_connectivity_issues = (
+                        _flow_chart_connectivity_issues(corrected) if connectivity_issues else []
                     )
+                # Otherwise keep the first spec rather than looping further -
+                # is_usable() and render_diagram_svg's own repairs still get
+                # the final say, same safety net as before.
             except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
-                log.warning("Diagram connectivity retry failed for %s: %s", block.id, exc)
+                log.warning("Diagram corrective retry failed for %s: %s", block.id, exc)
 
         if not spec.is_usable():
             log.info(
@@ -799,17 +1197,41 @@ class DiagramService:
         # Structural usability (right number of labelled nodes/edges) says
         # nothing about whether the content is actually ABOUT the brief -
         # the gap behind "a flowchart with boxes but no meaningful
-        # information". One bounded content-relevance retry, same shape as
-        # every other QA step here; unlike the connectivity check above,
-        # there's no renderer-level safety net for wrong CONTENT, so a
-        # persistent failure falls back to the raster illustration path
-        # rather than shipping it, same as a persistent render-QA failure.
+        # information". Bounded content-relevance retries, same shape as
+        # every other QA step here. A persistent GARBLED-TEXT failure still
+        # falls back to the raster illustration path, same as a persistent
+        # render-QA failure (see the garbled-text check right after this
+        # retry loop) - but a persistent off-topic/generic/missing-concept
+        # failure now ships the best attempt anyway, flagged for review
+        # (fallback-cascade root-cause fix - see this module's own
+        # docstring), since the retry loop below already always keeps the
+        # single best spec seen across every attempt.
+        #
+        # Up to _MAX_CONTENT_QA_RETRIES attempts (not just one): a real,
+        # confirmed case showed a SINGLE retry wasn't always enough for the
+        # model to actually fold in a specific missing concept (e.g. "show
+        # an explicit frame-conversion/rotation step") even when told
+        # exactly what was missing - the diagram fell back to the generic,
+        # unlabelled illustration path every time even though a second
+        # attempt, with the SAME feedback, often does land it. Still bounded
+        # (never unlimited) and still feeds back the latest failure's exact
+        # reasons each time, same as the one-retry version did.
         brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
         content_result = await evaluate_content(spec, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings)
-        if not content_result.passed:
+        # `spec`/`content_result` always track the BEST attempt seen so far
+        # (never regress to a worse one at the end), but the retry loop
+        # itself keeps spending its bounded budget off the MOST RECENT
+        # attempt's own feedback even when an attempt didn't improve on the
+        # issue count - a later retry can still fix a *different* instance
+        # of the same issue type (e.g. the missing concept's wording) that a
+        # raw count comparison can't see.
+        latest_result = content_result
+        for _ in range(_MAX_CONTENT_QA_RETRIES):
+            if latest_result.passed:
+                break
             log.info(
                 "Diagram content QA failed for %s (%s) - retrying with targeted feedback",
-                block.id, [issue.reason for issue in content_result.issues],
+                block.id, [issue.reason for issue in latest_result.issues],
             )
             try:
                 retried = await self._request_spec(
@@ -817,25 +1239,43 @@ class DiagramService:
                     memory=memory_text, kind_hint=spec.normalised_kind(), pin_kind=True, block_id=block.id,
                     qa_feedback=(
                         "The previous attempt's content was rejected for these reasons: "
-                        + "; ".join(issue.detail for issue in content_result.issues)
+                        + "; ".join(issue.detail for issue in latest_result.issues)
                         + ". Make every label specific and genuinely about this exact brief - "
                         "never a generic placeholder - and cover every concept the brief named."
                     ),
+                    existing_outline=existing_outline,
                 )
                 retried = self._normalise(retried)
-                if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
-                    retried_result = await evaluate_content(
-                        retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
-                    )
-                    if retried_result.passed or len(retried_result.issues) < len(content_result.issues):
-                        spec, content_result = retried, retried_result
-            except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
+                if retried.normalised_kind() != spec.normalised_kind() or not retried.is_usable():
+                    break
+                retried_result = await evaluate_content(
+                    retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
+                )
+                latest_result = retried_result
+                if retried_result.passed or len(retried_result.issues) < len(content_result.issues):
+                    spec, content_result = retried, retried_result
+            except Exception as exc:  # noqa: BLE001 - keep the best spec, don't fail the block
                 log.warning("Diagram content-QA retry failed for %s: %s", block.id, exc)
+                break
 
-            if not content_result.passed:
+        # Fallback-cascade root-cause fix: a diagram whose text is actually
+        # BROKEN (corrupted homoglyphs, or an LLM-confirmed misspelled/
+        # scrambled label) is never shippable regardless of how on-topic it
+        # otherwise is - that still falls back to the raster illustration
+        # path exactly as before. But every OTHER content-QA issue
+        # (off_topic/generic_content/missing_key_concept) is a judgment call
+        # about how WELL the diagram covers the brief, not a claim its real,
+        # legible, correctly-spelled labels are wrong - see this module's own
+        # docstring for why shipping that anyway, flagged for review, beats
+        # discarding it for an illustration fallback that has nothing
+        # structured left to fall back on itself.
+        content_qa_unresolved: list[dict] = []
+        if not content_result.passed:
+            garbled_types = {STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT}
+            if any(issue.reason in garbled_types for issue in content_result.issues):
                 log.info(
-                    "Diagram for %s still has content issues after retry - falling back to illustration",
-                    block.id,
+                    "Diagram for %s still has garbled/misspelled text after %s retries - "
+                    "falling back to illustration", block.id, _MAX_CONTENT_QA_RETRIES,
                 )
                 block.content = merge_content(
                     block.type,
@@ -848,6 +1288,15 @@ class DiagramService:
                     },
                 )
                 return False
+            log.info(
+                "Diagram for %s still has content-coverage issues after %s retries - shipping the best "
+                "attempt anyway, flagged for review, rather than discarding a real, topic-grounded diagram "
+                "for an unrelated illustration", block.id, _MAX_CONTENT_QA_RETRIES,
+            )
+            content_qa_unresolved = visual_qa_finding_entries(
+                [(issue.reason, issue.detail, issue.deterministic) for issue in content_result.issues],
+                resolution="rendered_with_unresolved_issues",
+            )
 
         if spec.normalised_kind() == "schematic":
             spec = await self._resolve_and_check_schematic(
@@ -908,7 +1357,17 @@ class DiagramService:
         # suite). Real QA coverage for these kinds is worth having - it
         # catches a genuinely broken diagram the same way it always did
         # for the box-based kinds.
-        _exempt_kinds = ("schematic", "graph")
+        # puzzle_pieces is exempt too: its pieces are drawn as `<path>`
+        # shapes (diagram_render_qa._shape_bbox has no notion of a path's
+        # own bounding box, so they're silently invisible to the overlap
+        # check either way) that DELIBERATELY interlock - each piece's tab
+        # bulges a few px into its neighbour's notch, by construction, the
+        # entire point of the shape. A bbox-overlap check built for
+        # discrete, non-touching node boxes would misread that intentional
+        # interlock as a collision defect; the pieces' own fixed,
+        # non-overlapping grid spacing (see _layout_puzzle_pieces) is
+        # already what guarantees they never ACTUALLY collide.
+        _exempt_kinds = ("schematic", "graph", "puzzle_pieces")
         issues = [] if spec.normalised_kind() in _exempt_kinds else validate_rendered_svg(svg_bytes, kind=spec.normalised_kind())
         if issues:
             log.info(
@@ -925,6 +1384,7 @@ class DiagramService:
                         + ". Use noticeably shorter labels and fewer nodes so everything has room to lay "
                         "out cleanly."
                     ),
+                    existing_outline=existing_outline,
                 )
                 retried = self._normalise(retried)
                 if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
@@ -968,6 +1428,14 @@ class DiagramService:
             return False
 
         relative = self.storage.save_asset(course_id, svg_bytes, extension="svg")
+        # See _correction_drift_issue's own docstring - a no-op ([], None)
+        # whenever this generation wasn't a replace_image correction at all
+        # (existing_outline unset), so a fresh first-time generation never
+        # gets a finding here.
+        drift_issue = _correction_drift_issue(existing_outline, spec)
+        findings = [("flow_chart_connectivity", detail, True) for detail in unresolved_connectivity_issues]
+        if drift_issue:
+            findings.append(("replace_image_correction_drift", drift_issue, True))
         block.content = merge_content(
             block.type,
             block.content,
@@ -1004,10 +1472,14 @@ class DiagramService:
                 # module's own "rendered anyway, unresolved" case;
                 # `deterministic=True` because `_flow_chart_connectivity_
                 # issues` is pure in/out-degree counting, no AI judgment call.
-                "visual_qa_findings": visual_qa_finding_entries(
-                    [("flow_chart_connectivity", detail, True) for detail in unresolved_connectivity_issues],
-                    resolution="rendered_with_unresolved_issues",
-                ) if unresolved_connectivity_issues else [],
+                # `content_qa_unresolved` (built above, same resolution) is
+                # concatenated in rather than replacing this - the two are
+                # independent issue sets (connectivity/drift vs content-
+                # coverage) that can both be non-empty on the same block.
+                "visual_qa_findings": (
+                    visual_qa_finding_entries(findings, resolution="rendered_with_unresolved_issues")
+                    if findings else []
+                ) + content_qa_unresolved,
             },
         )
         log.info(

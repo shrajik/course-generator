@@ -24,6 +24,7 @@ import asyncio
 import dataclasses
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from app.agents.planner import PlannerAgent
@@ -56,6 +57,7 @@ from app.course.document.builder import build_document, finalize_toc_page, reflo
 from app.course.document.diagram_compaction import compact_diagrams_for_spacing
 from app.course.document.layout import image_generation_failed
 from app.course.document.visual_repair import audit_and_repair_visuals
+from app.services.diagram_diversity import balance_diagram_kinds
 from app.services.visual_review import VisualReviewService
 from app.course.templates.registry import ensure_template_loaded, load_template
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
@@ -77,7 +79,7 @@ from app.schemas.course import (
     SourceUse,
     WorkspaceActivityEntry,
 )
-from app.schemas.document import CourseDocument
+from app.schemas.document import Block, CourseDocument
 from app.schemas.draft import (
     ChapterInventoryIssue,
     ChapterResearchIssue,
@@ -934,6 +936,27 @@ class CourseService:
                 accepted=True,
             )
 
+        # Cross-process guard: `self._jobs` only protects against a second
+        # call *within this same process* - it's empty right after a
+        # restart, or in a second process entirely. A persisted run that
+        # still looks "queued"/"running" AND was updated recently (every
+        # chapter/image completion bumps `run.updated_at`) is trusted as
+        # genuinely still in flight somewhere and refused here; once it goes
+        # stale past `generation_heartbeat_stale_seconds`, it's treated the
+        # same way the crash-recovery startup scan treats it - abandoned,
+        # safe to start fresh (normally caught earlier by that scan, but
+        # this covers the gap between a crash and the next restart).
+        if record.run and record.run.state in ("queued", "running") and self._run_heartbeat_fresh(record.run):
+            log.info("Generation already running for %s elsewhere (job %s)", course_id, record.run.job_id)
+            return GenerateResponse(
+                course_id=course_id,
+                document_id=record.document_id,
+                status=record.status,
+                mode="background",
+                job_id=record.run.job_id,
+                accepted=True,
+            )
+
         job_id = new_id("job")
         record.run = RunInfo(
             job_id=job_id,
@@ -943,6 +966,9 @@ class CourseService:
             updated_at=utc_now_iso(),
             chapters_total=len(request.chapter_ids or record.chapters) or len(record.chapters),
             writing_mode=self.settings.writing_mode,
+            # Carried over, not reset - see the matching comment in
+            # generate()'s own RunInfo reconstruction.
+            retry_count=record.run.retry_count if record.run else 0,
         )
         record.last_error = None
         await self._save_course(record)
@@ -984,12 +1010,110 @@ class CourseService:
             # subscriber know there's nothing left to replay.
             get_stream_hub().clear_course(course_id)
 
+    def _run_heartbeat_fresh(self, run: RunInfo) -> bool:
+        if not run.updated_at:
+            return False
+        try:
+            updated = datetime.fromisoformat(run.updated_at)
+        except ValueError:  # pragma: no cover
+            return False
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - updated).total_seconds()
+        return age < self.settings.generation_heartbeat_stale_seconds
+
+    async def recover_interrupted_courses(self) -> list[str]:
+        """Crash-recovery startup scan (see app/main.py's lifespan). On a
+        fresh process, `self._jobs` is empty - any course whose persisted
+        run was left "queued"/"running" was therefore orphaned by whatever
+        stopped the previous process, not something actually in flight.
+        Marks each "interrupted" and, up to
+        `settings.generation_max_auto_resume_retries` times total, resumes
+        it automatically from its now-consistent per-stage checkpoints (see
+        `_generate_chapter`). Past that limit it's left "interrupted" for a
+        human to resume via `POST /generate {"resume": true}` - bounds a
+        crash-loop for a course whose own content reliably kills the
+        process. Best-effort and never raises: one bad course record must
+        never block the rest of startup.
+        """
+        recovered: list[str] = []
+        try:
+            course_ids = await self._interrupted_course_ids()
+        except Exception:  # noqa: BLE001 - startup must not be blocked
+            log.exception("Crash-recovery scan could not list courses")
+            return recovered
+        for course_id in course_ids:
+            try:
+                record = await self._load_course(course_id)
+                if not record.run or record.run.state not in ("queued", "running"):
+                    continue
+                retry_count = record.run.retry_count
+                record.run.state = "interrupted"
+                await self._save_course(record)
+                recovered.append(course_id)
+                log.warning("Course %s was interrupted by a backend restart", course_id)
+                if retry_count < self.settings.generation_max_auto_resume_retries:
+                    await self._patch_run(course_id, retry_count=retry_count + 1)
+                    await self.start_generation(course_id, GenerateRequest(resume=True))
+                else:
+                    log.warning(
+                        "Course %s already auto-resumed %s time(s) - leaving for manual resume",
+                        course_id, retry_count,
+                    )
+            except Exception:  # noqa: BLE001 - one bad course must not sink the scan
+                log.exception("Crash-recovery could not process %s", course_id)
+        return recovered
+
+    async def _interrupted_course_ids(self) -> list[str]:
+        if self.use_db:
+            async with get_database_service() as db:
+                return await db.list_course_ids_by_run_state(["queued", "running"])
+        ids: list[str] = []
+        for course_id in self.storage.list_course_ids():
+            try:
+                record = self.storage.load_course(course_id)
+            except Exception:  # noqa: BLE001 - skip an unreadable course record
+                continue
+            if record.run and record.run.state in ("queued", "running"):
+                ids.append(course_id)
+        return ids
+
     async def job_state(self, course_id: str) -> RunInfo | None:
         try:
             record = await self._load_course(course_id)
             return record.run
         except NotFoundError:
             return None
+
+    async def cancel_generation(self, course_id: str) -> bool:
+        """Stop a running/queued generation. Returns True if a live task was
+        actually cancelled, False if there was nothing in-memory to cancel
+        (already finished, or this process didn't start it - e.g. after a
+        restart). Either way, a stale "queued"/"running" record is patched
+        to "cancelled" so the course record reflects reality.
+
+        No special handling is needed inside the pipeline itself:
+        `asyncio.Task.cancel()` raises `CancelledError` at whatever await
+        point is currently suspended (an AI call, or a `gather` over chapter/
+        image workers - cancelling the outer task cancels every pending
+        child too), which propagates up to `_run_job`'s existing
+        `except asyncio.CancelledError` handler. `CancelledError` is a
+        `BaseException`, not `Exception`, since Python 3.8 - none of the
+        pipeline's `except Exception` blocks can accidentally swallow it and
+        keep working after a cancel.
+        """
+        task = self._jobs.get(course_id)
+        cancelled_live = False
+        if task is not None and not task.done():
+            task.cancel()
+            cancelled_live = True
+        try:
+            record = await self._load_course(course_id)
+        except NotFoundError:
+            return cancelled_live
+        if record.run and record.run.state in ("queued", "running"):
+            await self._patch_run(course_id, state="cancelled")
+        return cancelled_live
 
     # --- phases 2+3: generate ---------------------------------------------
     async def generate(
@@ -1012,10 +1136,22 @@ class CourseService:
             # run sees it; cleared when a run carries none.
             record.sam_feedback = request.sam_feedback.strip()
             if request.resume:
+                # Stage-level, not chapter-level: a chapter that was written
+                # but not yet reviewed (crash mid-review) still goes through
+                # `_generate_chapter`, which now resumes it straight into the
+                # review stage rather than repaying the write call - see its
+                # own docstring. Only a chapter whose persisted progress
+                # already shows BOTH written and reviewed is skipped
+                # entirely, never one that's merely "has some file."
+                progress_by_id = {p.chapter_id: p for p in record.chapters}
                 targets = [
                     chapter
                     for chapter in targets
-                    if not self.storage.has_chapter(course_id, chapter.id, chapter.order)
+                    if not (
+                        (p := progress_by_id.get(chapter.id))
+                        and p.written
+                        and p.reviewed
+                    )
                 ]
                 log.info("Resuming %s: %s chapters left", course_id, len(targets))
             if not targets:
@@ -1044,6 +1180,10 @@ class CourseService:
                 chapters_total=len(targets),
                 chapters_done=0,
                 writing_mode=self.settings.writing_mode,
+                # Carried over, not reset - this is the crash-recovery
+                # auto-resume counter (see recover_interrupted_courses); a
+                # resumed run must not look like a fresh, never-retried one.
+                retry_count=record.run.retry_count if record.run else 0,
             )
             await self._save_course(record)
 
@@ -1252,6 +1392,14 @@ class CourseService:
 
         return ContinuityContext(previous=previous, upcoming=upcoming, planned=used_planned)
 
+    def _progress_for(self, record: CourseRecord, chapter_id: str) -> ChapterProgress:
+        for progress in record.chapters:
+            if progress.chapter_id == chapter_id:
+                return progress
+        # Should not happen - `chapters` is seeded from the blueprint at plan
+        # time - but a safe "nothing done yet" default is better than a crash.
+        return ChapterProgress(chapter_id=chapter_id, title="")
+
     async def _generate_chapter(
         self,
         *,
@@ -1262,20 +1410,57 @@ class CourseService:
         research,
         continuity: ContinuityContext,
     ) -> GeneratedChapter:
+        """Write, then review, a chapter - as two independently-resumable
+        stages rather than one atomic call. A crash (or cancellation)
+        between them must not repay the write AI call on resume, and must
+        never leave a `written`/`reviewed` flag persisted for content that
+        was not *also* durably saved - every save below happens BEFORE the
+        matching `_mark_progress` call, never after (a real, confirmed
+        ordering bug in the previous version of this function: `written`
+        used to be marked true before the chapter was ever written to
+        disk, so a crash during review left the DB claiming work that
+        didn't exist anywhere)."""
         hub = get_stream_hub()
+        progress = self._progress_for(record, chapter.id)
+        existing = (
+            self.storage.load_chapter(record.course_id, chapter.id, chapter.order)
+            if self.storage.has_chapter(record.course_id, chapter.id, chapter.order)
+            else None
+        )
         try:
-            blocks, summary = await self.writer.write_chapter(
-                blueprint=blueprint,
-                chapter=chapter,
-                template=template,
-                course_input=self._run_input(record),
-                research=research,
-                continuity=continuity,
-                on_delta=make_stream_sink(record.course_id, chapter.id, "writing"),
-            )
-            await self._mark_progress(
-                record, chapter.id, researched=research is not None, written=True
-            )
+            if progress.written and existing is not None:
+                # Already written and durably saved in an earlier attempt -
+                # resume straight into review, never repaying the write call.
+                blocks = [Block.model_validate(b) for b in existing.blocks]
+                summary = existing.summary
+            else:
+                blocks, summary = await self.writer.write_chapter(
+                    blueprint=blueprint,
+                    chapter=chapter,
+                    template=template,
+                    course_input=self._run_input(record),
+                    research=research,
+                    continuity=continuity,
+                    on_delta=make_stream_sink(record.course_id, chapter.id, "writing"),
+                )
+                self.storage.save_chapter(
+                    record.course_id,
+                    to_generated_chapter(
+                        chapter=chapter,
+                        blocks=blocks,
+                        summary=summary,
+                        review=None,
+                        revisions=0,
+                        model="mock" if self.ai.is_mock else self.settings.writer_model,
+                    ),
+                )
+                await self._mark_progress(
+                    record, chapter.id, researched=research is not None, written=True
+                )
+
+            if progress.reviewed and existing is not None:
+                # Review already ran and was persisted - never re-run it.
+                return existing
 
             review: ChapterReview | None = None
             structural_findings: list[StructuralFinding] = []
@@ -1407,17 +1592,106 @@ class CourseService:
             if record.input.content_level == 1:
                 generate_images = False
             if generate_images:
+                # Course-level diagram-kind diversity: relabels a bounded
+                # number of genuinely over-used diagram_kind blocks BEFORE
+                # they're generated, so the corrected kind is what actually
+                # renders - see app.services.diagram_diversity's own module
+                # docstring for why this (not continuity_pass above, which
+                # only warns about prose) is the real fix for "the
+                # generator keeps producing the same flowchart/SmartArt
+                # types". Never touches an already-generated block (resume-
+                # safe by construction - see its own docstring); zero AI
+                # calls when nothing is actually over-used.
+                try:
+                    warnings.extend(await balance_diagram_kinds(document, ai=self.ai, settings=self.settings))
+                except Exception as exc:  # noqa: BLE001 - advisory only, never blocks generation
+                    log.warning("Diagram diversity pass failed for %s: %s", record.course_id, exc)
                 # Images run after the document is already readable, so they are
                 # never what the user is waiting on to start editing.
                 record.status = "illustrating"
-                await self._save_course(record)
-                images = await self.images.generate_missing(
-                    document=document, template=template, force=request.force
+                images_total = len(
+                    self.images.missing_image_blocks(document, force=request.force)
                 )
+                record.run = record.run or RunInfo()
+                record.run.images_total = images_total
+                record.run.images_done = 0
+                await self._save_course(record)
+
+                images_done = 0
+                save_lock = self._document_locks.setdefault(record.course_id, asyncio.Lock())
+
+                async def _on_image_done(block, ok: bool) -> None:  # noqa: ANN001 - Block, local closure
+                    nonlocal images_done
+                    images_done += 1
+                    # Each image's result is durably saved the moment it
+                    # finishes, not batched - a crash partway through the
+                    # batch no longer loses every image that already
+                    # succeeded (see ImageService.generate_missing's own
+                    # docstring on `on_progress`). Mutates the SAME `record`
+                    # object the rest of `_finalise` goes on to use (not a
+                    # separately-loaded copy via `_patch_run`) - otherwise
+                    # the terminal RunInfo save at the end of this function
+                    # would read back the stale pre-loop `images_done=0` and
+                    # clobber every one of these updates. Serialised through
+                    # the same lock that already guards concurrent document
+                    # rebuilds for this course.
+                    async with save_lock:
+                        # Reflow BEFORE this intermediate save, not only once
+                        # after the whole batch finishes below - a real,
+                        # confirmed bug: a block's `layout.y`/`layout.height`
+                        # is set from a pre-generation placeholder estimate
+                        # (DEFAULT_IMAGE_ASPECT, a squat 16:9 guess - see
+                        # app.course.document.layout.image_box_height), but
+                        # the figure actually renders (both here and in any
+                        # client that reads the document mid-batch, e.g. the
+                        # editor/preview) from the block's REAL now-generated
+                        # content.width/height - which can be far taller (a
+                        # tall flow_chart diagram, easily 2-3x a 16:9 guess).
+                        # Without reflowing first, this per-image save
+                        # durably persists exactly that mismatch - the real
+                        # image rendering tall while every block after it on
+                        # the page still sits at its old, too-high position -
+                        # so anyone who loads the document in that window
+                        # sees the next block's text rendered on top of the
+                        # image instead of below it. The old code only
+                        # reflowed once after `generate_missing` fully
+                        # returned (still done below, now a cheap no-op
+                        # confirmation pass); every save in between is also a
+                        # point the document can be read from (incremental
+                        # persistence's whole purpose), so it needs the same
+                        # guarantee of self-consistent layout.
+                        reflow_document(document, template)
+                        await self._save_document(document)
+                        record.run.images_done = images_done
+                        record.run.updated_at = utc_now_iso()
+                        await self._save_course(record)
+
+                with metrics_phase("images"):
+                    images = await self.images.generate_missing(
+                        document=document,
+                        template=template,
+                        force=request.force,
+                        on_progress=_on_image_done,
+                        job_id=job_id,
+                    )
                 # A failed picture shrinks to a one-line strip, so the pages
                 # need re-flowing then too, not only when something succeeded.
                 if images or any(image_generation_failed(block) for _, block in document.iter_blocks()):
                     reflow_document(document, template)
+
+                async def _on_repair_progress(done: int, total: int) -> None:
+                    # Lightweight: only the progress counters, not a full
+                    # document reflow+save - see this function's own
+                    # docstring in visual_repair.py for why a partially-
+                    # applied document mid-batch wouldn't be meaningful to
+                    # persist anyway (insertions land after the WHOLE
+                    # concurrent batch returns, not as each one finishes).
+                    async with save_lock:
+                        record.run.visual_repair_total = total
+                        record.run.visual_repair_done = done
+                        record.run.updated_at = utc_now_iso()
+                        await self._save_course(record)
+
                 # Post-pagination visual repair: only NOW, with every
                 # originally-planned visual generated and the document
                 # paginated with their real (not estimated) heights, can a
@@ -1425,7 +1699,10 @@ class CourseService:
                 # audit every page and top up any still-deficient ones (see
                 # app.course.document.visual_repair for why this can't
                 # happen any earlier in the pipeline).
-                repair = await audit_and_repair_visuals(document, template, images=self.images, ai=self.ai)
+                repair = await audit_and_repair_visuals(
+                    document, template, images=self.images, ai=self.ai,
+                    job_id=job_id, on_progress=_on_repair_progress,
+                )
                 if repair.repaired:
                     log.info(
                         "Visual repair for %s: %s page(s) repaired, %s still deficient",
@@ -1440,7 +1717,8 @@ class CourseService:
                 # Re-renders the SAME already-stored spec more compactly
                 # (tighter spacing only, never smaller text) - no new AI
                 # call - and re-paginates.
-                compaction = await compact_diagrams_for_spacing(document, template, storage=self.storage)
+                with metrics_phase("diagram_compaction"):
+                    compaction = await compact_diagrams_for_spacing(document, template, storage=self.storage)
                 if compaction.compacted:
                     log.info(
                         "Diagram compaction for %s: %s diagram(s) compacted to recover page space",
@@ -1449,35 +1727,45 @@ class CourseService:
                 # Check every real picture and diagram against its text, and
                 # regenerate only the ones that fail.
                 if self.settings.enable_visual_review:
+                    async def _on_review_progress(block, done: int, total: int) -> None:  # noqa: ANN001 - Block, local closure
+                        async with save_lock:
+                            record.run.visual_review_total = total
+                            record.run.visual_review_done = done
+                            record.run.updated_at = utc_now_iso()
+                            await self._save_course(record)
+
                     try:
                         visual_report = await VisualReviewService(
                             ai=self.ai, settings=self.settings, storage=self.storage, images=self.images
-                        ).review_document(document, template, fix=True)
+                        ).review_document(
+                            document, template, fix=True, job_id=job_id, on_progress=_on_review_progress,
+                        )
                         if visual_report.counts()["regenerated"]:
                             reflow_document(document, template)
                         warnings.extend(visual_report.warnings())
                     except Exception as exc:  # noqa: BLE001 - a review problem never fails the course
                         log.warning("Visual review failed for %s: %s", record.course_id, exc)
                         warnings.append("The visual check could not be run.")
-                await self._save_document(document)
-                # QA gate: now that every image is in and the document is
-                # reflowed with real (not estimated) heights, catch a page
-                # a large image's real size left mostly blank, or a fully
-                # blank page - see app.services.pdf_spacing_qa's own
-                # docstring for the regression this closes. Advisory only
-                # (reuses the existing warnings channel, same as the
-                # continuity/quality-gate checks below) - it never blocks
-                # or retries generation; the fix lives in the layout engine
-                # itself (app.course.document.layout) plus the diagram
-                # compaction pass just above, both applied to every course
-                # automatically, so there is nothing further to re-apply here.
-                spacing_report = check_pdf_spacing(document)
-                if not spacing_report.ok:
-                    log.warning("PDF spacing QA for %s:\n%s", record.course_id, spacing_report.summary())
-                    warnings.append(
-                        f"PDF spacing check found {len(spacing_report.findings)} page(s) with excess "
-                        f"blank space and {len(spacing_report.blank_pages)} fully blank page(s) - see logs."
-                    )
+                with metrics_phase("finalization"):
+                    await self._save_document(document)
+                    # QA gate: now that every image is in and the document is
+                    # reflowed with real (not estimated) heights, catch a page
+                    # a large image's real size left mostly blank, or a fully
+                    # blank page - see app.services.pdf_spacing_qa's own
+                    # docstring for the regression this closes. Advisory only
+                    # (reuses the existing warnings channel, same as the
+                    # continuity/quality-gate checks below) - it never blocks
+                    # or retries generation; the fix lives in the layout engine
+                    # itself (app.course.document.layout) plus the diagram
+                    # compaction pass just above, both applied to every course
+                    # automatically, so there is nothing further to re-apply here.
+                    spacing_report = check_pdf_spacing(document)
+                    if not spacing_report.ok:
+                        log.warning("PDF spacing QA for %s:\n%s", record.course_id, spacing_report.summary())
+                        warnings.append(
+                            f"PDF spacing check found {len(spacing_report.findings)} page(s) with excess "
+                            f"blank space and {len(spacing_report.blank_pages)} fully blank page(s) - see logs."
+                        )
             # Real TOC page numbers: only knowable now that every page
             # number in the document is truly final - unconditional
             # (unlike the image-only steps above), since even a text-only
@@ -1485,13 +1773,15 @@ class CourseService:
             # real pages at this point. See finalize_toc_page's own
             # docstring for why this must be the two-pass build's second
             # pass, and why it's safe to call exactly here.
-            finalize_toc_page(
-                document, self.storage.load_all_chapters(record.course_id), template, storage=self.storage
-            )
-            await self._save_document(document)
+            with metrics_phase("finalization"):
+                finalize_toc_page(
+                    document, self.storage.load_all_chapters(record.course_id), template, storage=self.storage
+                )
+                await self._save_document(document)
             # The finished course is checked against the creator's own documents.
             if record.input.source_ids and self.settings.enable_fact_check:
-                warnings.extend(await self._audit_after_generation(record, document))
+                with metrics_phase("fact_check"):
+                    warnings.extend(await self._audit_after_generation(record, document))
             pages = len(document.pages)
             record.has_document = True
 
@@ -1509,34 +1799,35 @@ class CourseService:
             # being snapshotted here, so they can never go stale relative to
             # a later hand-edit.
             quality_report: QualityReport | None = None
-            try:
-                quality_chapters = self.storage.load_all_chapters(record.course_id)
-                # MOM quality-governance follow-up: this gate is advisory
-                # (never fatal to generation, exactly as before), so an
-                # incomplete inventory is surfaced as a visible, distinct
-                # warning here - never as a raised IncompleteChapterInventoryError,
-                # which is reserved for the hard submission/approval gates.
-                inventory_issues = await self._verify_inventory(record)
-                quality_report = build_course_quality_report(
-                    course_id=record.course_id,
-                    document_id=document.document_id,
-                    chapters=quality_chapters,
-                    document=document,
-                    inventory_issues=inventory_issues,
-                )
-                gate_warning = quality_gate_warning(quality_report)
-                if gate_warning:
-                    warnings.append(gate_warning)
-                inventory_warning = quality_gate_incomplete_inventory_warning(inventory_issues)
-                if inventory_warning:
-                    warnings.append(inventory_warning)
-            except Exception as exc:  # noqa: BLE001 - the gate is advisory, never fatal to generation
-                # An evaluation that could not run must never be silently
-                # indistinguishable from "evaluated and clean" - this used to
-                # only log server-side, so the course shipped with zero
-                # quality-related warnings on a genuine evaluation failure.
-                log.warning("Quality report failed for %s: %s", record.course_id, exc)
-                warnings.append(quality_gate_evaluation_failed_warning(exc))
+            with metrics_phase("quality_report"):
+                try:
+                    quality_chapters = self.storage.load_all_chapters(record.course_id)
+                    # MOM quality-governance follow-up: this gate is advisory
+                    # (never fatal to generation, exactly as before), so an
+                    # incomplete inventory is surfaced as a visible, distinct
+                    # warning here - never as a raised IncompleteChapterInventoryError,
+                    # which is reserved for the hard submission/approval gates.
+                    inventory_issues = await self._verify_inventory(record)
+                    quality_report = build_course_quality_report(
+                        course_id=record.course_id,
+                        document_id=document.document_id,
+                        chapters=quality_chapters,
+                        document=document,
+                        inventory_issues=inventory_issues,
+                    )
+                    gate_warning = quality_gate_warning(quality_report)
+                    if gate_warning:
+                        warnings.append(gate_warning)
+                    inventory_warning = quality_gate_incomplete_inventory_warning(inventory_issues)
+                    if inventory_warning:
+                        warnings.append(inventory_warning)
+                except Exception as exc:  # noqa: BLE001 - the gate is advisory, never fatal to generation
+                    # An evaluation that could not run must never be silently
+                    # indistinguishable from "evaluated and clean" - this used to
+                    # only log server-side, so the course shipped with zero
+                    # quality-related warnings on a genuine evaluation failure.
+                    log.warning("Quality report failed for %s: %s", record.course_id, exc)
+                    warnings.append(quality_gate_evaluation_failed_warning(exc))
 
             # TASK 2 (quality audit follow-up) - the audit trail snapshot:
             # standards version/status, when this was evaluated, and the
@@ -1596,10 +1887,16 @@ class CourseService:
             finished_at=utc_now_iso(),
             chapters_total=len(generated) + len(failed),
             chapters_done=len(generated),
+            # Carried over, not reset - set earlier in THIS SAME call once
+            # the image batch's size was known (see images_total/images_done
+            # above) and across resumed runs (crash-recovery's retry_count).
+            images_total=record.run.images_total if record.run else 0,
+            images_done=record.run.images_done if record.run else 0,
             writing_mode=self.settings.writing_mode,
             eta_seconds=0.0,
             error=record.last_error,
             timings=summary or {},
+            retry_count=record.run.retry_count if record.run else 0,
         )
         await self._save_course(record)
         await self._record_generation_run(

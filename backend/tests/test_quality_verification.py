@@ -494,6 +494,57 @@ def test_a_formula_verification_failure_is_attributed_to_formula_qa_and_is_a_blo
     assert findings[0].verifier == "formula_qa:formula_mismatch"
 
 
+def test_a_withheld_image_finding_is_a_blocker_that_actually_blocks_approval():
+    """Fallback-cascade production-readiness audit fix: a completely
+    withheld image (every attempt failed quality checks, no Wikimedia match
+    either - see ImageService.generate_for_block's `image_withheld_after_
+    qa_failure` path) must be severity="blocker" AND `independently_
+    verified` - the same two-part contract `test_a_formula_verification_
+    failure_is_attributed_to_formula_qa_and_is_a_blocker` already documents
+    for `formula_mismatch`. The REASON this image was withheld (garbled
+    text or an off-topic AI judgment) is not independently verified - but
+    the fact this finding actually reports, "no image exists for this
+    block", is a directly-checkable fact, not a judgment call (mirrors
+    `image_generation_failed`'s own identical reasoning for a technical
+    failure). A real, confirmed gap this closes: with `deterministic`
+    left at its default `False`, this finding's `verification_status`
+    would be "unverified", and `QualityReport.approval_blocking_findings`
+    (`severity == "blocker" and verification_status != "unverified"`)
+    would silently exclude it - a course with a completely missing image
+    could still pass the admin-approval gate."""
+    document = _document(
+        [
+            _image_block(
+                kind="illustration",
+                generated=False,
+                path=None,
+                error=None,
+                omitted_after_qa_failure=True,
+                visual_qa_findings=[
+                    {
+                        "type": "image_withheld_after_qa_failure",
+                        "detail": "every attempt failed quality checks and no suitable Wikimedia image "
+                        "was found",
+                        "resolution": "image_withheld_after_qa_failure",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "image_service"
+    assert findings[0].severity == "blocker"
+    assert findings[0].verification_status == "independently_verified"
+    assert findings[0].verifier == "image_service:image_withheld_after_qa_failure"
+
+    # And it genuinely gates approval, not just this report-building
+    # function in isolation - same proof shape as the formula test above.
+    report = QualityReport(course_id="c1", findings=findings)
+    assert findings[0] in report.approval_blocking_findings
+    assert report.passed is False
+
+
 def test_a_malformed_formula_finding_is_major_not_a_blocker():
     """Release-readiness audit correction: `malformed_expression` must NOT
     get the same "blocker" treatment as a confirmed `formula_mismatch` -

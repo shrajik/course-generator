@@ -29,6 +29,18 @@ class ImageAssessment(BaseModel):
     necessary: bool | None = None  # adds teaching value beyond the text
     text_in_image_correct: bool | None = None  # None when the picture has no text
     labels_and_arrows_correct: bool | None = None  # for a picture meant as a diagram
+    # Only meaningful for a `illustration_style: "textbook"` picture - None for
+    # every other kind. MAI-Image-2.6 (and every other raster provider this
+    # pipeline uses) has no negative-prompt/style parameter at the API level
+    # (see azure_mai_image_provider.py's own research notes) - the flat
+    # 2D vector, no-photorealism, no-3D-render, nothing-cropped-at-the-edge
+    # style contract (image_service.TEXTBOOK_ILLUSTRATION_GUIDANCE) lives
+    # entirely in prompt text with no model-level enforcement, so this is
+    # the only check that can catch the model drifting toward a
+    # photorealistic/3D/cropped result despite that instruction - a real,
+    # confirmed gap: nothing previously verified the STYLE contract was
+    # actually followed, only relevance/text/misleading-ness.
+    style_compliant: bool | None = None
     problems: list[str] = Field(default_factory=list)
     better_prompt: str = ""  # a corrected brief for regenerating it
 

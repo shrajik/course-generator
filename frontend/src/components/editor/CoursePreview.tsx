@@ -68,8 +68,15 @@ export function CoursePreview({ documentId }: { documentId: string }) {
               key={page.id}
               className="relative shrink-0 overflow-hidden rounded-[3px] bg-white shadow-canvas"
               style={{
-                width: PAGE_WIDTH,
-                height: PAGE_HEIGHT,
+                width: Math.max(page.size?.width ?? PAGE_WIDTH, PAGE_WIDTH),
+                // A page can be taller than the default when an unsplittable
+                // block (e.g. a tall diagram + its lead-in text) doesn't fit
+                // one sheet - the layout engine grows the page rather than
+                // clip it (see Canvas.tsx's identical fix for the editor
+                // canvas). Hardcoding PAGE_HEIGHT here silently clipped that
+                // extra content via this div's own overflow:hidden instead
+                // of showing it.
+                height: Math.max(page.size?.height ?? PAGE_HEIGHT, PAGE_HEIGHT),
                 background: page.background ?? "#ffffff",
               }}
             >

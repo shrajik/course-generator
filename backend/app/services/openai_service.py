@@ -131,6 +131,29 @@ class AIClient(abc.ABC):
         so every other call keeps using the configured default."""
 
     @abc.abstractmethod
+    async def image_edit(
+        self,
+        *,
+        prompt: str,
+        image: bytes,
+        size: str | None = None,
+        phase: str = "image",
+        provider: str | None = None,
+    ) -> bytes:
+        """A genuine image-to-image EDIT: `image` (the existing picture's
+        real bytes, read from disk by the caller - never a URL, never a
+        text description of it) is sent to the provider's own editing
+        endpoint alongside `prompt` (the correction instruction), and the
+        provider's response is the EDITED result, not a fresh unrelated
+        generation. Raises AIServiceError on any failure - including when
+        the resolved provider/deployment doesn't actually support editing
+        - and the caller must NEVER catch that and silently fall back to
+        `image()` (text-to-image) instead; see ImageService._edit_
+        illustration's own docstring for why ("never claim an image was
+        edited when it was actually regenerated"). Returns PNG bytes, the
+        same contract as `image()`."""
+
+    @abc.abstractmethod
     async def embed(
         self, *, texts: list[str], model: str | None = None, phase: str = "embedding"
     ) -> list[list[float]]:
@@ -903,6 +926,160 @@ class OpenAIClient(AIClient):
             self._record(
                 kind="image",
                 purpose="image",
+                model="MAI-Image-2.6",
+                started=started,
+                retries=0,
+                failed=failed,
+                provider="azure_mai",
+            )
+            if metrics:
+                metrics.call_finished()
+
+    async def image_edit(
+        self,
+        *,
+        prompt: str,
+        image: bytes,
+        size: str | None = None,
+        phase: str = "image",
+        provider: str | None = None,
+    ) -> bytes:
+        """Dispatches exactly like `image()` (same `provider` override /
+        `settings.image_provider` default, same unsupported-value error) -
+        see that method's own docstring - but to each provider's real
+        image-to-image EDIT endpoint instead of text-to-image generation.
+        Never silently falls back to `image()` on an unrecognised or
+        unconfigured provider; the caller (ImageService._edit_illustration)
+        is responsible for the "never claim edited when actually
+        regenerated" contract on any failure raised here."""
+        resolved = (provider or self.settings.image_provider or "azure").strip().lower()
+        if resolved == "azure":
+            return await self._image_edit_azure(prompt=prompt, image=image, size=size, phase=phase)
+        if resolved == "azure_mai":
+            return await self._image_edit_azure_mai(prompt=prompt, image=image, size=size, phase=phase)
+        if resolved != "openai":
+            raise AIServiceError(
+                f"Unsupported image_provider {resolved!r} - expected 'openai', 'azure' or 'azure_mai'"
+            )
+        return await self._image_edit_openai(prompt=prompt, image=image, size=size, phase=phase)
+
+    async def _image_edit_openai(
+        self, *, prompt: str, image: bytes, size: str | None, phase: str
+    ) -> bytes:
+        """gpt-image-1's own native `images.edit` call - the OpenAI SDK
+        accepts the image as a real file-like object (a BytesIO wrapping
+        the actual bytes, named so the SDK's own multipart encoder can
+        infer a content type), never a URL or a text description."""
+        import io
+
+        started = time.perf_counter()
+        metrics = current_metrics()
+        if metrics:
+            metrics.call_started()
+
+        async def call():
+            source = io.BytesIO(image)
+            source.name = "original.png"
+            return await self.client.images.edit(
+                model=self.settings.image_model,
+                image=source,
+                prompt=prompt,
+                n=1,
+                size=size or self.settings.image_size,
+            )
+
+        retries = 0
+        failed = True
+        try:
+            response, retries = await self._with_retries("image_edit", phase, call)
+            item = response.data[0]
+            b64 = getattr(item, "b64_json", None)
+            if b64:
+                failed = False
+                return base64.b64decode(b64)
+            url = getattr(item, "url", None)
+            if url:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=120) as http:
+                    fetched = await http.get(url)
+                    fetched.raise_for_status()
+                    failed = False
+                    return fetched.content
+            raise AIServiceError("Image edit response contained neither b64_json nor url")
+        finally:
+            self._record(
+                kind="image",
+                purpose="image_edit",
+                model=self.settings.image_model,
+                started=started,
+                retries=retries,
+                failed=failed,
+                provider="openai",
+            )
+            if metrics:
+                metrics.call_finished()
+
+    async def _image_edit_azure(
+        self, *, prompt: str, image: bytes, size: str | None, phase: str
+    ) -> bytes:
+        """FLUX.2-flex's documented reference-image edit workflow - see
+        app.services.azure_image_provider.edit_image for the actual HTTP
+        call (same provider endpoint as generation, a different request
+        shape - see that function's own docstring, verified against the
+        official Microsoft docs). `purpose="image_edit"` (not "image")
+        keeps editing and generation usage distinguishable in the recorded
+        call metrics, per this feature's own cost-tracking requirement."""
+        started = time.perf_counter()
+        metrics = current_metrics()
+        if metrics:
+            metrics.call_started()
+        failed = False
+        try:
+            return await azure_image_provider.edit_image(
+                prompt=prompt, image=image, settings=self.settings
+            )
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._record(
+                kind="image",
+                purpose="image_edit",
+                model="FLUX.2-flex",
+                started=started,
+                retries=0,
+                failed=failed,
+                provider="azure",
+            )
+            if metrics:
+                metrics.call_finished()
+
+    async def _image_edit_azure_mai(
+        self, *, prompt: str, image: bytes, size: str | None, phase: str
+    ) -> bytes:
+        """MAI-Image-2.6's documented image-edit endpoint - see
+        app.services.azure_mai_image_provider.edit_image for the actual
+        HTTP call (multipart, a real file upload of `image` - see that
+        function's own docstring, verified against the official Microsoft
+        docs). `purpose="image_edit"` (not "image") keeps editing and
+        generation usage distinguishable in the recorded call metrics."""
+        started = time.perf_counter()
+        metrics = current_metrics()
+        if metrics:
+            metrics.call_started()
+        failed = False
+        try:
+            return await azure_mai_image_provider.edit_image(
+                prompt=prompt, image=image, settings=self.settings
+            )
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._record(
+                kind="image",
+                purpose="image_edit",
                 model="MAI-Image-2.6",
                 started=started,
                 retries=0,

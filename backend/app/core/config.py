@@ -171,6 +171,36 @@ class Settings(BaseSettings):
     azure_mai_image_api_key: str = ""
     azure_mai_image_deployment: str = ""
 
+    # --- Wikimedia Commons (first-priority image source) --------------------
+    #  Checked BEFORE any AI image model for every `kind == "illustration"`
+    #  request (and the raster fallback a failed diagram/concept_experience
+    #  attempt takes) - see ImageService._try_wikimedia_image. A real,
+    #  properly-licensed Commons image that passes the same relevance/
+    #  legibility bar an AI-generated one must pass is preferred over
+    #  spending an AI call; MAI-Image-2.6/FLUX.2-flex remain the fallback,
+    #  unchanged, whenever nothing suitable is found or this is off.
+    enable_wikimedia_images: bool = True
+    #  Commons' own read API - no key required, same "full endpoint URL, not
+    #  just a base" convention as azure_mai_image_endpoint above.
+    wikimedia_api_base: str = "https://commons.wikimedia.org/w/api.php"
+    #  Wikimedia's API etiquette policy requires a descriptive User-Agent
+    #  identifying the application and a real contact method - confirmed
+    #  against a real, working reference implementation (PrepOwl's own
+    #  Wikimedia integration uses "PrepOwlTutor/1.0 (https://prepowl.ai;
+    #  visual-sourcing-pilot)", a real domain, not a placeholder). The
+    #  previous default here ("+set a real contact URL/email") was the
+    #  literal unfilled placeholder shipping in production - non-compliant
+    #  with Wikimedia's own policy by construction. Still overridable via
+    #  the WIKIMEDIA_USER_AGENT env var for a different deployment/contact.
+    wikimedia_user_agent: str = "CourseGenerator/1.0 (https://rentprompts.com; contact: ayushi@rentprompts.com)"
+    #  How many search results to evaluate (deterministic filters first,
+    #  cheap) before giving up and falling back to the AI model.
+    wikimedia_search_candidates: int = Field(default=5, ge=1, le=20)
+    #  A resolution floor so a tiny thumbnail-only upload never gets chosen
+    #  over a properly rendered AI illustration.
+    wikimedia_min_width: int = Field(default=600, ge=100, le=4000)
+    wikimedia_min_height: int = Field(default=600, ge=100, le=4000)
+
     # --- pipeline behaviour -------------------------------------------------
     research_mode: ResearchMode = "fast"
     #  parallel  - chapters are written concurrently against the blueprint's
@@ -181,6 +211,15 @@ class Settings(BaseSettings):
     #  One extra cheap call after a parallel run that checks for repetition and
     #  broken transitions across chapters.
     continuity_pass: bool = True
+    #  One bounded, batched call (never per-block) that relabels a handful
+    #  of genuinely over-used `diagram_kind` blocks to a better-fitting
+    #  alternative BEFORE diagram/image generation runs - see
+    #  app.services.diagram_diversity's own module docstring for why this
+    #  is the active fix for "the generator keeps producing the same
+    #  flowchart/SmartArt types" (continuity_pass above only WARNS about
+    #  prose repetition, never corrects anything). Zero AI calls at all
+    #  when nothing is actually over-used.
+    enable_diagram_diversity_pass: bool = True
     #  Ask the search-enabled call for structured output directly instead of
     #  shaping the notes in a second call.
     single_call_research: bool = True
@@ -261,6 +300,19 @@ class Settings(BaseSettings):
     #  itself, it only means a course ships with no pre-suggested labels
     #  (a person can still add one by hand in the editor).
     enable_image_overlay_suggestions: bool = True
+    #  Replace Image root-cause fix: when true, an AI-edit correction on an
+    #  illustration that already has a real picture on disk is sent to the
+    #  configured provider's actual image-to-image EDIT endpoint (see
+    #  app.services.azure_image_provider.edit_image / azure_mai_image_
+    #  provider.edit_image, both verified against the official Microsoft
+    #  docs - never a text-only regeneration with the old image merely
+    #  described in words). False reproduces the pre-fix behaviour exactly
+    #  (a fresh text-to-image generation from the corrective prompt) -
+    #  useful if a deployment's configured provider/API version doesn't
+    #  actually support editing yet. Diagram/concept_experience corrections
+    #  (their own `spec` fed back as context) are entirely unaffected
+    #  either way - this flag only gates the RASTER illustration path.
+    enable_image_editing: bool = True
     #  AI memory layer (templates/visual knowledge/course samples/generation
     #  history retrieval - see app.services.memory_service). Retrieval always
     #  fails soft regardless of this flag; the flag exists to disable the
@@ -321,9 +373,28 @@ class Settings(BaseSettings):
     max_concurrency: int = Field(default=6, ge=1, le=32)
     research_concurrency: int = Field(default=0, ge=0, le=32)
     writer_concurrency: int = Field(default=0, ge=0, le=32)
-    image_concurrency: int = Field(default=2, ge=0, le=32)
+    #  Default raised from 2 - benchmarked (scripts/benchmark_generation.py)
+    #  to meaningfully cut wall-clock image-generation time without
+    #  tripping provider rate limits any more often than before
+    #  (AdaptiveLimiter still halves this on its own the moment a 429 is
+    #  seen). Raise to 6+ via this env var if the provider's own quota
+    #  comfortably allows it.
+    image_concurrency: int = Field(default=4, ge=0, le=32)
     request_timeout: float = 900.0
     max_call_retries: int = Field(default=4, ge=1, le=8)
+    # Crash-recovery startup scan (see CourseService.recover_interrupted_courses):
+    # how many times a course found "interrupted" is auto-resumed before it's
+    # left for a human to resume manually - bounds a crash-loop for a course
+    # whose own content reliably kills the process.
+    generation_max_auto_resume_retries: int = Field(default=2, ge=0, le=10)
+    # How long a persisted "queued"/"running" RunInfo is trusted as genuinely
+    # still in flight (see CourseService.start_generation's cross-process
+    # guard) before a second start_generation call - from this process after
+    # the in-memory `_jobs` entry it would have seen is gone (a restart), or
+    # from a different process entirely - is allowed to proceed anyway. Each
+    # chapter/image completion bumps `run.updated_at`, so this only matters
+    # for a genuinely dead run, not a single long-running chapter.
+    generation_heartbeat_stale_seconds: int = Field(default=600, ge=60)
 
     # --- Storage / misc -----------------------------------------------------
     data_dir: Path = Path("data")
@@ -356,6 +427,39 @@ class Settings(BaseSettings):
     visual_review_max_images: int = Field(default=60, ge=0, le=500)
     visual_review_max_fixes: int = Field(default=12, ge=0, le=200)
     visual_review_model: str = ""  # empty = diagram_model (it already reads images)
+    #  How many visuals `VisualReviewService.review_document` checks/fixes at
+    #  once (see concurrency_for below) - a real, confirmed cost this fixes:
+    #  that loop used to run fully sequentially, one visual at a time, with
+    #  no concurrency at all, while the batch that GENERATES the images in
+    #  the first place is already parallelized - so "Building Document"
+    #  could sit for many minutes re-checking (and regenerating) visuals one
+    #  by one, long after "Generating Images" already showed 100%. A fixing
+    #  slot can itself run a full image regeneration (the same cost as one
+    #  worker in ImageService.generate_missing's own batch), so this is kept
+    #  in the same ballpark as image_concurrency rather than tuned
+    #  independently higher.
+    visual_review_concurrency: int = Field(default=4, ge=0, le=32)
+    #  Same reasoning as visual_review_concurrency, for
+    #  app.course.document.visual_repair.audit_and_repair_visuals's own
+    #  per-page planning+generation loop - also fully sequential before this
+    #  fix, also capable of running a full image/diagram generation per page.
+    visual_repair_concurrency: int = Field(default=4, ge=0, le=32)
+    #  Wikimedia Commons root-cause fix: deliberately kept LOW (1 = fully
+    #  serial) and SEPARATE from `image_concurrency` - a real, confirmed
+    #  comparison against a working reference implementation (PrepOwl's own
+    #  Wikimedia integration, which never issues more than one live Commons
+    #  request at a time) found that this app's own search previously ran
+    #  INSIDE the same per-image-block worker gated only by the shared
+    #  "image" limiter (4 by default) - up to 4 simultaneous Commons
+    #  requests from one IP, an unmistakable automated-burst pattern.
+    #  Wikimedia's own edge returned a real, explicit abuse/volume block
+    #  ("Please respect our robot policy... contact noc@wikimedia.org") tied
+    #  to that IP - a transient, volume-driven block, not a permanent ban or
+    #  a client-library incompatibility (plain httpx works fine at the low,
+    #  serial request rate PrepOwl's own proven implementation uses). This
+    #  throttle, not a different HTTP client or any TLS/fingerprint change,
+    #  is the actual fix - see wikimedia_provider.py's own module docstring.
+    wikimedia_concurrency: int = Field(default=1, ge=1, le=8)
 
     # --- global knowledge library (app/services/knowledge_service.py) --------
     # Admin-uploaded documents that every course searches while it is written.
@@ -498,6 +602,9 @@ class Settings(BaseSettings):
             "writer": self.writer_concurrency,
             "image": self.image_concurrency,
             "code_execution": self.code_execution_concurrency,
+            "visual_review": self.visual_review_concurrency,
+            "visual_repair": self.visual_repair_concurrency,
+            "wikimedia": self.wikimedia_concurrency,
         }.get(phase, 0)
         return override or self.max_concurrency
 

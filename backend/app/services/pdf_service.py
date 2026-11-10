@@ -16,6 +16,7 @@ from app.course.document.print import paginate_for_print
 from app.course.templates.registry import ensure_template_loaded, is_uploaded_template_id, load_template
 from app.render.html_renderer import render_document_html
 from app.schemas.document import PAGE_HEIGHT, PAGE_WIDTH, CourseDocument
+from app.services.math_qa import build_report
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
@@ -68,6 +69,33 @@ class PdfService:
         path.write_text(self.render_html(document), encoding="utf-8")
         return path
 
+    async def _check_math_rendering(self, page, course_id: str) -> None:
+        """Whether a given LaTeX string parses is a property of KaTeX's own
+        JS parser, not something Python can decide in advance (see
+        app.services.math_qa's own module docstring) - so this asks the
+        SAME live page that just typeset it, right after `window.
+        __mathRendered` confirms typesetting finished, no extra browser
+        launch. Never blocks export: a check that itself fails to run is
+        logged and dropped, same as the typesetting-wait timeout above."""
+        try:
+            error_texts: list[str] = await page.evaluate(
+                "Array.from(document.querySelectorAll('.katex-error'))"
+                ".map(el => el.textContent || '')"
+            )
+        except Exception as exc:  # noqa: BLE001 - never block export on this
+            log.warning("Could not check math rendering for %s: %s", course_id, exc)
+            return
+        report = build_report(course_id, error_texts)
+        if not report.passed:
+            log.warning(
+                "Math rendering QA for %s: %s unparseable expression(s): %s",
+                course_id, len(report.findings), [f.detail for f in report.findings],
+            )
+            self.storage.write_json(
+                self.storage.course_dir(course_id) / "math_qa.json",
+                {"course_id": course_id, "findings": [f.detail for f in report.findings]},
+            )
+
     async def export_pdf(self, document: CourseDocument) -> Path:
         await ensure_template_loaded(document.template_id)
         html_path = self.write_html(document)
@@ -95,6 +123,17 @@ class PdfService:
                         viewport={"width": int(PAGE_WIDTH), "height": int(PAGE_HEIGHT)}
                     )
                     await page.goto(html_path.resolve().as_uri(), wait_until="load")
+                    # KaTeX typesets math client-side, after `load` fires
+                    # (see course.html.j2's own inline script) - wait for
+                    # its completion signal so a page is never captured
+                    # mid-typeset. Bounded: a page with no math still sets
+                    # this immediately, and a genuinely broken KaTeX load
+                    # (missing script) times out rather than hanging forever.
+                    try:
+                        await page.wait_for_function("window.__mathRendered === true", timeout=10000)
+                    except Exception as exc:  # noqa: BLE001 - never block export on this
+                        log.warning("Timed out waiting for math typesetting on %s: %s", document.course_id, exc)
+                    await self._check_math_rendering(page, document.course_id)
                     await page.emulate_media(media="print")
                     await page.pdf(
                         path=str(pdf_path),

@@ -269,7 +269,11 @@ export interface ChapterProgress {
   sources_offered?: SourceUse[];
 }
 
-export type RunState = "queued" | "running" | "done" | "failed" | "cancelled";
+/** "interrupted" = the backend process died mid-run (found stale by the
+ * crash-recovery startup scan) - distinct from "cancelled" (the user asked
+ * to stop) and "failed" (the pipeline itself raised). All three resume via
+ * `generateCourse(courseId, { resume: true })`. */
+export type RunState = "queued" | "running" | "done" | "failed" | "cancelled" | "interrupted";
 
 /** Live state of the current or last generation run, persisted by the backend. */
 export interface RunInfo {
@@ -281,10 +285,26 @@ export interface RunInfo {
   finished_at: string;
   chapters_total: number;
   chapters_done: number;
+  /** Images run as their own batch after every chapter is written - tracked
+   * separately from chapters_total/done so progress can show real "N of M
+   * images" instead of one opaque "illustrating" phase. */
+  images_total: number;
+  images_done: number;
+  /** Post-image "Building Document" sub-stages (visual review, then visual
+   * repair) - tracked separately from images_total/done for the same
+   * reason: each is its own batch of real, sometimes slow AI work, and a
+   * static "Assembling your final document" label for several minutes
+   * after images already hit 100% is an opaque stall, not real progress. */
+  visual_review_total: number;
+  visual_review_done: number;
+  visual_repair_total: number;
+  visual_repair_done: number;
   writing_mode: string;
   eta_seconds: number | null;
   error: string | null;
   timings: Record<string, unknown>;
+  /** How many times crash recovery has auto-resumed this course. */
+  retry_count: number;
 }
 
 // --- review/approval workflow ------------------------------------------------

@@ -17,15 +17,20 @@ than silently left as-is.
 
 from __future__ import annotations
 
+import asyncio
+from typing import Awaitable, Callable
+
 from pydantic import BaseModel, Field
 
+from app.core.concurrency import get_limiter
 from app.core.logging import get_logger
+from app.core.metrics import phase as metrics_phase
 from app.course.document.builder import reflow_document
 from app.course.document.layout import page_visual_fraction
 from app.course.document.layout_validator import validate_document
 from app.core.ids import block_id as new_block_id
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, BlockType
-from app.schemas.document import Block, BlockLayout, BlockMeta, BlockStyle, CourseDocument
+from app.schemas.document import Block, BlockLayout, BlockMeta, BlockStyle, CourseDocument, Page
 from app.schemas.template import CourseTemplate
 from app.services.image_service import ImageService, chapter_section_context
 from app.services.openai_service import AIClient
@@ -207,6 +212,84 @@ class RepairReport(BaseModel):
     validation_findings: dict[int, list[str]] = Field(default_factory=dict)
 
 
+async def _plan_and_generate_one_page(
+    *,
+    page: Page,
+    document: CourseDocument,
+    template: CourseTemplate,
+    images: ImageService,
+    ai: AIClient,
+    chapter_title: str,
+    section_title: str,
+    key_concept: str,
+    job_id: str,
+) -> tuple[Page, Block | None, dict | None]:
+    """The expensive, network-bound work for ONE deficient page - planning
+    (one AI call) and, if a visual is genuinely called for, generating it
+    (the same ImageService path every other visual in this codebase goes
+    through). Returns `(page, new_block_or_None, failure_reason_or_None)`
+    and never mutates `document`/`report` itself - every caller runs a
+    batch of these concurrently (see `audit_and_repair_visuals`) and
+    applies the results (inserting blocks, appending to the report)
+    sequentially afterward, in fixed page order, so there is nothing here
+    that needs a lock: each task only ever touches its OWN page's
+    not-yet-inserted candidate block, never another task's.
+    """
+    try:
+        plan = await ai.structured(
+            schema=PageVisualPlan,
+            system=REPAIR_PLANNER_SYSTEM,
+            user=(
+                f"COURSE TITLE: {document.course_title}\n\nPAGE {page.page_number} TEXT:\n"
+                f"{_page_text(page.blocks)[:4000]}"
+            ),
+            model=images.settings.diagram_model,
+            purpose=f"visual_repair:{document.document_id}:p{page.page_number}",
+            phase="image",
+        )
+    except Exception as exc:  # noqa: BLE001 - one page's planning failure must not abort the pass
+        log.warning("Visual repair planning failed for page %s: %s", page.page_number, exc)
+        return page, None, {"page": page.page_number, "reason": f"planning failed: {exc}", "outcome": "failed"}
+
+    if not plan.needs_visual or not (plan.prompt.strip() or plan.purpose.strip()):
+        return page, None, {
+            "page": page.page_number,
+            "reason": plan.reason_if_not or "no relevant visual for this page's content",
+            "outcome": "skipped",
+        }
+
+    reference = page.blocks[-1]
+    new_block = _build_repair_block(plan, template, reference)
+    ok = await images.generate_for_block(
+        course_id=document.course_id,
+        block=new_block,
+        template=template,
+        course_title=document.course_title,
+        chapter_title=chapter_title,
+        section_title=section_title,
+        key_concept=key_concept,
+    )
+    if not ok:
+        return page, None, {
+            "page": page.page_number,
+            "reason": new_block.content.get("error") or "visual generation failed",
+            "outcome": "failed",
+        }
+    if job_id:
+        # Marks this freshly-generated-and-validated-at-generation-time
+        # visual so VisualReviewService.review_document (run right after
+        # this, in the SAME job) can skip re-spending a vision call on it -
+        # the exact same contract ImageService.generate_missing's own
+        # `worker()` already keeps for the main image batch. A real,
+        # confirmed gap this closes: a repair-inserted visual calls
+        # `images.generate_for_block` directly (bypassing
+        # `generate_missing`'s wrapper, the only place this marker used to
+        # be set), so every repair-inserted visual always got a redundant
+        # full re-check regardless of how fresh it genuinely was.
+        new_block.content["_qa_job_id"] = job_id
+    return page, new_block, None
+
+
 async def audit_and_repair_visuals(
     document: CourseDocument,
     template: CourseTemplate,
@@ -214,6 +297,8 @@ async def audit_and_repair_visuals(
     images: ImageService,
     ai: AIClient,
     max_passes: int = MAX_REPAIR_PASSES,
+    job_id: str = "",
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> RepairReport:
     """Audits every content page, plans and generates a relevant visual for
     each deficient one, inserts it, and re-paginates - bounded to
@@ -221,6 +306,25 @@ async def audit_and_repair_visuals(
     which can occasionally leave a *different* page thin, so more than one
     pass is worth attempting, but never unboundedly - see the module
     docstring). Mutates `document` in place; does not save it.
+
+    The planning+generation work for every deficient page in ONE pass runs
+    CONCURRENTLY, bounded by `get_limiter("visual_repair", ...)` - the same
+    pattern `ImageService.generate_missing` and `VisualReviewService.
+    review_document` already use. A real, confirmed cost this fixes: this
+    loop used to plan and generate one deficient page at a time, each a
+    full AI-planning-call-plus-image-generation round trip, with no
+    concurrency at all. Safe to parallelize WITHIN a pass because every
+    page's own candidate visual is independent - no page reads another
+    page's plan or generated block, and `context_map` (read-only during
+    the pass) is computed once, before any page's work starts. Applying
+    the RESULTS (inserting a block, appending to `report`) still happens
+    sequentially afterward, in fixed page order, so the report's own
+    ordering and the `attempted_anchor_ids` bookkeeping stay exactly as
+    deterministic as a fully sequential pass would have produced.
+    `reflow_document` - the one step that genuinely can't run per-page,
+    since it repositions the WHOLE document - still runs once at the end
+    of each pass, after every page's insertion for that pass has already
+    been applied, unchanged from before.
 
     A subtlety worth being explicit about: a page whose existing text
     already nearly fills it can't gain a substantial visual and KEEP it on
@@ -235,93 +339,80 @@ async def audit_and_repair_visuals(
     page (by its own last block's id, before reflow moves anything) has
     already had a repair attempt, so a page in that situation is reported
     once as `still_deficient` with the real reason, never retried into a
-    second, redundant visual stacking up wherever the first one landed."""
+    second, redundant visual stacking up wherever the first one landed.
+
+    `on_progress`, when given, fires once per deficient page attempted,
+    `(done, total)` scoped to the CURRENT pass (a second pass, when one
+    runs, starts its own fresh `1/N` - multi-pass repairs are rare and
+    bounded, and resetting per pass is simpler and no less honest than a
+    running total that would otherwise jump when a later pass discovers
+    more deficient pages)."""
     report = RepairReport()
     attempted_anchor_ids: set[str] = set()
 
-    for pass_number in range(1, max_passes + 1):
-        report.passes_run = pass_number
-        content_pages = [p for p in document.pages if p.kind == "content" and p.blocks]
-        deficient = [
-            p for p in content_pages
-            if page_needs_visual(p.blocks) and p.blocks[-1].id not in attempted_anchor_ids
-        ]
-        if not deficient:
-            break
+    with metrics_phase("visual_repair"):
+        limiter = get_limiter("visual_repair", images.settings.concurrency_for("visual_repair"))
 
-        # Computed once per pass (not once per page) over the document's
-        # CURRENT structure - reflow_document at the end of the previous
-        # pass can move blocks between pages/chapters, so this must be
-        # recomputed every pass, never cached across the whole repair run.
-        # Reuses the exact same production mechanism generate_missing()
-        # already uses (see image_service.py) - never a second,
-        # independent context-resolution implementation.
-        context_map = chapter_section_context(document)
+        for pass_number in range(1, max_passes + 1):
+            report.passes_run = pass_number
+            content_pages = [p for p in document.pages if p.kind == "content" and p.blocks]
+            deficient = [
+                p for p in content_pages
+                if page_needs_visual(p.blocks) and p.blocks[-1].id not in attempted_anchor_ids
+            ]
+            if not deficient:
+                break
 
-        any_inserted = False
-        for page in deficient:
-            fraction_before = page_visual_fraction(page.blocks)
-            attempted_anchor_ids.add(page.blocks[-1].id)
-            try:
-                plan = await ai.structured(
-                    schema=PageVisualPlan,
-                    system=REPAIR_PLANNER_SYSTEM,
-                    user=(
-                        f"COURSE TITLE: {document.course_title}\n\nPAGE {page.page_number} TEXT:\n"
-                        f"{_page_text(page.blocks)[:4000]}"
-                    ),
-                    model=images.settings.diagram_model,
-                    purpose=f"visual_repair:{document.document_id}:p{page.page_number}",
-                    phase="image",
-                )
-            except Exception as exc:  # noqa: BLE001 - one page's planning failure must not abort the pass
-                log.warning("Visual repair planning failed for page %s: %s", page.page_number, exc)
-                report.failed.append({"page": page.page_number, "reason": f"planning failed: {exc}"})
-                continue
+            # Computed once per pass (not once per page) over the document's
+            # CURRENT structure - reflow_document at the end of the previous
+            # pass can move blocks between pages/chapters, so this must be
+            # recomputed every pass, never cached across the whole repair run.
+            # Reuses the exact same production mechanism generate_missing()
+            # already uses (see image_service.py) - never a second,
+            # independent context-resolution implementation. Read-only for
+            # the rest of this pass, so concurrent pages sharing it is safe.
+            context_map = chapter_section_context(document)
+            fractions_before = {page.page_number: page_visual_fraction(page.blocks) for page in deficient}
+            for page in deficient:
+                attempted_anchor_ids.add(page.blocks[-1].id)
+            pass_total = len(deficient)
+            done_in_pass = 0
 
-            if not plan.needs_visual or not (plan.prompt.strip() or plan.purpose.strip()):
-                report.skipped.append({
-                    "page": page.page_number,
-                    "reason": plan.reason_if_not or "no relevant visual for this page's content",
-                })
-                continue
+            async def _run_one(page: Page) -> tuple[Page, Block | None, dict | None]:
+                nonlocal done_in_pass
+                reference = page.blocks[-1]
+                chapter_title, section_title, key_concept = context_map.get(reference.id, ("", "", ""))
+                async with limiter.slot():
+                    result = await _plan_and_generate_one_page(
+                        page=page, document=document, template=template, images=images, ai=ai,
+                        chapter_title=chapter_title, section_title=section_title, key_concept=key_concept,
+                        job_id=job_id,
+                    )
+                done_in_pass += 1
+                if on_progress is not None:
+                    await on_progress(done_in_pass, pass_total)
+                return result
 
-            reference = page.blocks[-1]
-            new_block = _build_repair_block(plan, template, reference)
-            # `new_block` isn't in `document` yet (inserted further below,
-            # only once generation succeeds), so it has no entry of its own
-            # in `context_map` - the reference block it's about to be
-            # inserted next to already does, and is exactly the chapter/
-            # section this repair visual belongs to.
-            chapter_title, section_title, key_concept = context_map.get(reference.id, ("", "", ""))
-            ok = await images.generate_for_block(
-                course_id=document.course_id,
-                block=new_block,
-                template=template,
-                course_title=document.course_title,
-                chapter_title=chapter_title,
-                section_title=section_title,
-                key_concept=key_concept,
-            )
-            if not ok:
-                report.failed.append({
-                    "page": page.page_number,
-                    "reason": new_block.content.get("error") or "visual generation failed",
-                })
-                continue
+            results = await asyncio.gather(*(_run_one(page) for page in deficient))
 
-            page.blocks.insert(_insertion_index(page.blocks), new_block)
-            any_inserted = True
-            report.repaired.append({
-                "page": page.page_number,
-                "block_id": new_block.id,
-                "kind": new_block.content.get("kind"),
-                "fraction_before": round(fraction_before, 2),
-            })
+            any_inserted = False
+            for page, new_block, outcome in results:
+                if new_block is not None:
+                    page.blocks.insert(_insertion_index(page.blocks), new_block)
+                    any_inserted = True
+                    report.repaired.append({
+                        "page": page.page_number,
+                        "block_id": new_block.id,
+                        "kind": new_block.content.get("kind"),
+                        "fraction_before": round(fractions_before[page.page_number], 2),
+                    })
+                elif outcome is not None:
+                    bucket = report.skipped if outcome["outcome"] == "skipped" else report.failed
+                    bucket.append({"page": outcome["page"], "reason": outcome["reason"]})
 
-        if not any_inserted:
-            break
-        reflow_document(document, template)
+            if not any_inserted:
+                break
+            reflow_document(document, template)
 
     # Final accounting: anything still deficient after the bounded passes is
     # reported explicitly, never silently accepted as done (the brief's own

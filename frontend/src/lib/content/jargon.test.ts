@@ -80,6 +80,16 @@ test("malformed and orphaned tags never reach the reader", () => {
   assert.deepEqual(parseJargon("</jargon> orphan"), [{ kind: "text", text: " orphan" }]);
 });
 
+test("a closing tag mistyped with a curly brace is also stripped", () => {
+  // A real, confirmed writer quirk: a closing tag occasionally comes back
+  // as `</jargon}` (a "}" where ">" belongs) instead of a well-formed
+  // `</jargon>` - mirrors the same fix in backend/app/render/
+  // html_renderer.py's own _JARGON_CLOSE_TAG_TYPO.
+  assert.deepEqual(parseJargon('the <jargon term="x">surface prescriptions</jargon} and more'), [
+    { kind: "text", text: "the surface prescriptions and more" },
+  ]);
+});
+
 test("ordinary text is untouched", () => {
   assert.deepEqual(parseJargon("plain > angle bracket stays"), [
     { kind: "text", text: "plain > angle bracket stays" },

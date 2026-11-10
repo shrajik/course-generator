@@ -2,6 +2,18 @@
 
 Pure, deterministic and AI-free: the PDF is just a projection of the document, so
 rendering must never introduce content of its own.
+
+Math/scientific notation: real typesetting (fractions, radicals, integrals,
+Greek letters, sub/superscripts, chemistry formulas) via client-side KaTeX
+(vendored under `static/katex/`, see STATIC_DIR below), not a server-side
+markup parser. The key simplification: Jinja's own `{{ para }}` output is
+HTML-escaped, but the browser reads it back as literal, un-escaped text via
+`textContent` - which is exactly what KaTeX's `renderMathInElement` auto-
+render scans to find `$...$`/`$$...$$` math spans (see course.html.j2's own
+inline script). So LaTeX source the writer puts directly into paragraph/
+list/heading text survives untouched through this whole pipeline and is
+typeset correctly once KaTeX's script runs client-side - no new inline-
+markup parsing step is needed here at all.
 """
 
 from __future__ import annotations
@@ -27,6 +39,22 @@ from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+STATIC_DIR = Path(__file__).parent / "static"
+
+# Vendored once (see STATIC_DIR/katex/, copied from the `katex` npm package)
+# rather than inlined into course.html.j2's own <style> block: KaTeX's CSS
+# references its font files via relative `url(fonts/KaTeX_*.woff2)` paths,
+# which only resolve correctly when the stylesheet is loaded via a real
+# <link> at its own on-disk location - inlining the raw CSS text would
+# break every one of those font references. Referenced by an absolute
+# `file://` URI (mirroring TEMPLATES_DIR's own on-disk-path convention)
+# so it resolves from wherever a course's exported HTML/PDF actually lives,
+# not relative to that file's own location.
+_KATEX_DIR = STATIC_DIR / "katex"
+
+
+def _katex_uri(*parts: str) -> str:
+    return (_KATEX_DIR / Path(*parts)).resolve().as_uri()
 
 _environment = Environment(
     loader=FileSystemLoader(str(TEMPLATES_DIR)),
@@ -159,6 +187,15 @@ _JARGON_TAG = re.compile(
     r"""</?\s*jargon\b(?:[^>"']|"[^"]*"|'[^']*')*>""",
     re.IGNORECASE,
 )
+# A real, confirmed writer quirk: a closing tag occasionally comes back as
+# `</jargon}` (a `}` where `>` belongs - apparently confused with a
+# different interpolation syntax) instead of a well-formed `</jargon>`.
+# `_JARGON_TAG` above requires a real `>` to terminate the match at all, so
+# that malformed form survives it untouched and reaches the PDF as literal
+# text - this second, narrower pattern catches exactly that one broken
+# shape (never a bare "}" anywhere else in the text, only right after
+# "jargon").
+_JARGON_CLOSE_TAG_TYPO = re.compile(r"</\s*jargon\s*}", re.IGNORECASE)
 
 
 def strip_jargon(value: Any) -> Any:
@@ -170,7 +207,7 @@ def strip_jargon(value: Any) -> Any:
     never mutated.
     """
     if isinstance(value, str):
-        return _JARGON_TAG.sub("", value)
+        return _JARGON_TAG.sub("", _JARGON_CLOSE_TAG_TYPO.sub("", value))
     if isinstance(value, list):
         return [strip_jargon(item) for item in value]
     if isinstance(value, dict):
@@ -353,7 +390,21 @@ def render_document_html(
                         "type": "section_intro_pair",
                         "content": {},
                         "css": _css(paragraph, theme),
-                        "paragraphs": _paragraphs(paragraph),
+                        # Missing here was a real, confirmed bug: the generic
+                        # block path two cases below already strips jargon
+                        # from its own `paragraphs` (line ~431) - this
+                        # section_intro-paired paragraph is rendered through
+                        # a completely separate branch (see this block's own
+                        # comment above on why it's one combined dict, not
+                        # two), so it needs the exact same call explicitly;
+                        # without it, a real `<jargon term="...">...</jargon>`
+                        # tag rendered as literal, visible markup in the PDF
+                        # on every section that pairs an image with its
+                        # lead-in paragraph - the majority of this
+                        # template's own sections (Concept/Process/Case/How
+                        # It Works/Technical Example/Best Practices/Common
+                        # Mistakes all use this exact pairing).
+                        "paragraphs": strip_jargon(_paragraphs(paragraph)),
                         "image_src": _image_src(block, asset_prefix),
                         "image_width": round(block.layout.width, 2),
                         "image_height": round(block.layout.height, 2),
@@ -433,4 +484,8 @@ def render_document_html(
         page_width=geometry.width,
         page_height=geometry.height,
         margin_x=geometry.margin_x,
+        katex_css_uri=_katex_uri("katex.min.css"),
+        katex_js_uri=_katex_uri("katex.min.js"),
+        katex_auto_render_uri=_katex_uri("auto-render.min.js"),
+        katex_mhchem_uri=_katex_uri("mhchem.min.js"),
     )

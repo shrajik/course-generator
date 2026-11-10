@@ -30,6 +30,13 @@ export interface GenerationView {
   currentDetailIsTitle: boolean;
   finished: boolean;
   failed: boolean;
+  /** True when the run was stopped (cancelled by the user, or interrupted
+   * by a backend restart) rather than genuinely failed or still running -
+   * resumable via `generateCourse(courseId, { resume: true })`. */
+  stopped: boolean;
+  /** True while running and not yet stopped/finished/failed - the Stop
+   * button is only meaningful in this state. */
+  isRunning: boolean;
   /** Seconds remaining, measured by the backend from this run's own pace. */
   etaSeconds: number | null;
   /** True once the document exists - the editor can be opened from here. */
@@ -136,6 +143,8 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
       currentDetailIsTitle: false,
       finished: false,
       failed: false,
+      stopped: false,
+      isRunning: true,
       etaSeconds: null,
       documentReady: false,
     };
@@ -146,6 +155,13 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
   const chapters = course.chapters;
   const total = chapters.length;
   const failed = status === "failed" || course.run?.state === "failed";
+  // "cancelled" (the user asked to stop) and "interrupted" (a backend
+  // restart found this run stale) are both resumable, not a generic
+  // failure - kept distinct from `failed` throughout this function so the
+  // UI can offer "Resume" instead of looking like a dead end.
+  const cancelled = course.run?.state === "cancelled";
+  const interrupted = course.run?.state === "interrupted";
+  const stopped = cancelled || interrupted;
   const running = IN_FLIGHT.includes(status) || course.run?.state === "running";
   const hasDocument = artifacts.document || course.has_document;
   /**
@@ -234,21 +250,59 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
 
   // --- images + document --------------------------------------------------
   const imagesActive = !ready && status === "illustrating";
+  const imagesTotal = course.run?.images_total ?? 0;
+  const imagesDoneCount = course.run?.images_done ?? 0;
+  // The backend now persists each image's result the moment it finishes
+  // (see RunInfo.images_total/images_done) - a real fraction, not a guess.
   const images: GenerationStage = {
     id: "images",
     label: "Generating Images",
-    status: ready ? "completed" : imagesActive ? "active" : failed ? "failed" : "pending",
-    // No per-chapter/per-image signal exists on the backend today (images are
-    // generated as one fire-and-forget batch) - a plain, honest "in progress"
-    // description is all that can be shown without inventing specifics.
-    detail: imagesActive ? "Generating images for your course" : undefined,
+    status: ready
+      ? "completed"
+      : imagesActive
+        ? imagesTotal > 0 && imagesDoneCount >= imagesTotal
+          ? "completed"
+          : "active"
+        : failed
+          ? "failed"
+          : "pending",
+    detail:
+      imagesActive && imagesTotal > 0
+        ? `${imagesDoneCount}/${imagesTotal} images`
+        : imagesActive
+          ? "Generating images for your course"
+          : undefined,
   };
+  const imagesFraction =
+    images.status === "completed" ? 1 : imagesTotal > 0 ? Math.min(imagesDoneCount / imagesTotal, 1) : 0;
   const documentActive = !ready && (status === "assembling" || status === "illustrating");
+  // The backend now persists real "N of M" counters for the two post-image
+  // sub-stages too (see RunInfo.visual_repair_total/done and
+  // visual_review_total/done) - without this, "Building Document" sat as a
+  // single static label for however long those took, which could be
+  // several minutes on a large course even after images already hit 100%.
+  // Repair runs before review in the backend (CourseService._finalise), so
+  // that's the order checked here; each falls through to the next/default
+  // once its own total/done says it's finished.
+  const visualRepairTotal = course.run?.visual_repair_total ?? 0;
+  const visualRepairDone = course.run?.visual_repair_done ?? 0;
+  const visualReviewTotal = course.run?.visual_review_total ?? 0;
+  const visualReviewDone = course.run?.visual_review_done ?? 0;
+  let documentDetail: string | undefined;
+  if (documentActive) {
+    if (visualRepairTotal > 0 && visualRepairDone < visualRepairTotal) {
+      documentDetail = `Adding visuals to thin pages: ${visualRepairDone}/${visualRepairTotal}`;
+    } else if (visualReviewTotal > 0 && visualReviewDone < visualReviewTotal) {
+      documentDetail = `Reviewing visuals: ${visualReviewDone}/${visualReviewTotal}`;
+    } else {
+      documentDetail = "Assembling your final document";
+    }
+  }
   const document: GenerationStage = {
     id: "document",
     label: "Building Document",
     status: ready ? "completed" : documentActive ? "active" : failed ? "failed" : "pending",
-    detail: documentActive ? "Assembling your final document" : undefined,
+    detail: documentDetail,
   };
 
   const stages = [
@@ -269,7 +323,7 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
             research.fraction * WEIGHTS.research +
             writingFraction * WEIGHTS.writing +
             (total > 0 ? Math.min(reviewedCount / total, 1) : 0) * WEIGHTS.reviewing +
-            (images.status === "completed" ? WEIGHTS.images : 0) +
+            imagesFraction * WEIGHTS.images +
             (document.status === "completed" ? WEIGHTS.document : 0),
         ),
       );
@@ -284,6 +338,11 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
   } else if (failed) {
     currentLabel = "Generation failed";
     currentDetail = course.run?.error ?? course.last_error ?? "";
+  } else if (stopped) {
+    currentLabel = interrupted ? "Generation was interrupted" : "Generation stopped";
+    currentDetail = interrupted
+      ? "The server restarted while this course was generating - resume to continue from where it left off."
+      : "You stopped this generation - resume to continue from where it left off.";
   } else if (active) {
     currentLabel = active.label;
     if (active.detail) {
@@ -300,6 +359,8 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
     currentDetailIsTitle,
     finished: ready,
     failed,
+    stopped,
+    isRunning: running && !stopped && !failed && !ready,
     etaSeconds: ready ? 0 : (course.run?.eta_seconds ?? null),
     documentReady: hasDocument,
   };
@@ -312,6 +373,7 @@ export function deriveStages(detail: CourseDetail | null): GenerationView {
  */
 export function emptyStateMessage(view: GenerationView): string {
   if (view.failed) return view.currentDetail || "Generation hit a problem.";
+  if (view.stopped) return view.currentDetail || "Generation was stopped.";
   if (view.currentLabel === "Course Planning" || view.currentLabel === "Preparing") {
     return "Preparing your course...";
   }

@@ -75,12 +75,12 @@ def _document(*, first_page_fill: float = 100.0, n_nodes: int = 4, with_spec: bo
 
 async def test_a_large_trailing_gap_is_closed_by_compacting_the_next_pages_diagram(storage):
     template = load_template("technical_v1")
-    # 5 nodes: the standard flowchart's own compact, single-column layout
-    # (app.render.diagram_renderer._layout_standard_flowchart) needs more
-    # steps than the old ring design did before gap-only compaction has
-    # real room to help - confirmed empirically against the current
-    # geometry, not guessed.
-    document = _document(first_page_fill=100.0, n_nodes=5)
+    # 6 nodes: the standard flowchart's own compact, single-column layout
+    # (app.render.diagram_renderer._layout_standard_flowchart, now with no
+    # Key table underneath it either) needs more steps than the old ring
+    # design did before gap-only compaction has real room to help -
+    # confirmed empirically against the current geometry, not guessed.
+    document = _document(first_page_fill=100.0, n_nodes=6)
 
     report = await compact_diagrams_for_spacing(document, template, storage=storage)
 

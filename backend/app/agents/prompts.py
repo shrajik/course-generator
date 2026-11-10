@@ -603,6 +603,36 @@ How to produce blocks:
   every chapter.
 - Fill only the fields that a block type needs; leave the rest empty.
 - Paragraphs: 60-140 words each. Several short paragraphs beat one long one.
+- Mathematical and scientific notation in body text (paragraphs, lists,
+  headings, tables - anywhere other than an image's own baked-in labels,
+  which follow `image_formula_expression`'s separate ASCII convention
+  below) is real LaTeX, typeset exactly as written - never a unicode
+  approximation ("½", "x²", "√x") and never spelled out in words as a
+  substitute for the real symbol. Wrap inline math in single dollar signs
+  (`$E = mc^2$`, `$\\alpha + \\beta$`) and a standalone equation that should
+  get its own centered line in double dollar signs
+  (`$$\\int_0^1 x^2\\,dx = \\frac{{1}}{{3}}$$`). Use real LaTeX commands for
+  anything that isn't a plain digit or letter: `\\frac{{a}}{{b}}` for
+  fractions, `\\sqrt{{x}}` / `\\sqrt[n]{{x}}` for roots, `^`/`_` for
+  super/subscripts (`x^2`, `H_2O` as `$H_2O$`), `\\alpha \\beta \\gamma
+  \\theta \\pi \\Delta \\Sigma \\Omega` etc. for Greek letters, `\\sum \\int
+  \\prod \\lim \\partial \\nabla \\infty \\leq \\geq \\neq \\approx \\times
+  \\cdot \\pm \\to \\rightarrow` for the corresponding operators/symbols,
+  `\\vec{{F}}` for a vector. For a chemistry reaction or formula, use the
+  `mhchem` package's `\\ce{{...}}` form (`$\\ce{{2H2 + O2 -> 2H2O}}$`,
+  `$\\ce{{Na+ + Cl- -> NaCl}}$`) - it correctly typesets reaction arrows,
+  charges and the subscripted counts a plain `H2O` cannot. Every symbol,
+  equation and unit a chapter actually discusses must be written this way,
+  with complete accuracy - a wrong exponent, a missing subscript, or an
+  unbalanced chemistry equation is a correctness error, not a style choice.
+  Never invent a formula, constant or reaction the brief/research doesn't
+  support; write only what you can state correctly. This applies with equal
+  force inside a table cell and inside a short `exercise` field like
+  `hints`/`steps` - a real, confirmed case left `\\hat{{n}}` and
+  `\\sin^2\\theta_t - 1` bare with no `$...$` around them in exactly those two
+  spots while the surrounding paragraph prose on the very same page wrapped
+  every symbol correctly, so a reader saw raw LaTeX commands as literal text
+  there. A short, structured field is not an exemption from this rule.
 - Pace the chapter so it reads as roughly 60% text / 40% visual (a diagram,
   concept_experience visual, illustration, table, or a code sample paired
   with its own explanation) - never a long unbroken stretch of prose. As a
@@ -644,10 +674,132 @@ How to produce blocks:
   THING-with-parts below -
   don't reach for `diagram`/`flow_chart` out of habit for a technical
   process (a protocol handshake, an algorithm's steps, a CI/CD pipeline)
-  when concept_experience's own "process"/"sequence" shape already covers
-  it better. Physics, biology, chemistry, math and other non-technical
-  domains never use concept_experience - always use `diagram` for those.
-  Two specific exceptions stay on `diagram` even for a technical topic,
+  when concept_experience's own "process"/"sequence"/"pipeline" numbered
+  step-card shape already covers it better - this numbered step-card look
+  is the RIGHT, approved look for a technical procedure, keep using it.
+  The one exception is a REPEATING sequence (the last step feeds back into
+  the first - an ML training loop, a release cycle): that is NEVER
+  `representation: "cycle"` (concept_experience has no good renderer for
+  it - a real, confirmed complaint about its circular icon-card look) -
+  give it `image_kind: diagram` with `diagram_kind: cycle` instead, the
+  same plain textbook ring diagram a repeating physics/biology process
+  gets. A one-shot (non-repeating) technical procedure still correctly
+  gets concept_experience's "process"/"sequence" shape per the paragraph
+  above. Physics, biology, chemistry, math and other non-technical
+  domains never use concept_experience - always use `diagram` for those -
+  with exactly one narrow exception: a structure whose whole point is a
+  genuine MATHEMATICAL NOTATION hierarchy/relationship/substitution that
+  needs real subscripts, superscripts, fractions or Greek symbols to read
+  correctly (separation-of-variables producing R_l(r)/Y_l^m(theta,phi)
+  branches, an element-to-model substitution table like R/L/C to their s-
+  domain impedances, a derivation's chain of named equations) gets
+  `image_kind: concept_experience` too, never `diagram` - `diagram` is pure
+  SVG with no math typesetting at all, so a formula placed in one of its
+  node labels/details can only ever come out as flat, unreadable "R_l(r)"-
+  style source text, never real notation; concept_experience's own HTML
+  fragment is inlined straight into the page DOM and DOES get typeset (the
+  exact same KaTeX pass already used for ordinary prose, see the $...$/
+  $$...$$ rule above), so every genuine formula fragment placed in any
+  concept_experience field (an entity/step/state's `label`, a `property`
+  value, `technical_signature`, `core_message`) MUST itself be wrapped in
+  `$...$` (a short inline piece, e.g. "$R_\\ell(r)$") or `$$...$$` (a
+  standalone equation on its own) - the same wrapping rule already required
+  everywhere else in this brief, never left as bare LaTeX/ASCII-math source
+  with no delimiters, which would show up as literal, un-typeset text.
+  A plain apparatus/mechanism with no real formula to typeset (a cell, a
+  circuit's physical layout, a titration setup) is NOT this exception and
+  still follows the general physics/bio/chem/math rule above. Neither is a
+  DECISION or WORKFLOW/PROCEDURE that merely mentions or labels things with
+  mathematical symbols along the way (e.g. "prioritise Fr and W/H, assess
+  whether Re can be relaxed, decide via Is viscosity important for QoI? ->
+  yes/no") - a real, confirmed complaint about exactly this: a Buckingham-
+  Pi planning decision (a goal, a few guidance panels, a yes/no branch)
+  took this exception purely because its labels mentioned Greek symbols
+  (Fr, Re, Kn), and concept_experience's generic entity-card renderer drew
+  it as several oversized, densely-bulleted colour panels next to a
+  decision box - cluttered, not the clean look this course's other
+  flowcharts have, and a repeat of a complaint already raised once before
+  about this same "cards" look. `Re`/`Fr`/`π`/`Kn`-style short symbols
+  read perfectly fine as plain flat text in an ordinary diagram node label
+  - they need no KaTeX typesetting at all, unlike an actual equation
+  (a fraction, a subscript/superscript, a derivation chain). The exception
+  above is ONLY for content whose whole POINT is real mathematical
+  notation itself (the equation/substitution/branch structure IS the
+  content); a decision or procedure that happens to reference a symbol is
+  normal flowchart/decision_tree content and must go through `diagram`
+  like any other technical decision/procedure, with `diagram_kind:
+  decision_tree` for the branch and the symbols as ordinary plain-text
+  labels - never `concept_experience`, regardless of domain.
+  The identical rule applies to a COMPARISON of physics/bio/chem/math
+  states or systems (e.g. isolated vs. closed vs. open systems, control
+  mass vs. control volume, a cell's resting vs. action potential) - a real,
+  confirmed complaint about exactly this: each column's own description
+  happening to mention a governing equation (ΔE = Q − W, h = u + pv) is not
+  "the content's whole point is mathematical notation", it is an ordinary
+  side-by-side comparison that merely cites a formula, so it belongs on
+  `diagram` with `diagram_kind: comparison` - plain-text symbols in a
+  table/column-header cell render perfectly fine there - never on
+  concept_experience, whose generic entity-card renderer reduces each
+  column's own descriptive label to a single first-letter badge ("Control
+  mass (closed)" and "Control volume (open)" both collapsing to a
+  meaningless, indistinguishable "C") and was a repeat of a complaint
+  already raised once before about this same cluttered "cards" look. Route
+  a comparison to concept_experience ONLY when it is genuinely
+  object/instance-driven, non-technical-domain content this section's
+  opening paragraphs already describe (Car vs. Truck instances, HTTP
+  200 vs. 404 responses) - never for a physics/bio/chem/math states-of-a-
+  system comparison, regardless of how many columns it has.
+  One further exception to the "comparison" rule just above, for the SAME
+  reason it exists (concept_experience's own entity-card renderer cannot
+  show this content either, and neither can a plain `comparison` card grid):
+  an ELECTRICAL CIRCUIT TOPOLOGY comparison - which specific components tie
+  to which SHARED nodes (series vs. parallel reductions, valid vs. invalid
+  simplifications, a bridge/Wheatstone network, a Thevenin/Norton
+  equivalent) - gets `diagram_kind: circuit_schematic`, never `comparison`.
+  A real, confirmed complaint about exactly this: "Series vs Parallel -
+  Valid and Invalid Reductions" shipped as four rectangular text cards
+  describing each case in prose, because `comparison` was the only kind that
+  existed for a multi-case comparison - it cannot draw an actual wire, so it
+  can only ever describe a circuit's topology in words, never show it. The
+  real test a circuit comparison needs to pass that a words-only card
+  cannot: can a reader SEE that two components land on the identical two
+  nodes (valid parallel) versus two visually-similar-but-different nodes
+  (invalid)? If the content's whole point is that visual distinction,
+  `comparison`'s prose-only cards cannot make it, so it is not a fit here
+  even though it technically is still "a comparison". Build it as one
+  `DiagramNode` per electrical junction (`id` unique per node ACROSS THE
+  WHOLE SPEC, even across different panels/scenarios - never reuse a short
+  id like "a"/"b" in two different panels, since nothing else scopes an
+  edge's `source`/`target` to one panel), grouped into side-by-side panels
+  with `DiagramNode.lane` set to each panel's own short header (e.g. "Valid
+  - Series pair"); each real wire is a `DiagramEdge` whose `label` encodes
+  its component with a prefix - "R:10Ω" (resistor), "C:100nF" (capacitor),
+  "L:<value>" (inductor), "V:9V" or "B:9V" (battery/source), "SW" (switch),
+  or a blank/plain string for an unlabelled plain wire. Give each panel one
+  extra `DiagramNode` with `shape_role: "caption"` (not a real junction,
+  never touched by an edge) whose `label` is the short verdict ("Valid" /
+  "Invalid") and `detail` the one-sentence reason why - this is what draws
+  the panel's own coloured verdict badge and explanation. A single,
+  non-paneled circuit (nothing being compared) just leaves `lane` blank on
+  every node.
+  General rule behind every exception above, for any subject, not just
+  electrical: `diagram_kind: comparison` is for a genuinely FLAT comparison
+  - the same short list of attributes read off side by side for 2+ things,
+  with no real structure connecting them (plan A vs. plan B's feature list,
+  three materials' cost/weight/strength). The moment what's being compared
+  has its own internal RELATIONSHIPS worth showing - components tied to
+  shared points (circuit_schematic, above), a process with branching steps
+  (flow_chart/decision_tree), causes grouped into categories (fishbone),
+  many things connected to many others (network_mesh), a parent/child
+  breakdown (hierarchy), tiers stacked in a fixed order (layered_diagram) -
+  pick THAT shape instead and let its own structure carry the comparison,
+  never flatten it into `comparison` cards merely because two or more
+  things are being set side by side. `comparison` describing the content
+  correctly in English ("comparing X to Y") is not the same as it being
+  the right SHAPE - ask whether a reader needs to see how the pieces
+  connect, not just read a list of facts about each one, and if so this
+  is not `comparison`.
+  Two further exceptions stay on `diagram` even for a technical topic,
   because concept_experience has no matching shape for them: a genuine
   multi-table DATABASE SCHEMA (2+ entities with their own fields, related by
   foreign keys - not just "explain what a JOIN is") gets `diagram_kind:
@@ -656,9 +808,10 @@ How to produce blocks:
   steps) gets `diagram_kind: data_flow_diagram`.
 - Every chapter that describes a SEQUENCE - steps that happen in order, a
   procedure, a decision path - and didn't already get `concept_experience`
-  above needs at least one `image` block with `image_kind: diagram` and
-  `diagram_kind: flow_chart` (or `process`/`cycle` for a repeating
-  sequence) right in the section it explains.
+  above (a one-shot technical procedure did; a REPEATING technical one
+  never does - see above) needs at least one `image` block with
+  `image_kind: diagram` and `diagram_kind: flow_chart` (or `process`/`cycle`
+  for a repeating sequence) right in the section it explains.
 - Every chapter that describes a THING made of parts, or a phenomenon/
   mechanism whose components act on or relate to each other (what physically
   happens, what causes what, which direction something moves or acts), and
@@ -667,7 +820,21 @@ How to produce blocks:
   itself, showing every relevant component, the direction of
   motion/force/current/flow, and what causes what. Prose describing a
   mechanism is not enough on its own; a reader needs to see the components
-  and how they relate. Choose which shape fits:
+  and how they relate. This is NOT a once-per-course quota - a real,
+  confirmed complaint: a 4-chapter engineering course (turbines,
+  compressors, heat exchangers, control volumes, piston-cylinder devices -
+  every one a genuine physical apparatus) shipped only ONE `illustration_
+  style: "textbook"` picture for its entire length, with every other device
+  left as a plain flow_chart/comparison diagram instead of also getting its
+  own realistic labelled picture - explicitly called out as the quality bar
+  to match MORE often, not an exception. Apply this rule to EVERY distinct
+  apparatus/device/setup a chapter introduces, not just the first or most
+  prominent one: a chapter naming a turbine, a compressor, a heat exchanger,
+  a piston-cylinder assembly, a nozzle, a valve, or a control-volume
+  boundary each names a separate real THING and each earns its own
+  `illustration_style: "textbook"` picture, in addition to (never instead
+  of) whatever flow_chart/comparison diagrams that chapter also needs for
+  its procedures and comparisons. Choose which shape fits:
   * `diagram_kind: schematic` is PERMANENTLY RETIRED - never set it, for any
     subject. A labelled-box schematic (a cell and its organelles, a magnet
     and a coil, a titration setup, an orbit, a mechanical assembly, any
@@ -688,19 +855,39 @@ How to produce blocks:
     unlabelled arrows and no indication of which one was B, which was the
     surface normal, or which direction was positive - technically a clean
     picture, but useless for actually teaching the mechanism, since nothing
-    in the image itself says what anything is. Identify the 2-6 real labels
-    this specific apparatus needs (component names, vector/quantity symbols
-    like "B", "n̂", "+"/"-", direction arrows) and set them in
+    in the image itself says what anything is. Identify AT MOST 6 real
+    labels this specific apparatus needs (component names, vector/quantity
+    symbols like "B", "n̂", "+"/"-", direction arrows) and set them in
     `image_expected_labels` (see below) - do not leave this picture
     unlabelled just because it's going through `illustration` instead of
-    `schematic`. If the picture includes a formula block (one key governing
-    equation with its symbols defined below it, e.g. "ε = induced emf"),
-    list EVERY one of those definition phrases in `image_expected_labels`
-    too, not just the component labels - a real, confirmed case shipped a
-    formula block with "electromotive force" garbled into "electromotivie
-    oforce" because only the diagram's own component labels were listed,
-    leaving the formula's own text completely unverified even though it's
-    exactly as checkable. Also set `image_formula_expression` to the exact
+    `schematic`. This is a hard ceiling, not a suggestion: a raster image
+    model cannot reliably bake in more than a handful of short labels as
+    legible text, and a real, confirmed case shows why - a set of
+    illustrations each asked for 9-15 `image_expected_labels` (several of
+    them full multi-symbol equations) failed the post-generation text check
+    on nearly every attempt and shipped as generic, off-topic placeholder
+    pictures instead of the real diagram, for most of a chapter. If the
+    picture includes a formula block (exactly ONE key governing equation,
+    never more than one, with its symbols defined below it, e.g. "ε =
+    induced emf"), list each SHORT symbol-and-definition phrase from that
+    one equation in `image_expected_labels` too (still inside the same
+    6-label ceiling) - a real, confirmed case shipped a formula block with
+    "electromotive force" garbled into "electromotivie oforce" because
+    only the diagram's own component labels were listed, leaving the
+    formula's own text completely unverified even though it's exactly as
+    checkable. Never put the equation itself (e.g. "τ = μ·γ̇", "Kn = λ/L_c")
+    into `image_expected_labels` as one entry - a relationship between
+    several symbols is exactly the kind of multi-operator notation a raster
+    image model cannot render reliably; each entry here is one short
+    symbol paired with its plain-word meaning only (e.g. "τ (shear
+    stress)", not "τ = μ·γ̇"). The same applies to a "term: ..." entry - the
+    part after the colon is a short definition (1-2 words, e.g. "ε:
+    induced emf"), never a judgement or a full clause (a real, confirmed
+    case kept generating entries like "Compressible: variable-density
+    model warranted" and "Rheogram: Apparent viscosity μ_app vs shear rate
+    γ̇" - both read as a caption or a conclusion, not a label, and every
+    extra word in one compounds the chance a raster model garbles or drops
+    it). Also set `image_formula_expression` to the exact
     equation in plain ASCII (letters/digits/Greek-as-words only - `*` for
     multiply, `/` for divide, `^` for exponent, `_` for subscript,
     parentheses as needed, exactly one `=`; e.g. "F = m * a", never "F=ma"
@@ -715,9 +902,23 @@ How to produce blocks:
     `diagram_kind: comparison` for two or more things compared side by side.
   * `diagram_kind: pyramid` for LEVELS of importance/priority/foundation
     (a base that supports what's above it, a "most fundamental at the
-    bottom" structure) or a NARROWING STAGE process (a funnel - fewer
-    items survive each stage, e.g. a sales pipeline or a filtering
-    process) - same shape either way, just which end tapers.
+    bottom" structure).
+  * `diagram_kind: funnel` for a NARROWING STAGE process (fewer items
+    survive each stage, e.g. a sales/conversion pipeline, a filtering or
+    triage process, "top of funnel to bottom of funnel").
+  * `diagram_kind: honeycomb` for a SET of related categories/pillars/
+    components with no inherent order and no deeper relationship worth
+    naming ("the 5 pillars of X", "core components of Y") that reads
+    better as a connected cluster than a plain list.
+  * `diagram_kind: puzzle_pieces` for components that only make sense
+    TOGETHER, as interlocking parts of one whole strategy/solution/
+    framework - content that would naturally be shown as jigsaw pieces
+    fitting together. Keep this to at most 6 components.
+  * `diagram_kind: gears_process` for a short MECHANISM whose steps
+    genuinely work together as one system, each step driving the next the
+    way gears literally mesh (not just an ordinary sequence - the brief
+    itself should frame it as interdependent/interlocking parts of one
+    machine). Keep this to at most 5 steps.
   * `diagram_kind: matrix` when the content classifies or compares things
     across exactly two independent axes/dimensions (impact vs. effort,
     urgency vs. importance, a SWOT-style grid, a priority matrix) - a
@@ -772,6 +973,47 @@ How to produce blocks:
     sprint/launch schedule) - only when the brief gives real relative
     timing for each task; a plain list of steps with no timing is
     `flow_chart`/`process`/`chevron_process` instead.
+  * `diagram_kind: donut_segments` for CATEGORIES that together make up
+    one whole (a budget's spending categories, a framework's pillars shown
+    as proportions rather than just a list) - not `honeycomb`, which has
+    no "parts of a whole" framing.
+  * `diagram_kind: pie_wedge` for the same "parts of a whole" idea as
+    donut_segments, when a classic filled pie (no open centre) reads
+    better - typically fewer, larger categories.
+  * `diagram_kind: wavy_journey_path` for a NARRATIVE journey or roadmap
+    told as a story arc (a customer journey, a product roadmap, "the path
+    from awareness to advocacy") - not `timeline` (dated historical
+    events) and not `flow_chart` (a procedure, not a narrative arc).
+  * `diagram_kind: progress_rings` when the brief gives a real PERCENTAGE/
+    STAT for each of several named items (a satisfaction score, a
+    completion rate, an adoption percentage) - set each node's
+    `value_pct` to that exact number, never invent one.
+  * `diagram_kind: orbit_diagram` for ONE central concept with items at
+    DIFFERENT, MEANINGFUL DISTANCES or tiers from it (layers of the
+    atmosphere, concentric rings of influence) - distinct from
+    `radial_mindmap`, whose branches are all equally independent with no
+    distance meaning.
+  * `diagram_kind: bridge_process` for a short sequence explicitly framed
+    as CROSSING from one state to another (a migration, a transformation
+    journey with a clear before/after framing). Keep this to at most 5
+    steps.
+  * `diagram_kind: chain_links` for items that form a DEPENDENCY CHAIN,
+    each one following from the one before it (a supply chain, a chain of
+    custody/causation) - distinct from `honeycomb`/`puzzle_pieces`, which
+    have no inherent order.
+  * `diagram_kind: flower_petal` for ONE central theme with several
+    related sub-topics orbiting it, when a softer, more decorative
+    presentation suits the content better than `radial_mindmap`'s plain
+    spokes (core values around a mission, themes radiating from one idea).
+  * `diagram_kind: hourglass_diagram` when the content weighs TWO OPPOSING
+    FRAMINGS where EACH SIDE has its own internal layers worth showing as
+    a stack (cost broken into several cost types vs. value broken into
+    several value types) - not `balance_comparison`, which is a flat list
+    of points on each side, no internal layers.
+  * `diagram_kind: org_chart` for a real ORGANISATION's reporting
+    structure - actual roles/titles and who reports to whom - not
+    `hierarchy`, which is for a generic category tree/taxonomy where the
+    nodes aren't people/roles.
   * NEVER `schematic`/`concept_map`/`hierarchy`/`comparison` for a
     coordinate-axis graph or curve - a supply-and-demand curve, a
     distance-time or velocity-time graph, a function's plot, any X-Y
@@ -850,10 +1092,15 @@ How to produce blocks:
   tell which one was B, the surface normal, or the sign convention).
 - Set `diagram_kind` whenever you can tell which shape fits (flow_chart,
   process, cycle, concept_map, hierarchy, comparison, smart_art,
-  data_flow_diagram, er_diagram, swimlane, pyramid, matrix, radial_mindmap,
-  venn, chevron_process, timeline, staircase_process, balance_comparison,
+  data_flow_diagram, er_diagram, swimlane, pyramid, funnel, honeycomb,
+  puzzle_pieces, gears_process, matrix, radial_mindmap, venn,
+  chevron_process, timeline, staircase_process, balance_comparison,
   nested_circles, network_mesh, decision_tree, fishbone, layered_diagram,
-  gantt_chart - never `schematic`, permanently retired, see above) - this
+  gantt_chart, donut_segments, pie_wedge, wavy_journey_path,
+  progress_rings, orbit_diagram, bridge_process, chain_links,
+  flower_petal, hourglass_diagram, org_chart, circuit_schematic (real
+  electrical wire/node topology - see its own rule above; never use
+  `comparison` for this) - this
   is what the renderer actually builds, so getting it right here is what makes the
   diagram useful. Leave it blank only when you genuinely cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a
@@ -1431,7 +1678,14 @@ Rules:
   structure (a class and its objects, a data structure, a protocol
   handshake, a pipeline, a state machine, a SQL JOIN)? If yes, set `kind` to
   "concept_experience" and leave `diagram_kind` blank - this is the right
-  choice for that content, not a fallback. Otherwise set `kind` to
+  choice for that content, not a fallback, including for a technical
+  SEQUENCE (concept_experience's "process"/"sequence"/"pipeline" numbered
+  step-card look is the right, approved look for a technical procedure).
+  The one exception is a REPEATING sequence (the last step feeds back into
+  the first): never set `representation: "cycle"` on a concept_experience
+  (no good renderer for it - a real, confirmed complaint about its
+  circular icon-card look) - give that `kind: "diagram"` with
+  `diagram_kind: "cycle"` instead, the plain textbook ring diagram. Otherwise set `kind` to
   "diagram" for a flow chart, process, hierarchy, comparison, concept
   map/labelled relationship diagram or SmartArt-style list (rendered from
   labelled shapes, so labels stay exact); also set `diagram_kind` to the
@@ -1477,6 +1731,46 @@ Rules:
   itself), or to "illustration" (with `illustration_style: "textbook"` for
   the former-schematic case) instead of only swapping the prompt and
   reproducing the same wrong output.
+  A `replace_image` instruction that describes a PROBLEM with the current
+  picture (overlapping/cut-off text, a wrong symbol, garbled or missing
+  labels, cramped spacing, a cluttered/unprofessional look, a wrong detail)
+  is a CORRECTION, not a request for a different picture - the reader
+  already approved what this image depicts and is asking you to fix
+  specific named problems with it, not redesign it. When the block stays
+  `kind: "diagram"` or `"concept_experience"`, the server automatically
+  feeds the block's own existing structure back into the regeneration as
+  correction context, so your `prompt` only needs to state the fix(es)
+  clearly - you do not need to re-describe the whole diagram/visual
+  yourself. When the block stays `kind: "illustration"` (no such server-
+  side memory exists for a raster picture), you must do this preservation
+  yourself: write `prompt` by taking the block's own existing `content.
+  prompt` almost unchanged and inserting or adjusting only the specific
+  correction the instruction describes - never write a fresh, unrelated
+  scene description that discards what the picture already correctly
+  showed. If a label/symbol itself is what's wrong, missing or needs
+  adding, also set `expected_labels` to the corrected complete list
+  (every exact part-label the regenerated image must show, spelled
+  correctly) - leave it unset when the correction is purely visual
+  (spacing, overlap, clutter) and the existing labels are already right.
+  When the instruction genuinely asks for a DIFFERENT diagram (not a
+  correction), a `diagram_kind: flow_chart`/`decision_tree` replacement
+  must stay within the same node/branch-count discipline DIAGRAM_SYSTEM
+  already holds fresh generations to - a real, confirmed case: a
+  replacement description that spelled out 5 parallel branches all
+  re-converging into one shared decision, then branching and re-converging
+  again into one terminal node, failed the deterministic renderer's own
+  geometry QA twice (both the first attempt and its one retry) before
+  falling back through the ENTIRE raster-illustration chain behind it
+  (text-free retries, relevance retries, a final generic fallback) - a
+  long, multi-stage cascade any single step of which can fail under real
+  network conditions, which is exactly how a "corrected" diagram can come
+  back completely blank instead. `flow_chart`/`decision_tree` lay out
+  cleanly as a mostly-linear spine with occasional SHORT side branches,
+  not a web of several parallel paths that all merge back into shared
+  nodes (a general graph, not a tree/spine) - when the instruction's own
+  content has this shape, pick only the 1-2 branches that matter most
+  rather than enumerating every one, or keep the merge implicit in prose
+  instead of drawing every path back to a shared node explicitly.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.

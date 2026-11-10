@@ -253,6 +253,76 @@ def test_ai_edit_rejects_unknown_block_ids(client):
     assert "Unknown block ids" in response.json()["error"]["message"]
 
 
+def test_ai_edit_restores_the_previous_image_when_regeneration_totally_fails(client, documents, monkeypatch):
+    """A real, confirmed bug: `replace_image` on a `kind: "diagram"`/
+    `"concept_experience"` block can fail every bounded regeneration
+    attempt (the structured spec AND the whole raster-illustration
+    fallback chain behind it - an ambitious replacement diagram failing
+    the deterministic renderer's own geometry QA twice, then cascading
+    through text-free/relevance retries and a final generic fallback, any
+    single step of which can fail under real network conditions) - the
+    block used to end up with NO image at all ("Image not generated yet")
+    even though it had a perfectly good one a moment earlier, because
+    `apply_patch` clears `path`/`generated` unconditionally before
+    generation even starts. It must instead keep showing the working
+    picture it had before the failed correction."""
+    from app.schemas.patch import DocumentPatch
+
+    course_id = _create(client)["course_id"]
+    client.post(f"/api/courses/{course_id}/generate", json={"mode": "sync"})
+    document = client.get(f"/api/courses/{course_id}/document").json()
+    document_id = document["document_id"]
+    image_block = next(
+        b for page in document["pages"] for b in page["blocks"]
+        if b["type"] == "image" and b["content"].get("generated") and b["content"].get("path")
+    )
+    original_path = image_block["content"]["path"]
+
+    async def fake_edit(*, document, selected_block_ids, instruction):
+        return DocumentPatch.model_validate({
+            "operations": [
+                {"type": "replace_image", "block_id": image_block["id"], "prompt": "fix the overlap"}
+            ],
+            "reasoning": "test",
+        })
+
+    async def fake_generate_missing(*, document, template, only_block_ids=None, force=False, on_progress=None, job_id=""):
+        # Simulate every bounded attempt failing, exactly like the real
+        # chain's own final state on total failure - no block actually got
+        # a working image.
+        return 0
+
+    monkeypatch.setattr(documents.editor, "edit", fake_edit)
+    monkeypatch.setattr(documents.images, "generate_missing", fake_generate_missing)
+
+    response = client.post(
+        f"/api/documents/{document_id}/ai-edit",
+        json={"selected_block_ids": [image_block["id"]], "instruction": "fix the overlap"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["images_failed"] == [image_block["id"]]
+
+    updated = client.get(f"/api/documents/{document_id}").json()
+    restored = next(b for page in updated["pages"] for b in page["blocks"] if b["id"] == image_block["id"])
+    assert restored["content"]["path"] == original_path
+    assert restored["content"]["generated"] is True
+
+
+def test_replace_image_regenerated_to_nothing_detects_a_total_failure():
+    from app.services.document_service import _replace_image_regenerated_to_nothing
+
+    had_image = {"path": "assets/image_001.svg", "generated": True}
+    no_image = {"path": None, "generated": False}
+    still_has_image = {"path": "assets/image_002.svg", "generated": True}
+
+    assert _replace_image_regenerated_to_nothing(had_image, no_image) is True
+    assert _replace_image_regenerated_to_nothing(had_image, still_has_image) is False
+    # Nothing to fall back to in the first place - restoring would just
+    # swap one blank state for another, identical one.
+    assert _replace_image_regenerated_to_nothing(no_image, no_image) is False
+
+
 def test_non_technical_course_uses_its_own_template(client):
     course = _create(
         client,

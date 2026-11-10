@@ -32,6 +32,44 @@ from app.services.visual_planner import VisualPlanner
 
 log = get_logger(__name__)
 
+_CORRECTION_DRIFT_MIN_LABELS = 2
+_CORRECTION_DRIFT_RATIO_FLOOR = 0.4
+
+
+def _spec_labels(spec: DiagramSpec) -> set[str]:
+    return {
+        item.label.strip().lower()
+        for item in (*spec.entities, *spec.steps, *spec.concept_states)
+        if item.label.strip()
+    }
+
+
+def _correction_drift_issue(existing_spec: dict | None, spec: DiagramSpec) -> str | None:
+    """Mirrors `DiagramService._correction_drift_issue` exactly (see its own
+    docstring for the full reasoning) for the concept_experience pipeline:
+    a deterministic, zero-AI-call check of how much of the ORIGINAL
+    visual's labelled content (entities/steps/states) survived a
+    replace_image correction. `None` when there's nothing to compare (a
+    fresh generation) or too few labels to measure meaningfully."""
+    if not existing_spec:
+        return None
+    try:
+        old_labels = _spec_labels(DiagramSpec.model_validate(existing_spec))
+    except Exception:  # noqa: BLE001 - a malformed stored spec just can't be compared
+        return None
+    if len(old_labels) < _CORRECTION_DRIFT_MIN_LABELS:
+        return None
+    new_labels = _spec_labels(spec)
+    kept = old_labels & new_labels
+    ratio = len(kept) / len(old_labels)
+    if ratio >= _CORRECTION_DRIFT_RATIO_FLOOR:
+        return None
+    return (
+        f"This regenerated a visual that was meant to be CORRECTED, but only "
+        f"{len(kept)}/{len(old_labels)} of its original entity/step/state labels survived - "
+        f"it may be a different visual rather than the same one with the requested fix."
+    )
+
 
 
 class ConceptVisualService:
@@ -53,10 +91,11 @@ class ConceptVisualService:
 
     async def _plan_and_prepare(
         self, *, purpose: str, prompt: str, caption: str, course_title: str, block_id: str, qa_feedback: str = "",
+        existing_spec: dict | None = None,
     ) -> DiagramSpec:
         spec = await self.planner.plan(
             purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
-            block_id=block_id, qa_feedback=qa_feedback,
+            block_id=block_id, qa_feedback=qa_feedback, existing_spec=existing_spec,
         )
         return apply_concept_blueprint_defaults(spec)
 
@@ -76,9 +115,23 @@ class ConceptVisualService:
             log.warning("Concept visual block %s has no purpose/prompt - skipped", block.id)
             return False
 
+        # A real, confirmed bug this closes: `replace_image` (the editor's
+        # "fix this visual" workflow) clears `content["path"]` so this
+        # block regenerates, but never cleared `content["spec"]` - the
+        # existing entities/steps/metaphor just sat there unused while
+        # this call planned from `purpose`/`prompt`/`caption` alone, with
+        # zero awareness the old visual ever existed, so a "fix the
+        # overlapping label" correction came back as a different visual
+        # instead of the same one with that one thing fixed. See
+        # DiagramService.generate_for_block's identical fix/comment for the
+        # sibling `diagram` pipeline.
+        existing_spec = content.get("spec")
+        existing_spec = existing_spec if isinstance(existing_spec, dict) and existing_spec else None
+
         try:
             spec = await self._plan_and_prepare(
                 purpose=purpose, prompt=prompt, caption=caption, course_title=course_title, block_id=block.id,
+                existing_spec=existing_spec,
             )
         except Exception as exc:  # noqa: BLE001 - caller falls back to illustration
             log.warning("Concept visual planning failed for %s: %s", block.id, exc)
@@ -101,7 +154,7 @@ class ConceptVisualService:
             try:
                 retried = await self._plan_and_prepare(
                     purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
-                    block_id=block.id, qa_feedback=result.feedback(),
+                    block_id=block.id, qa_feedback=result.feedback(), existing_spec=existing_spec,
                 )
             except Exception as exc:  # noqa: BLE001 - keep the first attempt, don't fail the block
                 log.warning("Concept visual QA retry failed for %s: %s", block.id, exc)
@@ -118,6 +171,11 @@ class ConceptVisualService:
             return False
 
         relative = self.storage.save_asset(course_id, html_bytes, extension="html")
+        # See _correction_drift_issue's own docstring - a no-op (None)
+        # whenever this generation wasn't a replace_image correction at
+        # all (existing_spec unset), so a fresh first-time generation
+        # never gets a finding here.
+        drift_issue = _correction_drift_issue(existing_spec, spec)
         # A real, spec-specific estimate - not a fixed placeholder - so the
         # page layout engine reserves the actual space this content needs.
         # Getting this wrong doesn't just make the block look odd; the next
@@ -158,7 +216,9 @@ class ConceptVisualService:
                     # own short-circuit contract) only ever be ALL layer-1 or
                     # ALL layer-2 - but reading each issue's own flag keeps
                     # this correct even if that contract ever changes.
-                    [(issue.reason, issue.detail, issue.deterministic) for issue in result.issues],
+                    [
+                        (issue.reason, issue.detail, issue.deterministic) for issue in result.issues
+                    ] + ([("replace_image_correction_drift", drift_issue, True)] if drift_issue else []),
                     resolution="rendered_with_unresolved_issues",
                 ),
             },

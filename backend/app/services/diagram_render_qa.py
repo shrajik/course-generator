@@ -33,7 +33,24 @@ from app.render.diagram_renderer import (
     STAIRCASE_LABEL_SIZE,
     STANDARD_FLOWCHART_LABEL_SIZE,
     TIMELINE_LABEL_SIZE,
+    _BRIDGE_LABEL_SIZE,
+    _CHAIN_LABEL_SIZE,
+    _CIRCUIT_LABEL_SIZE,
+    _DFD_LABEL_SIZE,
+    _DONUT_LABEL_SIZE,
+    _GEAR_LABEL_SIZE,
+    _HONEYCOMB_LABEL_SIZE,
+    _HOURGLASS_LABEL_SIZE,
+    _JOURNEY_LABEL_SIZE,
+    _ORBIT_LABEL_SIZE,
+    _ORG_CHART_LABEL_SIZE,
+    _PETAL_LABEL_SIZE,
+    _PIE_LABEL_SIZE,
+    _PROGRESS_RING_LABEL_SIZE,
+    _PUZZLE_LABEL_SIZE,
+    _RANKED_BAR_LABEL_SIZE,
     _SANS_RATIO,
+    _SPECTRUM_LABEL_SIZE,
 )
 from app.schemas.document import CONTENT_WIDTH
 
@@ -118,7 +135,53 @@ def _shape_bbox(el: ET.Element) -> BBox | None:
             xs = [p[0] for p in points]
             ys = [p[1] for p in points]
             return (min(xs), min(ys), max(xs), max(ys))
+    if tag == "path":
+        return _path_bbox(el.get("d") or "")
     return None
+
+
+_PATH_CMD_RE = re.compile(r"([MLCAZ])\s*([-\d.,\s]*)")
+
+
+def _path_bbox(d: str) -> BBox | None:
+    """An approximate bounding box for an arbitrary path `d` string - the
+    newer node kinds that draw their own main shape as a `<path>` (a donut/
+    pie wedge's arc sector, a flower petal's bezier outline) need SOME
+    overlap/occupancy coverage, where previously `_shape_bbox` simply had
+    no case for `path` at all and these shapes were invisible to every
+    check below. Every command's own real endpoint is a candidate point -
+    for `C` (cubic bezier), its CONTROL points too, since a bezier curve
+    never leaves the convex hull of its own control points, so including
+    them only WIDENS the box, never misses real extent in that direction.
+    `A` (elliptical arc) contributes only its endpoint, not the arc's own
+    bulge past the endpoint-to-endpoint chord - a known, accepted
+    approximation (deriving the true arc extent needs the circle's centre,
+    not available from the `d` string's numbers alone without re-deriving
+    it) - acceptable here because this module's own arcs are used for
+    either many equal wedges around a shared centre (whose endpoints
+    collectively approximate the full circle's extent once aggregated
+    across all of them) or a background band already exempted from the
+    checks that would otherwise suffer from it (see bridge_process's own
+    exemption below). Deliberately NOT reused by `_edge_segments`/
+    `_walk_path`, which intentionally stay blind to curve commands so a
+    node's own filled-shape path is never misread as a connector crossing
+    itself - see that function's own docstring."""
+    points: list[tuple[float, float]] = []
+    for cmd, args in _PATH_CMD_RE.findall(d):
+        nums = [float(n) for n in re.findall(r"-?[\d.]+", args)]
+        if cmd in ("M", "L") and len(nums) >= 2:
+            points.append((nums[0], nums[1]))
+        elif cmd == "C" and len(nums) >= 6:
+            points.append((nums[0], nums[1]))
+            points.append((nums[2], nums[3]))
+            points.append((nums[4], nums[5]))
+        elif cmd == "A" and len(nums) >= 7:
+            points.append((nums[5], nums[6]))
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
 def _node_boxes(root: ET.Element) -> list[BBox]:
@@ -147,13 +210,40 @@ def _parse_points(raw: str) -> list[tuple[float, float]]:
     return [(float(x), float(y)) for x, y in pairs]
 
 
+def _iter_excluding_icons(el: ET.Element):
+    """Like `el.iter()`, but never descends into a `class="diagram-icon"`
+    group - see `_edge_segments`'s own docstring on why icon artwork must
+    never be read as this module's "edge"/"node" geometry."""
+    if "diagram-icon" in (el.get("class") or "").split():
+        return
+    yield el
+    for child in el:
+        yield from _iter_excluding_icons(child)
+
+
 def _edge_segments(root: ET.Element) -> list[list[tuple[float, float]]]:
     """Every edge as a polyline of points (straight `<line>`s are 2 points;
     a `<path>` is walked command-by-command, sampling quadratic-bezier `Q`
     segments so a curved swimlane cross-lane edge is checked too, not just
-    the straight ones)."""
+    the straight ones).
+
+    Deliberately skips every element inside a `class="diagram-icon"` group
+    (see `_draw_icon`/`_icon_badge`, app.render.diagram_renderer) - an
+    icon's own glyph is built from `<line>`/`<path>` primitives in a small
+    LOCAL coordinate box (roughly -12..12), meant to be read only through
+    the `translate(...) scale(...)` transform its wrapper group applies.
+    This function has no notion of SVG `transform` at all (same as every
+    other geometry check in this module - see this file's own module
+    docstring on why every layout function draws directly in absolute
+    canvas coordinates with no nested transforms, EXCEPT icon groups, the
+    one deliberate exception); reading an icon's raw local-space
+    coordinates as if they were absolute edge points is exactly what
+    produced real, confirmed false positives (`out_of_canvas` on an icon's
+    own small negative coordinates, `shared_edge_segment` between two
+    unrelated icons' internal lines) once icons were added - never a real
+    geometry defect in the diagram itself."""
     segments: list[list[tuple[float, float]]] = []
-    for el in root.iter():
+    for el in _iter_excluding_icons(root):
         tag = _local(el.tag)
         if tag == "line":
             segments.append([(_f(el, "x1"), _f(el, "y1")), (_f(el, "x2"), _f(el, "y2"))])
@@ -637,8 +727,27 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
     # scaled", never the old box convention's LABEL_SIZE for any of these.
     _RING_KINDS = ("cycle", "concept_map", "conceptual", "radial_mindmap", "venn")
     _STANDARD_FLOWCHART_KINDS = ("flow_chart", "process", "decision_tree", "fishbone", "layered_diagram")
-    if kind in _RING_KINDS:
+    if kind in _RING_KINDS or kind == "er_diagram":
+        # er_diagram mixes `_node_block` entity boxes with `_draw_attribute_
+        # oval`'s smaller attribute ovals (also sized at RING_LABEL_SIZE - a
+        # real, confirmed bug: they used to render at a hardcoded 11.5px,
+        # under the readability floor once scaled, and this kind wasn't even
+        # in this lookup table to catch it). Using the smaller size here is
+        # the conservative floor: if RING_LABEL_SIZE-based text clears the
+        # readability check, the larger box text automatically does too,
+        # and a genuinely too-small circle/oval (the actual shape this
+        # check exists to catch) never gets missed by being judged against
+        # the bigger box size instead.
         label_base_size = RING_LABEL_SIZE
+    elif kind == "data_flow_diagram":
+        # Its own, larger floor (see `_DFD_LABEL_SIZE`'s own comment on
+        # diagram_renderer - a real, confirmed complaint that RING_LABEL_
+        # SIZE-sized circles, scaled down to this kind's always-fixed
+        # canvas width, sat right AT the 11px readability floor instead of
+        # comfortably above it) - still the smaller of the two shapes this
+        # kind mixes (`_node_block` boxes at LABEL_SIZE=19.0, circles at
+        # _DFD_LABEL_SIZE=18.0), so it's still the real conservative floor.
+        label_base_size = _DFD_LABEL_SIZE
     elif kind in _STANDARD_FLOWCHART_KINDS:
         label_base_size = STANDARD_FLOWCHART_LABEL_SIZE
     elif kind == "chevron_process":
@@ -655,7 +764,44 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
         label_base_size = NETWORK_LABEL_SIZE
     elif kind == "gantt_chart":
         label_base_size = GANTT_LABEL_SIZE
+    elif kind == "honeycomb":
+        label_base_size = _HONEYCOMB_LABEL_SIZE
+    elif kind == "puzzle_pieces":
+        label_base_size = _PUZZLE_LABEL_SIZE
+    elif kind == "gears_process":
+        label_base_size = _GEAR_LABEL_SIZE
+    elif kind == "donut_segments":
+        label_base_size = _DONUT_LABEL_SIZE
+    elif kind == "pie_wedge":
+        label_base_size = _PIE_LABEL_SIZE
+    elif kind == "orbit_diagram":
+        label_base_size = _ORBIT_LABEL_SIZE
+    elif kind == "progress_rings":
+        label_base_size = _PROGRESS_RING_LABEL_SIZE
+    elif kind == "bridge_process":
+        label_base_size = _BRIDGE_LABEL_SIZE
+    elif kind == "chain_links":
+        label_base_size = _CHAIN_LABEL_SIZE
+    elif kind == "flower_petal":
+        label_base_size = _PETAL_LABEL_SIZE
+    elif kind == "hourglass_diagram":
+        label_base_size = _HOURGLASS_LABEL_SIZE
+    elif kind == "org_chart":
+        label_base_size = _ORG_CHART_LABEL_SIZE
+    elif kind == "wavy_journey_path":
+        label_base_size = _JOURNEY_LABEL_SIZE
+    elif kind == "spectrum":
+        label_base_size = _SPECTRUM_LABEL_SIZE
+    elif kind == "causal_loop":
+        label_base_size = RING_LABEL_SIZE
+    elif kind == "ranked_bars":
+        label_base_size = _RANKED_BAR_LABEL_SIZE
+    elif kind == "circuit_schematic":
+        label_base_size = _CIRCUIT_LABEL_SIZE
     else:
+        # iceberg/feedback_loop_process/input_process_output all draw
+        # their node content through `_node_block` at LABEL_SIZE, same as
+        # this default - no dedicated entry needed for them.
         label_base_size = LABEL_SIZE
     issues: list[RenderQAIssue] = [
         *text_overflow_issues(root),
@@ -679,7 +825,18 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
         # TOLERANCE's fix for the unrelated ER false-positive below -
         # exempting this kind specifically keeps that fix from also
         # re-litigating an already-verified-clean network render.
-        *(duplicate_arrowhead_issues(root) if kind != "network_mesh" else []),
+        # donut_segments/pie_wedge/flower_petal/bridge_process join for
+        # the same reason as their own edge_crosses_node exemption above -
+        # this check's `_edge_segments` input picks up each one's own
+        # node-shape `<path>` as if it were a real connector, and every
+        # one of those "lands" near the shapes' shared centre point -
+        # never an actual ambiguous arrowhead pair, since none of these
+        # kinds draws an arrow at all.
+        *(
+            duplicate_arrowhead_issues(root)
+            if kind not in ("network_mesh", "donut_segments", "pie_wedge", "flower_petal", "bridge_process")
+            else []
+        ),
         # font_size_issues checks role-specific floors calibrated to
         # _node_block's box title/subtitle structure (LABEL_SIZE/
         # DETAIL_SIZE). flow_chart/process used to draw that structure and
@@ -694,13 +851,35 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
 
     # venn's own circles are SUPPOSED to overlap - that overlap is the
     # entire semantic point of the diagram (_layout_venn), not a layout
-    # bug - so this is one of two kinds exempt from the overlap check, the
+    # bug - so this is one of the kinds exempt from the overlap check, the
     # same "a real, structural reason this kind's geometry doesn't fit the
     # generic rule" exemption schematic/graph already get elsewhere in
-    # this module's own docstring. nested_circles is the other one - its
-    # whole point is FULL containment (an inner ring sits entirely inside
-    # every ring around it, by design - see _layout_nested_circles).
-    _OVERLAP_EXEMPT_KINDS = ("venn", "nested_circles")
+    # this module's own docstring. nested_circles is the same - its whole
+    # point is FULL containment (an inner ring sits entirely inside every
+    # ring around it, by design - see _layout_nested_circles). honeycomb
+    # joins them for a related but distinct reason: adjacent hexagons
+    # TESSELLATE (share a real edge, by design - see _layout_honeycomb),
+    # which means their axis-aligned bounding BOXES always overlap in the
+    # corner regions outside the hexagon's own hexagonal outline, even
+    # though the actual painted shapes never do - a real, confirmed false
+    # positive on every honeycomb cluster, not a rare edge case.
+    # chain_links joins them for the same reason as honeycomb: each link
+    # legitimately overlaps its neighbour by design (the "interlocking
+    # chain" look - see _layout_chain_links). donut_segments/pie_wedge/
+    # flower_petal join for a DIFFERENT but related structural reason:
+    # every one of their own node shapes is a `<path>` whose own true
+    # outline this module can only bound approximately (`_path_bbox`'s own
+    # docstring on why) - and, more fundamentally, every wedge/petal
+    # SHARES the same centre point by construction (a pie/donut slice's
+    # point, a petal's own base), so even a perfectly accurate bounding
+    # box for each one would still overlap every other one right at that
+    # shared point - an unavoidable, structural property of a
+    # radiates-from-one-centre shape family, not a real collision between
+    # two things that are supposed to stay apart.
+    _OVERLAP_EXEMPT_KINDS = (
+        "venn", "nested_circles", "honeycomb", "chain_links",
+        "donut_segments", "pie_wedge", "flower_petal",
+    )
     if kind not in _OVERLAP_EXEMPT_KINDS:
         for i, a in enumerate(nodes):
             for b in nodes[i + 1 :]:
@@ -713,9 +892,20 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
     # the chart, behind every task bar, the standard Gantt convention
     # (see _layout_gantt_chart). This check's whole premise ("a connector
     # accidentally passing through an unrelated node") doesn't apply to a
-    # background gridline doing exactly what it's there to do.
+    # background gridline doing exactly what it's there to do. bridge_
+    # process joins it for the same reason: its arched band (a <path>, by
+    # construction - an arc needs one) is a decorative background shape
+    # that every step node legitimately sits ON TOP of (see
+    # _layout_bridge_process) - every sampled point along that band near a
+    # node is the band doing its job, not a connector straying into an
+    # unrelated shape. donut_segments/pie_wedge/flower_petal join for the
+    # same "shared centre point" structural reason _OVERLAP_EXEMPT_KINDS
+    # documents just above - every one of their own `<path>` node shapes
+    # meets every other one exactly at that shared centre, which an
+    # edge-vs-node containment check can't tell apart from a real
+    # connector straying into an unrelated node.
     node_shapes = _node_shapes(root)
-    if kind != "gantt_chart":
+    if kind not in ("gantt_chart", "bridge_process", "donut_segments", "pie_wedge", "flower_petal"):
         for edge in edges:
             for p0, p1 in zip(edge, edge[1:]):
                 samples = _sample_segment(p0, p1)

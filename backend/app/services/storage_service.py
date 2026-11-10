@@ -15,6 +15,7 @@ reimplementing one class, not touching the AI services.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -285,6 +286,58 @@ class StorageService:
 
     def asset_abs_path(self, course_id: str, relative: str) -> Path:
         return self.course_dir(course_id) / relative
+
+    # --- Wikimedia cache ----------------------------------------------------
+    # Course-INDEPENDENT (sibling of courses_dir, not under any one course)
+    # so a Commons image found for one course is reused across every later
+    # course that asks an equivalent topic, instead of being re-searched/
+    # re-downloaded/re-validated - see ImageService._try_wikimedia_image and
+    # wikimedia_provider.WikimediaCandidate. Keyed by a normalised query
+    # string (lowercased, whitespace-collapsed) so "mitosis diagram" and
+    # "Mitosis  Diagram" hit the same entry - exact-string matching, not
+    # embedding similarity, to stay dependency-free.
+    def wikimedia_cache_dir(self) -> Path:
+        return self.settings.data_dir / "wikimedia_cache"
+
+    @staticmethod
+    def normalize_wikimedia_cache_key(text: str) -> str:
+        return " ".join((text or "").strip().lower().split())
+
+    def _wikimedia_cache_entry_dir(self, key: str) -> Path:
+        normalized = self.normalize_wikimedia_cache_key(key)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+        return self.wikimedia_cache_dir() / digest
+
+    def load_wikimedia_cache_entry(self, key: str) -> tuple[bytes, dict[str, Any]] | None:
+        """`None` on a cache miss OR a corrupt/incomplete entry - the latter
+        is treated exactly like a miss (re-search, re-populate) rather than
+        raising, since a cache is only ever a speed optimisation, never a
+        source of truth this pipeline can fail on."""
+        entry_dir = self._wikimedia_cache_entry_dir(key)
+        meta_path = entry_dir / "meta.json"
+        if not meta_path.exists():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            image_name = str(meta.get("image_file") or "")
+            image_path = entry_dir / image_name
+            if not image_name or not image_path.is_file():
+                return None
+            return image_path.read_bytes(), meta
+        except Exception:  # noqa: BLE001 - a corrupt cache entry degrades to a miss, never a crash
+            log.warning("Corrupt Wikimedia cache entry for key %r - treating as a miss", key)
+            return None
+
+    def save_wikimedia_cache_entry(
+        self, key: str, data: bytes, metadata: dict[str, Any], *, extension: str = "png"
+    ) -> None:
+        entry_dir = self._wikimedia_cache_entry_dir(key)
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        image_name = f"image.{extension}"
+        (entry_dir / image_name).write_bytes(data)
+        (entry_dir / "meta.json").write_text(
+            json.dumps({**metadata, "image_file": image_name}), encoding="utf-8"
+        )
 
 
 _storage: StorageService | None = None

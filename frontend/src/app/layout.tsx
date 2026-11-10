@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "katex/dist/katex.min.css";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AuthProvider } from "@/lib/auth/auth-provider";
 import { CourseDraftProvider } from "@/lib/state/course-draft";

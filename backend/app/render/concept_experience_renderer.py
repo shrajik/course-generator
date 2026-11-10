@@ -85,7 +85,7 @@ def _header_html(spec: DiagramSpec, theme: TemplateTheme) -> str:
         # non-technical reader - surfaced here as its own friendly callout
         # rather than left unrendered (it previously was).
         parts.append(
-            '<div class="cev-metaphor"><span class="cev-metaphor-icon" aria-hidden="true">&#128161;</span>'
+            '<div class="cev-metaphor"><span class="cev-metaphor-label">Analogy</span>'
             f'<span class="cev-metaphor-text">{_esc(spec.visual_metaphor.strip())}</span></div>'
         )
     if spec.core_message.strip():
@@ -106,9 +106,28 @@ def _entity_icon_char(entity: VisualEntity) -> str:
     label though ("Car (Class)" -> "C") - truncating a numeric/symbolic
     label (a BST node "10", a stack value "42") to its first character
     would sit right next to the real value and silently misstate it ("1"
-    next to "10"), which is worse than no icon at all."""
-    first_char = (entity.label.strip() or entity.id)[:1]
-    return entity.icon.strip() or (first_char.upper() if first_char.isalpha() else "◆")
+    next to "10"), which is worse than no icon at all.
+
+    Root-cause fix (production course audit, ThermoDynamics/
+    doc_a2f5625a7fd9): a letter-initial only reads sensibly for a short,
+    name-like label ("Car", "Order") - reducing a multi-word descriptive
+    PHRASE ("Control mass (closed)", "Isolated system", "Target audience")
+    to its first letter produces a meaningless, often-duplicated badge (two
+    different "Control ..." columns both showing "C", indistinguishable
+    from each other) that reads as broken, not deliberate. A trailing
+    parenthetical annotation is stripped before judging word count (so
+    "Car (Class)" still correctly yields "C"); anything left with more than
+    one word falls back to the same neutral "◆" a non-alphabetic label
+    already gets, rather than a misleading initial."""
+    label = entity.label.strip() or entity.id
+    icon = entity.icon.strip()
+    if icon:
+        return icon
+    core = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip()
+    if not core or " " in core:
+        return "◆"
+    first_char = core[:1]
+    return first_char.upper() if first_char.isalpha() else "◆"
 
 
 # A property key that describes the card's own PRESENTATION rather than any
@@ -124,7 +143,32 @@ _META_PROPERTY_KEYS = {"style", "styling", "css", "format", "formatting"}
 # VALUE is still genuine content (e.g. "ordered", "mutable"); only the key
 # is meaningless noise, so it renders as a plain fact instead of a bold,
 # content-free "BULLET1:" label.
-_PLACEHOLDER_PROPERTY_KEY_RE = re.compile(r"^(bullet|point|item|line|prop(?:erty)?|note|fact)\s*\d*$", re.IGNORECASE)
+_PLACEHOLDER_PROPERTY_KEY_RE = re.compile(
+    r"^(bullet|point|item|line|top|step|prop(?:erty)?|note|fact)\s*\d*$", re.IGNORECASE
+)
+
+# A value with terminal punctuation, a clause-joining semicolon, or simply
+# several words reads as a sentence/explanation, not a one-fact attribute
+# value ("Red", "O(n)") - a property KEY bolded in front of one is exactly
+# as meaningless as a placeholder key like "bullet1", just spelled
+# differently. A real, confirmed case: entity `properties` with keys like
+# "admin"/"warning"/"symptom_fix"/"symptom_title" (none caught by
+# `_PLACEHOLDER_PROPERTY_KEY_RE` - they read as real English words, not
+# placeholders) each paired with a full sentence, rendered as a wall of
+# bold scratch-note-looking field names ("admin: Tolerance guidance:
+# record chosen bands as 'SME to confirm'..."). app.services.concept_qa's
+# structural QA already flags this spec as too-dense and retries it once
+# at the source, but that pipeline has no fallback if the retry doesn't
+# improve things (see concept_visual_service.generate_for_block's own
+# comment) - this is the deterministic, always-effective safety net that
+# guarantees a sentence-shaped value never ships with a raw key bolted in
+# front of it, independent of whatever the model actually generated.
+_SENTENCE_LIKE_VALUE_RE = re.compile(r"[.!?]\s*$")
+
+
+def _looks_like_sentence(value: str) -> bool:
+    return bool(_SENTENCE_LIKE_VALUE_RE.search(value)) or len(value) > 45 or len(value.split()) >= 6 or ";" in value
+
 
 # A sentence/formula-shaped property value is caught and retried at the
 # source - app.services.concept_qa's structural QA (same length caps) - not
@@ -134,9 +178,10 @@ _PLACEHOLDER_PROPERTY_KEY_RE = re.compile(r"^(bullet|point|item|line|prop(?:erty
 # `.cev-root *`) rather than being cut short, which a blanket length-based
 # truncation here would silently break.
 def _render_prop(key: str, value: str) -> str:
-    if _PLACEHOLDER_PROPERTY_KEY_RE.match(key.strip()):
-        return f'<span class="cev-prop">{_esc(value)}</span>' if value.strip() else ""
-    return f'<span class="cev-prop"><b>{_esc(key)}</b>{": " + _esc(value) if value.strip() else ""}</span>'
+    value = value.strip()
+    if _PLACEHOLDER_PROPERTY_KEY_RE.match(key.strip()) or (value and _looks_like_sentence(value)):
+        return f'<span class="cev-prop">{_esc(value)}</span>' if value else ""
+    return f'<span class="cev-prop"><b>{_esc(key)}</b>{": " + _esc(value) if value else ""}</span>'
 
 
 def _entity_card_html(entity: VisualEntity, *, extra_class: str = "", index: int = 0) -> str:
@@ -944,8 +989,8 @@ def _style_html(theme: TemplateTheme) -> str:
   position:relative;overflow:hidden;
 }}
 .cev-root::before {{
-  content:"";position:absolute;inset:0 0 auto 0;height:7px;
-  background:linear-gradient(90deg, #f472b6, #fb923c, #facc15, #4ade80, #22d3ee, #60a5fa, #c084fc);
+  content:"";position:absolute;inset:0 0 auto 0;height:4px;
+  background:{theme.accent_color};
 }}
 /* Any single unbroken "word" (a long function signature, a path, an
    identifier with no spaces - very common in this domain) must never be
@@ -961,7 +1006,10 @@ def _style_html(theme: TemplateTheme) -> str:
   border-radius:14px;padding:10px 16px;margin:0 auto 14px;max-width:520px;
   animation:cevFadeUp .45s ease both;
 }}
-.cev-metaphor-icon{{font-size:19px;line-height:1.4;flex:none;}}
+.cev-metaphor-label{{
+  font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;line-height:1.5;
+  flex:none;color:{theme.accent_color};
+}}
 .cev-metaphor-text{{font-size:13.5px;font-style:italic;color:{theme.text_color};line-height:1.4;}}
 .cev-core-message{{font-size:14px;color:{theme.muted_color};text-align:center;margin-bottom:12px;line-height:1.5;}}
 .cev-technical{{
@@ -1972,7 +2020,11 @@ _REPRESENTATION_RENDERERS = {
                                               # shape, not just "relationship" with different edge labels
     "decision_tree": _render_tree,           # a branching decision is the exact same tree shape, with its
                                               # Yes/No (or condition) edges shown as branch labels
-    "spatial": _render_object,               # best-effort; a documented future gap, not a crash
+    "spatial": _render_object,               # RETIRED - the writer is steered away from ever choosing
+                                              # this (see VisualPlanner's CONCEPT_SYSTEM); kept mapped
+                                              # here only so a stray/older spec already carrying this
+                                              # value still renders via the generic fallback instead of
+                                              # hitting the `or _render_object` default a different way
     "timeline": _render_timeline,
     "before_after": _render_before_after,
     "data_structure": _render_data_structure,

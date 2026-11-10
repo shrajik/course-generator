@@ -69,6 +69,20 @@ async def lifespan(app: FastAPI):
     await refresh_uploaded_templates()
     if settings.use_database:
         await log_pgvector_status()
+    # Crash recovery: a course left "queued"/"running" when the PREVIOUS
+    # process stopped is orphaned, not actually in flight (self._jobs, the
+    # in-memory task registry, is always empty on a fresh process) - find
+    # and mark them "interrupted", auto-resuming up to the configured retry
+    # limit. Best-effort: an unreachable database/storage must not block
+    # startup (same contract as the template refresh above).
+    try:
+        from app.services.course_service import get_course_service
+
+        recovered = await get_course_service().recover_interrupted_courses()
+        if recovered:
+            log.warning("Crash recovery: found %s interrupted course(s): %s", len(recovered), recovered)
+    except Exception:  # noqa: BLE001
+        log.exception("Crash-recovery scan failed at startup")
     # Each worker caches templates in memory; this keeps a worker in step
     # with templates created, edited or deleted through another one.
     refresher = (

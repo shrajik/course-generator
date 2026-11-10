@@ -146,7 +146,8 @@
     "surface_color": "#f8fafc",
     "border_color": "#e2e8f0",
     "base_font_size": 15.0,
-    "base_line_height": 1.6
+    "base_line_height": 1.6,
+    "diagram_palette": "corporate"
   },
   "block_styles": {
     "heading": { "font_size": 26, "font_weight": 700, "color": "#0f172a", "line_height": 1.25 },

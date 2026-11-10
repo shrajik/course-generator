@@ -356,6 +356,16 @@ class _RecordingImages:
         self.sizes.append(size)
         return _png(size=(300, 200))
 
+    async def structured(self, *, schema, **kwargs):
+        # This test's subject is the requested picture SHAPE, not the text/
+        # relevance QA cascade - a clean, default-passing verification on
+        # every check keeps the generation on its ordinary success path
+        # (fallback-cascade root-cause fix: an inconclusive/errored check
+        # now has the image withheld rather than shipping a further,
+        # differently-sized generic fallback, which this test must not
+        # incidentally exercise).
+        return schema()
+
 
 async def test_d_an_aspect_ratio_sets_the_requested_picture_shape(settings):
     from app.services.image_service import ImageService
@@ -364,10 +374,8 @@ async def test_d_an_aspect_ratio_sets_the_requested_picture_shape(settings):
     service = ImageService(ai=images)
     block = _block(BlockType.IMAGE, "how_it_works", kind="illustration", prompt="volunteers sorting boxes", aspect="landscape")
     assert await service.generate_for_block(course_id="c1", block=block, template=_md_template(), course_title="T")
-    # The template's landscape shape is what is requested. (Text-free pictures are now verified and retried
-    # when the check is inconclusive, which this stub cannot answer, so more than one request is expected;
-    # every attempt but the last-resort fallback keeps the requested shape.)
-    assert images.sizes[0] == "1536x1024" and images.sizes.count("1536x1024") >= 1
+    # The template's landscape shape is what is requested, on every attempt.
+    assert images.sizes and all(size == "1536x1024" for size in images.sizes)
     assert block.content["generated"] is True
 
 

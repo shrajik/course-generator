@@ -15,6 +15,10 @@ illustration from the image model, as before.
 from __future__ import annotations
 
 import asyncio
+import unicodedata
+import uuid
+from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
@@ -31,11 +35,432 @@ from app.services.formula_qa import evaluate_formula
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.quality_framework import visual_qa_finding_entries
+from app.render.section_icons import match_generic_section_icon, render_section_icon_svg
 from app.services.storage_service import StorageService, get_storage
+from app.services import wikimedia_provider
+from app.services.wikimedia_image_qa import candidate_passed, evaluate_candidate
+from app.services.wikimedia_provider import WikimediaCandidate
 
 log = get_logger(__name__)
 
 MAX_PROMPT_CHARS = 4500
+
+# Defensive last-resort ceiling at the ACTUAL provider call (`_draw`), not a
+# replacement for `PROMPT_CHAR_BUDGET` (16_000, enforced once at initial
+# `build_prompt` assembly). Root cause this closes: every bounded RETRY
+# this module runs (the relevance retry loop in `_generate_illustration`,
+# the missing-label retries in `_generate_with_text_check`) builds its next
+# prompt by APPENDING a fresh "IMPORTANT: ..."/"ABSOLUTELY CRITICAL: ..."
+# correction onto the previous attempt's already near-budget prompt,
+# without ever re-applying the budget - a real, confirmed production case
+# (a dense two-concept textbook illustration brief) compounded across 2
+# relevance retries into a 21,356-character prompt that Azure's API
+# rejected outright (a hard ~20,000-char limit, undocumented in this
+# codebase until this failure), turning a quality problem (the image not
+# quite matching the brief) into a total generation failure (no image at
+# all). Truncated from the FRONT (keeping the tail): the front is the
+# generic style/guidance boilerplate assembled once at the start, while
+# every retry's freshest, most specific correction is always appended at
+# the END - keeping the tail is what keeps the retry's whole point (telling
+# the model exactly what the previous attempt got wrong) intact even when
+# this safety net has to trim something. In ordinary use (prompt already
+# under PROMPT_CHAR_BUDGET) this is always a no-op.
+_PROVIDER_PROMPT_HARD_LIMIT = 19_000
+
+# A raster image model (MAI-Image-2.6, and every other current text-to-image
+# model alike) can reliably bake in a short symbol/term and its plain-word
+# definition ("ρ (density)", "ε = induced emf" - the writer prompt's own
+# template example) but not a multi-symbol mathematical RELATIONSHIP between
+# several quantities ("τ = μ·γ̇ (Newtonian)", "Kn = λ / L_c", "D/Dt = ∂/∂t +
+# (u·∇)") - a real, confirmed case: a fluid-mechanics course's textbook
+# illustrations, each asked for 9-15 `expected_labels` including several
+# full equations like these, failed the post-generation text-legibility
+# check on nearly every attempt (not a style problem - `style_compliant`
+# passed on most of these) and burned their one bounded retry before
+# falling back to a generic, off-topic placeholder image - so the reader
+# never saw the actual requested diagram at all, on most of a chapter's
+# illustrations. `image_formula_expression` already exists as the one-
+# equation, separately-and-correctly-verified channel for a genuine
+# governing equation (see WRITER_SYSTEM's own guidance) - `expected_labels`
+# only needs to carry what raster text generation can actually deliver.
+# Counting characters from this operator set is a cheap, reliable proxy for
+# "this reads as an equation between symbols", not just a labelled term -
+# `_` and `^` are included because a subscript/superscript baked into raster
+# text is exactly as unreliable as any other multi-symbol notation.
+_LABEL_OPERATOR_CHARS = "=/·*+^_∂∇×→∫Σ"
+_MAX_EXPECTED_LABELS = 6
+# How many extra attempts `_generate_illustration` gives a textbook image
+# that fails `_verify_image_relevance` before giving up and shipping a
+# generic fallback - see that retry loop's own comment for the real,
+# confirmed case this covers.
+_MAX_RELEVANCE_RETRIES = 2
+# Generous on plain length - a genuine real case needed a 46-character
+# descriptive phrase with zero math notation ("Induced current creates
+# opposing field (Lenz)") and is exactly the kind of label a raster model
+# CAN attempt; length alone was never the actual problem in the confirmed
+# failures (several were under 20 characters: "Kn = λ / L_c"). The operator
+# count is the real signal - this cap only catches genuine runaway text.
+_MAX_LABEL_CHARS = 70
+
+
+_SUPERSCRIPT_SUBSCRIPT_CHARS = "⁰¹²³⁴⁵⁶⁷⁸⁹⁻₀₁₂₃₄₅₆₇₈₉"
+
+
+def _has_hard_to_render_glyph(label: str) -> bool:
+    """A real, confirmed case: plain Greek letters (ρ, μ, σ, τ) rendered
+    perfectly in a real generation, but "γ̇" (gamma with a COMBINING DOT
+    ABOVE, U+0307 - the standard shear-rate notation) kept failing text
+    verification in every attempt even as the ONLY non-trivial symbol in
+    an otherwise maximally simple label set. A combining mark is a second,
+    floating glyph stacked onto its base character at render time, not a
+    single precomposed letterform - exactly the kind of fine typographic
+    detail a raster image model cannot reliably reproduce as legible,
+    correctly-spelled text. Unicode superscript/subscript characters ("10²",
+    "s⁻¹") are the same problem in a different guise - tiny raised/lowered
+    glyphs, not normal-sized text."""
+    if any(ch in _SUPERSCRIPT_SUBSCRIPT_CHARS for ch in label):
+        return True
+    return any(unicodedata.combining(ch) != 0 for ch in label)
+
+
+def _is_renderable_label(label: str) -> bool:
+    operator_count = sum(label.count(ch) for ch in _LABEL_OPERATOR_CHARS)
+    if len(label) > _MAX_LABEL_CHARS or operator_count > 1 or _has_hard_to_render_glyph(label):
+        return False
+    # A "term: short definition" pair ("ε: induced emf") is exactly the
+    # allowed pattern, same as "ε = induced emf" - but a real, confirmed
+    # case shows the writer sometimes fills that same shape with a whole
+    # CLAUSE or verdict instead of a definition ("Compressible: variable-
+    # density model warranted", "Rheogram: Apparent viscosity μ_app vs
+    # shear rate γ̇") - still only one operator-set character (or none) by
+    # the check above, so it slipped through, and these consistently
+    # garbled: every extra word compounds the chance a raster model drops
+    # or misspells one of them. More than 2 words after the colon is no
+    # longer a short definition.
+    if ":" in label and len(label.split(":", 1)[1].split()) > 2:
+        return False
+    return True
+
+
+def sanitize_expected_labels(labels: list[str]) -> list[str]:
+    """Drop any label too equation-like for raster text to render, then cap
+    the remainder to `_MAX_EXPECTED_LABELS` - applied once, at every point
+    `expected_labels` is read, so the SAME shortened list is both what the
+    image model is asked to draw and what the post-generation check
+    verifies (never a prompt asking for 15 labels while verification only
+    checks 6, or vice versa)."""
+    return [label for label in labels if _is_renderable_label(label)][:_MAX_EXPECTED_LABELS]
+
+
+# --- image-generation prompt budget (priority-based) -------------------------
+#
+# This section covers ONLY `ImageService.build_prompt`'s own final assembly -
+# the prompt actually sent to the image-generation model. `MAX_PROMPT_CHARS`
+# above is a separate, unrelated budget used for QA "brief" strings (the
+# Wikimedia search/validation brief, the post-generation relevance-check
+# brief) that are never sent to an image-generation model at all; those are
+# deliberately untouched here.
+#
+# Root cause this replaces: `build_prompt` used to assemble
+# `[context_line, writer_prompt, labels_line, style_guidance,
+# negative_constraints]`, join them, then blindly slice the WHOLE result to
+# `MAX_PROMPT_CHARS` (4500). Since `style_guidance` was concatenated near the
+# END, a long combined course/chapter/section/key_concept context plus a
+# verbose writer `image_prompt` could silently cut off the TAIL of the fixed
+# style guidance - for `TEXTBOOK_ILLUSTRATION_GUIDANCE` specifically, that
+# tail is the CRITICAL FRAMING RULE, the single rule most directly
+# responsible for catching the real, confirmed label-overlap defect this
+# module's own history already documents (see TEXTBOOK_ILLUSTRATION_GUIDANCE's
+# FORMULA BLOCK section). A silent `[:n]` slice gave no log line, no error,
+# nothing - the first sign would have been another garbled/overlapping image.
+#
+# Fix: `_assemble_prompt_with_priority` below builds the prompt from
+# explicitly prioritised `_PromptSegment`s instead of one flat string-then-
+# slice. Priority 1 (the fixed style/negative-constraint rules - every
+# "never do X" and "must do Y" instruction, CRITICAL FRAMING RULE included)
+# is never shortened or dropped, full stop. Priority 2 (expected labels) is
+# preserved whenever the budget allows. Priority 3 (the per-block
+# course/chapter/section/key_concept context and the writer's own free-text
+# prompt) is the ONLY tier ever shortened, and only word/sentence-boundary
+# aware (`_shorten_to_budget`), never a bare `[:n]` slice - see both
+# functions' own docstrings.
+#
+# Provider limit, verified rather than assumed (per the "do not guess" brief
+# this fix was built to): Microsoft's own documentation for the MAI image
+# generations API states, for the `prompt` request parameter, "Maximum
+# context length: 32,000 tokens." -
+# https://learn.microsoft.com/en-us/azure/foundry/foundry-models/how-to/use-foundry-models-mai-image
+# (fetched 2026-11-07; applies to MAI-Image-2.6, MAI-Image-2.6-Flash and the
+# MAI-Image-2.5 family alike - this module's `textbook_image_provider`
+# setting routes every "textbook"-style illustration through exactly this
+# API). This is a TOKEN limit, not a character limit, and no tokenizer is
+# called here to convert exactly (that would be an extra per-prompt CPU cost
+# for a problem budget headroom alone already solves - see "no unnecessary
+# additional LLM calls" in this fix's own brief). Converting with a
+# deliberately pessimistic ratio instead: real GPT-family tokenizers average
+# roughly 4 characters per token for English prose; mixed technical/math/
+# symbol-heavy text (`\sin`, `\theta_t`, `n_1`, single combining-diacritic
+# glyphs like `n̂`) tokenizes LESS efficiently, so erring toward FEWER
+# characters per token is the safe direction - this module uses 3.
+MAI_IMAGE_MAX_PROMPT_TOKENS = 32_000  # the verified, documented provider limit - see above
+_CONSERVATIVE_CHARS_PER_TOKEN = 3  # deliberately pessimistic; see this section's own comment
+
+# The actual assembly target `_assemble_prompt_with_priority` builds against.
+# Deliberately far below the ~96,000-char ceiling the two constants above
+# imply (32,000 x 3) - this is not "spend the whole budget", it is "stay
+# inside a budget an order of magnitude larger than any real combined prompt
+# needs, so the priority system only ever has to shorten Priority 3 content
+# in a genuinely pathological case (a test fixture built to force it), never
+# in ordinary use." A documented, verified multiple of the old, unverified
+# MAX_PROMPT_CHARS (4500) - not an arbitrary bump (see this fix's own
+# constraint against that).
+PROMPT_CHAR_BUDGET = 16_000
+
+
+@dataclass(frozen=True)
+class _PromptSegment:
+    """One named piece of an image-generation prompt, tagged with how it
+    may be treated when the assembled prompt would otherwise exceed
+    `PROMPT_CHAR_BUDGET`.
+
+    Priority 1 - never truncated or dropped: the fixed style/negative-
+    constraint rules (CRITICAL FRAMING RULE, STRICT NO-TEXT RULE, label-
+    overlap/formula-correctness requirements, "no watermarks" - every
+    "must"/"never" instruction the illustration's own correctness depends
+    on). This is the one hard invariant `_assemble_prompt_with_priority`
+    keeps.
+
+    Priority 2 - preserved whenever the budget allows, shortened only under
+    genuine pressure (and then by dropping the least-essential labels from
+    the end of the list, never truncating a label mid-word): the expected-
+    labels instruction.
+
+    Priority 3 - the only tier ever shortened to make room, and always via
+    `_shorten_to_budget` (word/sentence-boundary aware), never a bare
+    slice: the per-block course/chapter/section/key_concept context line
+    and the writer's own free-text `image_prompt`/`purpose`/`caption` -
+    genuinely the most variable, least load-bearing-for-correctness content
+    in the prompt, and (per this fix's own brief) the first place "redundant
+    writer instructions" and "long descriptive context" should be optimised
+    before anything else."""
+
+    name: str
+    text: str
+    priority: int  # 1 = never truncate, 2 = preserve when possible, 3 = optimise first
+
+
+def _shorten_to_budget(text: str, max_chars: int) -> str:
+    """Fits `text` into `max_chars` WITHOUT a bare `text[:max_chars]` slice -
+    the exact failure class this fix exists to remove (a mid-word, mid-
+    sentence cut with no indication anything was lost). Prefers the last
+    complete SENTENCE boundary at or before the limit (so what survives
+    reads as whole, coherent prose, not a dangling fragment); falls back to
+    the last complete WORD boundary only when no sentence boundary leaves
+    enough of the text intact to be worth keeping. Always appends a visible
+    marker, so a shortened segment is never silently indistinguishable from
+    a complete one - in the prompt itself, in a log line, and in a test
+    asserting against it."""
+    if len(text) <= max_chars:
+        return text
+    marker = " [...shortened for length]"
+    budget = max_chars - len(marker)
+    if budget <= 0:
+        return ""
+    window = text[:budget]
+    best = -1
+    for terminator in (". ", "! ", "? ", "\n"):
+        idx = window.rfind(terminator)
+        if idx == -1:
+            continue
+        end = idx + (1 if terminator == "\n" else len(terminator))
+        if end > best:
+            best = end
+    if best < budget * 0.4:  # too little kept to be worth preferring over a word boundary
+        space = window.rfind(" ")
+        if space > 0:
+            best = space
+    if best <= 0:
+        best = budget
+    return text[:best].rstrip() + marker
+
+
+@dataclass(frozen=True)
+class PromptAssemblyResult:
+    """What `_assemble_prompt_with_priority` actually did, returned
+    alongside the prompt string itself - so a caller can log it, and a test
+    can assert against exactly what happened, instead of re-deriving "was
+    anything shortened" by diffing strings after the fact."""
+
+    prompt: str
+    total_chars: int
+    budget: int
+    segments_shortened: tuple[str, ...]  # names of any Priority 3 segment that had to be shortened
+    segments_dropped: tuple[str, ...]  # names of any Priority 2 segment dropped entirely under pressure
+    mandatory_content_intact: bool  # False only if Priority 1 content alone could not fit - see below
+
+
+def _assemble_prompt_with_priority(
+    segments: list[_PromptSegment], *, budget: int = PROMPT_CHAR_BUDGET
+) -> PromptAssemblyResult:
+    """Builds the final prompt from `segments`, honouring each one's
+    priority - the structured replacement for the old flat-string-then-
+    `[:MAX_PROMPT_CHARS]`-slice approach (see this module's own "image-
+    generation prompt budget" section for the real, confirmed risk that
+    fixed).
+
+    Priority 1 segments are always included in full - the one hard
+    invariant this function keeps, no matter how large the other segments
+    are. Priority 2 is included in full whenever there's room, and only
+    ever shortened by dropping whole segments from the END of the list
+    (never a mid-label cut) once nothing else is left to trim. Priority 3
+    is the only tier ever shortened mid-segment, word/sentence-boundary
+    aware (`_shorten_to_budget`), and only after every Priority 1/2 segment
+    already has its full space reserved - "redundant writer instructions"
+    and "long descriptive context" are deliberately the first and only
+    things this function will ever visibly trim.
+
+    Segments with empty text are dropped before anything else (matches the
+    previous `if part` filter) and never counted as "shortened" or
+    "dropped" - there was never anything there to preserve."""
+    present = [s for s in segments if s.text]
+    p1 = [s for s in present if s.priority == 1]
+    p2 = [s for s in present if s.priority == 2]
+    p3 = [s for s in present if s.priority == 3]
+
+    p1_text = "\n".join(s.text for s in p1)
+    mandatory_intact = len(p1_text) <= budget
+    if not mandatory_intact:
+        # Unreachable in ordinary use - every Priority 1 segment is fixed,
+        # authored text, individually far smaller than `budget` (see this
+        # module's own constants) - but per this fix's own brief, a
+        # mandatory instruction is never silently dropped to make room:
+        # log loudly (never raise - a bad image prompt must never fail the
+        # whole course generation run, the same convention
+        # `generate_for_block`'s own error handling already keeps
+        # throughout this module) and return it in full regardless of the
+        # overrun, so the caller can see exactly what happened rather than
+        # receiving a silently-incomplete prompt.
+        log.error(
+            "Image prompt assembly: mandatory (Priority 1) content alone is %d chars, "
+            "exceeding the %d-char budget - this should be structurally impossible. "
+            "Returning it in full rather than silently dropping any of it.",
+            len(p1_text), budget,
+        )
+
+    remaining = max(budget - len(p1_text) - (1 if p1_text else 0), 0)
+    p2_text = ""
+    dropped: list[str] = []
+    if p2:
+        candidate = "\n".join(s.text for s in p2)
+        if len(candidate) <= remaining:
+            p2_text = candidate
+            remaining = max(remaining - len(candidate) - 1, 0)
+        else:
+            # Keep whole segments from the FRONT of the list (the writer's
+            # own ordering - typically most-important-first) until no more
+            # fit; a segment that doesn't fit whole is dropped entirely,
+            # never cut mid-label.
+            kept: list[str] = []
+            used = 0
+            still_fitting = True
+            for seg in p2:
+                cost = len(seg.text) + (1 if kept else 0)
+                if still_fitting and used + cost <= remaining:
+                    kept.append(seg.text)
+                    used += cost
+                else:
+                    still_fitting = False
+                    dropped.append(seg.name)
+            p2_text = "\n".join(kept)
+            remaining = max(remaining - used, 0)
+
+    p3_text = ""
+    shortened: list[str] = []
+    if p3:
+        candidate = "\n".join(s.text for s in p3)
+        if len(candidate) <= remaining:
+            p3_text = candidate
+        else:
+            pieces: list[str] = []
+            share = remaining
+            for seg in p3:
+                cost_separator = 1 if pieces else 0
+                if share - cost_separator <= 0:
+                    shortened.append(seg.name)
+                    continue
+                available = share - cost_separator
+                if len(seg.text) <= available:
+                    pieces.append(seg.text)
+                    share -= len(seg.text) + cost_separator
+                else:
+                    piece = _shorten_to_budget(seg.text, available)
+                    if piece:
+                        pieces.append(piece)
+                    shortened.append(seg.name)
+                    share = 0
+            p3_text = "\n".join(pieces)
+
+    prompt = "\n".join(part for part in (p1_text, p2_text, p3_text) if part)
+    return PromptAssemblyResult(
+        prompt=prompt,
+        total_chars=len(prompt),
+        budget=budget,
+        segments_shortened=tuple(shortened),
+        segments_dropped=tuple(dropped),
+        mandatory_content_intact=mandatory_intact,
+    )
+
+
+# Pre-generation validation: the literal, named marker this fix's own brief
+# calls out by name ("Verify that the CRITICAL FRAMING RULE has not been
+# removed") plus the equivalent anchor for each of the other two styles -
+# an extra, independent check on top of `mandatory_content_intact` above
+# (which only confirms Priority 1 content was INCLUDED, never that a future
+# edit didn't accidentally tag the wrong text as Priority 1 in the first
+# place). Checked against the FINAL assembled prompt, not the source
+# constant, so this also catches a regression in the segment-building code
+# itself, not just in `_assemble_prompt_with_priority`.
+_MANDATORY_PROMPT_MARKERS: dict[str, tuple[str, ...]] = {
+    "textbook": ("CRITICAL FRAMING RULE",),
+    "section_intro": ("STRICT NO-TEXT RULE",),
+    "": ("STRICT NO-TEXT RULE", "RELATIONSHIP DIRECTION MUST BE CORRECT"),
+}
+
+
+def _validate_prompt_assembly(result: PromptAssemblyResult, *, style: str) -> list[str]:
+    """Returns the names of every mandatory marker missing from
+    `result.prompt` for this illustration `style` - empty when everything
+    required is present. Never raises; the caller logs and decides (see
+    `build_prompt`) - consistent with this module's own "a bad image must
+    never fail the whole course" convention, applied here to "a bad PROMPT
+    must never silently fail the whole course" instead."""
+    missing = [marker for marker in _MANDATORY_PROMPT_MARKERS.get(style, ()) if marker not in result.prompt]
+    if missing or not result.mandatory_content_intact:
+        log.error(
+            "Image prompt validation failed for style=%r: missing markers=%s, "
+            "mandatory_content_intact=%s, total_chars=%d/%d, shortened=%s, dropped=%s",
+            style, missing, result.mandatory_content_intact, result.total_chars, result.budget,
+            result.segments_shortened, result.segments_dropped,
+        )
+    elif result.segments_shortened or result.segments_dropped:
+        log.info(
+            "Image prompt assembly optimised for style=%r: total_chars=%d/%d, shortened=%s, dropped=%s",
+            style, result.total_chars, result.budget, result.segments_shortened, result.segments_dropped,
+        )
+    return missing
+
+
+# Wikimedia Commons is not tried for these illustration styles - see
+# ImageService._try_wikimedia_image's own docstring for why (section_intro's
+# own fixed-crop resize only ever applies to an AI-generated image today;
+# keeping that path exactly as it was before this feature existed is the
+# lowest-risk choice).
+_WIKIMEDIA_EXCLUDED_STYLES = ("section_intro",)
+# At most this many downloaded-and-vision-checked candidates per query -
+# the deterministic license/resolution/mime filter already did the cheap
+# elimination; this bounds how many AI vision calls one query can ever cost
+# ("avoid unnecessary sequential AI calls").
+_WIKIMEDIA_MAX_CANDIDATES_CHECKED = 2
 
 _CONTEXT_FIELD_CHAR_CAP = 120  # a title is always short; this only guards against a pathological outlier
 
@@ -168,6 +593,34 @@ class ImageRelevanceCheck(BaseModel):
     on_topic_detail: str = ""
     genuinely_educational: bool = True
     educational_detail: str = ""
+    # A real, confirmed gap: `_verify_generated_text` only checks that each
+    # expected label's TEXT appears somewhere, verbatim - it has no notion
+    # of WHERE on the canvas it landed. A labelled illustration can pass
+    # that check while two callouts are drawn directly on top of each other
+    # (or on top of the image's own title/caption), unreadable - confirmed
+    # on a real generated "rigid-body rotation" diagram whose "omega (axis)"
+    # and "Point P" callouts collided with other labels. Defaults to True so
+    # a text-free image (nothing to collide) never fails this for free, and
+    # so a vision-call failure (`errored=True`) never masquerades as a
+    # confirmed layout defect either - same contract as `on_topic`/
+    # `genuinely_educational`.
+    labels_legible: bool = True
+    labels_legible_detail: str = ""
+    # Only asked about (and only ever False) when this was a
+    # `illustration_style: "textbook"` generation - see
+    # `_verify_image_relevance`'s `textbook_style` parameter. MAI-Image-2.6
+    # (and every other raster provider this pipeline uses) has no negative-
+    # prompt/style parameter at the API level - the flat 2D vector, no-
+    # photorealism, no-3D-render, nothing-cropped-at-the-edge style
+    # contract (TEXTBOOK_ILLUSTRATION_GUIDANCE below) lives entirely in
+    # prompt text with no model-level enforcement, so this is the only
+    # mechanism that can catch - and automatically retry - the model
+    # drifting toward a photorealistic/3D/cropped result despite that
+    # instruction. Defaults to True for the same "a vision-call failure
+    # never masquerades as a confirmed defect" reason `on_topic`/
+    # `genuinely_educational` already document.
+    style_compliant: bool = True
+    style_compliant_detail: str = ""
     errored: bool = False
 
 
@@ -282,7 +735,10 @@ TEXTBOOK_ILLUSTRATION_GUIDANCE = (
     "each symbol it uses defined immediately below in short \"symbol = "
     "meaning\" lines (exactly like a textbook's own equation callout) - "
     "spell every defined term correctly and completely, nothing truncated "
-    "or cut off.\n"
+    "or cut off. Its title badge sits in its own strip ABOVE the equation, "
+    "never overlapping the equation or any symbol - a confirmed failure "
+    "rendered a \"Snell's law\" badge directly over its own equation. No "
+    "label may ever overlap another label, a title, or the equation.\n"
     "Avoid unnecessary or excessive text beyond callouts/panel titles/the "
     "formula block - never paragraphs baked into the image. Do not render "
     "the overall course/chapter/subject name anywhere in the image - the "
@@ -430,7 +886,9 @@ class ImageService:
         # include these labels" line there would directly contradict it if
         # `expected_labels` were ever populated by mistake.
         expected_labels = (
-            [str(label).strip() for label in (content.get("expected_labels") or []) if str(label).strip()]
+            sanitize_expected_labels(
+                [str(label).strip() for label in (content.get("expected_labels") or []) if str(label).strip()]
+            )
             if style == "textbook"
             else []
         )
@@ -446,14 +904,31 @@ class ImageService:
             if expected_labels
             else ""
         )
-        parts = [
-            context_line,
-            content.get("prompt") or content.get("purpose") or content.get("caption") or "",
-            labels_line,
-            style_guidance,
-            "Do not include watermarks, signatures or lorem ipsum text.",
+        # Priority-based assembly (see this module's own "image-generation
+        # prompt budget" section) - never a flat join-then-slice. Priority 1
+        # (style_guidance + the fixed negative-constraint line) is the full
+        # "must"/"never" rule set an image's own correctness depends on,
+        # CRITICAL FRAMING RULE included, and is never shortened or dropped.
+        # Priority 2 (labels_line) is preserved whenever the budget allows.
+        # Priority 3 (context_line, the writer's own free-text prompt) is
+        # the only tier `_assemble_prompt_with_priority` will ever shorten,
+        # and only word/sentence-boundary aware - see `_shorten_to_budget`.
+        segments = [
+            _PromptSegment("style_guidance", style_guidance, priority=1),
+            _PromptSegment(
+                "negative_constraints", "Do not include watermarks, signatures or lorem ipsum text.", priority=1,
+            ),
+            _PromptSegment("expected_labels", labels_line, priority=2),
+            _PromptSegment("context", context_line, priority=3),
+            _PromptSegment(
+                "writer_prompt",
+                content.get("prompt") or content.get("purpose") or content.get("caption") or "",
+                priority=3,
+            ),
         ]
-        return "\n".join(part for part in parts if part)[:MAX_PROMPT_CHARS]
+        result = _assemble_prompt_with_priority(segments)
+        _validate_prompt_assembly(result, style=style)
+        return result.prompt
 
     @staticmethod
     def _dimensions(data: bytes) -> tuple[int | None, int | None]:
@@ -595,6 +1070,44 @@ class ImageService:
         detected = {normalize(text) for text in result.detected_text}
         return [label for label in expected_labels if normalize(label) not in detected]
 
+    async def _confirm_text_free(self, data: bytes) -> list[str] | None:
+        """Root-cause fix (production course audit, ThermoDynamics/
+        doc_a2f5625a7fd9): a SINGLE vision call reporting "no text found" is
+        not reliable enough to trust on its own for a result this
+        consequential. Confirmed, reproduced case: block_aab38b60c031's
+        shipped image (`assets/image_001.jpg`) has "Precise language &
+        coniJt consistent sign conventions" and "undergraduate
+        thermodynamics; mullivtrabile calculus" baked in, plainly visible -
+        yet it was persisted with `text_verified: true`. Re-running
+        `_verify_image_has_no_text` against that EXACT SAME image bytes
+        after the fact correctly detects all 14 pieces of garbled text on
+        every fresh call - proving the check function itself works; the
+        failure was a false-negative on ONE of the (at most two) vision
+        calls actually made during the original generation, i.e. LLM
+        vision-judgment variance, not a logic bug. The costs of being wrong
+        are asymmetric: a false POSITIVE (reporting text that isn't there)
+        only wastes one extra vision call here; a false NEGATIVE (reporting
+        clean when text is baked in) ships exactly the misleading content
+        this whole verification exists to prevent - so a `[]` ("clean")
+        first result is re-checked with one independent second opinion
+        before being trusted, while any non-empty first result is accepted
+        immediately (it has already failed; no need to spend a second call
+        confirming that)."""
+        first = await self._verify_image_has_no_text(data)
+        if first != []:
+            return first
+        return await self._verify_image_has_no_text(data)
+
+    async def _confirm_labels_correct(self, data: bytes, expected_labels: list[str]) -> list[str] | None:
+        """The `_verify_generated_text` sibling of `_confirm_text_free` -
+        same reasoning, same asymmetric-cost justification for the extra
+        call, applied to the labelled-illustration path instead of the
+        text-free one."""
+        first = await self._verify_generated_text(data, expected_labels)
+        if first != []:
+            return first
+        return await self._verify_generated_text(data, expected_labels)
+
     async def _verify_image_has_no_text(self, image: bytes) -> list[str] | None:
         """For a force-text-free image (see `_generate_text_free_illustration`)
         - the same vision-model transcription technique `_verify_generated_text`
@@ -636,7 +1149,7 @@ class ImageService:
         return [text for text in result.detected_text if text.strip()]
 
     async def _verify_image_relevance(
-        self, image: bytes, *, brief: str, course_title: str
+        self, image: bytes, *, brief: str, course_title: str, textbook_style: bool = False,
     ) -> ImageRelevanceCheck:
         """Does this generated image actually depict its own brief, and does
         it read as genuinely educational rather than purely decorative or
@@ -648,22 +1161,46 @@ class ImageService:
         failure returns `errored=True`, never a confirmed "off-topic" claim
         the image never earned - but also never silently indistinguishable
         from a genuine pass; see `ImageRelevanceCheck.errored`'s own
-        docstring, production risk follow-up)."""
+        docstring, production risk follow-up).
+
+        `textbook_style=True` adds a fourth judgment, `style_compliant` -
+        see `ImageRelevanceCheck.style_compliant`'s own docstring for why
+        this is the only check that can catch a MAI-Image-2.6 generation
+        drifting away from the required flat-vector textbook look (no
+        negative-prompt/style parameter exists at the API level to enforce
+        it instead)."""
         if not brief.strip():
             return ImageRelevanceCheck()
+        style_question = (
+            " (4) `style_compliant` - this image was required to be a flat 2D vector textbook "
+            "illustration (crisp line art, flat/simply-shaded colors, no photorealistic shading, "
+            "no 3D render, no soft studio lighting or glow, nothing cropped at or crowding the "
+            "canvas edge). Does it actually look that way? Answer false if it instead reads as "
+            "photorealistic, 3D-rendered, has a glow/gradient/dark background, or has any panel, "
+            "icon, label or text cut off at an edge."
+            if textbook_style else ""
+        )
         try:
             return await self.ai.structured(
                 schema=ImageRelevanceCheck,
                 system=(
                     "You are a strict reviewer judging whether a generated educational image "
                     "actually depicts what it was asked to depict. Look at the attached image "
-                    "and judge two things: (1) `on_topic` - does the image's actual visual "
+                    "and judge three things: (1) `on_topic` - does the image's actual visual "
                     "content genuinely, specifically depict the stated brief, not a generic, "
                     "unrelated, or merely thematically-adjacent picture? (2) `genuinely_"
                     "educational` - does this read as a real teaching aid for the brief, not a "
                     "purely decorative/stock-photo-style image that happens not to contradict "
-                    "it? Be concrete in every detail field: name exactly what the image actually "
-                    "shows and why that does or doesn't match, never a bare \"could be better\"."
+                    "it? (3) `labels_legible` - if the image has ANY text, labels or callout "
+                    "boxes baked into it, is every one of them cleanly legible and clearly "
+                    "separated - no two labels overlapping or colliding with each other, with a "
+                    "title/caption bar, or with the picture's own linework? A label that is "
+                    "partly covered by another label or box, or sits crammed on top of other "
+                    "text so it's hard to read, means `labels_legible` is false. If the image "
+                    "has no text at all, `labels_legible` is true by default - there is nothing "
+                    "to collide." + style_question + " Be concrete in every detail field: name "
+                    "exactly what the image actually shows and why that does or doesn't match, "
+                    "never a bare \"could be better\"."
                 ),
                 user=f"COURSE: {course_title}\n\nBRIEF (what this image is supposed to depict):\n{brief}\n\n"
                 "Judge the attached image against this brief.",
@@ -741,10 +1278,13 @@ class ImageService:
         retry using a more emphatic prompt - never unlimited - and the
         honest `text_verified` result returned either way, the same
         contract `_generate_with_text_check` already keeps for the labelled
-        path."""
+        path. A "clean" verdict from either bounded attempt is itself
+        double-checked via `_confirm_text_free` before being trusted - see
+        its own docstring for the real, confirmed false-negative case
+        (block_aab38b60c031/doc_a2f5625a7fd9) this closes."""
         size = size or self.settings.image_size
         data = await self._draw(prompt=f"{prompt}{_NO_TEXT_SUFFIX}", size=size, provider=provider)
-        found = await self._verify_image_has_no_text(data)
+        found = await self._confirm_text_free(data)
         if found == []:
             return data, True
 
@@ -759,7 +1299,7 @@ class ImageService:
             "attempt still rendered some text - this time, render no text at all, full stop."
         )
         data = await self._draw(prompt=final_prompt, size=size, provider=provider)
-        found = await self._verify_image_has_no_text(data)
+        found = await self._confirm_text_free(data)
         if found == []:
             return data, True
         if found is None:
@@ -824,6 +1364,21 @@ class ImageService:
             )
             if ok:
                 return True
+            # Root-cause fix (Phase 2 card-grid audit): a retired-"schematic"
+            # hint (see DiagramService.generate_for_block's own comment on
+            # this exact rerouting) deliberately sets `illustration_style:
+            # "textbook"` on the block BEFORE returning False here - that is
+            # NOT a failed diagram attempt whose text-heavy authoring prompt
+            # should be stripped text-free (`force_text_free`'s whole
+            # purpose), it's a considered decision that this content needs
+            # the ordinary, label-VERIFIED textbook illustration path, same
+            # as a block the writer authored as `illustration_style:
+            # "textbook"` from the start. Without this override,
+            # `force_text_free=True` below would still force the text-free
+            # path regardless, silently discarding the labels this reroute
+            # just recovered from the diagram prompt.
+            if block.content.get("illustration_style") == "textbook":
+                structured_fallback = False
             log.info("Falling back to a raster illustration for %s", block.id)
         elif kind == "concept_experience" and self.settings.enable_concept_experience_visuals:
             ok = await self.concept_visuals.generate_for_block(
@@ -832,6 +1387,24 @@ class ImageService:
             if ok:
                 return True
             log.info("Falling back to a raster illustration for %s", block.id)
+        if kind == "illustration" and block.content.get("_pending_edit"):
+            if self.settings.enable_image_editing:
+                # Replace Image root-cause fix: a `replace_image` correction
+                # on an illustration that already has a real picture - see
+                # `_edit_illustration`'s own docstring for the full
+                # contract. Deliberately NEVER falls through to
+                # `_generate_illustration` (text-to-image) below on
+                # failure - that strict "no silent fallback to an unrelated
+                # fresh generation" contract is the whole point of this
+                # branch, not an oversight.
+                return await self._edit_illustration(course_id=course_id, block=block)
+            # Editing is off by operator choice (Settings.enable_image_
+            # editing's own docstring) - this is NOT a failure, so it DOES
+            # fall through to the ordinary fresh-generation path below,
+            # exactly reproducing the pre-this-feature behaviour. The stale
+            # flag is cleared first so a later, unrelated regeneration
+            # never mistakes it for a still-pending correction.
+            block.content = merge_content(block.type, block.content, {"_pending_edit": False})
         return await self._generate_illustration(
             course_id=course_id,
             block=block,
@@ -888,6 +1461,13 @@ class ImageService:
     async def _draw(self, *, prompt: str, size: str | None, provider: str | None = None) -> bytes:
         """One image-model call. `provider` is passed only when one was chosen, so an image client that
         predates the option (or a test double) keeps working unchanged."""
+        if len(prompt) > _PROVIDER_PROMPT_HARD_LIMIT:
+            log.warning(
+                "Image prompt (%d chars) exceeds the provider's hard limit - truncating to the "
+                "last %d chars (see _PROVIDER_PROMPT_HARD_LIMIT's own comment)",
+                len(prompt), _PROVIDER_PROMPT_HARD_LIMIT,
+            )
+            prompt = prompt[-_PROVIDER_PROMPT_HARD_LIMIT:]
         if provider is None:
             return await self.ai.image(prompt=prompt, size=size)
         return await self.ai.image(prompt=prompt, size=size, provider=provider)
@@ -930,10 +1510,15 @@ class ImageService:
         None`, see `_verify_generated_text`) is never treated the same as a
         genuine pass, at any of the four bounded attempts below; it falls
         through to the next attempt exactly like a confirmed wrong answer
-        would, and the final, honest `text_verified` is False either way."""
+        would, and the final, honest `text_verified` is False either way.
+        A "clean" (`missing == []`) verdict from any of the four bounded
+        attempts below is itself double-checked via `_confirm_labels_
+        correct` before being trusted - see `_confirm_text_free`'s own
+        docstring for the real, confirmed false-negative case this
+        pattern closes."""
         size = size or self.settings.image_size
         data = await self._draw(prompt=prompt, size=size, provider=provider)
-        missing = await self._verify_generated_text(data, expected_labels)
+        missing = await self._confirm_labels_correct(data, expected_labels)
         if missing == []:
             return data, True
 
@@ -949,7 +1534,7 @@ class ImageService:
             "a near-miss spelling (an extra, missing, or swapped letter) is still wrong."
         )
         data = await self._draw(prompt=retry_prompt, size=size, provider=provider)
-        missing = await self._verify_generated_text(data, expected_labels)
+        missing = await self._confirm_labels_correct(data, expected_labels)
         if missing == []:
             return data, True
 
@@ -962,7 +1547,7 @@ class ImageService:
         # with partial, wrong text (the confirmed "Oxgeen" case) - checked
         # against the exact same expected labels, since any of them
         # appearing wrong is exactly as bad as it was on a labelled attempt.
-        missing = await self._verify_generated_text(data, expected_labels)
+        missing = await self._confirm_labels_correct(data, expected_labels)
         if missing == []:
             return data, True
 
@@ -978,7 +1563,7 @@ class ImageService:
             "render no text at all, full stop."
         )
         data = await self._draw(prompt=final_prompt, size=size, provider=provider)
-        missing = await self._verify_generated_text(data, expected_labels)
+        missing = await self._confirm_labels_correct(data, expected_labels)
         # Whatever this final, bounded attempt produced is what ships - but
         # the caller is told the honest truth about whether it's clean.
         # `missing == []` is deliberately NOT `not missing`: that would also
@@ -1016,12 +1601,14 @@ class ImageService:
         path, never trusted on faith."""
         topic = key_concept.strip() or section_title.strip() or chapter_title.strip() or course_title.strip()
         base = (
-            f"A clean, abstract, symbolic educational illustration representing the general "
-            f"theme of \"{topic}\" for a course titled \"{course_title}\". Use simple geometric "
-            "shapes, soft colors and generic iconography (e.g. gears, books, charts, arrows, "
-            "lightbulbs) rather than depicting any specific person, scene, brand, weapon, or "
-            "sensitive subject matter. Nothing graphic, violent, political, or controversial - "
-            "purely decorative and safe for an educational audience of any age."
+            f"A clean, minimal textbook-style line diagram for the general theme of \"{topic}\" "
+            f"in a course titled \"{course_title}\". Draw simple labeled geometric shapes or a "
+            "plain schematic that abstracts the subject's actual structure (boxes, lines, arrows,"
+            " simple curves) - flat colors, no shading or gradients, no decorative stock icons "
+            "(no gears, lightbulbs, trophies, books-as-props, generic charts), no mascots, and "
+            "nothing that depicts a specific person, scene, brand, weapon, or sensitive subject "
+            "matter. Nothing graphic, violent, political, or controversial - purely schematic and "
+            "safe for an educational audience of any age."
         )
         labels = [label.strip() for label in (expected_labels or []) if label.strip()]
         if not labels:
@@ -1031,6 +1618,404 @@ class ImageService:
             f"correctly, in large legible lettering, even though the overall scene is generic/"
             f"abstract: {', '.join(labels)}."
         )
+
+    # --- Wikimedia Commons (first priority, before any AI model) ----------
+
+    @staticmethod
+    def _wikimedia_queries(
+        *, chapter_title: str, section_title: str, key_concept: str, block: Block,
+    ) -> list[str]:
+        """Most-specific-first search queries - `_try_wikimedia_image` stops
+        at the first one that yields a validated candidate, so this order IS
+        what "prefer the more specific match" means in practice. Built from
+        the exact same grounding fields `build_prompt` already uses for the
+        AI path - never a separate, new notion of "what this block is
+        about". Deduplicated case-insensitively (a block with no distinct
+        key_concept/purpose would otherwise search the same chapter title
+        two or three times over)."""
+        purpose = str(block.content.get("purpose") or "").strip()
+        queries: list[str] = []
+        seen: set[str] = set()
+        for text in (key_concept.strip(), purpose, section_title.strip(), chapter_title.strip()):
+            if not text:
+                continue
+            query = text[:200]
+            key = query.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            queries.append(query)
+        return queries[:3]
+
+    @staticmethod
+    def _wikimedia_metadata(candidate: WikimediaCandidate) -> dict:
+        return {
+            "image_source": "wikimedia",
+            "source_url": candidate.file_page_url,
+            "license_name": candidate.license_short_name,
+            "license_url": candidate.license_url,
+            "attribution_text": candidate.attribution_text(),
+            "wikimedia_title": candidate.title,
+            # Carried through to a cache hit too (see storage.
+            # save_wikimedia_cache_entry) so _materialize_wikimedia_result
+            # can tell an SVG candidate apart from a raster one without
+            # re-sniffing the cached bytes.
+            "mime": candidate.mime,
+        }
+
+    def _materialize_wikimedia_result(self, data: bytes, meta: dict, *, course_id: str) -> dict:
+        """Saves `data` as this COURSE's own asset (same `storage.save_asset`
+        every AI-generated image uses - a Wikimedia image is otherwise
+        indistinguishable from a generated one to the rest of the pipeline)
+        and builds the `block.content` patch. `meta` is either a freshly
+        validated candidate's own metadata or a cache hit's stored metadata -
+        both carry the exact same keys (see `_wikimedia_metadata`/
+        `storage.save_wikimedia_cache_entry`).
+
+        SVG (`meta["mime"] == "image/svg+xml"`) never goes through
+        `_detect_extension`/`_dimensions` - both decode via PIL, which
+        cannot open SVG at all (confirmed: raises UnidentifiedImageError).
+        `wikimedia_provider.svg_dimensions` reads the real intrinsic size
+        straight out of the SVG's own markup instead - the SVG-specific
+        counterpart to `_dimensions` for every raster format."""
+        is_svg = meta.get("mime") == "image/svg+xml"
+        if is_svg:
+            extension = "svg"
+            width, height = wikimedia_provider.svg_dimensions(data)
+        else:
+            extension = self._detect_extension(data)
+            width, height = self._dimensions(data)
+        relative = self.storage.save_asset(course_id, data, extension=extension)
+        return {
+            "path": relative,
+            "asset_id": relative.rsplit("/", 1)[-1],
+            "generated": True,
+            "error": None,
+            "omitted_after_qa_failure": False,
+            "width": width,
+            "height": height,
+            "generation_mode": "wikimedia",
+            "image_source": meta.get("image_source", "wikimedia"),
+            "source_url": meta.get("source_url", ""),
+            "license_name": meta.get("license_name", ""),
+            "license_url": meta.get("license_url", ""),
+            "attribution_text": meta.get("attribution_text", ""),
+            "wikimedia_title": meta.get("wikimedia_title", ""),
+        }
+
+    async def _wikimedia_result_for_query(
+        self, query: str, *, course_id: str, course_title: str, brief: str
+    ) -> dict | None:
+        """One query's own full pipeline: cache check, then (on a miss)
+        search -> deterministic filter -> bounded vision-check -> cache the
+        first pass. Returns None on "nothing suitable for this query" -
+        the caller tries the next, broader query, if any."""
+        cached = self.storage.load_wikimedia_cache_entry(query)
+        if cached is not None:
+            data, meta = cached
+            log.info("Wikimedia cache hit for query %r (%s)", query, meta.get("wikimedia_title"))
+            return self._materialize_wikimedia_result(data, meta, course_id=course_id)
+
+        candidates = await wikimedia_provider.search_commons(
+            query, limit=self.settings.wikimedia_search_candidates, settings=self.settings
+        )
+        eligible = [
+            candidate for candidate in candidates
+            if candidate.license_ok
+            # SVG is explicitly INCLUDED (not excluded) - a real, confirmed
+            # check against the live Commons API found that a large share
+            # of its best educational diagrams are published as SVG, not
+            # JPEG/PNG; excluding it meant Wikimedia rarely won for exactly
+            # the "textbook diagram" topics this feature targets. See
+            # wikimedia_provider.svg_dimensions/rasterize_svg_for_vision's
+            # own docstrings for how PIL's "cannot open SVG at all" gap
+            # (the original reason it was excluded) is actually closed
+            # below, rather than worked around by skipping it.
+            and (candidate.mime.startswith("image/"))
+            and candidate.width >= self.settings.wikimedia_min_width
+            and candidate.height >= self.settings.wikimedia_min_height
+        ]
+        for candidate in eligible[:_WIKIMEDIA_MAX_CANDIDATES_CHECKED]:
+            try:
+                data = await wikimedia_provider.fetch_image_bytes(candidate.image_url, settings=self.settings)
+            except Exception as exc:  # noqa: BLE001 - one bad candidate must not abort the whole lookup
+                log.warning("Could not download Wikimedia candidate %r: %s", candidate.title, exc)
+                continue
+            is_svg = candidate.mime == "image/svg+xml"
+            if is_svg:
+                # The vision model can only look at real pixels (see
+                # rasterize_svg_for_vision's own docstring) - this
+                # rasterised copy is used for THIS check only; the
+                # original SVG `data` is still what gets saved/served if
+                # the candidate passes, a few lines down.
+                vision_bytes = await wikimedia_provider.rasterize_svg_for_vision(data, settings=self.settings)
+                if vision_bytes is None:
+                    log.warning("Could not rasterise SVG Wikimedia candidate %r for review - skipped", candidate.title)
+                    continue
+            else:
+                vision_bytes = data
+            check = await evaluate_candidate(
+                vision_bytes, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
+            )
+            if not candidate_passed(check):
+                continue
+            meta = self._wikimedia_metadata(candidate)
+            extension = "svg" if is_svg else self._detect_extension(data)
+            self.storage.save_wikimedia_cache_entry(query, data, meta, extension=extension)
+            return self._materialize_wikimedia_result(data, meta, course_id=course_id)
+        return None
+
+    async def _try_wikimedia_image(
+        self,
+        *,
+        course_id: str,
+        block: Block,
+        course_title: str,
+        chapter_title: str,
+        section_title: str,
+        key_concept: str,
+    ) -> dict | None:
+        """The one, correct insertion point for "search Wikimedia Commons
+        before ever calling an AI image model" - see this module's own
+        docstring and the approved plan. Returns the `block.content` patch
+        to apply on a genuine, validated hit, or `None` when nothing
+        suitable exists OR Wikimedia itself is unreachable/erroring - both
+        `None` cases are indistinguishable to the caller on purpose, which
+        simply falls through to the existing, unchanged AI path either way.
+        Never raises: a Wikimedia outage must never interrupt course
+        generation."""
+        if not self.settings.enable_wikimedia_images:
+            return None
+        style = str(block.content.get("illustration_style") or "").strip().lower()
+        if style in _WIKIMEDIA_EXCLUDED_STYLES:
+            return None
+        brief = "\n".join(
+            part for part in (
+                key_concept.strip(),
+                str(block.content.get("purpose") or "").strip(),
+                str(block.content.get("prompt") or "").strip(),
+                str(block.content.get("caption") or "").strip(),
+            ) if part
+        )[:MAX_PROMPT_CHARS]
+        if not brief:
+            return None  # nothing to search for or validate a candidate against
+        queries = self._wikimedia_queries(
+            chapter_title=chapter_title, section_title=section_title, key_concept=key_concept, block=block,
+        )
+        # Root-cause fix: this used to `return None` (give up on Wikimedia
+        # entirely for this block, falling through to the AI model) the
+        # moment the FIRST query raised - a real, confirmed bug: a single
+        # transient/volume-driven failure (see wikimedia_provider.py's own
+        # module docstring) on query 1 of N silently discarded every chance
+        # the remaining, genuinely different queries had to find a real,
+        # valid Wikimedia result. Now every query gets its own real attempt;
+        # only after ALL of them have failed/missed does this fall through.
+        # Deliberately serial, kept LOW and process-wide (not per-block) via
+        # `wikimedia_concurrency` (default 1) - see that setting's own
+        # docstring for why a bursty multi-block concurrent search pattern
+        # was itself the actual root cause of being blocked, never the HTTP
+        # client used.
+        limiter = get_limiter("wikimedia", self.settings.concurrency_for("wikimedia"))
+        for query in queries:
+            try:
+                async with limiter.slot():
+                    result = await self._wikimedia_result_for_query(
+                        query, course_id=course_id, course_title=course_title, brief=brief
+                    )
+            except Exception as exc:  # noqa: BLE001 - never block course generation on a Wikimedia failure
+                log.warning(
+                    "Wikimedia lookup failed for query %r (block %s): %s - trying the next query if any",
+                    query, block.id, exc,
+                )
+                continue
+            if result is not None:
+                return result
+        return None
+
+    async def _edit_illustration(
+        self,
+        *,
+        course_id: str,
+        block: Block,
+    ) -> bool:
+        """Replace Image root-cause fix - genuine image-to-image EDIT of an
+        illustration block's EXISTING picture, set up by
+        `app.course.document.patcher`'s `replace_image` handler: it leaves
+        `content["path"]` untouched (never clears it, unlike the old
+        behaviour) and sets `content["_pending_edit"] = True` exactly when
+        the block already has a real raster image on disk and is staying
+        `kind: "illustration"` - see that function's own docstring. This
+        reads that EXACT picture's real bytes off disk and sends them to
+        the configured provider's own image-to-image edit endpoint
+        (`AIClient.image_edit` -> azure_image_provider.edit_image /
+        azure_mai_image_provider.edit_image, both verified against the
+        official Microsoft docs, never a generic `image()` text-to-image
+        call) alongside the correction instruction - a genuine edit, never
+        a fresh regeneration with the old image merely described in words.
+
+        Callers (`generate_for_block`) only reach this function at all when
+        `settings.enable_image_editing` is also on - that flag's own
+        "editing is off, fall through to fresh generation" case is handled
+        entirely by the caller BEFORE this function is ever invoked (a
+        deliberate operator choice, not a failure), so every failure
+        reported from inside this function is a genuine editing failure.
+
+        STRICT failure contract - deliberately different from every other
+        path in this module: this NEVER falls back to `self.ai.image()`
+        (text-to-image) on any failure. Doing so would silently replace a
+        correctly-working picture with an unrelated new one while this
+        function's own caller reports the course as "edited" - the exact
+        failure mode this whole feature exists to close. On ANY failure
+        (no source file, unreadable source, no instructions, a provider/
+        API error), `content["path"]`/`width`/`height`/`generated`/
+        `asset_id` are never written to at all here, so the block keeps
+        showing its last known-good picture; only `content["error"]` (a
+        clear, real reason) and `_pending_edit` (cleared, so a later
+        unrelated regeneration never silently retries a stale correction)
+        change."""
+        content = block.content
+        source_path = content.get("path")
+        if not isinstance(source_path, str) or not source_path:
+            # patcher.py only ever sets `_pending_edit=True` alongside a
+            # real `path` - still checked defensively so a stale/manually-
+            # crafted flag with nothing to edit reports a clear reason
+            # rather than crashing the block.
+            block.content = merge_content(
+                block.type, block.content,
+                {"_pending_edit": False, "error": "No existing image to edit"},
+            )
+            return False
+        try:
+            source_bytes = self.storage.asset_abs_path(course_id, source_path).read_bytes()
+        except OSError as exc:
+            log.warning("Could not read the existing image to edit for %s (%s): %s", block.id, source_path, exc)
+            block.content = merge_content(
+                block.type, block.content,
+                {"_pending_edit": False, "error": f"Could not read the existing image to edit: {exc}"},
+            )
+            return False
+
+        correction = str(content.get("prompt") or "").strip()
+        if not correction:
+            block.content = merge_content(
+                block.type, block.content,
+                {"_pending_edit": False, "error": "No correction instructions were given"},
+            )
+            return False
+        # Explicitly distinguishes "what changes" from "what must stay the
+        # same" - the whole point of an EDIT instruction versus a fresh
+        # generation prompt, which has no existing picture to preserve
+        # anything from. `correction` is the editor agent's own already-
+        # composed corrective prompt (see EDITOR_SYSTEM's replace_image
+        # guidance - built from the block's ORIGINAL prompt plus the
+        # user's exact instructions, prioritised over any generic framing).
+        edit_prompt = (
+            f"Edit the attached image exactly as follows: {correction}\n\n"
+            "Preserve everything else about the original image unchanged - its subject, "
+            "composition, objects, their positions, and overall visual style - except for "
+            "what this instruction explicitly asks to change. Do not redesign the picture "
+            "from scratch or replace its subject."
+        )
+        is_textbook = (content.get("illustration_style") or "").strip().lower() == "textbook"
+        provider = self.settings.textbook_image_provider if is_textbook else None
+        expected_labels = sanitize_expected_labels(
+            [str(label).strip() for label in (content.get("expected_labels") or []) if str(label).strip()]
+        )
+        log.info(
+            "%s image EDIT for %s (provider=%s)",
+            "MOCK" if self.ai.is_mock else "REAL", block.id,
+            "mock" if self.ai.is_mock else (provider or self.settings.image_provider),
+        )
+        try:
+            data = await self.ai.image_edit(prompt=edit_prompt, image=source_bytes, provider=provider)
+            if expected_labels:
+                # One bounded retry on a confirmed-wrong label - the same
+                # "never trust text on faith" discipline _generate_with_
+                # text_check already keeps for a fresh generation, just a
+                # single retry here (not four) since an edit that already
+                # preserves most of the image correctly needs far less
+                # room for the model to get labels wrong than a from-
+                # scratch generation does - see this feature's own "avoid
+                # unnecessary additional AI calls" requirement.
+                missing = await self._verify_generated_text(data, expected_labels)
+                if missing:
+                    log.info(
+                        "Edited image text check failed for %s (missing/misspelled: %s) - "
+                        "retrying the edit once", block.id, missing,
+                    )
+                    retry_prompt = (
+                        f"{edit_prompt}\n\nThe previous edit got this text wrong or left it out: "
+                        f"{', '.join(missing)}. This exact text must appear, spelled correctly: "
+                        f"{', '.join(expected_labels)}."
+                    )
+                    data = await self.ai.image_edit(prompt=retry_prompt, image=source_bytes, provider=provider)
+        except Exception as exc:  # noqa: BLE001 - never silently fall back to a fresh, unrelated generation
+            log.warning("Image edit failed for %s - the existing image was kept unchanged: %s", block.id, exc)
+            block.content = merge_content(
+                block.type, block.content,
+                {"_pending_edit": False, "error": f"Image edit failed: {str(exc)[:300]}"},
+            )
+            return False
+
+        relative = self.storage.save_asset(course_id, data, extension=self._detect_extension(data))
+        width, height = self._dimensions(data)
+        block.content = merge_content(
+            block.type,
+            block.content,
+            {
+                "path": relative,
+                "asset_id": relative.rsplit("/", 1)[-1],
+                "generated": True,
+                "error": None,
+                "width": width,
+                "height": height,
+                "_pending_edit": False,
+            },
+        )
+        log.info("Edited illustration %s for block %s", relative, block.id)
+        return True
+
+    def _use_generic_section_icon(
+        self, *, course_id: str, block: Block, template: CourseTemplate, icon_kind: str,
+    ) -> bool:
+        """Deterministic, zero-AI-call replacement for a GENERIC pedagogical
+        section opener - see `app.render.section_icons`'s own module
+        docstring for why this category is special-cased ahead of both
+        Wikimedia and the AI illustration path. Can never fail: there is no
+        network call, no model call and no QA step, so this always returns
+        True."""
+        data = render_section_icon_svg(icon_kind, template.theme)
+        relative = self.storage.save_asset(course_id, data, extension="svg")
+        block.content = merge_content(
+            block.type,
+            block.content,
+            {
+                "path": relative,
+                "asset_id": relative.rsplit("/", 1)[-1],
+                "generated": True,
+                "error": None,
+                "omitted_after_qa_failure": False,
+                "width": self._SECTION_INTRO_WIDTH,
+                "height": self._SECTION_INTRO_HEIGHT,
+                # Nothing was promised to check here - a hand-authored glyph
+                # has no baked-in label text to verify, matching
+                # `text_verified`'s own "nothing checkable" None contract
+                # (see ImageContent.text_verified's docstring).
+                "text_verified": None,
+                "visual_qa_findings": [],
+                # Distinct from both "generated" (an AI model drew this) and
+                # "wikimedia" (a licensed Commons photo) - a course-template-
+                # themed static glyph is neither. Display code only ever
+                # special-cases the "wikimedia" value (for attribution), so
+                # this is a safe, additive third value.
+                "image_source": "static_icon",
+            },
+        )
+        log.info(
+            "Used a deterministic generic icon (%s) for section-opener block %s - no model call made",
+            icon_kind, block.id,
+        )
+        return True
 
     async def _generate_illustration(
         self,
@@ -1060,6 +2045,45 @@ class ImageService:
         unverified attempt was exactly how a flowchart-shaped request for
         "list vs generator" ended up as a real image with "coan oicts" and
         "medership" baked into it."""
+        # Root-cause fix (production course audit, ThermoDynamics/
+        # doc_a2f5625a7fd9): a `section_intro` opener for a GENERIC,
+        # subject-agnostic pedagogical section (Quiz/Summary/Best
+        # Practices/Common Mistakes/Exercise/Challenge/Learning
+        # Objectives - see app.render.section_icons's own module
+        # docstring) carries no real information content, so there is
+        # nothing an AI model usefully adds - it only adds the one
+        # failure mode a "strictly no text" raster prompt cannot be
+        # trusted not to hit (see this function's own docstring above).
+        # A deterministic, theme-coloured SVG glyph never fails, never
+        # calls a model, and is checked BEFORE Wikimedia/AI so this
+        # category never spends a provider call or a bounded-retry
+        # attempt at all. Every other section_intro (a course's actual
+        # subject matter) is untouched.
+        if (block.content.get("illustration_style") or "").strip().lower() == "section_intro":
+            icon_kind = match_generic_section_icon(section_title)
+            if icon_kind is not None:
+                return self._use_generic_section_icon(
+                    course_id=course_id, block=block, template=template, icon_kind=icon_kind,
+                )
+        # Wikimedia Commons is checked FIRST, before any AI model, for every
+        # path that reaches this function (a genuine illustration request
+        # AND the raster fallback from a failed diagram/concept_experience
+        # attempt - see this module's own docstring and the approved plan).
+        # `None` here means "nothing suitable, or Wikimedia itself failed" -
+        # both cases fall straight through to the unchanged AI path below,
+        # never raise, never interrupt course generation.
+        wikimedia_result = await self._try_wikimedia_image(
+            course_id=course_id,
+            block=block,
+            course_title=course_title,
+            chapter_title=chapter_title,
+            section_title=section_title,
+            key_concept=key_concept,
+        )
+        if wikimedia_result is not None:
+            block.content = merge_content(block.type, block.content, wikimedia_result)
+            log.info("Used a Wikimedia Commons image for block %s (%s)", block.id, wikimedia_result.get("wikimedia_title"))
+            return True
         prompt = self.build_prompt(
             block, template, course_title,
             chapter_title=chapter_title, section_title=section_title, key_concept=key_concept,
@@ -1067,6 +2091,32 @@ class ImageService:
         if not prompt.strip():
             log.warning("Image block %s has no prompt - skipped", block.id)
             return False
+        if force_text_free:
+            # Root-cause fix (production course audit, ThermoDynamics/
+            # doc_a2f5625a7fd9): `prompt` here is still the ORIGINAL
+            # diagram-authoring text (block.content["prompt"], written by
+            # the content agent for a structured SVG diagram), which
+            # routinely instructs exact quoted labels ('labeled exactly:
+            # "Mastery milestones (self‑checks)"...') for a dozen+ nodes -
+            # a real, confirmed case shipped exactly that prompt, appended
+            # with only the generic `_NO_TEXT_SUFFIX`, and the model tried
+            # to honour BOTH the explicit "label it exactly" instructions
+            # and the trailing "no text" note, producing a text-heavy image
+            # with several labels garbled ("coniJt", "mullivtrabile"). A
+            # trailing suffix alone is too easy for a model to under-weight
+            # against several much more specific, repeated instructions
+            # earlier in the same prompt - this override is prepended
+            # instead, directly superseding any such instruction before the
+            # model reads it, on top of (not instead of) `_NO_TEXT_SUFFIX`
+            # still being appended by `_generate_text_free_illustration`.
+            prompt = (
+                "OVERRIDE: ignore any instruction below that asks for specific quoted "
+                "text, labels, captions or exact wording to be rendered in the image - "
+                "this request has been downgraded to a decorative, completely TEXT-FREE "
+                "illustration. Use shape, position, grouping and colour alone to convey "
+                "the same structure; render zero letters, words or numbers anywhere.\n\n"
+                f"{prompt}"
+            )
         # Made explicit (never silent) so nobody evaluates visual quality
         # against a deterministic offline placeholder without realising it -
         # `MockAIClient.image()` ignores prompt content entirely. `is_mock`
@@ -1089,9 +2139,9 @@ class ImageService:
             block.id,
             "mock" if self.ai.is_mock else (provider or self.settings.image_provider),
         )
-        expected_labels = [
-            str(label).strip() for label in (block.content.get("expected_labels") or []) if str(label).strip()
-        ]
+        expected_labels = sanitize_expected_labels(
+            [str(label).strip() for label in (block.content.get("expected_labels") or []) if str(label).strip()]
+        )
         # A content-rich textbook illustration (several distinct labelled
         # parts) is routinely a naturally WIDE composition (several icons or
         # components side by side) - forcing it into a square canvas and
@@ -1104,11 +2154,32 @@ class ImageService:
         # layer together (this for genuine breathing room, the framing rule
         # in TEXTBOOK_ILLUSTRATION_GUIDANCE as the safety net for whatever
         # composition the model still chooses).
-        # A shape the template asked for wins; otherwise a labelled textbook picture gets real extra width.
+        #
+        # `len(expected_labels) >= 4` alone is NOT a reliable density signal
+        # - a real, confirmed case: a dense 3-scene bench-wiring schematic
+        # (low-side shunt / high-side alternative / an inset plot, ~15 real
+        # labelled parts in the brief) had only 3 labels actually recovered
+        # into `expected_labels` (a best-effort extraction from free text,
+        # not a perfect count), so it missed this threshold entirely and
+        # got squeezed into the default 1024x1024 SQUARE canvas - every
+        # label crammed into a fraction of the space a wide canvas would
+        # have given it, which is exactly why its text rendered too small/
+        # blurry to read and the picture never filled a landscape display
+        # box either. The writer's own RAW prompt length is a much harder
+        # signal to under-count this way: a multi-scene/multi-component
+        # brief is long regardless of how many of its labels a downstream
+        # extraction step happened to catch - so it's checked here too, as
+        # a second, independent trigger for the same wide canvas.
+        # A shape the template asked for wins; otherwise a labelled/content-rich textbook picture gets real extra width.
+        raw_prompt_len = len(str(block.content.get("prompt") or ""))
         image_size = (
             self._request_size(block)
             if block.content.get("aspect")
-            else ("1536x1024" if is_textbook and len(expected_labels) >= 4 else None)
+            else (
+                "1536x1024"
+                if is_textbook and (len(expected_labels) >= 4 or raw_prompt_len > 1200)
+                else None
+            )
         )
         # None means "nothing was promised to verify" (no expected labels at
         # all) - genuinely different from False ("checked, and it's still
@@ -1246,41 +2317,97 @@ class ImageService:
                     str(block.content.get("caption") or ""),
                 ) if part
             )[:MAX_PROMPT_CHARS]
-            relevance = await self._verify_image_relevance(data, brief=brief, course_title=course_title)
-            # `relevance.errored` is checked explicitly, alongside on_topic/
-            # genuinely_educational - a vision-call exception leaves BOTH of
-            # those at their safe default (True), so without this check an
-            # errored (never actually verified) attempt would silently fall
-            # straight through as if it had genuinely passed (production
-            # risk follow-up: the same ERROR-vs-PASS conflation fixed for
-            # the text-legibility checks above).
-            if relevance.errored or not (relevance.on_topic and relevance.genuinely_educational):
-                log.info(
-                    "Image relevance check failed for %s (on_topic=%s, genuinely_educational=%s, "
-                    "errored=%s) - retrying once with the brief re-emphasised",
-                    block.id, relevance.on_topic, relevance.genuinely_educational, relevance.errored,
+            relevance = await self._verify_image_relevance(
+                data, brief=brief, course_title=course_title, textbook_style=is_textbook,
+            )
+
+            def _relevance_failed(check: ImageRelevanceCheck) -> bool:
+                # `errored` is checked explicitly, alongside on_topic/
+                # genuinely_educational/labels_legible - a vision-call
+                # exception leaves all three at their safe default (True),
+                # so without this check an errored (never actually
+                # verified) attempt would silently fall straight through as
+                # if it had genuinely passed (production risk follow-up:
+                # the same ERROR-vs-PASS conflation fixed for the text-
+                # legibility checks above). `labels_legible` closes a
+                # separate, real gap: `_verify_generated_text` only checks
+                # that each expected label's text appears somewhere,
+                # verbatim - never whether it landed legibly, without
+                # colliding with another label or the image's own title -
+                # so a labelled illustration could pass that check while
+                # its callouts overlapped each other (confirmed on a real
+                # generated "rigid-body rotation" diagram). `style_compliant`
+                # is only ever asked about for a `textbook`-style generation
+                # (see `_verify_image_relevance`'s `textbook_style` param) -
+                # gated on `is_textbook` here too, not just trusted to stay
+                # at its True default, since nothing stops a model (or a
+                # test double) from setting it False on a field it was
+                # never actually asked to judge.
+                return check.errored or not (
+                    check.on_topic and check.genuinely_educational and check.labels_legible
+                    and (check.style_compliant or not is_textbook)
                 )
-                retry_prompt = (
-                    f"{prompt}\n\nIMPORTANT: the previous attempt did not clearly depict the actual "
-                    f"subject. This image MUST specifically, unmistakably depict: {brief or course_title}. "
-                    "Do not produce a generic or decorative image unrelated to this exact subject."
-                )
-                try:
-                    retried_data = await self._draw(
-                        prompt=retry_prompt, size=image_size or self.settings.image_size, provider=provider
+
+            if _relevance_failed(relevance):
+                # Bounded at _MAX_RELEVANCE_RETRIES (2), not the single
+                # retry every other dimension here uses - a real, confirmed
+                # case: `style_compliant` specifically (MAI-Image-2.6, like
+                # every current raster provider, has no negative-prompt/
+                # style parameter - see `ImageRelevanceCheck.style_
+                # compliant`'s own docstring) failed BOTH attempts on most
+                # of a chapter's textbook illustrations even after the
+                # `expected_labels` overload fix (see `sanitize_expected_
+                # labels`) resolved their text-legibility failures - a
+                # single retry wasn't enough to overcome this provider's
+                # genuine per-attempt style-drift rate, and every one of
+                # those blocks shipped a generic, off-topic placeholder
+                # instead of its real diagram. Still bounded (never
+                # unbounded) - the loop exits the moment an attempt passes,
+                # so a check that already reliably recovers on the first
+                # retry (on_topic/labels_legible, per this file's own
+                # regression tests) never spends the second one.
+                for attempt in range(_MAX_RELEVANCE_RETRIES):
+                    log.info(
+                        "Image relevance check failed for %s (on_topic=%s, genuinely_educational=%s, "
+                        "labels_legible=%s, style_compliant=%s, errored=%s) - retrying (attempt %s of %s) "
+                        "with the brief re-emphasised",
+                        block.id, relevance.on_topic, relevance.genuinely_educational,
+                        relevance.labels_legible, relevance.style_compliant, relevance.errored,
+                        attempt + 1, _MAX_RELEVANCE_RETRIES,
                     )
-                    retried_relevance = await self._verify_image_relevance(
-                        retried_data, brief=brief, course_title=course_title
+                    legibility_note = (
+                        f" The previous attempt also had labels/callouts overlapping or colliding with "
+                        f"each other or with other elements ({relevance.labels_legible_detail or 'unreadable'}) "
+                        "- give every label clear, non-overlapping space with its own leader line."
+                        if not relevance.labels_legible else ""
                     )
-                    if (
-                        not retried_relevance.errored
-                        and retried_relevance.on_topic
-                        and retried_relevance.genuinely_educational
-                    ):
+                    style_note = (
+                        f" The previous attempt also did not follow the required flat 2D vector textbook "
+                        f"style ({relevance.style_compliant_detail or 'drifted photorealistic/3D or was cropped'}) "
+                        "- redraw as crisp flat-colour line art with no photorealistic shading, no 3D render, "
+                        "no glow/gradient background, and every element fully inside the frame with margin."
+                        if is_textbook and not relevance.style_compliant else ""
+                    )
+                    retry_prompt = (
+                        f"{prompt}\n\nIMPORTANT: the previous attempt did not clearly depict the actual "
+                        f"subject. This image MUST specifically, unmistakably depict: {brief or course_title}. "
+                        f"Do not produce a generic or decorative image unrelated to this exact subject."
+                        f"{legibility_note}{style_note}"
+                    )
+                    try:
+                        retried_data = await self._draw(
+                            prompt=retry_prompt, size=image_size or self.settings.image_size, provider=provider
+                        )
+                        retried_relevance = await self._verify_image_relevance(
+                            retried_data, brief=brief, course_title=course_title, textbook_style=is_textbook,
+                        )
                         data, relevance, prompt = retried_data, retried_relevance, retry_prompt
-                except Exception as exc:  # noqa: BLE001 - keep the first image, don't fail the block
-                    log.warning("Image relevance retry failed for %s: %s", block.id, exc)
-                if relevance.errored or not (relevance.on_topic and relevance.genuinely_educational):
+                        if not _relevance_failed(relevance):
+                            break
+                    except Exception as exc:  # noqa: BLE001 - keep the last good image, don't fail the block
+                        log.warning("Image relevance retry failed for %s: %s", block.id, exc)
+                        break
+                if _relevance_failed(relevance):
                     log.warning(
                         "Image for %s still failed relevance check after retry - will be omitted "
                         "rather than published, not silently accepted as correct", block.id,
@@ -1295,8 +2422,22 @@ class ImageService:
                         ))
                     if not relevance.on_topic:
                         issues.append(("off_topic_image", relevance.on_topic_detail or "Image does not depict the requested topic.", False))
+                    if not relevance.labels_legible:
+                        issues.append((
+                            "overlapping_or_illegible_labels",
+                            relevance.labels_legible_detail
+                            or "Text labels/callouts overlap each other or other elements, unreadable.",
+                            False,
+                        ))
                     if not relevance.genuinely_educational:
                         issues.append(("decorative_not_educational", relevance.educational_detail or "Image reads as decorative, not educational.", False))
+                    if is_textbook and not relevance.style_compliant:
+                        issues.append((
+                            "textbook_style_not_followed",
+                            relevance.style_compliant_detail
+                            or "Image does not follow the required flat 2D vector textbook style.",
+                            False,
+                        ))
                     relevance_findings = visual_qa_finding_entries(issues, resolution="image_relevance_unverified")
         if (block.content.get("illustration_style") or "").strip().lower() == "section_intro":
             data = self._resize_section_intro(data)
@@ -1331,10 +2472,21 @@ class ImageService:
         # moment earlier (a real, confirmed risk: a failed diagram falls
         # back to THIS SAME illustration call with its "fell_back_to_
         # illustration" finding already sitting in block.content). Keep
-        # every existing entry except a STALE formula/relevance one from an
-        # earlier attempt on this same block (never double-stack across
-        # re-renders), then add this attempt's own findings, if any.
-        _stale_resolutions = {"formula_verification_failed", "image_relevance_unverified"}
+        # every existing entry except a STALE formula/relevance/fallback one
+        # from an earlier attempt on this same block (never double-stack
+        # across re-renders) - `generic_fallback_published`/`image_withheld_
+        # after_qa_failure` belong in this set too (a real, confirmed bug: a
+        # block that fell back once kept that finding forever, even after a
+        # LATER regeneration succeeded cleanly with the real, on-topic image
+        # - misreporting a defect that no longer existed). `generic_
+        # fallback_published` is kept here even though nothing persists it
+        # any more (fallback-cascade root-cause fix) so a course saved
+        # before that fix still gets its stale finding cleared on its next
+        # successful regeneration.
+        _stale_resolutions = {
+            "formula_verification_failed", "image_relevance_unverified",
+            "generic_fallback_published", "image_withheld_after_qa_failure",
+        }
         existing_findings = [
             entry for entry in (block.content.get("visual_qa_findings") or [])
             if isinstance(entry, dict) and entry.get("resolution") not in _stale_resolutions
@@ -1364,89 +2516,100 @@ class ImageService:
         confirmed_text_failure = text_verified is False
         confirmed_relevance_failure = bool(relevance_findings)
         if confirmed_text_failure or confirmed_relevance_failure:
-            # Every real attempt at the actual brief failed its own QA - but
-            # a blank "Image not generated yet" placeholder is a worse
-            # outcome for every page than a clean, generic, still
-            # chapter-themed illustration, so this is never the end of the
-            # road: one final attempt drops exactly what broke the last few
-            # tries - any specific labels (the source of every confirmed
-            # text failure above) and any claim of depicting the precise
-            # brief (the source of every confirmed relevance failure) -
-            # reusing the same generic/abstract/policy-safe prompt builder
-            # the content-safety path already trusts enough to ship
-            # unverified (see `is_safety_fallback` below). This can only
-            # ever be reached after a genuine, confirmed QA failure, never
-            # in place of a normal successful generation.
+            # Fallback-cascade root-cause fix: every real attempt at the
+            # actual brief failed its own bounded QA, and Wikimedia (tried
+            # BEFORE any of this, at the very top of this method - see
+            # `_try_wikimedia_image`) already had nothing suitable either.
+            # This used to draw one more, deliberately generic/abstract
+            # picture here and publish it as if it were a genuine answer to
+            # the brief - exactly the "generic decorative placeholder...as a
+            # substitute for educational content" this pipeline must never
+            # ship: a reader cannot tell a published image apart from a
+            # real, verified one, so an unrelated generic picture is
+            # actively MISLEADING, not merely decorative. Withholding the
+            # image instead (same `omitted_after_qa_failure` state a
+            # technical generation failure already uses, so the page gets
+            # the same compact placeholder either way) is the honest
+            # outcome - the course's text content is completely unaffected,
+            # and exactly why is recorded in `visual_qa_findings` below for
+            # a human reviewer, never papered over with a picture that
+            # doesn't actually depict anything real.
             log.warning(
                 "Image for %s failed confirmed QA after every bounded attempt (text_failed=%s, "
-                "relevance_failed=%s) - trying one generic, label-free fallback before giving up "
-                "on this block entirely", block.id, confirmed_text_failure, confirmed_relevance_failure,
+                "relevance_failed=%s) and no Wikimedia match was available - withholding the image "
+                "rather than publishing an unrelated generic picture in its place",
+                block.id, confirmed_text_failure, confirmed_relevance_failure,
             )
-            fallback_prompt = self._safety_fallback_prompt(
-                course_title=course_title,
-                chapter_title=chapter_title,
-                section_title=section_title,
-                key_concept=key_concept,
-                expected_labels=None,
-            )
-            try:
-                data = await self._draw(
-                    prompt=fallback_prompt, size=self.settings.image_size, provider=provider
-                )
-            except Exception as exc:  # noqa: BLE001 - genuinely nothing left to try
-                log.warning(
-                    "Generic last-resort fallback also failed for %s: %s - omitting the image "
-                    "rather than publishing a known-bad visual; the course's text content is "
-                    "unaffected", block.id, exc,
-                )
-                block.content = merge_content(
-                    block.type,
-                    block.content,
-                    {
-                        "path": None,
-                        "asset_id": None,
-                        "generated": False,
-                        "error": None,
-                        # Narrow, explicit state (layout-defect follow-up) -
-                        # see ImageContent.omitted_after_qa_failure's own
-                        # docstring. This is what lets app.course.document.
-                        # layout.image_generation_failed tell this apart from
-                        # "simply not generated yet" and give it the same
-                        # compact placeholder a technical failure gets,
-                        # WITHOUT setting `error` (which would incorrectly
-                        # trip quality_framework's separate, always-"blocker"
-                        # `image_generation_failed` finding - unchanged by
-                        # this field, which that function never reads).
-                        "omitted_after_qa_failure": True,
-                        "prompt": prompt,
-                        "width": None,
-                        "height": None,
-                        "text_verified": text_verified,
-                        "formula_verified": formula_verified,
-                        "visual_qa_findings": existing_findings + formula_findings + relevance_findings,
-                        "generation_mode": "mock" if self.ai.is_mock else "real",
-                    },
-                )
-                return False
-            prompt = fallback_prompt
-            text_verified = None
-            # The ORIGINAL image's relevance findings described a picture
-            # that is no longer what's being shipped - keeping them would
-            # misreport a defect on an image nobody will ever see. The
-            # generic fallback is deliberately NOT topic-specific (same
-            # reasoning `is_safety_fallback` already uses to skip this same
-            # check above), so it never makes sense to re-run the relevance
-            # check against it either.
-            relevance_findings = visual_qa_finding_entries(
+            withheld_findings = visual_qa_finding_entries(
                 [(
-                    "generic_fallback_used",
-                    "Every attempt at the actual brief failed quality checks (garbled text or "
-                    "off-topic/decorative) - a clean, generic, chapter-themed illustration was "
-                    "published instead so this page is never left without an image.",
-                    False,
+                    "image_withheld_after_qa_failure",
+                    "Every attempt failed quality checks (garbled text or off-topic/decorative) and no "
+                    "suitable Wikimedia image was found - withheld rather than replaced with an unrelated "
+                    "generic illustration. Regenerate, or replace with a specific image.",
+                    # True (production-readiness audit fix), not False: the
+                    # REASON this image was withheld is an AI judgment call
+                    # (already recorded, as such, via the preserved
+                    # `relevance_findings`/`text_verified` below) - but the
+                    # fact THIS finding reports is simply "no image exists
+                    # for this block", a directly-checkable fact
+                    # (`content["path"] is None`), not a judgment. Mirrors
+                    # the genuine-technical-failure finding's own reasoning
+                    # (quality_framework.py's hardcoded `image_generation_
+                    # failed`, `verification_status="independently_
+                    # verified"`): without this, `deterministic=False` ->
+                    # `verification_status="unverified"` -> quality_
+                    # framework.QualityReport.approval_blocking_findings'
+                    # `severity == "blocker" and verification_status !=
+                    # "unverified"` gate would silently EXCLUDE this
+                    # "blocker" finding, letting a course with a completely
+                    # missing image still pass approval - exactly the
+                    # "silently treated as fully quality-approved" failure
+                    # mode this field must prevent.
+                    True,
                 )],
-                resolution="generic_fallback_published",
+                resolution="image_withheld_after_qa_failure",
             )
+            block.content = merge_content(
+                block.type,
+                block.content,
+                {
+                    "path": None,
+                    "asset_id": None,
+                    "generated": False,
+                    "error": None,
+                    # Narrow, explicit state (layout-defect follow-up) - see
+                    # ImageContent.omitted_after_qa_failure's own docstring.
+                    # This is what lets app.course.document.layout.image_
+                    # generation_failed tell this apart from "simply not
+                    # generated yet" and give it the same compact
+                    # placeholder a technical failure gets, WITHOUT setting
+                    # `error` (which would incorrectly trip quality_
+                    # framework's separate, always-"blocker" image_
+                    # generation_failed finding - unchanged by this field,
+                    # which that function never reads; `image_withheld_
+                    # after_qa_failure` is its own equally-"blocker"
+                    # resolution instead, see quality_framework.py).
+                    "omitted_after_qa_failure": True,
+                    "prompt": prompt,
+                    "width": None,
+                    "height": None,
+                    # None, not the confirmed-False value - no image is
+                    # being published at all, so there is nothing left to
+                    # make a "this image's text" claim about; the
+                    # `image_withheld_after_qa_failure` finding below is
+                    # the single, authoritative record of why (and already
+                    # names "garbled text" as one real cause). Without
+                    # this reset, quality_framework's separate `text_
+                    # verified is False` check would also fire its own
+                    # `image_text_unverified` finding describing a picture
+                    # that was never actually shipped.
+                    "text_verified": None,
+                    "formula_verified": formula_verified,
+                    "visual_qa_findings": existing_findings + formula_findings + relevance_findings + withheld_findings,
+                    "generation_mode": "mock" if self.ai.is_mock else "real",
+                },
+            )
+            return False
         relative = self.storage.save_asset(course_id, data, extension=self._detect_extension(data))
         width, height = self._dimensions(data)
         # Edit Visuals Part 2 - suggested overlay labels, only for a
@@ -1507,17 +2670,15 @@ class ImageService:
         log.info("Generated %s for block %s", relative, block.id)
         return True
 
-    async def generate_missing(
-        self,
-        *,
-        document: CourseDocument,
-        template: CourseTemplate,
-        only_block_ids: list[str] | None = None,
-        force: bool = False,
-    ) -> int:
-        """Generate every image the document is still missing. Returns the count."""
-        targets: list[Block] = []
+    @staticmethod
+    def missing_image_blocks(
+        document: CourseDocument, *, only_block_ids: list[str] | None = None, force: bool = False
+    ) -> list[Block]:
+        """Every IMAGE block `generate_missing` would (re)generate - exposed
+        so a caller can get an accurate total (for progress reporting)
+        before the batch starts, without duplicating this filter."""
         wanted = set(only_block_ids) if only_block_ids else None
+        targets: list[Block] = []
         for _, block in document.iter_blocks():
             if block.type is not BlockType.IMAGE:
                 continue
@@ -1526,7 +2687,34 @@ class ImageService:
             if block.content.get("path") and not force:
                 continue
             targets.append(block)
+        return targets
 
+    async def generate_missing(
+        self,
+        *,
+        document: CourseDocument,
+        template: CourseTemplate,
+        only_block_ids: list[str] | None = None,
+        force: bool = False,
+        on_progress: Callable[[Block, bool], Awaitable[None]] | None = None,
+        job_id: str = "",
+    ) -> int:
+        """Generate every image the document is still missing. Returns the count.
+
+        `on_progress`, when given, fires once per image AS IT FINISHES
+        (success or failure) rather than only after the whole batch - the
+        caller (`CourseService._finalise`) uses this to persist each image's
+        result immediately and keep a real "N of M" counter, instead of
+        losing every completed image in the batch if a later one crashes.
+
+        `job_id` tags every freshly-generated block with the id of the run
+        that validated it (`content["_qa_job_id"]`) - `VisualReviewService.
+        review_document`, called later in the SAME run, uses this to skip
+        re-spending a vision call re-checking an image that was just
+        checked moments ago. Defaults to a fresh id when the caller doesn't
+        have one (e.g. an ad-hoc "regenerate missing images" call).
+        """
+        targets = self.missing_image_blocks(document, only_block_ids=only_block_ids, force=force)
         if not targets:
             return 0
 
@@ -1535,11 +2723,12 @@ class ImageService:
         # the same linear walk once per image block.
         context_map = chapter_section_context(document)
         limiter = get_limiter("image", self.settings.concurrency_for("image"))
+        job_id = job_id or str(uuid.uuid4())
 
         async def worker(block: Block) -> bool:
             chapter_title, section_title, key_concept = context_map.get(block.id, ("", "", ""))
             async with limiter.slot():
-                return await self.generate_for_block(
+                ok = await self.generate_for_block(
                     course_id=document.course_id,
                     block=block,
                     template=template,
@@ -1548,9 +2737,22 @@ class ImageService:
                     section_title=section_title,
                     key_concept=key_concept,
                 )
+                if ok:
+                    # Marks this block as validated during THIS job - see
+                    # VisualReviewService.review_document's own skip logic,
+                    # which avoids re-spending a vision call re-checking an
+                    # image that was just checked moments ago in the same run.
+                    block.content["_qa_job_id"] = job_id
+                return ok
+
+        async def tracked(block: Block) -> bool:
+            ok = await worker(block)
+            if on_progress is not None:
+                await on_progress(block, ok)
+            return ok
 
         with metrics_phase("images"):
-            results = await asyncio.gather(*(worker(block) for block in targets))
+            results = await asyncio.gather(*(tracked(block) for block in targets))
         generated = sum(1 for ok in results if ok)
         log.info("Generated %s/%s images for %s", generated, len(targets), document.course_id)
         return generated

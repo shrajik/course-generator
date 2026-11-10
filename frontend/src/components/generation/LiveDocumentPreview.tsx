@@ -1,11 +1,12 @@
 "use client";
 
 import { CitedText } from "@/components/blocks/CitationBadge";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { FileText, Loader2 } from "lucide-react";
 import { assetUrl } from "@/lib/api/documents";
 import { asString, asStringArray } from "@/lib/editor/blocks";
 import { isHtmlPath, isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
+import { useMathTypeset } from "@/lib/editor/useMathTypeset";
 import type { ChapterProgress } from "@/lib/types/course";
 import type { Block, BlockContent, CourseDocument } from "@/lib/types/document";
 import type { ChapterStreamView } from "./GenerationProgress";
@@ -471,11 +472,17 @@ function ImagePreviewBlock({
   const isHtmlFragment = (kind === "concept_experience" || kind === "toc") && isHtmlPath(path);
   const wantsInline = isDiagram || isHtmlFragment;
   const inlineMarkup = useInlineDiagramSvg(documentId, path, wantsInline);
+  const inlineRef = useRef<HTMLDivElement | null>(null);
+  // See ImageBlock.tsx's identical hook for why this fragment (never passed
+  // through <MathText>) needs its own typesetting pass for any `$...$`
+  // formula a concept_experience field might contain.
+  useMathTypeset(inlineRef, inlineMarkup);
 
   return (
     <div className="gen-block-in mt-4 overflow-hidden rounded-[10px] border border-line bg-canvas">
       {inlineMarkup ? (
         <div
+          ref={inlineRef}
           className="flex items-center justify-center overflow-y-auto p-2 [&>div]:w-full [&>svg]:h-auto [&>svg]:max-h-[360px] [&>svg]:w-full"
           style={{ maxHeight: 360 }}
           role="img"
@@ -498,6 +505,22 @@ function ImagePreviewBlock({
       )}
       {content.caption ? (
         <p className="px-3 py-2 text-[11.5px] text-ink-400">{asString(content.caption)}</p>
+      ) : null}
+      {asString(content.image_source) === "wikimedia" && asString(content.attribution_text) ? (
+        <p className="px-3 pb-2 text-[11px] text-ink-400">
+          {asString(content.source_url) ? (
+            <a
+              href={asString(content.source_url)}
+              target="_blank"
+              rel="noreferrer"
+              className="underline underline-offset-2"
+            >
+              {asString(content.attribution_text)}
+            </a>
+          ) : (
+            asString(content.attribution_text)
+          )}
+        </p>
       ) : null}
     </div>
   );

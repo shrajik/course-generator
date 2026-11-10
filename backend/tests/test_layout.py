@@ -5,9 +5,11 @@ from __future__ import annotations
 import pytest
 
 from app.course.document.layout import (
+    BLOCK_GAP,
     MAX_DIAGRAM_IMAGE_HEIGHT,
     MAX_IMAGE_HEIGHT,
     MISSING_IMAGE_BOX_HEIGHT,
+    _NEAR_FIT_TOLERANCE,
     estimate_height,
     flow_blocks,
     image_box_height,
@@ -86,11 +88,16 @@ def test_blocks_flow_onto_a_single_page_when_they_fit():
 
 
 def test_long_content_paginates():
+    """The `+ 1` was the old exact-fit tolerance (float rounding only); a
+    block may now legitimately land up to `_NEAR_FIT_TOLERANCE` past the
+    nominal content bottom - a deliberate, footer-verified-safe allowance
+    (see _NEAR_FIT_TOLERANCE's own docstring) that stops a near-miss
+    estimate from forfeiting an entire page's worth of real estate."""
     pages = flow_blocks([_paragraph(60) for _ in range(20)])
     assert len(pages) > 1
     for page in pages:
         last = page[-1]
-        assert last.layout.y + last.layout.height <= PAGE_MARGIN_TOP + CONTENT_HEIGHT + 1
+        assert last.layout.y + last.layout.height <= PAGE_MARGIN_TOP + CONTENT_HEIGHT + _NEAR_FIT_TOLERANCE + 1
 
 
 def test_no_blocks_overlap_within_a_page():
@@ -417,6 +424,139 @@ def test_a_section_intro_pair_moves_together_to_a_fresh_page_when_it_doesnt_fit(
     assert pages[1] == [image, paragraph]
     assert image.layout.y == PAGE_MARGIN_TOP
     assert image.layout.y == paragraph.layout.y
+
+
+def test_visual_run_height_accounts_for_a_pending_section_intro_pairs_real_height():
+    """A real, confirmed bug: `_pending_visual_run`/`_is_visual_pair`'s own
+    run-height computation used to be plain `estimate_height`, which for a
+    section_intro image measures only its own small standalone box
+    (SECTION_INTRO_IMAGE_WIDTH, no caption) - no visibility into the
+    paragraph it's about to be paired with, whose wrapped text usually
+    dominates the pair's REAL combined height (see
+    `_section_intro_pair_height`). This under-count let the lookahead
+    conclude a heading+pair group "fits" by a comfortable margin when the
+    TRUE pair height did not, so the heading placed normally and the pair -
+    now needing its own, separately and correctly computed height - missed
+    the page by a narrow margin moments later and landed alone with most
+    of a page wasted. `_visual_run_height` is the fix: it must return
+    something noticeably larger than the naive sum whenever the run's
+    terminal visual is a section_intro image immediately followed by a
+    paragraph."""
+    from app.course.document.layout import (
+        SECTION_INTRO_IMAGE_WIDTH,
+        _padding,
+        _section_intro_pair_height,
+        _visual_run_height,
+        image_box_height,
+    )
+
+    heading = _heading_block("Technical Example")
+    image = _section_intro_image()
+    long_paragraph = _paragraph(80)
+    run = [heading, image]
+    naive = sum(estimate_height(b) for b in run) + 18.0  # the OLD, buggy computation
+    corrected = _visual_run_height(run, [image, long_paragraph])
+    assert corrected > naive
+    # Specifically close to heading + the REAL pair height, not heading +
+    # the image's own tiny standalone box - not just "a bit more."
+    assert corrected == pytest.approx(
+        estimate_height(heading) + _section_intro_pair_height(
+            image, long_paragraph, image_box_height(image, width_hint=SECTION_INTRO_IMAGE_WIDTH) + 2 * _padding(image)
+        ) + 18.0
+    )
+
+
+def test_visual_run_height_matches_the_naive_sum_when_theres_no_pairing():
+    """No special-casing when the terminal visual isn't a section_intro
+    image about to be paired - same number the old plain sum produced,
+    confirming the fix is scoped to exactly the one case it exists for."""
+    from app.course.document.layout import _visual_run_height
+
+    paragraph = _paragraph(20)
+    diagram = _image_block("diagram", width=666, height=400)
+    run = [paragraph, diagram]
+    naive = sum(estimate_height(b) for b in run) + 18.0
+    assert _visual_run_height(run, []) == pytest.approx(naive)
+    # Also unaffected when a section_intro image IS the terminal visual but
+    # nothing follows it (no pairing to account for).
+    lone_image = _section_intro_image()
+    run2 = [paragraph, lone_image]
+    naive2 = sum(estimate_height(b) for b in run2) + 18.0
+    assert _visual_run_height(run2, []) == pytest.approx(naive2)
+
+
+def test_near_fit_tolerance_lets_a_small_miss_place_on_the_current_page(monkeypatch):
+    """Direct test of the tolerance mechanism itself (see
+    _NEAR_FIT_TOLERANCE's own docstring), via a patched `estimate_height`
+    so the second block's "needed" height is a precise, controlled few
+    pixels over what's left - real paragraph text wraps in whole-line
+    jumps far coarser than the tolerance window, so this is the reliable
+    way to hit an exact few-pixel miss rather than hunting for a word count
+    that happens to land there. A miss within the tolerance must still
+    place on the CURRENT page, not forfeit the rest of it to a fresh one."""
+    import app.course.document.layout as layout_module
+
+    filler, second = _paragraph(1), _paragraph(1)
+    remaining_after_filler = 10.0  # arbitrary, well inside (0, _NEAR_FIT_TOLERANCE)
+    filler_height = CONTENT_HEIGHT - BLOCK_GAP - remaining_after_filler
+    second_height = remaining_after_filler + (layout_module._NEAR_FIT_TOLERANCE - 5.0)  # misses, but within tolerance
+    real_estimate = layout_module.estimate_height
+
+    def fake(block: Block) -> float:
+        if block is filler:
+            return filler_height
+        if block is second:
+            return second_height
+        return real_estimate(block)
+
+    monkeypatch.setattr(layout_module, "estimate_height", fake)
+    pages = flow_blocks([filler, second])
+    assert pages == [[filler, second]]
+
+
+def test_near_fit_tolerance_still_breaks_for_a_miss_beyond_it(monkeypatch):
+    """The other half of the same contract: the tolerance is bounded, not
+    unlimited (see _NEAR_FIT_TOLERANCE's own footer-gap derivation) - a
+    miss larger than it must still move the block to a fresh page, exactly
+    as before this fix."""
+    import app.course.document.layout as layout_module
+
+    filler, second = _paragraph(1), _paragraph(1)
+    remaining_after_filler = 10.0
+    filler_height = CONTENT_HEIGHT - BLOCK_GAP - remaining_after_filler
+    second_height = remaining_after_filler + (layout_module._NEAR_FIT_TOLERANCE + 5.0)  # misses BEYOND tolerance
+    real_estimate = layout_module.estimate_height
+
+    def fake(block: Block) -> float:
+        if block is filler:
+            return filler_height
+        if block is second:
+            return second_height
+        return real_estimate(block)
+
+    monkeypatch.setattr(layout_module, "estimate_height", fake)
+    pages = flow_blocks([filler, second])
+    assert pages == [[filler], [second]]
+
+
+def test_a_heading_bridges_early_with_its_pending_pair_not_just_the_image():
+    """Integration-level regression for the same bug, end to end through
+    flow_blocks: a heading whose OWN upcoming section_intro pair would
+    "fit" by the old, under-counted image-only estimate but genuinely does
+    NOT fit at its real combined height must bridge early with the whole
+    pair - never land alone on a page the pair then has to abandon moments
+    later. Filler/paragraph sizes are chosen (see this test's own
+    derivation) so the naive old estimate (~229px) says "fits" against the
+    ~301px left after the filler, while the real pair height (~356px, plus
+    the heading itself) does not - exactly the gap this bug lived in."""
+    filler = _paragraph(170)  # leaves ~301px after the heading's own gap
+    heading = _heading_block("Technical Example")
+    image = _section_intro_image()
+    long_paragraph = _paragraph(80)
+    pages = flow_blocks([filler, heading, image, long_paragraph])
+    heading_page = next(p for p in pages if heading in p)
+    assert image in heading_page
+    assert long_paragraph in heading_page
 
 
 def test_an_ordinary_illustration_followed_by_a_paragraph_is_not_paired():

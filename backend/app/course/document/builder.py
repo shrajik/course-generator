@@ -204,7 +204,7 @@ def _toc_page(
     editor/preview/PDF all render it identically without any new plumbing."""
     geometry = template.theme.geometry()
     toc_chapters = [
-        TocChapter(number=chapter.chapter_number, title=chapter.title, summary=chapter.summary)
+        TocChapter(number=chapter.chapter_number, title=chapter.title, summary=_first_sentence(chapter.summary))
         for chapter in chapters
     ]
     html_bytes = render_toc_html(toc_chapters, course_title=course_title, theme=template.theme)
@@ -609,7 +609,7 @@ def finalize_toc_page(
         TocChapter(
             number=chapter.chapter_number,
             title=chapter.title,
-            summary=chapter.summary,
+            summary=_first_sentence(chapter.summary),
             page=first_pages.get(chapter.chapter_id, 0),
             sections=_chapter_sections(document, chapter),
         )

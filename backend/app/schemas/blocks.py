@@ -192,6 +192,32 @@ class ImageContent(_Content):
     # block/course is unaffected. Only meaningful for kind == "illustration";
     # diagram/concept_experience/toc already have their own labelling.
     overlay_labels: list["OverlayLabel"] = Field(default_factory=list)
+    # Wikimedia Commons first-priority sourcing (see
+    # ImageService._try_wikimedia_image) - "generated" (default) means an AI
+    # image model drew this; "wikimedia" means a real, licensed Commons
+    # image was found, validated and used instead, and the AI model was
+    # never called for this block. Every existing block predates this field
+    # and defaults to "generated", so nothing already generated is
+    # reinterpreted.
+    image_source: str = "generated"
+    # The remaining fields are only ever populated when image_source ==
+    # "wikimedia" - blank for every AI-generated image, same "only
+    # meaningful for X" convention illustration_style/expected_labels
+    # already use above. `source_url` is the Commons File: description page
+    # (what an attribution link should point to); `wikimedia_title` is that
+    # same page's own title (e.g. "File:Mitosis diagram.svg") - kept
+    # separately as the stable cache key app.services.storage_service's
+    # Wikimedia cache is keyed on, since a file can be renamed/moved on
+    # Commons but this field is only ever read back, never re-resolved.
+    source_url: str = ""
+    license_name: str = ""
+    license_url: str = ""
+    # A short, pre-formatted credit line (see
+    # WikimediaCandidate.attribution_text) - rendered by the frontend
+    # directly under the existing caption, never fabricated beyond what
+    # Commons' own metadata stated.
+    attribution_text: str = ""
+    wikimedia_title: str = ""
 
 
 class OverlayLabel(BaseModel):

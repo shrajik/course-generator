@@ -19,6 +19,16 @@ os.environ["MOCK_OPENAI"] = "true"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["DATA_DIR"] = _TMP_DATA
 os.environ["ENABLE_IMAGE_GENERATION"] = "true"
+# Wikimedia lookup is a real, separate HTTP call to commons.wikimedia.org -
+# NOT covered by MOCK_OPENAI (that only mocks the AIClient abstraction) - so
+# it must be off by default for the whole suite, the same way a test would
+# never want a real network call to any other external service. Tests that
+# specifically exercise app.services.wikimedia_provider /
+# ImageService._try_wikimedia_image turn it back on via their own
+# Settings(enable_wikimedia_images=True, ...) and mock the transport/AI
+# calls themselves - see test_wikimedia_provider.py, test_wikimedia_image_
+# qa.py and the Wikimedia-specific cases in test_image_service.py.
+os.environ["ENABLE_WIKIMEDIA_IMAGES"] = "false"
 os.environ["MAX_REVIEW_REVISIONS"] = "0"
 os.environ["LOG_LEVEL"] = "WARNING"
 # This suite exercises the pipeline end-to-end against the filesystem, isolated
@@ -33,6 +43,7 @@ os.environ["REQUIRE_OUTLINE_APPROVAL"] = "false"
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.core.concurrency import reset_limiters  # noqa: E402
 from app.core.config import get_settings, reset_settings_cache  # noqa: E402
 from app.db.engine import dispose_engine  # noqa: E402
 from app.schemas.course import CourseInput  # noqa: E402
@@ -149,6 +160,18 @@ def isolated_data_dir(tmp_path, monkeypatch):
     audit_service.reset_audit_service()
     knowledge_service.reset_knowledge_service()
     notification_service.reset_notification_service()
+    # app.core.concurrency.get_limiter caches one AdaptiveLimiter (and the
+    # asyncio.Semaphore inside it) per phase name for the whole PROCESS, not
+    # per test - the same class of bug every other reset_*() call here
+    # already guards against. pytest-asyncio gives each test its own event
+    # loop, but a semaphore created under test A's loop is still bound to it
+    # when test B (a new loop) reuses the cached limiter - a real, confirmed
+    # case: test_pipeline.py's own tests (each calling research_chapters,
+    # which calls get_limiter("research", ...)) failed with "Semaphore ...
+    # is bound to a different event loop" from the second such test onward,
+    # in a fresh process, every run - this was simply missing from this
+    # fixture's list, not a deliberate omission.
+    reset_limiters()
     (tmp_path / "data" / "courses").mkdir(parents=True, exist_ok=True)
     yield
     source_service.reset_source_service()
@@ -161,6 +184,7 @@ def isolated_data_dir(tmp_path, monkeypatch):
     document_service.reset_document_service()
     set_ai_client(None)
     reset_embedding_service()
+    reset_limiters()
 
 
 @pytest.fixture

@@ -64,6 +64,12 @@ class Course(Base):
     document_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
+    # Mirrors CourseRecord.run.state (queued/running/done/failed/cancelled/
+    # interrupted) in its own indexed column so a crash-recovery startup scan
+    # can find every in-flight run with one query instead of deserializing
+    # every course's metadata_json. Nullable: a course that has never been
+    # generated (or one saved before this column existed) has no run yet.
+    run_state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     template_id: Mapped[str] = mapped_column(String(100), nullable=False)
     # Nullable: courses created before ownership existed have no owner, and a
     # deleted user's courses fall back to ownerless (admin-only) rather than

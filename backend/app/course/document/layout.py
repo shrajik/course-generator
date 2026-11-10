@@ -61,6 +61,42 @@ MIN_ORPHAN_SPACE = 140.0  # don't leave a heading alone at the bottom of a page
 # fix for oversized-visual waste lives in shrink_image_width_to_fit instead.
 _MIN_CONTENT_BEFORE_EARLY_BREAK = 150.0
 
+# Real, measured root cause of a spacing/pagination defect PdfSpacingQA
+# flags on a genuinely generated course (see app.services.pdf_spacing_qa):
+# several of this module's own "does it fit here" checks reject a block by
+# only a SMALL margin (confirmed via instrumented runs on a real course:
+# e.g. a section_intro pair needing 236.1px against 202.4px available -
+# short by 33.7px out of a page that still had over 700px left to fill),
+# yet the rejection forfeits the ENTIRE remaining page. Most of these
+# checks compare against conservatively-padded height ESTIMATES (this
+# file's own stated philosophy: "estimates should err high" - see _SAFETY
+# above), so a block that's "over" by a small margin is very often one that
+# would genuinely have fit at its REAL rendered height; even for a block
+# whose height is exact rather than padded (an image's is - aspect ratio
+# times width, no safety factor), this module's own top-of-file docstring
+# already establishes why a small overflow is safe regardless: "the CSS
+# deliberately uses min-height, so a slightly under-estimated block grows
+# rather than clipping" - the box is absolutely positioned with nothing
+# else below it on that page, so growing past the nominal boundary costs
+# only a little of the page's own bottom margin, never another block.
+#
+# This tolerance lets a current-page fit check accept a block that's over
+# by up to this many pixels, instead of forfeiting the rest of the page for
+# a miss the conservative estimate itself made likely to be illusory. The
+# ceiling is deliberately small and grounded in the one real, physical
+# constraint that matters here, not guessed: the exported PDF's own footer
+# (app/render/templates/course.html.j2's `.footer` rule - `bottom: 34px`,
+# `padding-top: 8px`, an 11px line) sits with its own top edge roughly 32px
+# above CONTENT_HEIGHT's nominal bottom boundary. A block overflowing past
+# that boundary by less than this tolerance still lands safely inside that
+# gap, never reaching the footer's border-top line - comfortably inside the
+# PAGE_MARGIN_BOTTOM (88px) reserve either way. Applied only to "does this
+# fit on the page I'm already building" checks, never to "does this fit a
+# FRESH, empty page" checks (those stay exact - a block that's genuinely
+# too large for an entire page is a different problem this tolerance isn't
+# meant to paper over).
+_NEAR_FIT_TOLERANCE = 20.0
+
 # How many upcoming non-visual blocks this module will bridge over to find a
 # pending visual worth protecting. The writer rarely stacks more than one or
 # two paragraphs before a diagram/image; bounding the scan keeps the check
@@ -258,7 +294,15 @@ def image_box_height(block: Block, *, width_hint: float | None = None) -> float:
     kind = block.content.get("kind")
     if kind in _UNCAPPED_IMAGE_KINDS:
         return height
-    if kind == "diagram":
+    # A `textbook` illustration carries its own baked-in labels the same
+    # way a `kind == "diagram"` SVG does (see MAX_DIAGRAM_IMAGE_HEIGHT's own
+    # comment on why that matters) - a real, confirmed case: a dense 3-panel
+    # bench-wiring schematic with ~15 labelled parts, generated at a wide
+    # 1536x1024 to keep that text legible (see ImageService._generate_
+    # illustration's own `raw_prompt_len` comment), still got its DISPLAYED
+    # width squeezed back down by the small-photo cap/shrink floor below -
+    # defeating the point of the wider canvas. Treated as a diagram here too.
+    if kind == "diagram" or (block.content.get("illustration_style") or "") == "textbook":
         return min(height, MAX_DIAGRAM_IMAGE_HEIGHT)
     return min(height, MAX_IMAGE_HEIGHT)
 
@@ -320,7 +364,14 @@ def shrink_image_width_to_fit(block: Block, available: float) -> float | None:
         return None
 
     full_width = float(block.layout.width or CONTENT_WIDTH)
-    min_fraction = _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION if kind == "diagram" else _MIN_SHRINK_WIDTH_FRACTION
+    # Same reasoning as image_box_height's own diagram/textbook pairing just
+    # above it: a textbook illustration's baked-in labels are just as
+    # vulnerable to a width shrink as a diagram's - give it the same gentler
+    # floor (so a page that would need to squeeze it past that point instead
+    # moves it whole to a fresh page, where it renders at its real full
+    # width) rather than the small-decorative-photo floor.
+    is_label_dense = kind == "diagram" or (content.get("illustration_style") or "") == "textbook"
+    min_fraction = _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION if is_label_dense else _MIN_SHRINK_WIDTH_FRACTION
     min_width = full_width * min_fraction
     pad = _padding(block)
     aspect = float(intrinsic_h) / float(intrinsic_w)
@@ -745,6 +796,48 @@ def split_code_cell(
 # ---------------------------------------------------------------------------
 
 
+def _visual_run_height(run: list[Block], queue_after_current: list[Block]) -> float:
+    """The height `flow_blocks` should reserve to keep `run` together on one
+    page - `sum(estimate_height(b) for b in run) + gaps`, with one real,
+    confirmed correction: when `run`'s own terminal visual is a
+    section_intro image about to be paired with the paragraph immediately
+    following it (see flow_blocks' own section_intro-pair special case),
+    `estimate_height` alone can only measure that image's small standalone
+    box (SECTION_INTRO_IMAGE_WIDTH, no caption) - it has no way to know a
+    pairing is coming, so it can't account for the paragraph's own wrapped
+    text, which usually dominates the pair's REAL combined height (see
+    `_section_intro_pair_height`).
+
+    Confirmed via instrumented runs on a real generated course: this
+    under-count let the lookahead conclude a heading+pair group "fits" by
+    a comfortable margin (an image-only estimate of ~157px against ~299px
+    available), when the pair's TRUE height (236px, paragraph-dominated)
+    left only ~220px once the heading itself was placed - so the heading
+    placed normally instead of bridging early, and the pair, now needing
+    its own separately (and correctly) computed full height, missed the
+    page by a narrow margin moments later and landed alone with 700+px of
+    the page wasted. Using the real pair height here instead lets the
+    lookahead make the SAME decision the section_intro-pair placement code
+    will actually make a few iterations later, instead of being blindsided
+    by it.
+
+    `queue_after_current` is the block queue as seen immediately after
+    `run[0]` (`run`'s own `current_block`) - exactly what
+    `_pending_visual_run`/`_is_visual_pair` were already called with."""
+    total = sum(estimate_height(b) for b in run) + BLOCK_GAP * (len(run) - 1)
+    terminal = run[-1]
+    if _is_section_intro(terminal):
+        following_index = len(run) - 1  # run = [current_block, *bridged], so this many queue items were consumed
+        following = (
+            queue_after_current[following_index] if following_index < len(queue_after_current) else None
+        )
+        if following is not None and following.type is BlockType.PARAGRAPH:
+            image_h = image_box_height(terminal, width_hint=SECTION_INTRO_IMAGE_WIDTH) + 2 * _padding(terminal)
+            pair_h = _section_intro_pair_height(terminal, following, image_h)
+            total += pair_h - estimate_height(terminal)
+    return total
+
+
 def _is_visual_pair(current_block: Block, queue: list[Block]) -> list[Block] | None:
     """Two visuals placed directly back-to-back, nothing between them - e.g.
     a diagram-only template slot (technical_v1.json's `visual_explanation`)
@@ -905,7 +998,7 @@ def flow_blocks(
             combined_h = _section_intro_pair_height(block, paragraph, image_h)
             gap = (BLOCK_GAP if current else 0.0)
 
-            if y + gap + combined_h <= bottom:
+            if y + gap + combined_h <= bottom + _NEAR_FIT_TOLERANCE:
                 block.layout.y = y + gap
                 block.layout.height = round(image_h, 2)
                 block.layout.z_index = 1  # paints over the paragraph in the (non-floating) editor canvas
@@ -975,9 +1068,9 @@ def flow_blocks(
         if current:
             visual_pair = _is_visual_pair(block, queue)
             if visual_pair is not None:
-                pair_height = sum(estimate_height(b) for b in visual_pair) + BLOCK_GAP
+                pair_height = _visual_run_height(visual_pair, queue)
                 space_here = bottom - (y + gap)
-                would_strand_pair = pair_height > space_here
+                would_strand_pair = pair_height > space_here + _NEAR_FIT_TOLERANCE
                 pair_fits_a_fresh_page = pair_height <= box.content_height
                 if would_strand_pair and not try_shrink_trailing_visual(visual_pair, space_here) and pair_fits_a_fresh_page:
                     start_new_page()
@@ -1003,15 +1096,15 @@ def flow_blocks(
         if current and (y - margin_top) >= _MIN_CONTENT_BEFORE_EARLY_BREAK:
             run = _pending_visual_run(block, queue)
             if run is not None:
-                run_height = sum(estimate_height(b) for b in run) + BLOCK_GAP * (len(run) - 1)
+                run_height = _visual_run_height(run, queue)
                 space_here = bottom - (y + gap)
-                would_strand_visual = run_height > space_here
+                would_strand_visual = run_height > space_here + _NEAR_FIT_TOLERANCE
                 fits_a_fresh_page = run_height <= box.content_height
                 if would_strand_visual and not try_shrink_trailing_visual(run, space_here) and fits_a_fresh_page:
                     start_new_page()
                     gap = 0.0
 
-        if y + gap + height <= bottom:
+        if y + gap + height <= bottom + _NEAR_FIT_TOLERANCE:
             block.layout.y = y + gap
             block.layout.height = round(height, 2)
             current.append(block)

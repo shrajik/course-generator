@@ -159,6 +159,23 @@ class MockAIClient(AIClient):
         await self._simulate("image", "image")
         return _placeholder_png(prompt, size or self.settings.image_size)
 
+    async def image_edit(
+        self,
+        *,
+        prompt: str,
+        image: bytes,
+        size: str | None = None,
+        phase: str = "image",
+        provider: str | None = None,
+    ) -> bytes:
+        # Offline stand-in for a real image-to-image edit - `image` is
+        # genuinely received (an offline test can assert on it) but, like
+        # `image()` above, the mock's own output is a deterministic
+        # placeholder, never a real edited picture.
+        self.calls.append({"kind": "image_edit", "source_bytes": len(image)})
+        await self._simulate("image_edit", "image")
+        return _placeholder_png(prompt, size or self.settings.image_size)
+
     async def embed(
         self, *, texts: list[str], model: str | None = None, phase: str = "embedding"
     ) -> list[list[float]]:

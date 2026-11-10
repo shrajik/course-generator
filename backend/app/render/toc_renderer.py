@@ -96,32 +96,45 @@ def _section_row_html(chapter: TocChapter, section: TocSection) -> str:
 
 
 def _style_html(theme: TemplateTheme) -> str:
+    # A real printed textbook's contents page, not a spreadsheet export: no
+    # grid lines boxing in every cell, no shaded header band, no zebra
+    # striping - just generous whitespace, a bold chapter number/title, a
+    # single hairline rule ABOVE each chapter to group its own sub-sections
+    # underneath it, and the page number set in quiet tabular-nums so a
+    # column of them lines up the way it does in a real printed index.
     return f"""\
 <style>
 .toc-root {{
   font-family:{theme.font_family};color:{theme.text_color};
-  background:#ffffff;border:1px solid {theme.border_color};border-radius:6px;
-  padding:28px;box-sizing:border-box;
+  background:#ffffff;border-radius:6px;
+  padding:34px 32px;box-sizing:border-box;
 }}
 .toc-root *{{box-sizing:border-box;}}
-.toc-title{{font-size:22px;font-weight:800;text-align:center;margin:4px 0 2px;letter-spacing:-.01em;}}
-.toc-subtitle{{font-size:12.5px;color:{theme.muted_color};text-align:center;margin:0 0 18px;
-  text-transform:uppercase;letter-spacing:.08em;}}
+.toc-title{{font-size:24px;font-weight:800;text-align:center;margin:2px 0 3px;letter-spacing:-.01em;}}
+.toc-subtitle{{font-size:11px;color:{theme.muted_color};text-align:center;margin:0 0 26px;
+  text-transform:uppercase;letter-spacing:.18em;}}
 table.toc-table{{width:100%;border-collapse:collapse;}}
 .toc-table thead th{{
-  background:#f3f4f6;color:{theme.text_color};font-size:11.5px;font-weight:700;
-  text-transform:uppercase;letter-spacing:.04em;text-align:left;
-  padding:8px 10px;border-bottom:2px solid {theme.border_color};
+  color:{theme.muted_color};font-size:10px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.1em;text-align:left;
+  padding:0 10px 9px;border-bottom:1px solid {theme.border_color};
 }}
 .toc-table thead th.toc-page{{text-align:right;}}
-.toc-table td{{padding:7px 10px;border-bottom:1px solid {theme.border_color};font-size:12.5px;vertical-align:top;}}
-.toc-chapter-row td{{font-weight:700;font-size:13.5px;}}
-.toc-chapter-row td.toc-no{{width:42px;}}
-.toc-section-row td{{font-weight:400;color:{theme.text_color};}}
-.toc-section-row td.toc-title{{padding-left:22px;}}
+.toc-table thead th.toc-no{{width:30px;}}
+.toc-table td{{padding:5px 10px;vertical-align:top;font-size:12.5px;}}
+.toc-chapter-row td{{
+  font-weight:700;font-size:14px;padding-top:17px;padding-bottom:3px;
+  border-top:1px solid {theme.border_color};
+}}
+.toc-chapter-row td.toc-no{{width:30px;color:{theme.muted_color};}}
+.toc-chapter-row td.toc-learn{{font-weight:400;font-style:italic;color:{theme.muted_color};font-size:11.5px;}}
+.toc-section-row td{{font-weight:400;color:{theme.text_color};font-size:12px;padding-top:3px;padding-bottom:3px;}}
+.toc-section-row td.toc-title{{padding-left:26px;}}
 .toc-section-row td.toc-no{{color:{theme.muted_color};}}
+.toc-section-row td.toc-learn{{color:{theme.muted_color};font-style:italic;font-weight:400;}}
 td.toc-learn{{color:{theme.muted_color};}}
-td.toc-page{{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}}
+td.toc-page{{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:600;}}
+.toc-section-row td.toc-page{{font-weight:400;color:{theme.muted_color};}}
 </style>"""
 
 
@@ -182,16 +195,17 @@ def _learn_line_count(text: str, *, chars_per_line: int = 70) -> int:
 
 def _raw_pixel_size(chapters: list[TocChapter]) -> tuple[int, float]:
     width = _REFERENCE_WIDTH
-    height = 56.0  # .toc-root vertical padding
-    height += 28.0  # title
-    height += 24.0  # subtitle + margin
-    height += 34.0  # header row
+    height = 68.0  # .toc-root vertical padding
+    height += 30.0  # title
+    height += 36.0  # subtitle + margin
+    height += 24.0  # header row
 
-    row_pad = 14.0  # vertical padding across a row's own two cells
+    chapter_row_pad = 20.0  # a chapter row's own top/bottom padding
+    section_row_pad = 6.0  # a (tighter) sub-section row's own top/bottom padding
     for chapter in chapters:
-        height += row_pad + _learn_line_count(chapter.summary) * 15.0
+        height += chapter_row_pad + _learn_line_count(chapter.summary) * 15.0
         for section in chapter.sections:
-            height += row_pad + _learn_line_count(section.learn_line) * 14.0
+            height += section_row_pad + _learn_line_count(section.learn_line) * 14.0
 
     return width, height * _ESTIMATE_SAFETY
 

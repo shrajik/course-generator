@@ -8,6 +8,7 @@ import { isSectionIntroImage } from "@/lib/editor/pairing";
 import { nextLabelId, pctFromPointer } from "@/lib/editor/overlayLabels";
 import { imageBoxHeight } from "@/lib/editor/style";
 import { isHtmlPath, isSvgPath, useInlineDiagramSvg } from "@/lib/editor/useInlineDiagramSvg";
+import { useMathTypeset } from "@/lib/editor/useMathTypeset";
 import type { OverlayLabel } from "@/lib/types/document";
 import { cn } from "@/lib/utils/cn";
 import type { BlockViewProps } from "./types";
@@ -106,10 +107,24 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
   const source = assetUrl(documentId, path);
   const boxHeight = imageBoxHeight(block);
   const error = readText(block.content, "error");
+  // Fallback-cascade root-cause fix: a QA-withheld visual (every attempt at
+  // the real brief failed its checks and no Wikimedia match existed - see
+  // ImageService.generate_for_block) has `error` unset (it is not a
+  // technical failure), so without this it fell into the same "Image not
+  // generated yet" copy as a block the pipeline simply hasn't reached yet -
+  // misleadingly implying generation is still pending rather than already
+  // attempted and deliberately withheld.
+  const omittedAfterQaFailure = Boolean(block.content.omitted_after_qa_failure);
   const kind = readText(block.content, "kind");
   const isFlexibleHeightHtml = _FLEXIBLE_HEIGHT_KINDS.has(kind) && isHtmlPath(path);
   const wantsInline = (kind === "diagram" && isSvgPath(path)) || isFlexibleHeightHtml;
   const inlineMarkup = useInlineDiagramSvg(documentId, path, wantsInline);
+  const inlineRef = useRef<HTMLDivElement | null>(null);
+  // A concept_experience/toc fragment can contain genuine `$...$` LaTeX (a
+  // physics/math concept's own formula) - see useMathTypeset's own
+  // docstring for why this HTML fragment needs its own typesetting pass,
+  // distinct from <MathText> which only ever wraps parsed text segments.
+  useMathTypeset(inlineRef, inlineMarkup);
   const intrinsicWidth = typeof block.content.width === "number" ? block.content.width : null;
   const intrinsicHeight = typeof block.content.height === "number" ? block.content.height : null;
   const overlayLabels = Array.isArray(block.content.overlay_labels)
@@ -149,6 +164,7 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
         >
           {inlineMarkup ? (
             <div
+              ref={inlineRef}
               className={
                 isFlexibleHeightHtml
                   ? "cev-block-inline w-full"
@@ -189,11 +205,23 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
           // one-line strip (see imageGenerationFailed); one not generated yet
           // keeps its full slot until it is.
           style={{ height: boxHeight }}
-          title={error ? `Image failed: ${error}` : undefined}
+          title={
+            error
+              ? `Image failed: ${error}`
+              : omittedAfterQaFailure
+                ? "Every attempt at this image failed quality checks and no suitable Wikimedia match was " +
+                  "found - withheld rather than publishing an unrelated generic picture. See this block's " +
+                  "quality findings, then regenerate or replace it."
+                : undefined
+          }
         >
           <ImageOff size={16} className="shrink-0 text-ink-300" aria-hidden />
           <p className="truncate text-[12.5px] text-ink-500">
-            {error ? "Visual unavailable" : "Image not generated yet"}
+            {error
+              ? "Visual unavailable"
+              : omittedAfterQaFailure
+                ? "Visual withheld - needs review"
+                : "Image not generated yet"}
           </p>
         </div>
       )}
@@ -207,6 +235,37 @@ export function ImageBlock({ block, documentId, editable, onEdit }: BlockViewPro
           onCommit={(value) => onEdit("caption", value)}
         />
       )}
+      {!isSectionIntroImage(block) && readText(block.content, "image_source") === "wikimedia" ? (
+        <WikimediaAttribution block={block} />
+      ) : null}
     </div>
+  );
+}
+
+/** A real, properly-licensed Wikimedia Commons image was used instead of an
+ * AI-generated one (see backend ImageService._try_wikimedia_image) - shown
+ * directly under the existing caption, never changing the image card's own
+ * size/layout. `attribution_text` is pre-formatted server-side from
+ * Commons' own metadata (see WikimediaCandidate.attribution_text) - never
+ * fabricated here. */
+function WikimediaAttribution({ block }: { block: BlockViewProps["block"] }) {
+  const text = readText(block.content, "attribution_text");
+  if (!text) return null;
+  const sourceUrl = readText(block.content, "source_url");
+  return (
+    <p className="mt-1 text-[11px] text-ink-400">
+      {sourceUrl ? (
+        <a
+          href={sourceUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="underline decoration-ink-300 underline-offset-2 hover:text-brand-700 hover:decoration-brand-300"
+        >
+          {text}
+        </a>
+      ) : (
+        text
+      )}
+    </p>
   );
 }

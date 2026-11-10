@@ -22,3 +22,14 @@ export function getRunState(
 ): Promise<{ course_id: string; run: RunInfo | null }> {
   return request(`/api/courses/${courseId}/run`, { signal });
 }
+
+/**
+ * Stop a running/queued generation. Already-completed chapters, images and
+ * the document are left exactly as they are. Safe to call even if nothing
+ * is actually running. Resume later with `generateCourse(courseId, { resume: true })`.
+ */
+export function cancelGeneration(
+  courseId: string,
+): Promise<{ course_id: string; cancelled: boolean }> {
+  return request(`/api/courses/${courseId}/cancel`, { method: "POST" });
+}

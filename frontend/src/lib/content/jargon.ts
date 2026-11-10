@@ -48,12 +48,19 @@ const PAIR = new RegExp(
 /** Any jargon tag at all, including an unclosed or orphaned one. */
 const ANY_TAG = new RegExp(String.raw`<\/?\s*jargon\b${ATTRIBUTES}>`, "gi");
 
+/** A real, confirmed writer quirk: a closing tag occasionally comes back as
+ * `</jargon}` (a "}" where ">" belongs) instead of a well-formed
+ * `</jargon>` - `ANY_TAG` above requires a real ">" to match at all, so
+ * that malformed form would otherwise survive as literal text. Mirrors
+ * `_JARGON_CLOSE_TAG_TYPO` in backend/app/render/html_renderer.py. */
+const CLOSE_TAG_TYPO = /<\/\s*jargon\s*\}/gi;
+
 /** `term="..."` or `term='...'` inside an opening tag. */
 const TERM_ATTRIBUTE = /\bterm\s*=\s*(?:"([^"]*)"|'([^']*)')/i;
 
 /** Remove every jargon tag, keeping the text it wrapped. */
 export function stripJargon(text: string): string {
-  return (text ?? "").replace(ANY_TAG, "");
+  return (text ?? "").replace(ANY_TAG, "").replace(CLOSE_TAG_TYPO, "");
 }
 
 export function hasJargon(text: string): boolean {

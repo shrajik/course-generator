@@ -24,8 +24,32 @@ import pytest
 from app.core.config import Settings
 from app.core.errors import AIServiceError
 from app.services import azure_mai_image_provider
-from app.services.azure_mai_image_provider import generate_image, parse_image_size
+from app.services.azure_mai_image_provider import edit_image, generate_image, parse_image_size
 from app.services.openai_service import OpenAIClient
+
+_EDIT_ENDPOINT = "https://example-foundry.services.ai.azure.test/mai/v1/images/edits"
+
+
+def _parse_multipart(request: httpx.Request) -> dict[str, bytes]:
+    """Decodes an httpx-encoded multipart/form-data request body so a test
+    can assert on its actual field values - httpx only ENCODES multipart on
+    the client side, it has no receiving-side parser, so this uses the
+    stdlib `email` package (multipart/form-data is standard RFC 2046 MIME,
+    which `email` parses generically) rather than a hand-rolled boundary
+    scanner."""
+    import email
+
+    content_type = request.headers["content-type"]
+    raw = b"Content-Type: " + content_type.encode("ascii") + b"\r\n\r\n" + request.content
+    message = email.message_from_bytes(raw)
+    fields: dict[str, bytes] = {}
+    for part in message.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        name = part.get_param("name", header="content-disposition")
+        if name:
+            fields[name] = part.get_payload(decode=True)
+    return fields
 
 _FAKE_KEY = "test-fake-azure-mai-key-not-real"
 _ENDPOINT = "https://example-foundry.services.ai.azure.test/mai/v1/images/generations"
@@ -483,3 +507,142 @@ async def test_azure_mai_failure_is_never_silently_retried_against_openai(monkey
 
     with pytest.raises(AIServiceError, match="simulated failure"):
         await client.image(prompt="p")
+
+
+# ---------------------------------------------------------------------------
+# image-to-image editing - /mai/v1/images/edits, verified against the
+# official MAI-Image-2.6 docs (https://learn.microsoft.com/en-us/azure/
+# foundry/foundry-models/how-to/use-foundry-models-mai)
+# ---------------------------------------------------------------------------
+
+_SOURCE_PNG = b"\x89PNG\r\n\x1a\nthe ORIGINAL image being corrected, not a new one"
+
+
+async def test_edit_endpoint_is_derived_from_the_generations_endpoint():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return _b64_response()
+
+    await edit_image(
+        prompt="fix the overlapping labels", image=_SOURCE_PNG, settings=_settings(),
+        transport=httpx.MockTransport(handler),
+    )
+    assert seen["url"] == _EDIT_ENDPOINT
+
+
+def test_edit_endpoint_derivation_fails_clearly_on_an_unexpected_base_url():
+    with pytest.raises(AIServiceError, match="images/generations"):
+        azure_mai_image_provider._edit_endpoint("https://example.test/something/else")
+
+
+async def test_edit_request_is_multipart_not_json():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content_type"] = request.headers.get("content-type", "")
+        return _b64_response()
+
+    await edit_image(
+        prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert seen["content_type"].startswith("multipart/form-data")
+
+
+async def test_edit_request_contains_the_original_image_bytes():
+    """The core requirement: the EXISTING image reaches the provider as a
+    real image input, not merely described in the prompt text."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["fields"] = _parse_multipart(request)
+        return _b64_response()
+
+    await edit_image(
+        prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert seen["fields"]["image"] == _SOURCE_PNG
+
+
+async def test_edit_request_carries_the_deployment_name_and_prompt_unchanged():
+    seen = {}
+    correction = (
+        "Correct all mathematical symbols, fix overlapping labels, improve spacing, "
+        "preserve the original objects and overall composition, and make the image "
+        "professionally designed."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["fields"] = _parse_multipart(request)
+        return _b64_response()
+
+    await edit_image(
+        prompt=correction, image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert seen["fields"]["model"].decode("utf-8") == _DEPLOYMENT
+    assert seen["fields"]["prompt"].decode("utf-8") == correction
+
+
+async def test_edit_uses_the_same_api_key_header_as_generation(capsys):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["api_key"] = request.headers.get("api-key")
+        seen["authorization"] = request.headers.get("authorization")
+        return _b64_response()
+
+    await edit_image(
+        prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert seen["api_key"] == _FAKE_KEY
+    assert seen["authorization"] is None
+    captured = capsys.readouterr()
+    assert _FAKE_KEY not in captured.out
+    assert _FAKE_KEY not in captured.err
+
+
+async def test_edit_decodes_the_edited_image_bytes_from_the_response():
+    edited = b"\x89PNG\r\n\x1a\nthe EDITED result, different bytes from the source"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _b64_response(edited)
+
+    result = await edit_image(
+        prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert result == edited
+
+
+async def test_edit_missing_endpoint_fails_clearly_without_any_request():
+    with pytest.raises(AIServiceError, match="AZURE_MAI_IMAGE_ENDPOINT"):
+        await edit_image(
+            prompt="p", image=_SOURCE_PNG, settings=_settings(azure_mai_image_endpoint=""),
+            transport=httpx.MockTransport(lambda r: _b64_response()),
+        )
+
+
+async def test_edit_provider_error_raises_clearly_and_is_never_silently_swallowed():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "unsupported deployment for image edits"})
+
+    with pytest.raises(AIServiceError, match="400"):
+        await edit_image(
+            prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+        )
+
+
+async def test_edit_429_is_retried_then_succeeds():
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(429, json={"error": "throttled"})
+        return _b64_response()
+
+    result = await edit_image(
+        prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert result == _PNG_BYTES
+    assert calls["count"] == 2

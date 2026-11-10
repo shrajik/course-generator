@@ -165,9 +165,11 @@ class DatabaseService:
         reviewed_at = (
             datetime.fromisoformat(record.reviewed_at) if record.reviewed_at else None
         )
+        run_state = record.run.state if record.run else None
         if existing:
             existing.title = record.input.course_title
             existing.status = record.status
+            existing.run_state = run_state
             existing.template_id = record.template_id
             existing.input_json = record.input.model_dump(mode="json")
             existing.metadata_json = metadata
@@ -190,6 +192,7 @@ class DatabaseService:
                 document_id=record.document_id,
                 title=record.input.course_title,
                 status=record.status,
+                run_state=run_state,
                 template_id=record.template_id,
                 owner_id=owner_id,
                 review_status=record.review_status,
@@ -229,6 +232,10 @@ class DatabaseService:
     async def course_exists(self, course_id: str) -> bool:
         """Check if a course exists."""
         return await self.courses.get_by_course_id(course_id) is not None
+
+    async def list_course_ids_by_run_state(self, states: list[str]) -> list[str]:
+        """See CourseRepository.list_course_ids_by_run_state."""
+        return list(await self.courses.list_course_ids_by_run_state(states))
 
     # --- Blueprints -------------------------------------------------------
     async def save_blueprint(self, course_id: str, blueprint: CourseBlueprint) -> None:

@@ -169,6 +169,49 @@ def test_rendering_leaves_the_source_document_untouched() -> None:
     assert document.pages[0].blocks[0].content["text"] == tagged
 
 
+def test_section_intro_pair_paragraph_is_stripped() -> None:
+    """A real, confirmed gap: a `section_intro`-style image immediately
+    followed by its paired paragraph (see render_document_html's own
+    "is_section_intro_pair" branch) is rendered through a SEPARATE code
+    path from every other block - Concept/Process/Case/How It Works/
+    Technical Example/Best Practices/Common Mistakes sections all use
+    exactly this pairing, so a course with this gap showed raw
+    `<jargon>` markup on the majority of its own sections, not an
+    occasional one. `test_rendered_html_carries_no_jargon_markup` above
+    never exercised this pairing at all - this is the regression guard for
+    it specifically."""
+    image = Block(
+        id="block_img_si01",
+        type=BlockType.IMAGE,
+        content={
+            "path": "assets/image_003.png",
+            "illustration_style": "section_intro",
+            "purpose": "Intro illustration",
+        },
+        meta=BlockMeta(),
+    )
+    paragraph = Block(
+        id="block_para_si01",
+        type=BlockType.PARAGRAPH,
+        content={"text": 'Definition: the <jargon term="primary artifact">primary artifact</jargon> is key.'},
+        meta=BlockMeta(),
+    )
+    html = render_document_html(_document([image, paragraph]), load_template("non_technical_v1"))
+    assert "jargon" not in html.lower()
+    assert "primary artifact" in html
+
+
+def test_a_closing_tag_mistyped_with_a_curly_brace_is_also_stripped() -> None:
+    """A real, confirmed writer quirk: a closing tag occasionally comes
+    back as `</jargon}` (a "}" where ">" belongs) instead of a well-formed
+    `</jargon>`. The main `_JARGON_TAG` pattern requires a real ">" to
+    match at all, so this malformed form survived untouched into a real
+    PDF before this fix."""
+    assert strip_jargon('the <jargon term="surface prescription">surface prescriptions</jargon} and more') == (
+        "the surface prescriptions and more"
+    )
+
+
 def test_inline_fragments_are_stripped() -> None:
     """Concept/TOC fragments are generated HTML built from the same AI text,
     and are inlined into the page rather than escaped - so they need the same

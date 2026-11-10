@@ -85,7 +85,10 @@ _GRADED_KINDS = frozenset(
         "concept_map", "data_flow_diagram", "er_diagram", "swimlane",
         "pyramid", "matrix", "radial_mindmap", "venn", "chevron_process", "timeline", "staircase_process",
         "balance_comparison", "nested_circles", "network_mesh", "decision_tree", "fishbone",
-        "layered_diagram", "gantt_chart",
+        "layered_diagram", "gantt_chart", "funnel", "honeycomb", "puzzle_pieces", "gears_process",
+        "donut_segments", "pie_wedge", "wavy_journey_path", "progress_rings", "orbit_diagram",
+        "bridge_process", "chain_links", "flower_petal", "hourglass_diagram", "org_chart",
+        "circuit_schematic",
     }
 )
 

@@ -38,6 +38,21 @@ test("a failed picture is a one-line strip, not the picture's slot", () => {
   assert.equal(imageBoxHeight(image({ error: "429", width: 1024, height: 1024 })), MISSING_IMAGE_HEIGHT);
 });
 
+test("a QA-withheld picture is also a one-line strip, not a blank aspect-ratio box", () => {
+  // Production-readiness audit fix: ImageService's fallback-cascade withhold
+  // state (every attempt failed quality checks, no Wikimedia match either -
+  // see image_service.py's `image_withheld_after_qa_failure`) sets
+  // `omitted_after_qa_failure: true` with `error` left `null` (it is not a
+  // technical failure) - this must collapse to the same compact strip a
+  // technical failure gets, mirroring the backend's own `image_generation_
+  // failed` (app/course/document/layout.py), not fall through to ordinary
+  // aspect-ratio sizing with no real width/height.
+  assert.equal(
+    imageBoxHeight(image({ error: null, omitted_after_qa_failure: true, width: null, height: null })),
+    MISSING_IMAGE_HEIGHT,
+  );
+});
+
 test("a picture not generated yet keeps its slot", () => {
   assert.ok(imageBoxHeight(image({})) > MISSING_IMAGE_HEIGHT);
 });

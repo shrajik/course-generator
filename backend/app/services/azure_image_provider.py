@@ -120,6 +120,117 @@ def _decode_image_bytes(response: httpx.Response) -> bytes:
         raise AIServiceError("Azure FLUX.2-flex returned 'b64_json' that was not valid base64") from exc
 
 
+async def edit_image(
+    *,
+    prompt: str,
+    image: bytes,
+    settings: Settings,
+    output_format: str = "png",
+    transport: httpx.BaseTransport | None = None,
+) -> bytes:
+    """POSTs to FLUX.2-flex's documented reference-image EDIT workflow -
+    the SAME endpoint `generate_image` already posts to
+    (`settings.azure_flux_endpoint`, already the Black Forest Labs provider
+    path `.../providers/blackforestlabs/v1/flux-2-flex` per this module's
+    own docstring), with `?api-version=preview` appended and the request
+    body swapped for the documented edit shape - a genuine image-to-image
+    edit, never a text-only regeneration with the old image merely
+    described in words.
+
+    Verified against https://learn.microsoft.com/en-us/azure/foundry/
+    foundry-models/how-to/use-foundry-models-flux (fetched and quoted
+    directly, not assumed): FLUX.2-flex supports "multi-reference image
+    editing with up to 10 reference images" through this exact BFL provider
+    route. Request body is **JSON** (unlike MAI's multipart) - `model`
+    ("FLUX.2-flex"), `prompt`, `output_format`, and the reference image as
+    **base64 text** in a field named `input_image` (a second/third image
+    would go in `input_image_2`/`input_image_3`, but this app only ever
+    edits one existing image at a time). Same `Authorization: Bearer`
+    auth as generation (the docs' edit sample uses the identical header -
+    confirmed, not assumed).
+
+    The edit sample's own response decoding isn't shown in the docs for
+    this specific route, so this reuses `_decode_image_bytes` (`{"data":
+    [{"b64_json": "..."}]}`) on the assumption that Azure's wrapper around
+    this same BFL endpoint returns the identical envelope for both
+    operations it already confirmed for generation - this is the one part
+    of this function not directly quoted from the docs; flagged here so a
+    real failure against the live endpoint is easy to trace back to this
+    specific assumption rather than treated as a generic bug.
+
+    Same retry/backoff policy and status-code handling as `generate_image`
+    (see its own docstring) - duplicated rather than shared so a future
+    change to one path's retry behaviour can never silently also change
+    the other's."""
+    if not settings.azure_flux_endpoint.strip():
+        raise AIServiceError("AZURE_FLUX_ENDPOINT is not configured")
+    if not settings.azure_flux_api_key.strip():
+        raise AIServiceError("AZURE_FLUX_API_KEY is not configured")
+
+    url = f"{settings.azure_flux_endpoint}?api-version=preview"
+    body = {
+        "model": "FLUX.2-flex",
+        "prompt": prompt,
+        "output_format": output_format,
+        "input_image": base64.b64encode(image).decode("ascii"),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {settings.azure_flux_api_key}",
+    }
+    attempts = max(settings.max_call_retries, 1)
+    failures = 0
+    throttled = 0
+    last_status: int | None = None
+
+    async with httpx.AsyncClient(timeout=settings.request_timeout, transport=transport) as client:
+        while True:
+            try:
+                response = await client.post(url, headers=headers, json=body)
+            except httpx.TimeoutException as exc:
+                failures += 1
+                if failures >= attempts:
+                    raise AIServiceError(f"Azure FLUX.2-flex edit request timed out after {attempts} attempt(s)") from exc
+                await asyncio.sleep(_backoff_seconds(failures))
+                continue
+            except httpx.HTTPError as exc:
+                failures += 1
+                if failures >= attempts:
+                    raise AIServiceError(f"Azure FLUX.2-flex edit request failed: {type(exc).__name__}") from exc
+                await asyncio.sleep(_backoff_seconds(failures))
+                continue
+
+            if response.status_code // 100 == 2:
+                try:
+                    return _decode_image_bytes(response)
+                except AIServiceError:
+                    failures += 1
+                    if failures >= attempts:
+                        raise
+                    await asyncio.sleep(_backoff_seconds(failures))
+                    continue
+
+            last_status = response.status_code
+            if response.status_code == 429:
+                throttled += 1
+                if throttled < _RATE_LIMIT_ATTEMPTS:
+                    await asyncio.sleep(_rate_limit_wait(_retry_after_seconds(response)))
+                    continue
+            elif response.status_code in _RETRYABLE_STATUS_CODES:
+                failures += 1
+                if failures < attempts:
+                    await asyncio.sleep(_backoff_seconds(failures))
+                    continue
+            raise AIServiceError(
+                f"Azure FLUX.2-flex edit request failed with status {response.status_code}: "
+                f"{_truncate(response.text)}"
+            )
+
+    raise AIServiceError(
+        f"Azure FLUX.2-flex edit request failed after {attempts} attempt(s) (last status {last_status})"
+    )
+
+
 async def generate_image(
     *, prompt: str, size: str, settings: Settings, transport: httpx.BaseTransport | None = None
 ) -> bytes:

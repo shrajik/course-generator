@@ -448,6 +448,24 @@ async def generate_course(
     return await service.start_generation(course_id, request or GenerateRequest())
 
 
+@router.post("/{course_id}/cancel")
+async def cancel_course_generation(
+    course_id: str,
+    service: CourseService = Depends(_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> dict[str, Any]:
+    """Stop a running/queued generation. Already-completed chapters, images
+    and the document are left exactly as they are - nothing is deleted.
+    Safe to call even if nothing is actually running (e.g. after a backend
+    restart): the course record is still patched to "cancelled" if it was
+    left "queued"/"running". Resume later with `POST /generate
+    {"resume": true}`. Same author-only authorization as starting a run.
+    """
+    await get_course_for_author_action(course_id, current_user, service)
+    cancelled_live = await service.cancel_generation(course_id)
+    return {"course_id": course_id, "cancelled": cancelled_live}
+
+
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 

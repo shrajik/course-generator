@@ -29,7 +29,7 @@ docker compose up --build -d
 docker compose exec backend alembic upgrade head  # first run only, see below
 ```
 
-- App: <http://loca>
+- App: <http://localhost:3000>
 - API docs: <http://localhost:8000/docs>
 
 No Python or Node installation needed on the host. Generated artifacts land in `backend/data/` on your machine

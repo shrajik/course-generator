@@ -106,6 +106,17 @@ class CourseRepository:
         )
         return result.all()
 
+    async def list_course_ids_by_run_state(self, states: Sequence[str]) -> Sequence[str]:
+        """Every course whose last-persisted run state is one of `states` -
+        the crash-recovery startup scan's query (see CourseService.
+        recover_interrupted_courses). Uses the indexed `run_state` column
+        rather than filtering on metadata_json, so this stays cheap even
+        with many courses."""
+        result = await self.session.scalars(
+            select(Course.course_id).where(Course.run_state.in_(states))
+        )
+        return result.all()
+
     async def distinct_statuses(self) -> Sequence[str]:
         result = await self.session.scalars(
             select(Course.status).distinct().order_by(Course.status)

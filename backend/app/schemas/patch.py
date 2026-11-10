@@ -90,6 +90,13 @@ class ReplaceImageOp(BaseModel):
     # "" | "textbook" - see ImageContent.illustration_style. Only meaningful
     # when the block ends up with kind == "illustration".
     illustration_style: str | None = None
+    # The exact part-labels the regenerated image/diagram must show,
+    # spelled correctly (see ImageService's own `expected_labels` QA gate).
+    # Left unset keeps the block's existing labels untouched (the common
+    # case: a correction fixes spacing/overlap/a wrong symbol, not what's
+    # being labelled at all); set this only when the instruction itself is
+    # about a label being wrong, missing or needing to be added/removed.
+    expected_labels: list[str] | None = None
 
 
 class UpdateStyleOp(BaseModel):
@@ -148,4 +155,18 @@ class AiEditResponse(BaseModel):
     patch: DocumentPatch
     applied_operations: list[str] = Field(default_factory=list)
     rejected_operations: list[dict[str, Any]] = Field(default_factory=list)
+    # A real, confirmed bug this closes: a `replace_image` whose regeneration
+    # ultimately failed every bounded attempt (structured diagram/concept
+    # spec AND the raster-illustration fallback chain behind it) used to
+    # leave the block with no image at all ("Image not generated yet") even
+    # though it had a perfectly good one a moment ago - `applied_operations`
+    # already said "replace_image:block_id" by the time generation even
+    # started (the patch itself - clearing the old spec reference and
+    # pointing at the new prompt - always applies cleanly; only the
+    # regeneration that follows can fail), so the chat reply claimed success
+    # on a block the reader then found blank. See DocumentService.ai_edit's
+    # own snapshot/restore comment - a block listed here had its PREVIOUS,
+    # working image restored instead of being left blank, and the chat
+    # reply should say so plainly rather than repeating "applied".
+    images_failed: list[str] = Field(default_factory=list)
     pages: int = 0

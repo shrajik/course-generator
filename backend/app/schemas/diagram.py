@@ -59,6 +59,30 @@ DIAGRAM_KINDS = (
     "fishbone",
     "layered_diagram",
     "gantt_chart",
+    "funnel",
+    "honeycomb",
+    "puzzle_pieces",
+    "gears_process",
+    "donut_segments",
+    "pie_wedge",
+    "wavy_journey_path",
+    "progress_rings",
+    "orbit_diagram",
+    "bridge_process",
+    "chain_links",
+    "flower_petal",
+    "hourglass_diagram",
+    "org_chart",
+    "spectrum",
+    "iceberg",
+    "feedback_loop_process",
+    "causal_loop",
+    "input_process_output",
+    "ranked_bars",
+    # circuit_schematic: real wire/node electrical topology - a STRUCTURE
+    # (which terminals are actually tied to which node), not a sequence. See
+    # its own comment below RELATIONSHIP_KINDS.
+    "circuit_schematic",
 )
 
 # "graph" is its own, third family - neither a sequence nor a labelled-box
@@ -78,10 +102,64 @@ DIAGRAM_KINDS = (
 SEQUENTIAL_KINDS = (
     "flow_chart", "process", "cycle", "data_flow_diagram", "swimlane", "chevron_process", "timeline",
     "staircase_process", "gantt_chart",
+    # funnel: stages narrow top-to-bottom in a fixed order (the top of the
+    # funnel happens before the bottom) - a real sequence, not just a
+    # pyramid-style size ordering (see "pyramid"'s own comment below on
+    # that distinction). gears_process: numbered, left-to-right steps of
+    # one mechanism, same ordered-sequence reasoning as chevron_process.
+    "funnel", "gears_process",
+    # wavy_journey_path: numbered milestones along a roadmap, in order.
+    # bridge_process: numbered steps crossing the bridge, in order.
+    # chain_links: each link depends on/follows the one before it (a chain
+    # of causation/dependency, not a static set) - same reasoning as
+    # funnel above, not a size/importance ordering.
+    "wavy_journey_path", "bridge_process", "chain_links",
+    # feedback_loop_process: a linear sequence of steps, same ordered
+    # reasoning as "process" - it just ALSO draws one explicit "revise and
+    # go back" return edge partway through, unlike "cycle" (which loops
+    # back to the very first step every time by definition).
+    # input_process_output: input happens, then processing, then output -
+    # a genuine three-stage time sequence, not a static structure.
+    "feedback_loop_process", "input_process_output",
 )
 RELATIONSHIP_KINDS = (
     "concept_map", "conceptual", "hierarchy", "schematic", "er_diagram", "matrix", "radial_mindmap", "venn",
     "balance_comparison", "nested_circles", "network_mesh", "decision_tree", "fishbone",
+    # honeycomb/puzzle_pieces: a set of related components with no inherent
+    # before/after order - the same reasoning "concept_map" already
+    # documents (a STRUCTURE, not a SEQUENCE).
+    "honeycomb", "puzzle_pieces",
+    # donut_segments/pie_wedge: categories that together make up one whole,
+    # with no inherent order. progress_rings: a set of independent metrics,
+    # not a sequence. orbit_diagram/flower_petal: a central theme and its
+    # surrounding related sub-topics, same "structure, not sequence"
+    # reasoning as concept_map/radial_mindmap. hourglass_diagram: two
+    # opposing framings (cost/value, before/after as CATEGORIES, not a time
+    # sequence between them) - same reasoning balance_comparison already
+    # documents. org_chart: a role tree with depth, same reasoning
+    # hierarchy already documents.
+    "donut_segments", "pie_wedge", "progress_rings", "orbit_diagram", "flower_petal",
+    "hourglass_diagram", "org_chart",
+    # spectrum: positions along a continuum, with no inherent before/after
+    # order between the labelled positions themselves (a political
+    # spectrum, a pH scale) - a STRUCTURE, same reasoning as matrix.
+    # iceberg: visible/hidden layers of ONE idea, not a time sequence -
+    # same reasoning hourglass_diagram's "categories, not a sequence"
+    # already documents. causal_loop: cause-and-effect relationships
+    # between factors (which can themselves cycle back on each other) -
+    # a STRUCTURE of causal links, same reasoning network_mesh already
+    # documents, not an ordered procedure. ranked_bars: a set of factors
+    # ordered by MAGNITUDE (importance/frequency/score), not by when they
+    # happen - same "ordered but not a sequence of steps" reasoning
+    # "pyramid" documents below, close enough to this family to join it
+    # rather than stand alone a third time.
+    "spectrum", "iceberg", "causal_loop", "ranked_bars",
+    # circuit_schematic: which terminals are actually wired to which shared
+    # node is a STRUCTURE (a parallel pair ties two components to the SAME
+    # two nodes; a series pair does not) - there's no time order between
+    # "component A" and "component B" sitting on the same circuit, the same
+    # reasoning network_mesh/concept_map already document above.
+    "circuit_schematic",
 )
 # "pyramid" deliberately joins neither tuple, the same reasoning "graph"
 # already documents above: its layers have a top-to-bottom ORDER (narrowest
@@ -99,6 +177,85 @@ def max_nodes_for(kind: str) -> int:
     DiagramService._exceeds_node_cap) so the two never drift apart."""
     if kind == "er_diagram":
         return 24
+    if kind == "puzzle_pieces":
+        # app.render.diagram_renderer._layout_puzzle_pieces draws a FIXED
+        # ~130px-wide piece per node in a single growing-wider row (like
+        # chevron_process) - unlike honeycomb (more nodes only add rows,
+        # never width), more pieces here directly shrinks the effective
+        # on-page font once the canvas is displayed at CONTENT_WIDTH. 6 is
+        # the largest count that still clears MIN_READABLE_PX
+        # (app.services.diagram_render_qa) at that kind's own label size -
+        # confirmed by the same math RING_LABEL_SIZE's own comment uses.
+        return 6
+    if kind == "gears_process":
+        # Same reasoning as puzzle_pieces just above - a single row that
+        # grows wider per node (app.render.diagram_renderer._layout_gears_
+        # process). 5 is the largest count that still clears
+        # MIN_READABLE_PX at this kind's own label size.
+        return 5
+    if kind in ("progress_rings", "chain_links", "donut_segments"):
+        # A single row (progress_rings/chain_links, same "grows wider per
+        # node" reasoning as puzzle_pieces/gears_process above) or a ring
+        # whose per-segment label space shrinks as segments are added
+        # (donut_segments) - 6 is the largest count that still clears
+        # MIN_READABLE_PX for each of these at their own label size.
+        return 6
+    if kind == "pie_wedge":
+        return 7
+    if kind == "orbit_diagram":
+        # One node per concentric ring - more than a handful of rings
+        # around one hub reads as clutter, not clarity.
+        return 5
+    if kind == "bridge_process":
+        # A fixed-width arch (app.render.diagram_renderer._layout_bridge_
+        # process) - more steps only cram the same arc tighter, never add
+        # width the way a straight row would.
+        return 5
+    if kind == "wavy_journey_path":
+        # A long wave with many milestones reads as clutter, not a clean
+        # roadmap - 8 is the largest count this kind stays legible at.
+        return 8
+    if kind == "flower_petal":
+        return 7
+    if kind == "hourglass_diagram":
+        # Split across two halves (see _layout_hourglass_diagram's own
+        # docstring) - 6 total keeps each half at a readable 3-ish layers.
+        return 6
+    if kind == "spectrum":
+        # A single horizontal line with labels alternating above/below it
+        # (see _layout_spectrum) - more than a handful of positions
+        # crowds the one line they all share.
+        return 8
+    if kind == "causal_loop":
+        # A ring of factors with curved, polarity-labelled arrows between
+        # them (see _layout_causal_loop) - the same crowding reasoning
+        # network_mesh/orbit_diagram already apply to a circular layout,
+        # tightened further since every edge here also carries a visible
+        # +/- badge the ring must leave room for. 6, not the 7 tried
+        # first - a real, confirmed case: many long-span edges (crossing
+        # several other factors' own positions on the ring, not just
+        # adjacent ones) on a dense 7-factor loop could still clip a node
+        # the curve had to route near, however much the curve's own bow
+        # grows with chord length. VisualPlanner's own guidance keeps the
+        # EDGE COUNT sparse too (favour a single loop plus a small number
+        # of real cross-links over a dense arbitrary graph).
+        return 6
+    if kind == "input_process_output":
+        # Three zones (input/process/output, see _layout_ipo) sharing one
+        # canvas width - the generic SEQUENTIAL_KINDS ceiling of 14 would
+        # cram far more steps into the narrower "process" zone than it
+        # can stay legible at.
+        return 9
+    if kind == "circuit_schematic":
+        # Unlike every other RELATIONSHIP_KINDS member, this one routinely
+        # draws SEVERAL independent circuit panels at once (e.g. "valid
+        # series" / "valid parallel" / two invalid variants side by side -
+        # see DiagramNode.lane's circuit_schematic meaning) - the generic 9-
+        # node ceiling was sized for ONE structure, not a small multiple of
+        # 3-5 junction nodes each. 30 comfortably covers a handful of small
+        # (<=6-node) panels without opening the door to one sprawling,
+        # illegible single circuit.
+        return 30
     if kind in SEQUENTIAL_KINDS:
         return 14
     return 9
@@ -147,6 +304,10 @@ class DiagramNode(BaseModel):
     # nested_circles: same as pyramid - `nodes` order IS the nesting order
     # (nodes[0] = outermost/broadest ring, nodes[-1] = innermost/most
     # specific), `level` itself ignored.
+    # iceberg: 0 = above the waterline (visible), >=1 = below it (hidden) -
+    # a deeper level draws progressively WIDER, the classic "the visible
+    # part is only the tip" shape. Nodes sharing a level stack within it in
+    # `nodes` order.
     # Ignored by other kinds.
     level: int = 0
     # Which shape this node draws as - meaning is kind-specific, ignored by
@@ -163,6 +324,19 @@ class DiagramNode(BaseModel):
     #   belongs to (e.g. "left" = cost/con, "right" = value/pro). ""
     #   (default) falls back to position: the first half of `nodes` is the
     #   left column, the rest is the right column.
+    # input_process_output: "input"/"process"/"output" - which of the
+    #   three zones this node belongs to; "" (default) falls back to
+    #   "process", so a model that only labels the real input(s) and
+    #   output(s) still places everything else sensibly in the middle.
+    # circuit_schematic: "" (default) = a real electrical junction, drawn as
+    #   a small labelled dot that wires/components (see DiagramEdge.label)
+    #   actually connect to. "caption" = NOT an electrical node at all - a
+    #   verdict/explanation node for its own panel (see `lane`), drawn as
+    #   text under that panel instead of a dot; never touched by an edge.
+    #   `label` holds its short verdict ("Valid", "Invalid - extra branch"),
+    #   `detail` the one-sentence reason why. At most one caption node per
+    #   lane is drawn; declare it anywhere in `nodes` - position doesn't
+    #   matter, only `lane` grouping does.
     shape_role: str = ""
     # er_diagram only, and only meaningful when shape_role == "attribute":
     # the id of the entity/relationship node this attribute belongs to -
@@ -174,6 +348,14 @@ class DiagramNode(BaseModel):
     # left to right in the order they're first seen across `nodes`. Every
     # node needs one for a sensible layout; a blank lane groups with any
     # other blank-lane nodes into its own column.
+    # circuit_schematic: which independent circuit PANEL this junction (or
+    # "caption", see `shape_role`) belongs to - e.g. "valid_series" vs
+    # "invalid_parallel" for a multi-scenario comparison. Panels are drawn
+    # left to right, wrapping into new rows, in the order first seen across
+    # `nodes` - the SAME convention swimlane already uses for its own lanes,
+    # just one circuit per "lane" instead of one actor's column. A blank
+    # lane on every node (the common single-circuit case - nothing being
+    # compared) draws one plain, unpanelled circuit with no header.
     lane: str = ""
     # Edit Visuals (flowchart editor) - flow_chart/process only. "" (default)
     # keeps diagram_renderer.role_of()'s existing in/out-degree + label-text
@@ -195,6 +377,31 @@ class DiagramNode(BaseModel):
     # every other kind.
     gantt_start: float = 0.0
     gantt_duration: float = 1.0
+    # smart_art/chevron_process/funnel/honeycomb/puzzle_pieces only: an
+    # optional small pictogram drawn inside this node's own shape, the same
+    # "icon badge" look real presentation-software SmartArt uses (see
+    # app.render.diagram_renderer._ICON_DRAWERS for the exact supported
+    # keywords - any other value, or blank, simply draws no icon; never an
+    # error). Ignored by every other kind.
+    icon: str = ""
+    # progress_rings: this node's own stat, 0-100. A percentage has no
+    # honest place in `label` (which stays the short metric NAME) or
+    # `detail` (free text, not a number this renderer can trust to parse) -
+    # a dedicated, explicitly-numeric field, same reasoning `gantt_start`/
+    # `gantt_duration` already use for their own kind-specific numbers.
+    # spectrum: this node's own POSITION along the continuum, 0 (the low
+    # end) to 100 (the high end) - same "a number has no honest place in
+    # `label`" reasoning. ranked_bars: this bar's own magnitude, 0-100 (a
+    # score/frequency/importance - whatever the brief's ranking is actually
+    # by), drawn as the bar's length; bars sort automatically by this value,
+    # highest first, so the model never has to pre-sort `nodes` itself.
+    # None (not 0.0) when the model didn't set one, so the renderer can
+    # tell "genuinely 0%"/0-valued from "nothing given" and fall back
+    # sensibly (an empty progress ring; an even spread along the spectrum;
+    # a ranked_bars node sorted last) rather than silently drawing a
+    # confident-looking 0. Ignored by
+    # every other kind.
+    value_pct: float | None = None
 
 
 class DiagramEdge(BaseModel):
@@ -202,6 +409,27 @@ class DiagramEdge(BaseModel):
 
     source: str = ""
     target: str = ""
+    # causal_loop only: starts with "+" for a reinforcing link (more of the
+    # source causes more of the target, e.g. "+ drives up") or "-" for a
+    # balancing one (more of the source causes LESS of the target, e.g.
+    # "- reduces"); the leading sign is pulled out and drawn as its own
+    # bold +/- badge on the arrow, the rest of the string (if any) still
+    # renders as the edge's own explanatory text. A label with neither
+    # leading sign draws no polarity badge, never a crash - the same
+    # "missing content degrades gracefully" contract every other optional
+    # field in this module already keeps.
+    # circuit_schematic only: a leading component tag, same "parse a prefix
+    # off the front of a generic field" convention causal_loop's +/- just
+    # above already uses, so this wire/component distinction needed no new
+    # schema field at all. "R:<value>" draws a resistor zigzag ("R:220Ω"),
+    # "C:<value>" a capacitor ("C:100nF"), "L:<value>" an inductor coil,
+    # "V:<value>" or "B:<value>" a battery/voltage source ("V:9V"),
+    # "SW"/"SW:<value>" a switch (open gap). The text after the colon (if
+    # any) is drawn as the component's own value label. Anything else -
+    # blank, or no recognised tag - draws a plain wire with that full string
+    # (if non-blank) as a small label beside it; never a crash on an
+    # unrecognised tag. See app.render.diagram_renderer._parse_circuit_
+    # component for the exact parsing rule.
     label: str = ""
 
 
@@ -447,8 +675,13 @@ REPRESENTATION_TYPES = (
                             # two entities: the FIRST entity in `entities` is "before", the SECOND is
                             # "after" - only set when there is a genuine, single before/after contrast
     "pipeline",            # staged data transformation (RAG, ETL, a compiler pipeline) - renders like a process
-    "spatial",             # physical/structural layout matters (memory layout, network topology, CPU
-                            # architecture) - best-effort via "object", a documented future gap
+    # "spatial" is RETIRED (see VisualPlanner's CONCEPT_SYSTEM prompt for the
+    # full reasoning) - it never had a real renderer, only a generic
+    # "object" fallback that dumps every entity's `properties` as literal
+    # "key: value" text instead of an actual structural layout. The writer
+    # is steered away from ever choosing it; the renderer dispatch table
+    # still maps the string to that same fallback purely so a stray/older
+    # spec with this value already on it still renders instead of crashing.
     "code_visualization",  # a short technical_signature tied directly to the entity it describes
     "cycle",               # a REPEATING sequence (an ML training loop, a release cycle, a review
                             # cadence) - uses `steps`, same grammar as "process", but the last step
@@ -556,6 +789,21 @@ class DiagramSpec(BaseModel):
 
     kind: str = "flow_chart"
     title: str = ""
+    # Editor-only "increase text size" control (Edit Diagram panel) - never
+    # set by the AI writer/planner, always 1.0 for a freshly generated
+    # diagram. A real, confirmed complaint: even a diagram that clears the
+    # renderer's own readability floor can still read as cramped/small to
+    # an actual reader, and the only way to get bigger text before this was
+    # to edit every node label by hand. 1.0 is today's existing, unchanged
+    # size; clamped to [1.0, 1.5] by the renderer - this control only ever
+    # makes text BIGGER, never smaller (which could push a diagram back
+    # under the readability floor). Applied uniformly by every kind that
+    # shares this module's common label-drawing/box-sizing primitives
+    # (`_node_block`, `_circle_node`/`_circle_node_size`, `_draw_diamond`,
+    # `_draw_process_box`, `_fit_boxed_text`, `_key_table_rows`,
+    # `_edge_label`, `_anchored_label`) - see render_diagram_svg's own
+    # comment for exactly which kinds that covers today.
+    label_scale: float = 1.0
     nodes: list[DiagramNode] = Field(default_factory=list)
     edges: list[DiagramEdge] = Field(default_factory=list)
     # Only used when kind == "schematic": either a flat `shapes` list (one
@@ -679,6 +927,11 @@ class DiagramSpec(BaseModel):
     matrix_y_label: str = ""
     # Endpoint labels for each axis (e.g. "Low" / "High") - purely cosmetic,
     # blank draws no endpoint tick label.
+    # Also reused by "spectrum" (only meaningful for kind == "spectrum"):
+    # `matrix_x_low`/`matrix_x_high` are the continuum's own two end labels
+    # (e.g. "Introvert" / "Extrovert", "Acidic" / "Basic") - `matrix_x_label`
+    # doubles as the spectrum's own short title drawn above the bar when
+    # set. `matrix_y_*` fields are unused by spectrum.
     matrix_x_low: str = ""
     matrix_x_high: str = ""
     matrix_y_low: str = ""
@@ -756,10 +1009,11 @@ class DiagramSpec(BaseModel):
         if kind == "concept_map":
             has_labelled_edge = any(e.label.strip() for e in self.edges)
             return bool(self.edges) and (has_labelled_edge or len(labelled) >= 3)
-        if kind in ("er_diagram", "data_flow_diagram"):
-            # A relationship/data-flow diagram is exactly its connections - a
-            # bare list of entities or processes with nothing joining them
-            # isn't one, the same reasoning concept_map already uses above.
+        if kind in ("er_diagram", "data_flow_diagram", "circuit_schematic"):
+            # A relationship/data-flow/circuit diagram is exactly its
+            # connections - a bare list of entities, processes or junctions
+            # with nothing wiring them together isn't one, the same
+            # reasoning concept_map already uses above.
             return bool(self.edges)
         if kind == "swimlane":
             # The whole point is showing work crossing roles/actors - at
@@ -770,4 +1024,16 @@ class DiagramSpec(BaseModel):
             # Venn geometry only reads cleanly at 2 or 3 overlapping circles -
             # the generic 2..9 node-count check above is too permissive here.
             return 2 <= len(labelled) <= 3
+        if kind == "iceberg":
+            # The whole point is a visible/hidden split - at least one node
+            # above the waterline (level 0) and at least one below it
+            # (level >= 1), the same "don't fake a shape the data doesn't
+            # have" reasoning concept_map/swimlane already apply above.
+            return any(n.level == 0 for n in self.nodes) and any(n.level >= 1 for n in self.nodes)
+        if kind in ("feedback_loop_process", "causal_loop"):
+            # Both kinds are defined by their edges (the loop-back step for
+            # feedback_loop_process, the causal links for causal_loop) -
+            # the same "a relationship IS its connections" reasoning
+            # concept_map/er_diagram/data_flow_diagram already use above.
+            return bool(self.edges)
         return True

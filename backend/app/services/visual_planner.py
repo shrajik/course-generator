@@ -23,6 +23,8 @@ No rendering, no QA here - see `app.render.concept_experience_renderer` and
 
 from __future__ import annotations
 
+import json
+
 from app.agents import prompts
 from app.core.config import Settings, get_settings
 from app.schemas.diagram import DiagramSpec
@@ -82,6 +84,21 @@ A visual that nails all four reads as genuinely built for teaching - not a
 generic diagram. Only after this does representation/entity selection below
 turn that thinking into actual fields.
 
+When the brief includes a "CURRENT VISUAL" section, this is a CORRECTION of
+an existing visual, not a fresh one - the reader already approved its
+concept, metaphor and structure and is asking you to fix specific, named
+problems with it (a wrong/garbled label, overlapping or cut-off text, a
+cluttered/decorative look, an incorrect property value or relationship),
+not to redesign it. Keep the same `representation`, the same entities/
+steps/states with the same ids/labels/properties, the same `visual_metaphor`
+and `core_message`, UNLESS the brief explicitly asks to add, remove, rename
+or restructure something - copy every field you are not asked to change
+verbatim rather than paraphrasing or reinventing it, even if your own
+phrasing would read slightly better. Only when the brief clearly asks for a
+broader redesign (a different representation, a different concept
+entirely) should you depart from the current visual more freely - and even
+then, preserve every fact it got right.
+
 First decide `representation` - the shape of visual that best teaches THIS
 concept, based on what the concept itself needs, never on what subject it
 belongs to. Do not blindly default to one family - actually reason about
@@ -134,7 +151,15 @@ relationship, or a state machine:
   repeated, that is itself a sign this content has no real relationships to
   diagram - prefer naming only the few genuinely distinct links (if any)
   and leaving the rest as plain, unconnected entities instead of inventing
-  a connection for every one of them.
+  a connection for every one of them. Also NOT for a simple 1:1 substitution/
+  equivalence mapping (each original thing maps to exactly one counterpart
+  via the SAME kind of link repeated per row - a unit conversion table, "this
+  time-domain element becomes this s-domain impedance", an enum's value-to-
+  label mapping) - that is "comparison" below (rendered as a real table:
+  one row per mapped pair), never a graph of boxes connected by "maps to"/
+  "equivalent to" arrows pointing the same way every time; a graph layout
+  for what is really a lookup table only adds visual clutter (extra colors,
+  icon badges, connector lines) over what a plain row already says clearly.
 - "hierarchy": parent/child structure (the OSI/TCP-IP layers, class
   inheritance, a file system, an org chart, a Kubernetes cluster's nesting).
 - "comparison": 2+ things compared side by side on the SAME criteria (stack
@@ -156,16 +181,38 @@ relationship, or a state machine:
   "comparison") - before_after is always the SAME thing, two moments in time.
 - "pipeline": staged data transformation (a RAG pipeline - query, embed,
   retrieve, generate; an ETL job; a compiler's stages).
-- "spatial": physical/structural layout matters (memory layout, a network
-  topology diagram, CPU cache hierarchy) - only when position/adjacency
-  itself is the point, which is rare outside hardware/networking topics.
+- "spatial" is RETIRED - never set it, for any subject. It has no real
+  renderer of its own (it falls back to the plain "object" entity-card
+  grid, dumping every `properties` key/value pair as literal "key: value"
+  text) - a real, confirmed case: a control-loop timing diagram planned as
+  "spatial" rendered as a wall of raw property dumps ("segments: sensing |
+  policy compute | actuation dispatch", "deadline: deadline (right)")
+  instead of an actual timeline with a deadline marker and an overrun
+  region, because nothing here ever interprets those properties
+  structurally. Re-plan what you were about to call "spatial" as whichever
+  of these actually fits: a chronological/staged sequence (even an
+  engineering one like sensing -> policy compute -> actuation dispatch) is
+  "process"/"pipeline"/"timeline", not "spatial"; a genuine memory-layout
+  or network-topology diagram (rare) is "object" with `entities` describing
+  each region/node directly in `label`/`properties` - still weaker than a
+  purpose-built renderer, but at least an intentional, reviewed choice
+  rather than "spatial"'s silent, unreviewed fallback.
 - "code_visualization": a short technical_signature tied directly to the
   entity it describes - most useful alongside "object" for a programming
   concept.
-- "cycle": a REPEATING sequence - the last step feeds back into the first
-  (an ML training loop - forward pass, loss, backward pass, update, repeat;
-  a software release cycle; a review-revise-repeat editorial loop). The
-  giveaway is whether the process is naturally described as "then it starts
+- "cycle" is RETIRED for a technical (programming/DSA/networks/AI-ML/etc.)
+  concept - never set it there, even for a genuinely repeating sequence (an
+  ML training loop, a software release cycle, a review-revise-repeat
+  editorial loop); you should not even be planning a concept_experience
+  visual for that content in the first place - the writer routes a
+  REPEATING technical sequence straight to `diagram`/`diagram_kind: cycle`
+  (a real, confirmed complaint about this representation's circular
+  icon-card look specifically). You will still see `representation:
+  "cycle"` requested for non-technical content on rare occasion (a
+  biological cycle, a historical cycle) where a plain `diagram` wasn't
+  chosen upstream for some reason - that case is unaffected and still uses
+  this representation normally: the giveaway for whether a sequence
+  "cycles" at all is whether it's naturally described as "then it starts
   over" - NOT for a one-shot procedure that finishes (that's "process").
 - "decision_tree": a branching decision path driven by a condition (an
   if/else flow, a diagnostic checklist, "is X true? then A, else B") -
@@ -199,7 +246,7 @@ Fill these fields:
 - `core_message`: ONE short, quotable sentence - the single takeaway.
 - `visual_metaphor`: OPTIONAL - a concrete, everyday real-world analogy a
   beginner already understands, when one genuinely fits (most useful for
-  "object"/"spatial"). Never a generic/abstract metaphor - it must be
+  "object"). Never a generic/abstract metaphor - it must be
   something visualisable and specific. Leave blank when the representation
   doesn't need one (e.g. a plain "process" or "relationship" often doesn't).
 - `technical_signature`: OPTIONAL, only when the concept has a real, short
@@ -208,6 +255,19 @@ Fill these fields:
   ONE single line, never a multi-line code block or anything resembling a
   code screenshot. Leave blank for concepts with no natural short technical
   mapping.
+- Math notation in ANY field (`core_message`, `technical_signature`, an
+  entity/step/state `label` or a `property` value - this is the whole
+  reason a physics/math concept is ever allowed to use concept_experience
+  at all): a real formula or symbol needing a subscript, superscript,
+  fraction, integral or Greek letter MUST be wrapped in `$...$` (a short
+  inline piece, e.g. "$R_\\ell(r)$") or `$$...$$` (a standalone equation on
+  its own line) - this fragment is typeset with real KaTeX wherever it
+  renders, exactly like ordinary prose math elsewhere in this course, but
+  ONLY when wrapped in these delimiters; bare, undelimited notation like
+  "R_l(r)" or "Y_l^m(theta,phi)" renders as flat, literal text with visible
+  underscores and carets, never real subscripts/superscripts. Plain prose
+  words (even a variable name mentioned in passing) never need this -
+  reserve it for an actual mathematical expression.
 - `generation_strategy`: your best guess at one of "deterministic_svg",
   "deterministic_interactive_html", "gpt_image", "hybrid" -
   "deterministic_interactive_html" is almost always right for a structured
@@ -216,7 +276,7 @@ Fill these fields:
   spend effort perfecting this field - correctness on the fields above
   matters far more.
 - `entities`: for "object"/"comparison"/"data_structure"/"relationship"/
-  "hierarchy"/"decision_tree"/"spatial"/"code_visualization"/"before_after" -
+  "hierarchy"/"decision_tree"/"code_visualization"/"before_after" -
   2-6 named things. For "object", typically one "template"-role entity and 2+
   "instance"-role entities with DIFFERENT property values from each other
   (never give two instances identical properties, that defeats the whole
@@ -241,20 +301,39 @@ Fill these fields:
   "bullet1"/"point2"/"line1" (meaningless once rendered as a label) and
   NEVER "style" or any property describing how the card itself should look
   (fill, border, shadow, font) - visual styling is this renderer's own job,
-  never a fact about the entity. Each entity also has `actions` (short
+  never a fact about the entity. A value is ONE short fact - a few words,
+  no terminal period, no semicolon joining two clauses (e.g. "Red",
+  "O(n log n)", "Relax if turbulent") - NEVER a multi-clause note, a
+  recommendation, a warning, or anything that reads as a sentence you'd
+  say out loud (a real, confirmed case: keys like "admin"/"warning"/
+  "example"/"symptom_fix"/"symptom_title" each paired with a full sentence
+  - "Tolerance guidance: record chosen bands as 'SME to confirm' and
+  obtain verification before release" - rendered as a wall of bold,
+  internal-looking field names in front of paragraphs, not real
+  attributes). If a fact genuinely needs a full sentence to say, it does
+  NOT belong in `properties` at all - fold it into `core_message`, a step/
+  state `description`, or drop it; do not invent a key just to smuggle a
+  sentence in under it. Keys are themselves data a reader SEES bolded next
+  to the value, exactly as spelled - a terse scaffold-sounding word
+  ("admin", "warning", "note", "top1") reads as an internal field name,
+  not a label a reader would recognise; use the plain English a textbook
+  caption would use instead (e.g. "Tolerance" not "admin", "Caution" not
+  "warning", "Example set" not "top1"). Each entity also has `actions` (short
   behaviour/capability labels, e.g. "start()" for a Java method, "commit()"
   for a Git repo - only for entities where that's meaningful), `icon`, and
-  `color_role`. The renderer is deliberately colorful and playful, closer
-  to a children's picture book than a corporate diagram - a concrete,
-  recognisable emoji for `icon` (never leave it blank when a sensible one
-  exists) and a genuine VARIETY of `color_role` across an entity list (one
-  of: primary, secondary, accent, structure, current, magnetic_field,
-  positive, negative, fluid, highlight, annotation, neutral) both matter for
-  real - they're what makes entities instantly tell apart at a glance for
-  a beginner. Reuse the same role only for entities that truly share one
-  meaning (e.g. every instance of the same class); give genuinely different
+  `color_role`. The renderer aims for a clean, textbook/technical-diagram
+  look, NOT a playful picture-book one - leave `icon` blank unless a plain,
+  unambiguous functional glyph genuinely aids recognition (e.g. a database
+  cylinder for a data store); never force a decorative emoji onto an entity
+  just to fill the field, and never use one for an abstract/mathematical
+  entity that has no real-world object to depict. A genuine VARIETY of
+  `color_role` across an entity list (one of: primary, secondary, accent,
+  structure, current, magnetic_field, positive, negative, fluid, highlight,
+  annotation, neutral) DOES matter for real - distinct roles are what let a
+  reader tell entities apart at a glance, so still give genuinely different
   things genuinely different roles rather than defaulting every entity to
-  "primary".
+  "primary". Reuse the same role only for entities that truly share one
+  meaning (e.g. every instance of the same class).
   Leave `entities` empty for a pure "process"/"cycle"/"state_machine"
   representation that doesn't need them.
 - `steps`: for "process"/"sequence"/"pipeline"/"timeline"/"cycle" - ordered
@@ -269,7 +348,7 @@ Fill these fields:
   (`id`, `label`, `description`, `entity_ids` it involves, `icon`,
   `color_role`) plus the transitions between them (`from_state`, `to_state`,
   `label`).
-- `relationships`: for "relationship"/"hierarchy"/"decision_tree"/"spatial" -
+- `relationships`: for "relationship"/"hierarchy"/"decision_tree" -
   entities connected by one of: inside, contains, connected_to, attached_to,
   passes_through, surrounds, contacts, points_to, flows_into, rotates_around
   - OR, for "decision_tree" specifically, the actual branch condition as
@@ -312,18 +391,38 @@ Rules:
 
 
 def _concept_user_prompt(
-    *, purpose: str, prompt: str, caption: str, course_title: str, memory: str = "", qa_feedback: str = "",
+    *,
+    purpose: str,
+    prompt: str,
+    caption: str,
+    course_title: str,
+    memory: str = "",
+    qa_feedback: str = "",
+    existing_spec: dict | None = None,
 ) -> str:
     brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
     section = prompts.memory_section(memory)
     memory_block = f"\n{section}\n" if section else ""
     feedback_block = f"\n{qa_feedback}\n" if qa_feedback else ""
+    # Set only on a correction (replace_image on a block that already has a
+    # rendered spec - see ConceptVisualService.generate_for_block) - see
+    # CONCEPT_SYSTEM's own "CURRENT VISUAL" instructions for what this
+    # means. The full spec, not a summary - concept_experience's fields
+    # (entities/steps/concept_states/properties/metaphor/core_message) are
+    # the thing being corrected, so trimming any of it here risks silently
+    # dropping exactly what the brief didn't ask to change.
+    current_block = (
+        f"\nCURRENT VISUAL (this is a correction - see the system prompt's "
+        f"own instructions on what to preserve):\n{json.dumps(existing_spec, ensure_ascii=False)[:MAX_BRIEF_CHARS * 2]}\n"
+        if existing_spec
+        else ""
+    )
     return f"""\
 COURSE: {course_title}
 
 VISUAL BRIEF:
 {brief or "(not specified)"}
-{memory_block}{feedback_block}
+{memory_block}{feedback_block}{current_block}
 Produce the concept_experience diagram specification for this visual.
 """
 
@@ -348,6 +447,7 @@ class VisualPlanner:
         course_title: str,
         block_id: str = "",
         qa_feedback: str = "",
+        existing_spec: dict | None = None,
     ) -> DiagramSpec:
         memory_context = await self.memory.build_context(
             stage="visual", course_title=course_title, chapter_title=purpose or prompt,
@@ -357,7 +457,7 @@ class VisualPlanner:
             system=CONCEPT_SYSTEM,
             user=_concept_user_prompt(
                 purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
-                memory=memory_context.render(), qa_feedback=qa_feedback,
+                memory=memory_context.render(), qa_feedback=qa_feedback, existing_spec=existing_spec,
             ),
             model=self.settings.concept_visual_model,
             purpose=f"concept_visual:{block_id}",

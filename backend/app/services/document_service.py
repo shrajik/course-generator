@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 from app.agents.editor import EditorAgent
@@ -34,6 +35,20 @@ from app.services.pdf_service import PdfService
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
+
+
+def _replace_image_regenerated_to_nothing(old_content: dict, new_content: dict) -> bool:
+    """True when `old_content` had a genuinely working image and
+    `new_content` (the SAME block, after a `replace_image` regeneration
+    attempt) does not - the signal `ai_edit` uses to restore the previous,
+    working image instead of leaving the block blank. A block with no
+    working image to begin with (`old_content` itself has no `path`/
+    `generated`) has nothing worth falling back to, so this is always
+    False for it - restoring would just replace one blank state with
+    another, identical one."""
+    had_image = bool(old_content.get("path")) and bool(old_content.get("generated"))
+    has_image_now = bool(new_content.get("path")) and bool(new_content.get("generated"))
+    return had_image and not has_image_now
 
 
 class DocumentService:
@@ -157,6 +172,31 @@ class DocumentService:
                 pages=len(document.pages),
             )
 
+        # Snapshot every `replace_image` target's content BEFORE the patch
+        # touches it (never `insert_block` - a brand new block has no prior
+        # image worth falling back to). `replace_image` on a block staying
+        # `kind: "diagram"`/`"concept_experience"` can fail every bounded
+        # attempt (the structured spec AND the raster-illustration fallback
+        # chain behind it - a real, confirmed case: an ambitious
+        # replacement diagram failed the deterministic renderer's own
+        # geometry QA twice, fell back through text-free illustration
+        # retries, relevance retries, and finally a generic fallback, any
+        # one of which can fail under real network conditions). `apply_
+        # patch` clears the OLD, perfectly good `path`/`generated`
+        # unconditionally, before generation even starts - without this
+        # snapshot, a total regeneration failure left the block with no
+        # image at all ("Image not generated yet") even though the reader
+        # had a working picture a moment earlier, while the chat reply
+        # still said "applied" because the PATCH itself (not the
+        # generation it triggers) is what a patch result's own `applied`
+        # list reflects.
+        snapshots: dict[str, dict] = {}
+        for operation in patch.operations:
+            if operation.type == "replace_image":
+                found = document.find_block(operation.block_id)
+                if found is not None:
+                    snapshots[operation.block_id] = copy.deepcopy(found[1].content)
+
         result = apply_patch(document, patch, template)
 
         if result.images_to_generate and request.regenerate_images:
@@ -168,6 +208,23 @@ class DocumentService:
             )
             if generated:
                 reflow_document(document, template)
+
+        images_failed: list[str] = []
+        for block_id, old_content in snapshots.items():
+            found = document.find_block(block_id)
+            if found is None:
+                continue
+            _, block = found
+            if _replace_image_regenerated_to_nothing(old_content, block.content):
+                log.warning(
+                    "replace_image regeneration for %s failed every bounded attempt - "
+                    "restoring its previous working image instead of leaving it blank",
+                    block_id,
+                )
+                block.content = old_content
+                images_failed.append(block_id)
+        if images_failed:
+            reflow_document(document, template)
 
         if result.changed:
             await self._save_document(document)
@@ -185,6 +242,7 @@ class DocumentService:
             patch=patch,
             applied_operations=result.applied,
             rejected_operations=result.rejected,
+            images_failed=images_failed,
             pages=len(document.pages),
         )
 

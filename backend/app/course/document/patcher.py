@@ -172,12 +172,32 @@ def apply_patch(
                 if block.type is not BlockType.IMAGE:
                     _reject(result, operation, f"block is {block.type.value}, not an image")
                     continue
-                update = {
-                    "prompt": operation.prompt,
-                    "path": None,
-                    "generated": False,
-                    "error": None,
-                }
+                # Raster illustration EDIT (not regenerate-from-scratch):
+                # when the block is staying an "illustration" (never set for
+                # a diagram/concept_experience, whose `path` is SVG/HTML, not
+                # an editable raster source, and never for a KIND CHANGE,
+                # whose old `path` belongs to a different kind entirely) and
+                # already has a real image on disk, the existing `path` is
+                # deliberately left UNTOUCHED here, not cleared - it is both
+                # the source image ImageService._edit_illustration reads and
+                # edits, AND the fallback that keeps showing the correct,
+                # already-good picture if that edit ever fails (see that
+                # function's own "never silently discard a working image"
+                # contract). `_pending_edit` is the one signal that tells
+                # ImageService this regeneration should be an EDIT, not a
+                # fresh text-to-image generation.
+                resulting_kind = operation.kind if operation.kind is not None else block.content.get("kind")
+                wants_edit = (
+                    block.content.get("kind") == "illustration"
+                    and resulting_kind == "illustration"
+                    and isinstance(block.content.get("path"), str)
+                    and bool(block.content.get("path"))
+                )
+                update: dict = {"prompt": operation.prompt, "_pending_edit": wants_edit}
+                if wants_edit:
+                    update["error"] = None
+                else:
+                    update.update({"path": None, "generated": False, "error": None})
                 if operation.caption is not None:
                     update["caption"] = operation.caption
                 if operation.alt is not None:
@@ -199,6 +219,8 @@ def apply_patch(
                         update["diagram_kind"] = operation.diagram_kind
                     if operation.illustration_style is not None:
                         update["illustration_style"] = operation.illustration_style
+                if operation.expected_labels is not None:
+                    update["expected_labels"] = operation.expected_labels
                 block.content = merge_content(block.type, block.content, update)
                 block.meta.origin = "edited"
                 block.meta.updated_at = utc_now_iso()

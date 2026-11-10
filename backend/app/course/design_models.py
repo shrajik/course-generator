@@ -98,6 +98,15 @@ def design_model_brief(design: DesignModels | None, *, bloom_already_stated: boo
             "diagram, simulation), flag that need instead of describing it in prose alone.",
             "- Development: flag every technical claim, code sample and procedure for "
             "subject-matter-expert verification, in a callout titled SME verification.",
+            "- ADDIE is how the course was PLANNED, not something the reader is being taught: the "
+            "performance gap, audience profile and task list belong in the course summary only, "
+            "stated briefly there and never expanded into their own chapter. A real, confirmed "
+            "failure mode produced a course whose entire first chapter explained the analysis/"
+            "design methodology itself (performance gap, audience profile, SME verification, "
+            "rubric) with almost no actual subject content - the reader opened the course to learn "
+            "the SUBJECT, not how it was built. Chapter 1 must open on and be substantially about "
+            "the real subject matter like every other chapter; it may reference the objectives "
+            "briefly but is never primarily about the design process.",
         ]
 
     if design.has("bloom") and not bloom_already_stated:

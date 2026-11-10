@@ -18,7 +18,7 @@ import pytest
 from app.core.config import Settings
 from app.core.errors import AIServiceError
 from app.services import azure_image_provider
-from app.services.azure_image_provider import generate_image, parse_image_size
+from app.services.azure_image_provider import edit_image, generate_image, parse_image_size
 from app.services.openai_service import OpenAIClient
 
 _FAKE_KEY = "test-fake-azure-key-not-real"
@@ -515,5 +515,257 @@ async def test_other_errors_keep_the_short_backoff(waits):
     assert len(waits) == 2 and all(wait < 20 for wait in waits)
 
 
-def test_image_concurrency_defaults_to_two():
-    assert Settings().concurrency_for("image") == 2
+def test_image_concurrency_defaults_to_four():
+    # Raised from 2 - benchmarked (scripts/benchmark_generation.py) to
+    # meaningfully cut image-generation wall clock without tripping
+    # provider rate limits any more often. Still overridable via
+    # IMAGE_CONCURRENCY.
+    assert Settings().concurrency_for("image") == 4
+
+
+def test_image_concurrency_is_overridable_up_to_six_or_higher():
+    assert Settings(image_concurrency=6).concurrency_for("image") == 6
+
+
+# ---------------------------------------------------------------------------
+# image-to-image editing - FLUX.2-flex reference-image editing, verified
+# against the official docs (https://learn.microsoft.com/en-us/azure/
+# foundry/foundry-models/how-to/use-foundry-models-flux)
+# ---------------------------------------------------------------------------
+
+_SOURCE_PNG = b"\x89PNG\r\n\x1a\nthe ORIGINAL image being corrected, not a new one"
+
+
+async def test_edit_hits_the_same_base_endpoint_with_api_version_preview():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return _b64_response()
+
+    await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+    assert seen["url"] == f"{_ENDPOINT}?api-version=preview"
+
+
+async def test_edit_request_is_json_not_multipart():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["content_type"] = request.headers.get("content-type")
+        return _b64_response()
+
+    await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+    assert seen["content_type"] == "application/json"
+
+
+async def test_edit_request_contains_the_original_image_as_base64_input_image():
+    """The core requirement: the EXISTING image reaches the provider as a
+    real image input (base64 in `input_image`, the documented FLUX.2
+    reference-image field), not merely described in the prompt text."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["body"] = json.loads(request.content)
+        return _b64_response()
+
+    await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+    assert base64.b64decode(seen["body"]["input_image"]) == _SOURCE_PNG
+
+
+async def test_edit_request_carries_the_model_and_prompt_unchanged():
+    seen = {}
+    correction = (
+        "Correct all mathematical symbols, fix overlapping labels, improve spacing, "
+        "preserve the original objects and overall composition, and make the image "
+        "professionally designed."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        seen["body"] = json.loads(request.content)
+        return _b64_response()
+
+    await edit_image(
+        prompt=correction, image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler)
+    )
+    assert seen["body"]["model"] == "FLUX.2-flex"
+    assert seen["body"]["prompt"] == correction
+    assert seen["body"]["output_format"] == "png"
+
+
+async def test_edit_uses_the_same_bearer_auth_as_generation(capsys):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return _b64_response()
+
+    await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+    assert seen["auth"] == f"Bearer {_FAKE_KEY}"
+    captured = capsys.readouterr()
+    assert _FAKE_KEY not in captured.out
+    assert _FAKE_KEY not in captured.err
+
+
+async def test_edit_decodes_the_edited_image_bytes_from_the_response():
+    edited = b"\x89PNG\r\n\x1a\nthe EDITED result, different bytes from the source"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _b64_response(edited)
+
+    result = await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+    assert result == edited
+
+
+async def test_edit_missing_endpoint_fails_clearly_without_any_request():
+    with pytest.raises(AIServiceError, match="AZURE_FLUX_ENDPOINT"):
+        await edit_image(
+            prompt="p", image=_SOURCE_PNG, settings=_settings(azure_flux_endpoint=""),
+            transport=httpx.MockTransport(lambda r: _b64_response()),
+        )
+
+
+async def test_edit_provider_error_raises_clearly_and_is_never_silently_swallowed():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "unsupported deployment for image edits"})
+
+    with pytest.raises(AIServiceError, match="400"):
+        await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+
+
+async def test_edit_429_is_retried_then_succeeds():
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(429, json={"error": "throttled"})
+        return _b64_response()
+
+    result = await edit_image(prompt="p", image=_SOURCE_PNG, settings=_settings(), transport=httpx.MockTransport(handler))
+    assert result == _PNG_BYTES
+    assert calls["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# AIClient.image_edit() provider dispatch - mirrors image()'s own dispatch
+# tests above exactly (same resolution order, same "never silently fall
+# back to a different provider" contract).
+# ---------------------------------------------------------------------------
+
+
+async def test_image_edit_provider_azure_uses_the_azure_edit_implementation(monkeypatch):
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    called = {"openai": False, "azure": False, "azure_mai": False}
+
+    async def fake_openai(**_kwargs):
+        called["openai"] = True
+        return b"openai-bytes"
+
+    async def fake_azure(**_kwargs):
+        called["azure"] = True
+        return b"azure-bytes"
+
+    async def fake_azure_mai(**_kwargs):
+        called["azure_mai"] = True
+        return b"azure-mai-bytes"
+
+    monkeypatch.setattr(client, "_image_edit_openai", fake_openai)
+    monkeypatch.setattr(client, "_image_edit_azure", fake_azure)
+    monkeypatch.setattr(client, "_image_edit_azure_mai", fake_azure_mai)
+
+    result = await client.image_edit(prompt="p", image=b"src")
+    assert result == b"azure-bytes"
+    assert called == {"openai": False, "azure": True, "azure_mai": False}
+
+
+async def test_image_edit_provider_azure_mai_uses_the_azure_mai_edit_implementation(monkeypatch):
+    settings = Settings(image_provider="azure_mai")
+    client = OpenAIClient(settings)
+
+    called = {"openai": False, "azure": False, "azure_mai": False}
+
+    async def fake_openai(**_kwargs):
+        called["openai"] = True
+        return b"openai-bytes"
+
+    async def fake_azure(**_kwargs):
+        called["azure"] = True
+        return b"azure-bytes"
+
+    async def fake_azure_mai(**_kwargs):
+        called["azure_mai"] = True
+        return b"azure-mai-bytes"
+
+    monkeypatch.setattr(client, "_image_edit_openai", fake_openai)
+    monkeypatch.setattr(client, "_image_edit_azure", fake_azure)
+    monkeypatch.setattr(client, "_image_edit_azure_mai", fake_azure_mai)
+
+    result = await client.image_edit(prompt="p", image=b"src")
+    assert result == b"azure-mai-bytes"
+    assert called == {"openai": False, "azure": False, "azure_mai": True}
+
+
+async def test_image_edit_provider_param_overrides_the_configured_default(monkeypatch):
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    called = {"openai": False, "azure": False}
+
+    async def fake_openai(**_kwargs):
+        called["openai"] = True
+        return b"openai-bytes"
+
+    async def fake_azure(**_kwargs):
+        called["azure"] = True
+        return b"azure-bytes"
+
+    monkeypatch.setattr(client, "_image_edit_openai", fake_openai)
+    monkeypatch.setattr(client, "_image_edit_azure", fake_azure)
+
+    result = await client.image_edit(prompt="p", image=b"src", provider="openai")
+    assert result == b"openai-bytes"
+    assert called == {"openai": True, "azure": False}
+    assert settings.image_provider == "azure"  # untouched
+
+
+async def test_unsupported_image_edit_provider_fails_clearly(monkeypatch):
+    settings = Settings(image_provider="not-a-real-provider")
+    client = OpenAIClient(settings)
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("should never be called for an unsupported provider")
+
+    monkeypatch.setattr(client, "_image_edit_openai", fail_if_called)
+    monkeypatch.setattr(client, "_image_edit_azure", fail_if_called)
+    monkeypatch.setattr(client, "_image_edit_azure_mai", fail_if_called)
+
+    with pytest.raises(AIServiceError, match="not-a-real-provider"):
+        await client.image_edit(prompt="p", image=b"src")
+
+
+async def test_image_edit_failure_is_never_silently_swallowed_into_a_different_provider(monkeypatch):
+    """A real edit failure (bad deployment, unsupported model, provider
+    outage) must propagate unchanged - never silently retried against a
+    different provider, which would risk editing with the wrong
+    credentials/model or masking a genuine misconfiguration."""
+    settings = Settings(image_provider="azure", azure_flux_endpoint=_ENDPOINT, azure_flux_api_key=_FAKE_KEY)
+    client = OpenAIClient(settings)
+
+    async def failing_azure(**_kwargs):
+        raise AIServiceError("Azure FLUX.2-flex edit request failed with status 400: unsupported deployment")
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("must never silently retry edit against a different provider")
+
+    monkeypatch.setattr(client, "_image_edit_azure", failing_azure)
+    monkeypatch.setattr(client, "_image_edit_azure_mai", fail_if_called)
+    monkeypatch.setattr(client, "_image_edit_openai", fail_if_called)
+
+    with pytest.raises(AIServiceError, match="unsupported deployment"):
+        await client.image_edit(prompt="p", image=b"src")

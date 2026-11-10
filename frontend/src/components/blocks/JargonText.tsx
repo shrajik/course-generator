@@ -2,8 +2,10 @@
 
 import { Fragment } from "react";
 import { parseJargon } from "@/lib/content/jargon";
+import { parseMath } from "@/lib/content/math";
 import { splitMarkers } from "@/lib/review/highlight";
 import { CitationBadge } from "./CitationBadge";
+import { MathText } from "./MathText";
 import { parseLinks } from "@/lib/content/links";
 
 /**
@@ -39,6 +41,28 @@ export function JargonText({ value }: { value: string }) {
           >
             {segment.label}
           </span>
+        ) : (
+          <MathAndLinkedText key={index} text={segment.text} />
+        ),
+      )}
+    </>
+  );
+}
+
+/**
+ * A jargon-free text run: real LaTeX math (`$...$`/`$$...$$`/`\(...\)`/
+ * `\[...\]`, see lib/content/math.ts) is typeset first, since a formula's
+ * own body shouldn't also be scanned for source markers or URLs; whatever
+ * plain text is left goes through the pre-existing marker/link handling
+ * unchanged.
+ */
+function MathAndLinkedText({ text }: { text: string }) {
+  const segments = parseMath(text);
+  return (
+    <>
+      {segments.map((segment, index) =>
+        segment.kind === "math" ? (
+          <MathText key={index} tex={segment.tex} display={segment.display} />
         ) : (
           <Fragment key={index}>
             {/* Source markers ([G2.5] knowledge library, [S1.3] the creator's own

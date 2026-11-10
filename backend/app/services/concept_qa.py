@@ -53,6 +53,18 @@ DISCONNECTED_CONCEPTS = "disconnected_concepts"
 CONCEPT_NOT_CLEAR = "concept_not_clear"
 CORE_MESSAGE_NOT_DELIVERED = "core_message_not_delivered"
 WRONG_RELATIONSHIP = "wrong_relationship"
+# Root-cause fix (production course audit, ThermoDynamics/doc_a2f5625a7fd9):
+# `_looks_garbled` (Layer 1, reused from diagram_qa) only catches homoglyph/
+# replacement-character corruption by construction - its own docstring says
+# so explicitly - so an ordinary scrambled-but-all-Latin typo ("coniJt"
+# instead of "and", "mullivtrabile" instead of "multivariable", both real,
+# confirmed cases found in a shipped concept_experience card) sails through
+# Layer 1 untouched. `diagram_content_qa.py` already closed this exact gap
+# for its own kind family via a `text_legible` LLM judgment; this was never
+# ported to concept_experience's own semantic check below, so the same typo
+# class that diagram/flow_chart content is now protected against could still
+# reach a concept_experience card completely unchecked.
+TEXT_NOT_LEGIBLE = "text_not_legible"
 
 _LABEL_LENGTH_CAP = 40  # characters - "short, a few words", not a sentence
 # Looser than _LABEL_LENGTH_CAP since a real short fact ("flattens at high
@@ -445,6 +457,11 @@ class ConceptCritique(BaseModel):
     criteria_verdicts: list[CriterionVerdict] = Field(default_factory=list)
     structure_correct: bool = True
     structure_detail: str = ""
+    # Mirrors diagram_content_qa.ContentCritique.text_legible - see
+    # TEXT_NOT_LEGIBLE's own module-level comment for why this needs its own
+    # LLM judgment rather than relying on the deterministic Layer-1 check.
+    text_legible: bool = True
+    text_legible_detail: str = ""
 
 
 CRITIQUE_SYSTEM = """\
@@ -466,6 +483,15 @@ Also judge:
 - `structure_correct`: are the entities/relationships/steps/states an
   accurate, sensible representation of the concept (not factually wrong,
   not missing something essential a beginner would need)?
+- `text_legible`: is every label/description/property value spelled
+  correctly and readable as real words - not a typo a proofreader would
+  immediately flag (e.g. "coniJt" instead of "and", "mullivtrabile" instead
+  of "multivariable"), not a word with swapped/dropped/duplicated letters,
+  and not a sentence whose words are present but scrambled out of readable
+  order. This is a LANGUAGE-CORRECTNESS check only, distinct from every
+  judgment above - grade it even when everything else about the spec is
+  excellent, and set `text_legible_detail` to the exact bad text found when
+  `text_legible` is false.
 
 Be specific and concrete in every `detail` - name exactly what's missing or
 wrong, in one sentence, never a generic "could be better."
@@ -542,6 +568,13 @@ async def _semantic_issues(spec: DiagramSpec, *, ai: AIClient, settings: Setting
         issues.append(DiagramQAIssue(
             WRONG_RELATIONSHIP,
             critique.structure_detail or "The entity/relationship structure doesn't correctly represent the concept.",
+            deterministic=False,
+        ))
+    if not critique.text_legible:
+        issues.append(DiagramQAIssue(
+            TEXT_NOT_LEGIBLE,
+            critique.text_legible_detail
+            or "This visual's labels contain misspelled or scrambled text.",
             deterministic=False,
         ))
     return issues

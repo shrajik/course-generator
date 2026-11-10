@@ -275,6 +275,10 @@ export interface FlowchartSpec {
   title?: string;
   nodes: DiagramNode[];
   edges: DiagramEdge[];
+  /** 1.0 (default) - 1.5. Scales every label/detail/edge-label font across
+   * the diagram's shared rendering primitives - see diagram.py's
+   * DiagramSpec.label_scale and diagram_renderer.py's _scaled_font_size. */
+  label_scale?: number;
   [key: string]: unknown;
 }
 

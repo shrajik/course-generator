@@ -175,16 +175,25 @@ def test_replace_block_keeps_the_id(document, template):
     assert replaced.content["text"] == "Replaced."
 
 
-def test_replace_image_clears_the_asset_and_queues_regeneration(document, template):
+def test_replace_image_on_an_illustration_with_an_existing_picture_preserves_it_for_editing(document, template):
+    """Raster-illustration editing root cause fix: an illustration block
+    that already has a real picture on disk gets `_pending_edit=True` and
+    its `path` left UNTOUCHED, not cleared - that path is both the source
+    image `ImageService._edit_illustration` reads and genuinely edits, AND
+    the fallback that keeps showing the correct, already-good picture if
+    that edit ever fails. Clearing it (the old behaviour) would have
+    discarded the one thing a real image-to-image edit needs."""
     image = document.pages[0].blocks[2]
+    assert image.content.get("kind", "illustration") == "illustration"  # the fixture's own default
     image.content["path"] = "assets/image_001.png"
+    image.content["generated"] = True
     patch = DocumentPatch.model_validate(
         {
             "operations": [
                 {
                     "type": "replace_image",
                     "block_id": image.id,
-                    "prompt": "a clearer diagram",
+                    "prompt": "fix the overlapping numbers",
                     "caption": "new caption",
                 }
             ]
@@ -192,10 +201,100 @@ def test_replace_image_clears_the_asset_and_queues_regeneration(document, templa
     )
     result = apply_patch(document, patch, template)
     updated = document.find_block(image.id)[1]
-    assert updated.content["path"] is None
-    assert updated.content["prompt"] == "a clearer diagram"
+    assert updated.content["path"] == "assets/image_001.png"
+    assert updated.content["generated"] is True
+    assert updated.content["_pending_edit"] is True
+    assert updated.content["prompt"] == "fix the overlapping numbers"
     assert updated.content["caption"] == "new caption"
+    assert updated.content["error"] is None
     assert result.images_to_generate == [image.id]
+
+
+def test_replace_image_on_a_block_with_no_existing_picture_has_nothing_to_edit(document, template):
+    """The mirror case: a block that never had a real picture (no `path`
+    yet) has nothing to edit from, so this is an ordinary fresh generation
+    - `_pending_edit` stays False and there's nothing to clear either way."""
+    image = document.pages[0].blocks[2]
+    assert image.content.get("path") is None
+    patch = DocumentPatch.model_validate(
+        {"operations": [{"type": "replace_image", "block_id": image.id, "prompt": "a clearer diagram"}]}
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["path"] is None
+    assert updated.content["_pending_edit"] is False
+
+
+def test_replace_image_on_a_diagram_or_concept_experience_still_clears_the_asset(document, template):
+    """A diagram/concept_experience's `path` is SVG/HTML, not an editable
+    raster source - `_pending_edit` must never fire for these, and the old
+    behaviour (clear `path` so the structured pipeline regenerates it) is
+    unchanged. See test_replace_image_preserves_the_existing_spec_... below
+    for the real editing mechanism these kinds use instead (their own
+    `spec`, never cleared, read back as correction context)."""
+    image = document.pages[0].blocks[2]
+    image.content["kind"] = "diagram"
+    image.content["diagram_kind"] = "concept_map"
+    image.content["path"] = "assets/image_001.svg"
+    patch = DocumentPatch.model_validate(
+        {"operations": [{"type": "replace_image", "block_id": image.id, "prompt": "fix the overlapping label"}]}
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["path"] is None
+    assert updated.content["_pending_edit"] is False
+
+
+def test_replace_image_preserves_the_existing_spec_for_the_regeneration_step_to_reuse(document, template):
+    """Replace Image root cause fix: `replace_image` clears `path` so the
+    block regenerates, but must NEVER discard `content["spec"]` - it's the
+    existing diagram/concept_experience structure DiagramService/
+    ConceptVisualService.generate_for_block now reads back as correction
+    context (see their own regression tests) so a correction preserves the
+    existing nodes/entities instead of the model inventing a different
+    visual. `merge_content`'s shallow merge already keeps any key `update`
+    doesn't touch - this locks that contract in explicitly for `spec`."""
+    image = document.pages[0].blocks[2]
+    image.content["kind"] = "diagram"
+    image.content["path"] = "assets/image_001.svg"
+    image.content["spec"] = {"kind": "concept_map", "title": "t", "nodes": [{"id": "a", "label": "A"}]}
+    patch = DocumentPatch.model_validate(
+        {"operations": [{"type": "replace_image", "block_id": image.id, "prompt": "fix the overlapping label"}]}
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["path"] is None
+    assert updated.content["spec"] == {"kind": "concept_map", "title": "t", "nodes": [{"id": "a", "label": "A"}]}
+
+
+def test_replace_image_can_set_expected_labels_for_a_label_correction(document, template):
+    image = document.pages[0].blocks[2]
+    patch = DocumentPatch.model_validate(
+        {
+            "operations": [
+                {
+                    "type": "replace_image",
+                    "block_id": image.id,
+                    "prompt": "fix the misspelled label",
+                    "expected_labels": ["Nucleus", "Cell wall"],
+                }
+            ]
+        }
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["expected_labels"] == ["Nucleus", "Cell wall"]
+
+
+def test_replace_image_without_expected_labels_leaves_the_existing_ones_untouched(document, template):
+    image = document.pages[0].blocks[2]
+    image.content["expected_labels"] = ["Anode", "Cathode"]
+    patch = DocumentPatch.model_validate(
+        {"operations": [{"type": "replace_image", "block_id": image.id, "prompt": "improve the spacing"}]}
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["expected_labels"] == ["Anode", "Cathode"]
 
 
 def test_replace_image_can_reclassify_a_stale_diagram_to_concept_experience(document, template):

@@ -152,6 +152,127 @@ def _decode_image_bytes(response: httpx.Response) -> bytes:
         raise AIServiceError("Azure MAI-Image-2.6 returned 'b64_json' that was not valid base64") from exc
 
 
+def _edit_endpoint(generations_endpoint: str) -> str:
+    """Derives MAI-Image-2.6's documented image-EDIT URL from the configured
+    GENERATION endpoint - same base, only the trailing path segment differs.
+    Verified against https://learn.microsoft.com/en-us/azure/foundry/
+    foundry-models/how-to/use-foundry-models-mai (fetched directly, not
+    assumed): the edit sample's own URL is literally
+    `{endpoint}/mai/v1/images/edits` where `{endpoint}` is the SAME resource
+    base the generations sample uses as `{endpoint}/mai/v1/images/
+    generations` - same auth, same deployment-name `model` field, same
+    response shape, confirmed by the docs text "modified as described in
+    the earlier section" for the edit call's own auth. Raises AIServiceError
+    if the configured endpoint doesn't end with the expected generations
+    suffix, rather than silently guessing at a URL that might not exist -
+    a real misconfiguration (e.g. someone already pointed
+    AZURE_MAI_IMAGE_ENDPOINT at some other path) must fail clearly here,
+    before any network call, not produce a confusing 404 from a wrong
+    derived URL."""
+    suffix = "/images/generations"
+    if not generations_endpoint.endswith(suffix):
+        raise AIServiceError(
+            f"Can't derive the MAI-Image-2.6 edits endpoint: AZURE_MAI_IMAGE_ENDPOINT "
+            f"({generations_endpoint!r}) doesn't end with {suffix!r}"
+        )
+    return generations_endpoint[: -len(suffix)] + "/images/edits"
+
+
+async def edit_image(
+    *,
+    prompt: str,
+    image: bytes,
+    settings: Settings,
+    image_mime: str = "image/png",
+    transport: httpx.BaseTransport | None = None,
+) -> bytes:
+    """POSTs to MAI-Image-2.6's documented image-EDIT endpoint (`/mai/v1/
+    images/edits`, derived from `settings.azure_mai_image_endpoint` - see
+    `_edit_endpoint`) with the ORIGINAL image as a real multipart file
+    upload - never a URL, never merely described in text - alongside the
+    correction `prompt`. This is a genuine image-to-image edit: the
+    provider receives the actual pixels being corrected, not just a text
+    description of them.
+
+    Per the documented request shape (https://learn.microsoft.com/en-us/
+    azure/foundry/foundry-models/how-to/use-foundry-models-mai, fetched
+    and verified, not assumed): **multipart/form-data**, never JSON like
+    generation - `model` (the deployment name, same field generation
+    uses), `prompt`, and a repeatable `image` file field (the docs allow up
+    to five; this app always sends exactly the one original image being
+    corrected). Same `api-key` auth as generation (the docs explicitly say
+    the edit call's auth is "modified as described in the earlier
+    section" - i.e. unchanged). Same response shape as generation -
+    `{"data": [{"b64_json": "..."}]}` - so `_decode_image_bytes` is reused
+    unmodified.
+
+    Same retry/backoff policy as `generate_image` (see its own docstring)
+    - duplicated rather than shared so a future change to one path's retry
+    behaviour can never silently also change the other's. `transport` is
+    the same test-only httpx.MockTransport injection point as every other
+    function in this module."""
+    if not settings.azure_mai_image_endpoint.strip():
+        raise AIServiceError("AZURE_MAI_IMAGE_ENDPOINT is not configured")
+    if not settings.azure_mai_image_api_key.strip():
+        raise AIServiceError("AZURE_MAI_IMAGE_API_KEY is not configured")
+    if not settings.azure_mai_image_deployment.strip():
+        raise AIServiceError("AZURE_MAI_IMAGE_DEPLOYMENT is not configured")
+
+    url = _edit_endpoint(settings.azure_mai_image_endpoint)
+    data = {"model": settings.azure_mai_image_deployment, "prompt": prompt}
+    headers = {"api-key": settings.azure_mai_image_api_key}
+    attempts = max(settings.max_call_retries, 1)
+    failures = 0
+    throttled = 0
+    last_status: int | None = None
+
+    async with httpx.AsyncClient(timeout=settings.request_timeout, transport=transport) as client:
+        while True:
+            # A fresh multipart `files` mapping each attempt - `image` is
+            # plain `bytes` (never a file handle), so re-sending it on a
+            # retry needs no re-opening/seeking, unlike a real file upload.
+            files = {"image": ("original.png", image, image_mime)}
+            try:
+                response = await client.post(url, headers=headers, data=data, files=files)
+            except httpx.TimeoutException as exc:
+                failures += 1
+                if failures >= attempts:
+                    raise AIServiceError(
+                        f"Azure MAI-Image-2.6 edit request timed out after {attempts} attempt(s)"
+                    ) from exc
+                await asyncio.sleep(_backoff_seconds(failures))
+                continue
+            except httpx.HTTPError as exc:
+                failures += 1
+                if failures >= attempts:
+                    raise AIServiceError(f"Azure MAI-Image-2.6 edit request failed: {type(exc).__name__}") from exc
+                await asyncio.sleep(_backoff_seconds(failures))
+                continue
+
+            if response.status_code // 100 == 2:
+                return _decode_image_bytes(response)
+
+            last_status = response.status_code
+            if response.status_code == 429:
+                throttled += 1
+                if throttled < _RATE_LIMIT_ATTEMPTS:
+                    await asyncio.sleep(_rate_limit_wait(_retry_after_seconds(response)))
+                    continue
+            elif response.status_code in _RETRYABLE_STATUS_CODES:
+                failures += 1
+                if failures < attempts:
+                    await asyncio.sleep(_backoff_seconds(failures))
+                    continue
+            raise AIServiceError(
+                f"Azure MAI-Image-2.6 edit request failed with status {response.status_code}: "
+                f"{_truncate(response.text)}"
+            )
+
+    raise AIServiceError(
+        f"Azure MAI-Image-2.6 edit request failed after {attempts} attempt(s) (last status {last_status})"
+    )
+
+
 async def generate_image(
     *, prompt: str, size: str, settings: Settings, transport: httpx.BaseTransport | None = None
 ) -> bytes:

@@ -27,13 +27,17 @@ a missing judgement leaves the visual "unchecked".
 
 from __future__ import annotations
 
+import asyncio
 import io
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
+from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
 from app.core.ids import utc_now_iso
 from app.core.logging import get_logger
+from app.core.metrics import phase as metrics_phase
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, BlockType
 from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
@@ -71,6 +75,13 @@ Answer every field honestly:
   spelled correctly and correct for the subject? Null if there is no text.
 - `labels_and_arrows_correct`: only when the picture is meant to be a diagram -
   are its labels, arrows and relationships correct? Null otherwise.
+- `style_compliant`: ONLY when told below this picture must be a flat 2D
+  vector textbook illustration - answer false if it instead looks
+  photorealistic, 3D-rendered, has soft studio lighting/a glow/gradient
+  background, or has any panel/icon/label/text cropped at or crowding the
+  canvas edge. A clean flat-colour illustration with simple shading is
+  compliant even if not perfectly flat; judge the OVERALL look, not every
+  pixel. Null when you were not told this picture must be that style.
 - `problems`: each concrete problem you found.
 - `better_prompt`: if anything is wrong, a precise brief (under 80 words) for a
   replacement picture that shows exactly what the text explains.
@@ -228,7 +239,100 @@ def _svg_words(svg: bytes) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def image_verdict(assessment: ImageAssessment, *, decorative_opener: bool, meant_as_diagram: bool) -> tuple[str, list[str], bool]:
+@dataclass
+class _DuplicateIndex:
+    """Precomputed duplicate relationships for one `review_document` pass -
+    see `_precompute_duplicates`'s own docstring for why this exists and
+    the ordering guarantee it preserves.
+
+    `order` fixes the DOCUMENT order every lookup here scans in, so a match
+    always resolves to "the earliest block in the course that shows this",
+    identical to what a fully sequential, one-block-at-a-time review would
+    have found - whether the lookup happens during the precompute pass
+    itself or later, during a `_fix` recheck of a freshly regenerated
+    image's NEW fingerprint (see `find_duplicate`).
+
+    `fingerprints`/`outline_keys` hold every eligible block's OWN
+    identity-on-disk data, read once at precompute time from the file as it
+    existed before any concurrent AI/regeneration work started - immutable
+    for the rest of the pass. Every duplicate lookup, whether for a
+    block's first check or for `_fix`'s post-regeneration recheck of a
+    freshly changed fingerprint, goes through `find_duplicate` - a fresh,
+    cheap, local (zero-AI) scan each time, always against this same fixed
+    `order` and these same frozen "others"' identities, which is what keeps
+    "who is a duplicate of whom" identical to a fully sequential review
+    regardless of WHEN during the concurrent phase a given block's own
+    check happens to run. `depicts` starts empty and is filled in as each
+    block's own check completes (each coroutine only ever writes its OWN
+    key, so this is safe to mutate concurrently) - it lets a LATER block's
+    `_fix` cite what an EARLIER duplicate "really shows" even though that
+    earlier block's own vision call may have finished only moments
+    before."""
+
+    order: list[str] = field(default_factory=list)
+    fingerprints: dict[str, Fingerprint] = field(default_factory=dict)
+    outline_keys: dict[str, frozenset[str]] = field(default_factory=dict)
+    depicts: dict[str, str] = field(default_factory=dict)
+
+    def find_duplicate(self, self_id: str, *, fingerprint: Fingerprint | None = None, outline_key: frozenset[str] | None = None) -> str:
+        """The earliest OTHER block (by fixed document `order`, self
+        excluded) whose precomputed identity matches `fingerprint`/
+        `outline_key` - "" when nothing matches. Always a fresh scan,
+        never a cached answer - see this class's own docstring for why
+        that is exactly what keeps this correct and cheap under
+        concurrency."""
+        for other_id in self.order:
+            if other_id == self_id:
+                continue
+            if fingerprint is not None and other_id in self.fingerprints:
+                if _distance(fingerprint, self.fingerprints[other_id]) <= _DUPLICATE_DISTANCE:
+                    return other_id
+            if outline_key is not None and len(outline_key) >= 2 and self.outline_keys.get(other_id) == outline_key:
+                return other_id
+        return ""
+
+
+def _precompute_duplicates(storage: StorageService, course_id: str, eligible: list[tuple[Block, "_Context", VisualCheck]]) -> _DuplicateIndex:
+    """Reads every eligible block's own saved file and computes its
+    identity (a perceptual hash for a picture, a label-set key for a
+    diagram outline) - pure local computation, zero AI calls, so doing
+    this for every block up front costs milliseconds even for a large
+    course. Walks `eligible` in DOCUMENT order and, for each block,
+    compares only against the blocks already added to the index (the
+    PRECEDING ones) - identical to the original fully-sequential review's
+    own duplicate-detection order: a later near-identical visual is always
+    "duplicate_of" the EARLIEST one that matches it, never the reverse, and
+    never a later one. This is what lets the actual AI-calling checks run
+    concurrently afterward (see `review_document`) without changing which
+    block gets flagged as whose duplicate - that relationship is already
+    fully and deterministically resolved before any concurrency starts."""
+    index = _DuplicateIndex()
+    for block, _context, check in eligible:
+        index.order.append(block.id)
+        content = block.content
+        path = str(content.get("path") or "")
+        if not path:
+            continue
+        file = storage.asset_abs_path(course_id, path)
+        if not file.is_file():
+            continue
+        data = file.read_bytes()
+        if path.lower().endswith(".svg"):
+            outline = content.get("diagram_outline") if isinstance(content.get("diagram_outline"), dict) else None
+            parts = [str(part.get("label") or "") for part in (outline or {}).get("parts", []) if part.get("label")]
+            key = frozenset(label.lower() for label in parts)
+            if len(key) >= 2:
+                index.outline_keys[block.id] = key
+        elif path.lower().endswith(_RASTER):
+            fingerprint = image_fingerprint(data)
+            if fingerprint is not None:
+                index.fingerprints[block.id] = fingerprint
+    return index
+
+
+def image_verdict(
+    assessment: ImageAssessment, *, decorative_opener: bool, meant_as_diagram: bool, textbook_style: bool = False,
+) -> tuple[str, list[str], bool]:
     """(status, problems, worth regenerating) from a vision assessment.
 
     Passed only when every judgement that matters is explicitly good; any
@@ -246,6 +350,8 @@ def image_verdict(assessment: ImageAssessment, *, decorative_opener: bool, meant
         failures.append("text drawn in the picture is wrong")
     if meant_as_diagram and assessment.labels_and_arrows_correct is False:
         failures.append("labels or arrows are wrong")
+    if textbook_style and assessment.style_compliant is False:
+        failures.append("does not follow the required flat textbook illustration style")
     unnecessary = assessment.necessary is False and not decorative_opener
     if unnecessary:
         failures.append("adds nothing the text does not already say")
@@ -258,6 +364,8 @@ def image_verdict(assessment: ImageAssessment, *, decorative_opener: bool, meant
         required.append(assessment.necessary)
     if meant_as_diagram:
         required.append(assessment.labels_and_arrows_correct)
+    if textbook_style:
+        required.append(assessment.style_compliant)
     if any(value is None for value in required):
         return "unchecked", problems or ["The check returned no verdict for this picture."], False
     return "passed", problems, False
@@ -304,6 +412,7 @@ def core_failures(assessment, check: VisualCheck) -> int:
     if isinstance(assessment, ImageAssessment):
         score += 3 * (assessment.relevant_to_topic is False) + 3 * (assessment.matches_text is False)
         score += 2 * (assessment.misleading is True) + (assessment.text_in_image_correct is False)
+        score += assessment.style_compliant is False
         if check.kind == "diagram":  # labels and arrows only matter for a picture meant as a diagram
             score += assessment.labels_and_arrows_correct is False
     elif isinstance(assessment, DiagramAssessment):
@@ -339,17 +448,58 @@ class VisualReviewService:
 
     # --- entry point ------------------------------------------------------------
     async def review_document(
-        self, document: CourseDocument, template: CourseTemplate, *, fix: bool = True
+        self,
+        document: CourseDocument,
+        template: CourseTemplate,
+        *,
+        fix: bool = True,
+        job_id: str = "",
+        on_progress: Callable[[Block, int, int], Awaitable[None]] | None = None,
     ) -> VisualReviewReport:
+        """Checks every real visual in `document` against its own text, and
+        regenerates the ones that fail, up to the configured per-course
+        caps. Runs the actual AI-calling work CONCURRENTLY, bounded by a
+        dedicated adaptive limiter (`get_limiter("visual_review", ...)` -
+        the same pattern `ImageService.generate_missing` already uses for
+        the main image-generation batch) - a real, confirmed cost: this
+        loop used to run one block at a time with no concurrency at all,
+        while the batch that generates the images in the first place is
+        already parallelized, so a course's "Building Document" stage could
+        sit for many minutes re-checking (and regenerating) visuals one by
+        one with zero progress visible, long after the "Generating Images"
+        counter already showed 100%.
+
+        Three things make this safe to parallelize without changing WHICH
+        visuals get flagged, regenerated or reported, or in what numbers:
+        1. Duplicate detection (`_precompute_duplicates`) is resolved in one
+           fast, strictly sequential, zero-AI-call pass BEFORE any
+           concurrent work starts - see its own docstring for why this
+           keeps "who is a duplicate of whom" identical to a fully
+           sequential review.
+        2. The per-course fix budget (`visual_review_max_fixes`) is
+           allocated in a SEPARATE sequential pass, in document order,
+           after every concurrent check has returned - so the first N
+           genuinely-failing visuals IN DOCUMENT ORDER still get the
+           limited regeneration slots, exactly as before; concurrency only
+           changes how fast the checks run, never which ones get fixed.
+        3. Every block's own `VisualCheck`/`block.content` mutation is
+           confined to that block alone - no two concurrent tasks ever
+           write the same block, so there is nothing to lock there.
+
+        `on_progress`, when given, fires once per CHECKED block (not the
+        skipped/capped ones) as it finishes, `(block, done, total)` - the
+        real "N of M visuals reviewed" counter `CourseService._finalise`
+        surfaces to the UI, the same progress-reporting contract
+        `ImageService.generate_missing`'s `on_progress` already keeps.
+        """
         contexts = _contexts(document)
         report = VisualReviewReport(
             document_id=document.document_id, course_id=document.course_id, checked_at=utc_now_iso()
         )
-        fingerprints: list[tuple[str, Fingerprint, str]] = []  # (block id, fingerprint, depicts)
-        outlines: dict[frozenset[str], str] = {}
-        fixes_left = self.settings.visual_review_max_fixes if fix else 0
-        reviewed = 0
 
+        # Selection pass - identical order/semantics to before, just
+        # separated from the (now concurrent) AI-calling work below.
+        candidates: list[tuple[Block, _Context, VisualCheck]] = []
         for page, block in document.iter_blocks():
             if block.type is not BlockType.IMAGE or block.content.get("kind") == "toc":
                 continue
@@ -362,29 +512,91 @@ class VisualReviewService:
                 kind=str(block.content.get("kind") or "illustration"),
             )
             report.checks.append(check)
-            if reviewed >= self.settings.visual_review_max_images:
+            candidates.append((block, context, check))
+
+        eligible: list[tuple[Block, _Context, VisualCheck]] = []
+        for block, context, check in candidates:
+            if len(eligible) >= self.settings.visual_review_max_images:
                 check.status, check.note = "unchecked", "Over the per-course review limit."
                 continue
-            outcome, assessment = await self._check(document.course_id, block, context, check, fingerprints, outlines)
-            reviewed += 1
-            if outcome and fix and not check.duplicate_of:
-                outcome, assessment = await self._confirm(document.course_id, block, context, check, outcome, assessment, fingerprints, outlines)
-            if outcome == "flag":
-                check.action = "flagged"
-            elif outcome and fixes_left > 0:
-                fixes_left -= 1
-                await self._fix(block, context, check, template, document, outcome, assessment, fingerprints, outlines)
-            elif outcome:
-                check.action, check.note = "flagged", "Not regenerated: the per-course fix limit was reached."
-            self._record(block, check)
+            # This exact image was already generated and fully validated
+            # moments ago, in THIS same run (see ImageService.generate_missing's
+            # `_qa_job_id` marker) - spending another vision call re-checking
+            # it here is pure duplicate work. An image reused from an earlier
+            # run (no marker, or a stale one from a different job) still gets
+            # the full check below - this only skips what's provably fresh.
+            if job_id and block.content.get("_qa_job_id") == job_id:
+                check.status, check.note = "skipped", "Already validated during generation."
+                continue
+            eligible.append((block, context, check))
+
+        with metrics_phase("visual_review"):
+            dupes = _precompute_duplicates(self.storage, document.course_id, eligible)
+
+            total = len(eligible)
+            done = 0
+            done_lock = asyncio.Lock()
+
+            async def _note_progress(block: Block) -> None:
+                nonlocal done
+                if on_progress is None:
+                    return
+                async with done_lock:
+                    done += 1
+                    current = done
+                await on_progress(block, current, total)
+
+            limiter = get_limiter("visual_review", self.settings.concurrency_for("visual_review"))
+
+            async def _check_and_confirm(block: Block, context: _Context, check: VisualCheck):
+                async with limiter.slot():
+                    outcome, assessment = await self._check(document.course_id, block, context, check, dupes)
+                    if outcome and fix and not check.duplicate_of:
+                        outcome, assessment = await self._confirm(
+                            document.course_id, block, context, check, outcome, assessment, dupes
+                        )
+                await _note_progress(block)
+                return outcome, assessment
+
+            outcomes = await asyncio.gather(
+                *(_check_and_confirm(block, context, check) for block, context, check in eligible)
+            )
+
+            # Fix-budget allocation - sequential and deterministic, in
+            # document order (see this method's own docstring, point 2).
+            fixes_left = self.settings.visual_review_max_fixes if fix else 0
+            to_fix: list[tuple[Block, _Context, VisualCheck, str, object]] = []
+            for (block, context, check), (outcome, assessment) in zip(eligible, outcomes):
+                if outcome == "flag":
+                    check.action = "flagged"
+                elif outcome and fixes_left > 0:
+                    fixes_left -= 1
+                    to_fix.append((block, context, check, outcome, assessment))
+                elif outcome:
+                    check.action, check.note = "flagged", "Not regenerated: the per-course fix limit was reached."
+
+            async def _run_fix(block: Block, context: _Context, check: VisualCheck, outcome: str, assessment) -> None:
+                async with limiter.slot():
+                    await self._fix(block, context, check, template, document, outcome, assessment, dupes)
+
+            if to_fix:
+                await asyncio.gather(*(_run_fix(*item) for item in to_fix))
+
+            for block, _context, check in eligible:
+                self._record(block, check)
+
         self.storage.write_json(
             self.storage.course_dir(document.course_id) / "visual_review.json", report.model_dump(mode="json")
         )
-        log.info("Visual review of %s: %s", document.document_id, report.counts())
+        skipped_fresh = sum(1 for _, _, check in candidates if check.note == "Already validated during generation.")
+        log.info(
+            "Visual review of %s: %s (%s/%s candidates checked, %s skipped as already-fresh, concurrency=%s)",
+            document.document_id, report.counts(), total, len(candidates), skipped_fresh, limiter.effective_limit,
+        )
         return report
 
     # --- one visual -------------------------------------------------------------
-    async def _check(self, course_id, block, context, check, fingerprints, outlines):
+    async def _check(self, course_id, block, context, check, dupes: _DuplicateIndex):
         """Fill `check`; return (what to fix - "" for nothing, the assessment)."""
         content = block.content
         if check.kind == "concept_experience":
@@ -400,23 +612,19 @@ class VisualReviewService:
             return "", None
         data = file.read_bytes()
         if path.lower().endswith(".svg"):
-            return await self._check_diagram(block, context, check, data, outlines)
+            return await self._check_diagram(block, context, check, data, dupes)
         if path.lower().endswith(_RASTER):
-            return await self._check_picture(block, context, check, data, fingerprints)
+            return await self._check_picture(block, context, check, data, dupes)
         check.status, check.note = "skipped", f"Unsupported image format: {path.rsplit('.', 1)[-1]}"
         return "", None
 
-    async def _check_picture(self, block, context, check, data, fingerprints) -> str:
+    async def _check_picture(self, block, context, check, data, dupes: _DuplicateIndex) -> str:
         content = block.content
         decorative_opener = (content.get("illustration_style") or "") == "section_intro"
+        textbook_style = (content.get("illustration_style") or "") == "textbook"
         meant_as_diagram = check.kind == "diagram"  # a diagram that fell back to a picture
-        duplicate = ""
         fingerprint = image_fingerprint(data)
-        if fingerprint is not None:
-            for other_id, other, _ in fingerprints:
-                if _distance(fingerprint, other) <= _DUPLICATE_DISTANCE:
-                    duplicate = other_id
-                    break
+        duplicate = dupes.find_duplicate(block.id, fingerprint=fingerprint) if fingerprint is not None else ""
         png = _vision_png(data)
         if png is None:
             check.status, check.problems = "unchecked", ["The image file could not be read."]
@@ -428,6 +636,12 @@ class VisualReviewService:
                 user=_context_lines(block, context)
                 + ("THIS PICTURE IS MEANT TO BE A DIAGRAM: check its labels and arrows too.\n" if meant_as_diagram else "")
                 + ("This is a small picture that opens its section; it need not add new information, but it must fit the section.\n" if decorative_opener else "")
+                + (
+                    "THIS PICTURE MUST BE A FLAT 2D VECTOR TEXTBOOK ILLUSTRATION: check `style_compliant` too - "
+                    "fail it if it looks photorealistic or 3D-rendered, has soft studio lighting or a glow/gradient "
+                    "background, or has anything cropped at or crowding the canvas edge.\n"
+                    if textbook_style else ""
+                )
                 + "Check the attached picture now.",
                 model=self.settings.visual_review_model or self.settings.diagram_model,
                 purpose=f"visual_review:{block.id}",
@@ -439,21 +653,21 @@ class VisualReviewService:
             check.status, check.problems = "unchecked", [f"The check could not run ({type(exc).__name__})."]
             return "", None
         status, problems, regenerate = image_verdict(
-            assessment, decorative_opener=decorative_opener, meant_as_diagram=meant_as_diagram
+            assessment, decorative_opener=decorative_opener, meant_as_diagram=meant_as_diagram,
+            textbook_style=textbook_style,
         )
         check.status, check.problems, check.depicts = status, problems, assessment.depicts
+        dupes.depicts[block.id] = assessment.depicts
         if duplicate:
             check.status = "failed"
             check.duplicate_of = duplicate
             check.problems.insert(0, f"Looks the same as the picture in block {duplicate}.")
             regenerate = True
-        if fingerprint is not None:
-            fingerprints.append((block.id, fingerprint, assessment.depicts))
         if check.status != "failed":
             return "", assessment
         return ("picture" if regenerate else "flag"), assessment
 
-    async def _check_diagram(self, block, context, check, svg, outlines) -> str:
+    async def _check_diagram(self, block, context, check, svg, dupes: _DuplicateIndex) -> str:
         from app.services.diagram_render_qa import validate_rendered_svg
 
         content = block.content
@@ -481,9 +695,7 @@ class VisualReviewService:
         else:
             drawn = "LABELS DRAWN (arrows not recorded for this older diagram):\n" + ", ".join(sorted(drawn_words))[:1500]
         key = frozenset(label.lower() for label in parts)
-        duplicate = outlines.get(key, "") if len(key) >= 2 else ""
-        if len(key) >= 2 and not duplicate:
-            outlines[key] = block.id
+        duplicate = dupes.find_duplicate(block.id, outline_key=key) if len(key) >= 2 else ""
         try:
             assessment = await self.ai.structured(
                 schema=DiagramAssessment,
@@ -508,7 +720,7 @@ class VisualReviewService:
             check.problems.insert(0, f"Shows the same parts as the diagram in block {duplicate}.")
         return ("diagram" if check.status == "failed" else ""), assessment
 
-    async def _confirm(self, course_id, block, context, check, outcome, assessment, fingerprints, outlines):
+    async def _confirm(self, course_id, block, context, check, outcome, assessment, dupes: _DuplicateIndex):
         """Ask a second, independent time before changing anything.
 
         Model judgements of the same picture are not fully consistent; one
@@ -518,9 +730,7 @@ class VisualReviewService:
         Duplicates are found from pixels and need no confirmation.
         """
         second = VisualCheck(block_id=block.id, kind=check.kind, page_number=check.page_number, section=check.section)
-        others = [entry for entry in fingerprints if entry[0] != block.id]
-        other_outlines = {key: owner for key, owner in outlines.items() if owner != block.id}
-        _, second_assessment = await self._check(course_id, block, context, second, others, other_outlines)
+        _, second_assessment = await self._check(course_id, block, context, second, dupes)
         if second.status == "failed" and core_failures(second_assessment, second) > 0:
             return outcome, assessment
         check.status = "unchecked"
@@ -531,7 +741,7 @@ class VisualReviewService:
         return "", assessment
 
     # --- fixing -------------------------------------------------------------------
-    async def _fix(self, block, context, check, template, document, outcome, assessment, fingerprints, outlines) -> None:
+    async def _fix(self, block, context, check, template, document, outcome, assessment, dupes: _DuplicateIndex) -> None:
         content = block.content
         original = dict(content)
         brief = str(content.get("original_prompt") or content.get("prompt") or content.get("purpose") or "")
@@ -539,7 +749,7 @@ class VisualReviewService:
             better = getattr(assessment, "better_prompt", "").strip()
             corrected = better or brief
             if check.duplicate_of:
-                other = next((depicts for bid, _, depicts in fingerprints if bid == check.duplicate_of), "")
+                other = dupes.depicts.get(check.duplicate_of, "")
                 corrected += f"\nIt must look clearly different from another picture in this course{f' (which shows: {other})' if other else ''}."
             if check.problems:
                 corrected += "\nAvoid these problems of the previous picture: " + "; ".join(check.problems[:4])
@@ -567,12 +777,13 @@ class VisualReviewService:
             return
         check.action = "regenerated"
         recheck = VisualCheck(block_id=block.id, kind=check.kind, page_number=check.page_number, section=check.section)
-        # The previous version is no longer in the course; don't compare against it.
-        fingerprints[:] = [entry for entry in fingerprints if entry[0] != block.id]
-        for key, owner in list(outlines.items()):
-            if owner == block.id:
-                outlines.pop(key)
-        _, reassessment = await self._check(document.course_id, block, context, recheck, fingerprints, outlines)
+        # `dupes` is frozen from precompute and was never mutated with this
+        # block's OWN (now-replaced) identity in the first place - see
+        # _DuplicateIndex's own docstring - so this recheck's `find_duplicate`
+        # calls (inside `_check`) naturally compare only against every OTHER
+        # block's original identity, never against this image's own stale,
+        # pre-regeneration fingerprint/outline.
+        _, reassessment = await self._check(document.course_id, block, context, recheck, dupes)
         before = core_failures(assessment, check)
         after = core_failures(reassessment, recheck)
         # Judged by what is seriously wrong, not by how many remarks were made:

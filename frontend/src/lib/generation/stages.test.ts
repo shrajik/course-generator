@@ -79,3 +79,94 @@ test("a genuinely failed generation run is unaffected by quality_snapshot being 
   assert.equal(view.failed, true);
   assert.equal(view.finished, false);
 });
+
+// --- pipeline reliability follow-up: real image progress + stopped/resumable states ---
+
+test("images progress shows a real fraction once the backend reports images_total/images_done", () => {
+  const view = deriveStages(
+    detail("illustrating", { run: { state: "running", images_total: 4, images_done: 1, eta_seconds: null } }),
+  );
+  const images = view.stages.find((s) => s.id === "images");
+  assert.ok(images);
+  assert.equal(images!.status, "active");
+  assert.equal(images!.detail, "1/4 images");
+  // 1/4 of the images weight (10) contributes 2.5 points - well under 100.
+  assert.ok(view.percent < 100);
+});
+
+test("images progress completes once images_done reaches images_total, even before status flips to ready", () => {
+  const view = deriveStages(
+    detail("illustrating", { run: { state: "running", images_total: 3, images_done: 3, eta_seconds: null } }),
+  );
+  const images = view.stages.find((s) => s.id === "images");
+  assert.equal(images!.status, "completed");
+});
+
+test("a cancelled run is reported as stopped, not failed, and offers resume", () => {
+  const view = deriveStages(detail("illustrating", { run: { state: "cancelled", eta_seconds: null } }));
+  assert.equal(view.stopped, true);
+  assert.equal(view.failed, false);
+  assert.equal(view.isRunning, false);
+  assert.equal(view.currentLabel, "Generation stopped");
+});
+
+test("an interrupted run (backend restart) is also reported as stopped, with its own label", () => {
+  const view = deriveStages(detail("writing", { run: { state: "interrupted", eta_seconds: null } }));
+  assert.equal(view.stopped, true);
+  assert.equal(view.failed, false);
+  assert.equal(view.currentLabel, "Generation was interrupted");
+});
+
+test("a run genuinely in progress is isRunning and not stopped", () => {
+  const view = deriveStages(detail("writing", { run: { state: "running", eta_seconds: null } }));
+  assert.equal(view.isRunning, true);
+  assert.equal(view.stopped, false);
+});
+
+// --- "Building Document" sub-stage progress (visual repair, then review) ---
+
+test("Building Document shows real visual-repair progress once the backend reports it", () => {
+  const view = deriveStages(
+    detail("assembling", {
+      run: { state: "running", images_total: 5, images_done: 5, visual_repair_total: 4, visual_repair_done: 1, eta_seconds: null },
+    }),
+  );
+  const document = view.stages.find((s) => s.id === "document");
+  assert.ok(document);
+  assert.equal(document!.status, "active");
+  assert.equal(document!.detail, "Adding visuals to thin pages: 1/4");
+});
+
+test("Building Document shows real visual-review progress once repair has finished", () => {
+  const view = deriveStages(
+    detail("assembling", {
+      run: {
+        state: "running", images_total: 5, images_done: 5,
+        visual_repair_total: 4, visual_repair_done: 4,
+        visual_review_total: 7, visual_review_done: 2, eta_seconds: null,
+      },
+    }),
+  );
+  const document = view.stages.find((s) => s.id === "document");
+  assert.equal(document!.detail, "Reviewing visuals: 2/7");
+});
+
+test("Building Document falls back to the generic label once both sub-stages are done", () => {
+  const view = deriveStages(
+    detail("assembling", {
+      run: {
+        state: "running", images_total: 5, images_done: 5,
+        visual_repair_total: 4, visual_repair_done: 4,
+        visual_review_total: 7, visual_review_done: 7, eta_seconds: null,
+      },
+    }),
+  );
+  const document = view.stages.find((s) => s.id === "document");
+  assert.equal(document!.detail, "Assembling your final document");
+});
+
+test("Building Document falls back to the generic label when no sub-stage counters have been reported yet", () => {
+  const view = deriveStages(detail("assembling", { run: { state: "running", eta_seconds: null } }));
+  const document = view.stages.find((s) => s.id === "document");
+  assert.equal(document!.detail, "Assembling your final document");
+});

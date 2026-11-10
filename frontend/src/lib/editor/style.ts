@@ -104,13 +104,20 @@ export const DEFAULT_IMAGE_ASPECT = 0.5625;
 /** Mirrors MISSING_IMAGE_BOX_HEIGHT: a failed picture is a one-line strip. */
 export const MISSING_IMAGE_HEIGHT = 36;
 
-/** Mirrors image_generation_failed: no file, and an error recorded. */
+/** Mirrors image_generation_failed: no file, and either a technical error or
+ * a QA-exhaustion omission recorded (production-readiness audit fix -
+ * `omitted_after_qa_failure` was missing here, so a QA-withheld block -
+ * `error` unset by design, see ImageService.generate_for_block's
+ * `image_withheld_after_qa_failure` path - fell through to ordinary
+ * aspect-ratio sizing with no real width/height instead of this compact
+ * placeholder, even though the backend/PDF side already handled it
+ * correctly via this exact same two-field check). */
 export function imageGenerationFailed(block: Block): boolean {
   return (
     block.type === "image" &&
     block.content.kind !== "toc" &&
     !block.content.path &&
-    Boolean(block.content.error)
+    Boolean(block.content.error || block.content.omitted_after_qa_failure)
   );
 }
 

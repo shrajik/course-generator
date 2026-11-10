@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, ArrowRight, RotateCcw, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowRight, PlayCircle, RotateCcw, Sparkles, StopCircle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { StepHeader } from "@/components/ui/StepHeader";
 import { ProgressRing } from "./ProgressRing";
@@ -11,7 +11,7 @@ import { StageDetailModal } from "./StageDetailModal";
 import { LiveDocumentPreview } from "./LiveDocumentPreview";
 import { SourcesUsed } from "./SourcesUsed";
 import { getCourse } from "@/lib/api/courses";
-import { generateCourse } from "@/lib/api/generation";
+import { cancelGeneration, generateCourse } from "@/lib/api/generation";
 import { getCourseDocument } from "@/lib/api/documents";
 import { apiUrl, ApiError } from "@/lib/api/client";
 import { deriveStages, emptyStateMessage, formatEta, type GenerationStage } from "@/lib/generation/stages";
@@ -42,6 +42,7 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
   );
   const [error, setError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [selectedStage, setSelectedStage] = useState<GenerationStage | null>(null);
   const startedRef = useRef(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
@@ -49,14 +50,23 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
 
   const view = useMemo(() => deriveStages(detail), [detail]);
 
-  /** Fired once per course; a reload just resumes polling. */
+  /** Fired once per course; a reload just resumes polling. `force` and
+   * `resume` are mutually exclusive intents: `force` restarts every
+   * targeted chapter from scratch, `resume` continues only the stages that
+   * weren't already written+reviewed (see the backend's per-stage
+   * checkpoints) - both bypass the session-storage "already started" guard
+   * since they're explicit user actions, not the automatic first kick-off. */
   const start = useCallback(
-    async (force: boolean) => {
+    async (options?: { force?: boolean; resume?: boolean }) => {
+      const explicit = Boolean(options?.force || options?.resume);
       const flag = `course-creator:generating:${courseId}`;
-      if (!force && window.sessionStorage.getItem(flag) === "1") return;
+      if (!explicit && window.sessionStorage.getItem(flag) === "1") return;
       window.sessionStorage.setItem(flag, "1");
       try {
-        await generateCourse(courseId, force ? { force: true } : {});
+        await generateCourse(
+          courseId,
+          options?.force ? { force: true } : options?.resume ? { resume: true } : {},
+        );
       } catch (caught) {
         setError(
           caught instanceof ApiError
@@ -89,7 +99,7 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
         update({ courseId: next.course.course_id, documentId: next.course.document_id });
         if (!startedRef.current) {
           startedRef.current = true;
-          if (next.course.status !== "ready") void start(false);
+          if (next.course.status !== "ready") void start();
         }
       } catch (caught) {
         if (cancelled || caught instanceof DOMException) return;
@@ -182,18 +192,42 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
     return () => window.clearTimeout(timer);
   }, [view.finished, documentId, router]);
 
-  const handleRetry = async () => {
-    setRetrying(true);
-    setError(null);
-    await start(true);
-    // Polling stops once a run reaches ready/failed (see the effect above);
-    // a manual retry starts a fresh run, so resume it instead of leaving the
-    // UI frozen on the old outcome.
+  /** Resumes polling after a manual action - a run that just reached a
+   * terminal state (ready/failed/cancelled/interrupted) stopped the poll
+   * timer (see the effect above); any explicit restart/resume/stop needs
+   * it running again or the UI freezes on the old outcome. */
+  const resumePolling = () => {
     if (pollTimerRef.current === undefined) {
       void pollRef.current();
       pollTimerRef.current = setInterval(() => pollRef.current(), POLL_INTERVAL_MS);
     }
+  };
+
+  const handleRetry = async () => {
+    setRetrying(true);
+    setError(null);
+    await start({ force: true });
+    resumePolling();
     setRetrying(false);
+  };
+
+  const handleResume = async () => {
+    setRetrying(true);
+    setError(null);
+    await start({ resume: true });
+    resumePolling();
+    setRetrying(false);
+  };
+
+  const handleStop = async () => {
+    setStopping(true);
+    try {
+      await cancelGeneration(courseId);
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "Could not stop generation.");
+    }
+    resumePolling();
+    setStopping(false);
   };
 
   return (
@@ -226,6 +260,18 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
             {!view.finished && formatEta(view.etaSeconds) ? (
               <p className="mt-2 text-[11.5px] text-ink-400">{formatEta(view.etaSeconds)}</p>
             ) : null}
+            {view.isRunning ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-4"
+                onClick={handleStop}
+                disabled={stopping}
+              >
+                <StopCircle size={13} />
+                {stopping ? "Stopping…" : "Stop generation"}
+              </Button>
+            ) : null}
           </div>
 
           <div className="border-t border-line pt-6">
@@ -234,15 +280,35 @@ export function GenerationProgress({ courseId }: { courseId: string }) {
 
           <SourcesUsed chapters={detail?.course.chapters ?? []} />
 
-          {error || view.failed ? (
+          {!error && view.stopped ? (
+            <div className="flex flex-col gap-3 rounded-card border border-amber-200 bg-amber-50 px-4 py-3">
+              <p className="text-[12.5px] text-amber-800">{view.currentDetail}</p>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" onClick={handleResume} disabled={retrying}>
+                  <PlayCircle size={13} />
+                  {retrying ? "Resuming…" : "Resume"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={handleRetry} disabled={retrying}>
+                  <RotateCcw size={13} />
+                  Start over
+                </Button>
+              </div>
+            </div>
+          ) : error || view.failed ? (
             <div className="flex flex-col gap-3 rounded-card border border-red-200 bg-red-50 px-4 py-3">
               <p className="text-[12.5px] text-red-800">
                 {error || view.currentDetail || "Generation failed. See the backend logs for details."}
               </p>
-              <Button variant="outline" size="sm" onClick={handleRetry} disabled={retrying}>
-                <RotateCcw size={13} />
-                {retrying ? "Retrying…" : "Retry generation"}
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" onClick={handleResume} disabled={retrying}>
+                  <PlayCircle size={13} />
+                  {retrying ? "Resuming…" : "Resume"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={handleRetry} disabled={retrying}>
+                  <RotateCcw size={13} />
+                  {retrying ? "Retrying…" : "Start over"}
+                </Button>
+              </div>
             </div>
           ) : (
             <div className="flex flex-col gap-3 rounded-card border border-brand-100 bg-brand-50 px-4 py-3.5">

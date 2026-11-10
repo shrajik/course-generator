@@ -223,17 +223,43 @@ class RunInfo(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     job_id: str = ""
-    state: Literal["queued", "running", "done", "failed", "cancelled"] = "queued"
+    # "interrupted" means the backend process died mid-run (found stale by
+    # the crash-recovery startup scan) - distinct from "cancelled" (the user
+    # asked to stop) and "failed" (the pipeline itself raised). All three are
+    # resumable via `GenerateRequest(resume=True)`.
+    state: Literal["queued", "running", "done", "failed", "cancelled", "interrupted"] = "queued"
     mode: Literal["background", "sync"] = "background"
     started_at: str = ""
     updated_at: str = ""
     finished_at: str = ""
     chapters_total: int = 0
     chapters_done: int = 0
+    # Images run as their own batch after every chapter is written (see
+    # CourseService._finalise) - tracked separately from chapters_total/done
+    # so the progress UI can show real "N of M images" rather than one
+    # opaque "illustrating" phase.
+    images_total: int = 0
+    images_done: int = 0
+    # Post-image "Building Document" sub-stages - tracked separately from
+    # images_total/done for the same reason those are tracked separately
+    # from chapters_total/done: each is its own batch of real, sometimes
+    # slow AI work (see app.services.visual_review/app.course.document.
+    # visual_repair), and a user staring at a static "Assembling your final
+    # document" label for several minutes after images already hit 100%
+    # deserves a real "N of M" counter here too, not an opaque stall.
+    visual_review_total: int = 0
+    visual_review_done: int = 0
+    visual_repair_total: int = 0
+    visual_repair_done: int = 0
     writing_mode: str = "parallel"
     eta_seconds: float | None = None
     error: str | None = None
     timings: dict[str, Any] = Field(default_factory=dict)
+    # How many times the crash-recovery startup scan has auto-resumed this
+    # course after finding it "interrupted" - bounded by
+    # Settings.generation_max_auto_resume_retries so a course whose content
+    # reliably crashes the process can't auto-resume forever.
+    retry_count: int = 0
 
 
 # Human review workflow - separate from `CourseStatus`, which tracks the AI

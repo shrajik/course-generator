@@ -44,6 +44,8 @@
   .title { font-size: 1.05em; font-weight: 700; margin-bottom: 6px; }
   .muted { color: {{ theme.muted_color }}; }
   .caption { font-size: 12.5px; color: {{ theme.muted_color }}; margin-top: 6px; }
+  .attribution { font-size: 10.5px; color: {{ theme.muted_color }}; margin-top: 3px; }
+  .attribution a { color: inherit; }
 
   /* Code cell - a Colab-style pair of boxes: light code box, white output box.
      Every size here is a number in app/course/document/code_cell.py; the
@@ -166,7 +168,14 @@
      outer .block's min-height) still accounts for the floated image. */
   .section-intro-figure { overflow: hidden; }
   .section-intro-img { float: left; margin: 0 16px 10px 0; border-radius: 8px; display: block; }
+
+  /* KaTeX's own CSS (linked below) handles real math typesetting; this only
+     keeps a genuine parse error visible (red, underlined) instead of
+     silently invisible, so it is caught by eye AND by
+     app.services.math_qa's own `.katex-error` scan. */
+  .katex-error { color: #b91c1c; text-decoration: underline wavy; }
 </style>
+<link rel="stylesheet" href="{{ katex_css_uri }}">
 </head>
 <body>
 {% for page in pages %}
@@ -213,6 +222,9 @@
         <div class="img-missing" style="height:{{ b.image_box }}px">Visual unavailable</div>
       {% endif %}
       {% if c.get('caption') and c.get('illustration_style') != 'section_intro' %}<div class="caption">{{ c.get('caption') }}</div>{% endif %}
+      {% if c.get('image_source') == 'wikimedia' and c.get('attribution_text') and c.get('illustration_style') != 'section_intro' %}
+      <div class="attribution">{% if c.get('source_url') %}<a href="{{ c.get('source_url') }}">{{ c.get('attribution_text') }}</a>{% else %}{{ c.get('attribution_text') }}{% endif %}</div>
+      {% endif %}
 
     {%- elif b.type == 'section_intro_pair' -%}
       <div class="section-intro-figure">
@@ -337,5 +349,37 @@
   {% endif %}
 </div>
 {% endfor %}
+<script src="{{ katex_js_uri }}"></script>
+<script src="{{ katex_mhchem_uri }}"></script>
+<script src="{{ katex_auto_render_uri }}"></script>
+<script>
+  // Jinja's own `{{ para }}` output is HTML-escaped, so LaTeX source written
+  // directly into paragraph/list/heading text ($...$, $$...$$, \ce{...})
+  // survives untouched and is read back as literal text here via
+  // `textContent` - no server-side markup parser needed (see
+  // app.render.html_renderer's own module docstring for the full
+  // reasoning). Runs once, after the whole page has loaded; sets
+  // `window.__mathRendered = true` whether or not any math was found, so
+  // PdfService.export_pdf can wait for this exact signal before capturing
+  // the page - math is always fully typeset before the PDF is produced.
+  (function () {
+    try {
+      if (window.renderMathInElement) {
+        window.renderMathInElement(document.body, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "$", right: "$", display: false },
+            { left: "\\[", right: "\\]", display: true },
+            { left: "\\(", right: "\\)", display: false },
+          ],
+          throwOnError: false,
+          ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+        });
+      }
+    } finally {
+      window.__mathRendered = true;
+    }
+  })();
+</script>
 </body>
 </html>

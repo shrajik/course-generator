@@ -55,6 +55,7 @@ from app.services.concept_qa import (
     MISSING_LEARNING_OBJECTIVES,
     MULTILINE_TECHNICAL_SIGNATURE,
     NO_INSTANCE_VARIATION,
+    TEXT_NOT_LEGIBLE,
     TOO_DENSE,
     evaluate_concept_experience,
 )
@@ -93,13 +94,17 @@ def test_representation_types_match_the_universal_taxonomy():
     section B (11-family taxonomy). `timeline`/`before_after` added later,
     each with a real dedicated renderer; `cycle` (dedicated renderer) and
     `decision_tree` (alias onto `hierarchy`/`object`) added after that -
-    see concept_experience_renderer."""
+    see concept_experience_renderer. `spatial` was later RETIRED (never a
+    real renderer of its own, only a generic property-dump fallback that
+    produced a real, confirmed bad result on a generated course) - the
+    writer is steered away from it, though `_REPRESENTATION_RENDERERS`
+    still maps the bare string so an older/stray spec still renders."""
     assert REPRESENTATION_TYPES == (
         "object", "data_structure", "process", "sequence", "state_machine", "relationship",
-        "hierarchy", "comparison", "timeline", "before_after", "pipeline", "spatial",
+        "hierarchy", "comparison", "timeline", "before_after", "pipeline",
         "code_visualization", "cycle", "decision_tree",
     )
-    for stale in ("concept_metaphor", "annotated_diagram", "lifecycle", "illustration"):
+    for stale in ("concept_metaphor", "annotated_diagram", "lifecycle", "illustration", "spatial"):
         assert stale not in REPRESENTATION_TYPES
 
 
@@ -1223,6 +1228,54 @@ class TestTextNeverOverflowsItsBox:
         assert long_token in html
 
 
+class TestPropertyKeyNeverDumpsRawFieldNames:
+    """A real, confirmed case from a generated course: entity `properties`
+    keys like "admin"/"warning"/"symptom_fix"/"symptom_title" (none caught
+    by the existing placeholder-key regex - they read as real English
+    words, not "bullet1"-style placeholders) each paired with a FULL
+    SENTENCE rendered as a wall of bold, internal-scaffold-looking field
+    names in front of paragraphs ("admin: Tolerance guidance: record
+    chosen bands as 'SME to confirm' and obtain verification before
+    release"). concept_qa's structural QA already flags this as too-dense
+    and retries once, but that pipeline ships the spec either way if the
+    retry doesn't improve it (concept_visual_service.generate_for_block
+    has no fallback) - the renderer itself must guarantee a sentence-
+    shaped value never ships with its raw key bolted on, regardless of
+    what the model actually generated."""
+
+    def test_a_sentence_shaped_value_renders_without_its_raw_key_label(self):
+        entity = VisualEntity(
+            id="repeating", label="Repeating-variable guidance",
+            properties={
+                "admin": "Tolerance guidance: record chosen bands as 'SME to confirm' and obtain verification before release.",
+                "symptom_fix": "Ensure repeating set spans M,L,T,Θ; variables non-zero; replace redundants",
+                "warning": "Avoid redundant choices (e.g., mu and nu)",
+            },
+        )
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=[entity])
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "<b>admin</b>" not in html
+        assert "<b>symptom_fix</b>" not in html
+        assert "<b>warning</b>" not in html
+        assert "Tolerance guidance" in html
+        assert "Ensure repeating set spans" in html
+        assert "Avoid redundant choices" in html
+
+    def test_an_ordinal_scaffold_key_is_treated_as_a_placeholder(self):
+        entity = VisualEntity(id="priority", label="Priority groups", properties={"top1": "Fr (gravity-inertia)"})
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=[entity])
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "<b>top1</b>" not in html
+        assert "Fr (gravity-inertia)" in html
+
+    def test_a_genuinely_short_fact_still_keeps_its_bold_key_label(self):
+        entity = VisualEntity(id="repeating", label="Repeating-variable guidance", properties={"bases": "M, L, T, Θ"})
+        spec = DiagramSpec(kind="concept_experience", representation="relationship", entities=[entity])
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert "<b>bases</b>" in html
+        assert "M, L, T, Θ" in html
+
+
 def _extract_hex_colors(html: str) -> set[str]:
     import re
 
@@ -1509,6 +1562,31 @@ class TestMultiDomainConcepts:
         html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
         assert '<span class="cev-icon">1</span>' not in html
         assert '<span class="cev-icon">C</span>' in html
+
+    def test_a_multi_word_phrase_label_falls_back_to_a_neutral_icon_not_a_misleading_initial(self):
+        """Root-cause fix (production course audit, ThermoDynamics/
+        doc_a2f5625a7fd9): a letter-initial avatar only reads sensibly for a
+        short, name-like label - a real, confirmed case reduced "Control
+        mass (closed)" and "Control volume (open)" to two indistinguishable
+        "C" badges, and "Isolated system"/"Target audience" to meaningless
+        single letters. A multi-word descriptive phrase must fall back to
+        the same neutral "◆" a non-alphabetic label already gets, never an
+        initial - while a genuine short name like "Car (Class)" still
+        correctly gets its letter (see the sibling test above)."""
+        spec = DiagramSpec(
+            kind="concept_experience",
+            concept="control_volume_vs_control_mass",
+            representation="comparison",
+            title="Control Mass vs Control Volume",
+            entities=[
+                VisualEntity(id="cm", label="Control mass (closed)"),
+                VisualEntity(id="cv", label="Control volume (open)"),
+                VisualEntity(id="car", label="Car (Class)"),
+            ],
+        )
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        assert '<span class="cev-icon">C</span>' in html  # "Car (Class)" unaffected
+        assert html.count('<span class="cev-icon">◆</span>') == 2  # both phrase labels
 
     def test_print_media_disables_entrance_animations(self):
         """PDF export (Playwright) emulates print media and snapshots the
@@ -1896,6 +1974,34 @@ class TestConceptQASemantic:
         assert result.issues  # a real finding exists to assert on
         assert all(issue.deterministic is False for issue in result.issues)
 
+    async def test_semantic_layer_catches_a_scrambled_english_typo_layer_1_cannot_see(self, monkeypatch):
+        """Root-cause fix (production course audit, ThermoDynamics/
+        doc_a2f5625a7fd9): a real, confirmed case shipped "coniJt consistent
+        sign conventions" and "mullivtrabile calculus" in a concept_experience
+        card - plain scrambled-but-all-Latin typos that Layer 1's
+        `_looks_garbled` (homoglyph/replacement-character detection only)
+        structurally cannot catch, see its own docstring. Only the new
+        `text_legible` LLM judgment can, so this proves Layer 1 passes this
+        spec (no GARBLED_TEXT) while Layer 2 still catches the typo."""
+        def failing_critique(user: str) -> dict:
+            return {
+                "objective_verdicts": [], "core_message_delivered": True, "core_message_detail": "",
+                "criteria_verdicts": [], "structure_correct": True, "structure_detail": "",
+                "text_legible": False,
+                "text_legible_detail": "\"coniJt\" is not a real English word (scrambled \"and\").",
+            }
+
+        monkeypatch.setitem(mock_ai_module._BUILDERS, "ConceptCritique", failing_critique)
+        spec = _good_metaphor_spec()
+        assert GARBLED_TEXT not in {
+            i.reason for i in (await evaluate_concept_experience(spec, ai=MockAIClient(get_settings()), settings=get_settings())).issues
+        }
+        result = await evaluate_concept_experience(spec, ai=MockAIClient(get_settings()), settings=get_settings())
+        assert not result.passed
+        assert TEXT_NOT_LEGIBLE in {i.reason for i in result.issues}
+        assert "coniJt" in result.feedback()
+        assert all(issue.deterministic is False for issue in result.issues)
+
 
 class TestConceptQAProvenance:
     """Quality-governance follow-up (Phase 3.7): Layer 1 (structural) issues
@@ -2008,6 +2114,103 @@ async def test_a_persistent_semantic_failure_is_persisted_as_not_deterministic(m
     assert visual_qa_findings
     assert all(f.verification_status == "unverified" for f in visual_qa_findings)
     assert all(f.verifier is None for f in visual_qa_findings)
+
+
+async def test_replace_image_on_a_concept_visual_feeds_its_existing_spec_back_in_as_correction_context(
+    monkeypatch,
+):
+    """Replace Image root cause (pipeline investigation): `replace_image`
+    (app.course.document.patcher) clears `content["path"]` so this block
+    regenerates, but leaves `content["spec"]` (the already-rendered
+    entities/steps/metaphor) untouched - ConceptVisualService.generate_for_block
+    must read it back and pass it to VisualPlanner.plan as `existing_spec` so
+    a correction can preserve the existing structure instead of the model
+    inventing a different visual from the editor's text prompt alone, with
+    no idea the old one ever existed. See DiagramService's identical fix/test
+    for the sibling `diagram` pipeline."""
+    original_spec = _good_metaphor_spec()
+    captured: dict = {}
+
+    async def fake_plan(self, **kwargs):
+        captured.update(kwargs)
+        return original_spec.model_copy(deep=True)
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block(
+        prompt="Fix the overlapping property label",
+        spec=original_spec.model_dump(mode="json"),
+    )
+    ok = await service.generate_for_block(
+        course_id="course_concept_replace", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    assert captured.get("existing_spec") == original_spec.model_dump(mode="json")
+
+
+async def test_a_concept_correction_that_discards_most_original_labels_is_flagged_as_drift(monkeypatch):
+    """Phase 3 quality-verification step (deterministic, zero extra AI
+    calls) - the concept_experience sibling of DiagramService's identical
+    regression test."""
+    original_spec = apply_concept_blueprint_defaults(
+        DiagramSpec(
+            kind="concept_experience", concept="java_class_and_object",
+            entities=[
+                VisualEntity(id="t", label="Car (class)", role="template"),
+                VisualEntity(id="a", label="myCar (object)", role="instance", properties={"color": "Red"}),
+            ],
+        )
+    )
+
+    async def fake_plan(self, **kwargs):
+        # A completely different concept - none of the original labels survive.
+        return DiagramSpec(
+            kind="concept_experience", concept="stack_push_pop",
+            entities=[
+                VisualEntity(id="x", label="Unrelated frame one"),
+                VisualEntity(id="y", label="Unrelated frame two"),
+            ],
+        )
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block(
+        prompt="Fix the overlapping property label", spec=original_spec.model_dump(mode="json"),
+    )
+    ok = await service.generate_for_block(
+        course_id="course_concept_drift", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings")
+    assert findings and any(f["type"] == "replace_image_correction_drift" for f in findings)
+
+
+async def test_a_fresh_concept_block_with_no_prior_spec_passes_no_existing_spec(monkeypatch):
+    """The mirror case: a block generating for the FIRST time (no
+    `content["spec"]` yet) must never fabricate correction context."""
+    captured: dict = {}
+
+    async def fake_plan(self, **kwargs):
+        captured.update(kwargs)
+        return _good_metaphor_spec()
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block()  # no "spec" key at all
+    ok = await service.generate_for_block(
+        course_id="course_concept_fresh", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    assert captured.get("existing_spec") is None
 
 
 async def test_unusable_spec_falls_back_without_generating(monkeypatch):

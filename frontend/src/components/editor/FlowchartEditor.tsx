@@ -38,6 +38,12 @@ const ROLE_OPTIONS: { value: string; label: string }[] = [
   { value: "end", label: "End" },
 ];
 
+const TEXT_SIZE_OPTIONS: { value: number; label: string }[] = [
+  { value: 1, label: "Normal" },
+  { value: 1.25, label: "Large" },
+  { value: 1.5, label: "Extra large" },
+];
+
 const inputClass =
   "w-full rounded-[7px] border border-line bg-white px-2 py-1.5 text-[12px] text-ink outline-none " +
   "transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100";
@@ -178,6 +184,10 @@ export function FlowchartEditor({
     setSpec((prev) => (prev ? { ...prev, edges: prev.edges.filter((_, i) => i !== index) } : prev));
   };
 
+  const updateLabelScale = (scale: number) => {
+    setSpec((prev) => (prev ? { ...prev, label_scale: scale } : prev));
+  };
+
   const handleReset = () => setSpec(original);
 
   const handleSave = async () => {
@@ -233,6 +243,36 @@ export function FlowchartEditor({
       ) : spec ? (
         <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="space-y-5">
+            <div>
+              <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-400">
+                Text size
+              </h3>
+              <div className="flex gap-1.5">
+                {TEXT_SIZE_OPTIONS.map((option) => {
+                  const active = (spec.label_scale ?? 1) === option.value;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => updateLabelScale(option.value)}
+                      className={
+                        "flex-1 rounded-[7px] border px-2 py-1.5 text-[12px] font-medium transition " +
+                        (active
+                          ? "border-brand-400 bg-brand-50 text-brand-700"
+                          : "border-line bg-white text-ink-500 hover:bg-ink-50")
+                      }
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1.5 text-[11px] text-ink-400">
+                Scales every label in this diagram. Use Large or Extra large if text looks cramped in the
+                preview.
+              </p>
+            </div>
+
             <div>
               <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-ink-400">
                 Nodes
