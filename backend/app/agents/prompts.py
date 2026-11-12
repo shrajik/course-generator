@@ -782,6 +782,26 @@ How to produce blocks:
   the panel's own coloured verdict badge and explanation. A single,
   non-paneled circuit (nothing being compared) just leaves `lane` blank on
   every node.
+  A real PERIODIC TABLE OF THE ELEMENTS (groups/periods/blocks, trends
+  across the whole table, which elements belong to a given family) is
+  NEVER `illustration` (a raster image model has no real chemical data to
+  draw from - it only knows what a periodic table generally LOOKS like,
+  not which 118 real elements actually go where) and never freehand
+  `diagram` nodes either - it is `image_kind: diagram`, `diagram_kind:
+  periodic_table`, whose grid is a real, fixed, scientifically correct
+  dataset the renderer itself always draws (app.render.periodic_table_data)
+  - nothing about the grid's layout is ever authored here. A real, confirmed
+  complaint about exactly this: an `illustration`-generated periodic table
+  shipped with duplicated element symbols and duplicated/wrong group
+  numbers, because the raster model was inventing a plausible-looking grid
+  from scratch rather than reproducing real chemistry. For this kind,
+  `nodes` is ONLY an optional, short list of elements to highlight/annotate
+  - never the grid itself: each highlighted element is one `DiagramNode`
+  whose `id` is that element's real symbol (e.g. "Na", "Cl" - case
+  insensitive, ignored entirely if it isn't a real symbol), `color` an
+  optional "#rrggbb" highlight fill, and `detail` the one-line reason it's
+  highlighted (shown in a small legend below the grid). Leave `nodes` empty
+  entirely for a plain, complete, unannotated table.
   General rule behind every exception above, for any subject, not just
   electrical: `diagram_kind: comparison` is for a genuinely FLAT comparison
   - the same short list of attributes read off side by side for 2+ things,
@@ -1014,6 +1034,31 @@ How to produce blocks:
     structure - actual roles/titles and who reports to whom - not
     `hierarchy`, which is for a generic category tree/taxonomy where the
     nodes aren't people/roles.
+  * `diagram_kind: feedback_loop_process` for a procedure with one explicit
+    "revise and go back" step partway through (the scientific method, an
+    Agile sprint, an editorial review cycle) - not a clean full loop back
+    to the very first step (that's `cycle`), one named return edge from a
+    later step back to an earlier one it revises.
+  * `diagram_kind: causal_loop` when factors drive each other in a feedback
+    system - more of one thing causing more or less of another, which can
+    itself loop back (a population/resource dynamic, a market feedback
+    effect, an ecosystem interaction). Keep this SPARSE - a single loop plus
+    at most one or two real cross-links, never a dense web.
+  * `diagram_kind: spectrum` for positions along a single continuum or scale
+    with no real structure beyond where each one sits (a political
+    spectrum, a pH scale, an introvert-extrovert scale).
+  * `diagram_kind: iceberg` for a specifically "visible vs. hidden"
+    structure - the small part everyone notices vs. the much larger set of
+    root causes/drivers underneath it (an iceberg of conflict, a
+    competency iceberg, a visible symptom vs. its underlying causes).
+  * `diagram_kind: input_process_output` for the classic "black box"
+    systems view - what goes IN, what processing happens, what comes OUT
+    (an algorithm's input/processing/output, a function's signature, a
+    system boundary).
+  * `diagram_kind: ranked_bars` when the content ranks or sizes a set of
+    factors by magnitude - importance, frequency, a score, a survey result
+    (top causes of X, most common reasons for Y) - rather than describing a
+    sequence or structure between them.
   * NEVER `schematic`/`concept_map`/`hierarchy`/`comparison` for a
     coordinate-axis graph or curve - a supply-and-demand curve, a
     distance-time or velocity-time graph, a function's plot, any X-Y
@@ -1100,7 +1145,8 @@ How to produce blocks:
   progress_rings, orbit_diagram, bridge_process, chain_links,
   flower_petal, hourglass_diagram, org_chart, circuit_schematic (real
   electrical wire/node topology - see its own rule above; never use
-  `comparison` for this) - this
+  `comparison` for this), periodic_table (a real periodic table of the
+  elements - see its own rule above; never `illustration` for this) - this
   is what the renderer actually builds, so getting it right here is what makes the
   diagram useful. Leave it blank only when you genuinely cannot tell.
 - For an `image` block, do not produce the image. Provide `image_purpose`, a

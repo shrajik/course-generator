@@ -209,6 +209,81 @@ def test_b_lines_that_try_to_steer_the_ai_are_dropped_and_reported():
     assert "system prompt" not in blueprint_brief(_md_template())
 
 
+# Real, confirmed production case: an uploaded "Kids Course Template" has a
+# top-level "8. Quality Checklist" heading that is plain bullet prose ("Every
+# page has a picture.", "No image contains any text.") - not phrased as an
+# instruction, and (before this fix) not recognised as a rules-opening
+# heading either, so it was classified as an ordinary CONTENT section like
+# "Meet the Topic"/"Let's Learn". That meant every generated chapter got its
+# own "Quality Checklist" page, with the writer dutifully inventing "subject
+# matter" for a section whose real content is the template's own formatting
+# rules - producing pages that re-teach "every page has a picture" back to
+# the learner as if it were a fact about the course topic. Fixed by adding
+# "checklist(s)" (and "production/author/editor notes", the same class of
+# meta-heading) to `_RULES_HEADING_RE`, so this heading now opens a rules
+# area instead of a chapter section.
+QUALITY_CHECKLIST_BLUEPRINT = """# Kids Course Blueprint
+
+## Writing rules
+- Tone: cheerful and simple
+- Sentences of 8 to 12 words.
+
+## Meet the Topic (required)
+Introduce the topic with a big picture and a fun question.
+
+## Quality Checklist
+- Every page has a picture.
+- No image contains any text.
+- All diagrams are fully visible on the page.
+"""
+
+
+def test_h_a_quality_checklist_heading_is_a_rules_area_not_a_content_section():
+    template = process_template_file(
+        QUALITY_CHECKLIST_BLUEPRINT.encode(), source_format="md", template_id="uploaded:checklist-test",
+        name="Kids Blueprint", kind="non_technical",
+    ).template
+    # Only the real content section survives - "Quality Checklist" never
+    # becomes a section the writer would reproduce once per chapter.
+    assert [section.key for section in template.sections] == ["meet_the_topic"]
+
+
+# Real, confirmed production case: an uploaded "Kids Course Template" states
+# its own intended audience in a labelled table row ("Audience | Children
+# aged 6 to 11 (Class 1 to 5)") under an ordinary "Template Overview"
+# section - nothing extracted that fact before this fix, so a course's own
+# `target_audience` ("advanced researchers") could be generated against it
+# with no contradiction ever detected.
+AUDIENCE_TABLE_BLUEPRINT = """# Kids Course Blueprint
+
+## Template Overview
+
+| Item | Specification |
+| --- | --- |
+| Audience | Children aged 6 to 11 (Class 1 to 5) |
+| Tone | Friendly and cheerful |
+
+## Meet the Topic (required)
+Introduce the topic with a big picture and a fun question.
+"""
+
+
+def test_h_a_templates_own_stated_audience_is_extracted_from_its_overview_table():
+    template = process_template_file(
+        AUDIENCE_TABLE_BLUEPRINT.encode(), source_format="md", template_id="uploaded:audience-test",
+        name="Kids Blueprint", kind="non_technical",
+    ).template
+    assert template.audience == "Children aged 6 to 11 (Class 1 to 5)"
+    # The same table's other rows are untouched - this is a narrow,
+    # additive scan, not a change to how tables are otherwise classified.
+    assert [section.key for section in template.sections] == ["template_overview", "meet_the_topic"]
+
+
+def test_h_a_template_with_no_stated_audience_leaves_the_field_blank():
+    template = _md_template()  # the existing B-suite fixture states no audience
+    assert template.audience == ""
+
+
 # ---------------------------------------------------------------------------
 # C. topic change
 # ---------------------------------------------------------------------------

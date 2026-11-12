@@ -60,6 +60,7 @@ from app.course.document.visual_repair import audit_and_repair_visuals
 from app.services.diagram_diversity import balance_diagram_kinds
 from app.services.visual_review import VisualReviewService
 from app.course.templates.registry import ensure_template_loaded, load_template
+from app.services.audience_gate import check_audience_compatibility
 from app.schemas.blueprint import BlueprintChapter, CourseBlueprint
 from app.schemas.course import (
     ChapterProgress,
@@ -243,6 +244,15 @@ class CourseService:
     async def create_course(
         self, course_input: CourseInput, *, run_planner: bool = True, owner_id: str | None = None
     ) -> CourseRecord:
+        # Audience/template gate - see audience_gate's own module docstring
+        # for the real, confirmed production failure this closes. Checked
+        # BEFORE the course record is created at all (fail fast, no partial
+        # state) - a no-op unless the template states a real audience AND
+        # the course states one too.
+        await ensure_template_loaded(course_input.template_id)
+        await check_audience_compatibility(
+            self.ai, course_audience=course_input.target_audience, template=load_template(course_input.template_id)
+        )
         course_id = new_course_id()
         design = course_input.design_models
         # Content Studio Phase 3 - phase-gated approval is an ADDIE concept;
@@ -573,6 +583,26 @@ class CourseService:
             return quality_gate_blockers(inventory_issues, blocking, eval_error)
         except Exception as exc:  # noqa: BLE001 - the brief still renders without it
             log.warning("Could not evaluate approval blockers for %s: %s", record.course_id, exc)
+            return []
+
+    async def approval_review_items(self, record: CourseRecord) -> list[str]:
+        """Root-cause fix (visual-accuracy architecture audit): the review
+        screen's counterpart to `approval_quality_blockers` above, for the
+        genuinely-uncertain middle case that gate deliberately never blocks
+        on - `QualityReport.review_findings` (severity == "blocker" AND
+        verification_status == "unverified"). Never raises, same contract
+        as `approval_quality_blockers`; an evaluation failure here is
+        already surfaced separately via that method's own `eval_error`
+        handling, so this one simply reports nothing rather than
+        duplicating it."""
+        from app.course.review_brief import quality_gate_review_items
+
+        try:
+            _inventory_issues, report, _eval_error = await self._evaluate_quality_for_approval(record)
+            review = report.review_findings if report is not None else []
+            return quality_gate_review_items(review)
+        except Exception as exc:  # noqa: BLE001 - the brief still renders without it
+            log.warning("Could not evaluate review items for %s: %s", record.course_id, exc)
             return []
 
     # --- admin-only quality-gate overrides ----------------------------------

@@ -26,13 +26,18 @@ from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.core.metrics import phase as metrics_phase
-from app.schemas.blocks import BlockType, merge_content
+from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, BlockType, merge_content
 from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
 from app.services.concept_visual_service import ConceptVisualService
 from app.services.diagram_service import DiagramService
 from app.services.formula_qa import evaluate_formula
 from app.services.memory_service import MemoryService, get_memory_service
+from app.services.numeric_consistency_qa import (
+    IDENTIFIER_VALUE_NEEDS_REVIEW,
+    find_identifier_value_issues,
+    find_numeric_contradictions,
+)
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.quality_framework import visual_qa_finding_entries
 from app.render.section_icons import match_generic_section_icon, render_section_icon_svg
@@ -468,8 +473,25 @@ _CONTEXT_FIELD_CHAR_CAP = 120  # a title is always short; this only guards again
 _KEY_CONCEPT_CHAR_CAP = 200
 
 
-def chapter_section_context(document: CourseDocument) -> dict[str, tuple[str, str, str]]:
-    """Maps every block id to (chapter_title, section_title, key_concept).
+# Cap on `source_excerpt` (chapter_section_context's new 4th element) - a
+# section's real prose, concatenated, for source-grounding verification (see
+# app.services.diagram_content_qa/ImageService._verify_image_relevance). Not
+# one isolated paragraph: the WHOLE section's prose (every real-text block
+# under the same heading, wherever it sits relative to the image - see the
+# function's own docstring on why) - a real, specifically-requested
+# requirement that a fact appearing later in the same section must still be
+# available, never missed just because it wasn't in the one paragraph
+# immediately before the image. Capped only as a token-budget safety net
+# (matching this module's existing MAX_PROMPT_CHARS=4500 QA-brief budget,
+# not the much larger PROMPT_CHAR_BUDGET=16000 reserved for the actual
+# generation prompt) - a pathologically long section is truncated, never
+# silently dropped, so verification still runs against *most* of the real
+# content rather than none of it.
+_SOURCE_EXCERPT_CHAR_CAP = 4000
+
+
+def chapter_section_context(document: CourseDocument) -> dict[str, tuple[str, str, str, str]]:
+    """Maps every block id to (chapter_title, section_title, key_concept, source_excerpt).
 
     `chapter_title`/`section_title` are the nearest preceding level-1/other
     heading's text, walking the document in its own natural page/block
@@ -501,6 +523,15 @@ def chapter_section_context(document: CourseDocument) -> dict[str, tuple[str, st
     titles: dict[str, tuple[str, str]] = {}
     chapter_key_concept: dict[str, str] = {}
     chapter_fallback_concept: dict[str, str] = {}
+    # Accumulated per (chapter_title, section_title) - the REAL prose text of
+    # every TEXTUAL_BLOCK_TYPES block seen anywhere in that section, in
+    # document order, regardless of whether it sits before or after the
+    # image block(s) that will later be verified against it (see
+    # _SOURCE_EXCERPT_CHAR_CAP's own comment on why "the whole section", not
+    # one preceding paragraph). A single extra pass-sized dict, not a second
+    # walk - built in the SAME walk as the existing chapter/section/key-
+    # concept bookkeeping above.
+    section_prose: dict[tuple[str, str], list[str]] = {}
     for _, block in document.iter_blocks():
         if block.type is BlockType.HEADING:
             text = str(block.content.get("text") or "").strip()
@@ -524,8 +555,18 @@ def chapter_section_context(document: CourseDocument) -> dict[str, tuple[str, st
             ]
             if takeaways:
                 chapter_fallback_concept[chapter_title] = takeaways[0][:_KEY_CONCEPT_CHAR_CAP]
+        if block.type in TEXTUAL_BLOCK_TYPES:
+            text = str(block.content.get("text") or "").strip()
+            if text:
+                section_prose.setdefault((chapter_title, section_title), []).append(text)
+    excerpt_cache: dict[tuple[str, str], str] = {
+        key: "\n\n".join(parts)[:_SOURCE_EXCERPT_CHAR_CAP] for key, parts in section_prose.items()
+    }
     return {
-        block_id: (ch, se, chapter_key_concept.get(ch) or chapter_fallback_concept.get(ch, ""))
+        block_id: (
+            ch, se, chapter_key_concept.get(ch) or chapter_fallback_concept.get(ch, ""),
+            excerpt_cache.get((ch, se), ""),
+        )
         for block_id, (ch, se) in titles.items()
     }
 
@@ -622,6 +663,21 @@ class ImageRelevanceCheck(BaseModel):
     style_compliant: bool = True
     style_compliant_detail: str = ""
     errored: bool = False
+    # Canonical Visual Spec milestone - source-grounding, ONLY ever asked
+    # about when a real `source_excerpt` (the course's own chapter prose)
+    # was available to judge against; both default to the safe "nothing
+    # wrong" value when no excerpt was given (see `_verify_image_relevance`'s
+    # own source-grounding section). IMPORTANT, and distinct from every
+    # other field above: this is NEVER a claim that the image (or the
+    # course's own text) is scientifically correct - only whether the
+    # image's depicted claims are CONSISTENT WITH what the course's own
+    # prose already says. A real scientific error already present in the
+    # source text would not be caught here; that is a different, harder
+    # problem this check deliberately does not attempt (see `diagram_
+    # content_qa`'s matching fields for the full reasoning, shared verbatim).
+    contradicts_source_text: bool = False
+    contradicts_source_text_detail: str = ""
+    unsupported_claims: list[str] = Field(default_factory=list)
 
 
 class SuggestedOverlayLabel(BaseModel):
@@ -1150,6 +1206,7 @@ class ImageService:
 
     async def _verify_image_relevance(
         self, image: bytes, *, brief: str, course_title: str, textbook_style: bool = False,
+        source_excerpt: str = "",
     ) -> ImageRelevanceCheck:
         """Does this generated image actually depict its own brief, and does
         it read as genuinely educational rather than purely decorative or
@@ -1168,7 +1225,16 @@ class ImageService:
         this is the only check that can catch a MAI-Image-2.6 generation
         drifting away from the required flat-vector textbook look (no
         negative-prompt/style parameter exists at the API level to enforce
-        it instead)."""
+        it instead).
+
+        `source_excerpt` (Canonical Visual Spec milestone), when given, adds
+        the source-grounding judgment (`contradicts_source_text`/
+        `unsupported_claims`) to this SAME call - zero new API calls for the
+        common case, the same reasoning `diagram_content_qa.evaluate_content`
+        documents for its own matching fields. Blank (the default, and the
+        deliberate no-op for a `section_intro` illustration - see this
+        method's own caller) skips asking the question at all, exactly like
+        an empty `brief` already skips the whole call."""
         if not brief.strip():
             return ImageRelevanceCheck()
         style_question = (
@@ -1179,6 +1245,26 @@ class ImageService:
             "photorealistic, 3D-rendered, has a glow/gradient/dark background, or has any panel, "
             "icon, label or text cut off at an edge."
             if textbook_style else ""
+        )
+        grounding_question = (
+            " (5) `contradicts_source_text` - the course's own written text (below) describes "
+            "this subject. Does this image depict any entity, relationship, direction, or value "
+            "that DIRECTLY CONTRADICTS something the source text states (not merely absent from "
+            "it - a reasonable illustrative detail a textbook author would add is NOT a "
+            "contradiction)? Answer true only for a genuine, specific conflict, and name it "
+            "exactly in `contradicts_source_text_detail`. Separately, list in `unsupported_"
+            "claims` any specific thing the image clearly depicts as fact that the source text "
+            "simply does not address either way (neither confirms nor denies) - leave this empty "
+            "if the image's claims are all either confirmed by the source text or are ordinary, "
+            "reasonable illustrative elaboration. IMPORTANT: you are judging CONSISTENCY with "
+            "the course's own text, never independent scientific truth - if the source text "
+            "itself were wrong, that is a different problem this judgment does not cover."
+            if source_excerpt.strip() else ""
+        )
+        source_block = (
+            f"\n\nCOURSE'S OWN TEXT (the ground truth to check consistency against - not an "
+            f"external authority, just what this course itself already says):\n{source_excerpt}"
+            if source_excerpt.strip() else ""
         )
         try:
             return await self.ai.structured(
@@ -1198,12 +1284,12 @@ class ImageService:
                     "partly covered by another label or box, or sits crammed on top of other "
                     "text so it's hard to read, means `labels_legible` is false. If the image "
                     "has no text at all, `labels_legible` is true by default - there is nothing "
-                    "to collide." + style_question + " Be concrete in every detail field: name "
-                    "exactly what the image actually shows and why that does or doesn't match, "
-                    "never a bare \"could be better\"."
+                    "to collide." + style_question + grounding_question + " Be concrete in every "
+                    "detail field: name exactly what the image actually shows and why that does "
+                    "or doesn't match, never a bare \"could be better\"."
                 ),
-                user=f"COURSE: {course_title}\n\nBRIEF (what this image is supposed to depict):\n{brief}\n\n"
-                "Judge the attached image against this brief.",
+                user=f"COURSE: {course_title}\n\nBRIEF (what this image is supposed to depict):\n{brief}"
+                f"{source_block}\n\nJudge the attached image against this brief.",
                 model=self.settings.diagram_model,
                 purpose="image_relevance_check",
                 phase="image",
@@ -1328,11 +1414,27 @@ class ImageService:
         chapter_title: str = "",
         section_title: str = "",
         key_concept: str = "",
+        source_excerpt: str = "",
     ) -> bool:
         """Diagram/concept_experience blocks try their structured path first
         and fall back to the raster illustration path on any failure - a
         block must never end up with nothing just because a specialised path
-        had trouble."""
+        had trouble.
+
+        `source_excerpt` (Canonical Visual Spec milestone): the real chapter
+        prose this block's visual sits alongside - see `chapter_section_
+        context`'s own docstring for how it's gathered (the WHOLE section,
+        not one paragraph). Threaded into the structured-diagram content-QA
+        critique and the raster-illustration relevance check so both can
+        verify a visual's claims are actually grounded in what the course
+        itself says, not just internally well-formed or "on topic" in a
+        generic sense - see `diagram_content_qa.evaluate_content`'s and
+        `_verify_image_relevance`'s own docstrings for what this check does
+        and, importantly, does NOT claim (source-consistency, never
+        independent scientific truth). Blank is always a safe no-op -
+        exactly the same degrade-gracefully contract `chapter_title`/
+        `section_title`/`key_concept` already keep.
+        """
         kind = block.content.get("kind")
         if kind == "toc":
             # A course-contents page (app.render.toc_renderer) is built once,
@@ -1360,7 +1462,8 @@ class ImageService:
         structured_fallback = kind in ("diagram", "concept_experience")
         if kind == "diagram" and self.settings.enable_diagram_generation:
             ok = await self.diagrams.generate_for_block(
-                course_id=course_id, block=block, template=template, course_title=course_title
+                course_id=course_id, block=block, template=template, course_title=course_title,
+                source_excerpt=source_excerpt,
             )
             if ok:
                 return True
@@ -1414,6 +1517,7 @@ class ImageService:
             section_title=section_title,
             key_concept=key_concept,
             force_text_free=structured_fallback,
+            source_excerpt=source_excerpt,
         )
 
     def _reuse_template_asset(self, *, course_id: str, block: Block, template: CourseTemplate) -> bool:
@@ -1663,7 +1767,9 @@ class ImageService:
             "mime": candidate.mime,
         }
 
-    def _materialize_wikimedia_result(self, data: bytes, meta: dict, *, course_id: str) -> dict:
+    def _materialize_wikimedia_result(
+        self, data: bytes, meta: dict, *, course_id: str, visual_qa_findings: list[dict] | None = None,
+    ) -> dict:
         """Saves `data` as this COURSE's own asset (same `storage.save_asset`
         every AI-generated image uses - a Wikimedia image is otherwise
         indistinguishable from a generated one to the rest of the pipeline)
@@ -1677,7 +1783,16 @@ class ImageService:
         cannot open SVG at all (confirmed: raises UnidentifiedImageError).
         `wikimedia_provider.svg_dimensions` reads the real intrinsic size
         straight out of the SVG's own markup instead - the SVG-specific
-        counterpart to `_dimensions` for every raster format."""
+        counterpart to `_dimensions` for every raster format.
+
+        `visual_qa_findings` (Category B hardening pass): a REVIEW-level
+        identifier-value ambiguity `_wikimedia_result_for_query` found while
+        checking an information-bearing candidate's own transcribed labels
+        against this course's source text - a CONFIRMED contradiction is
+        never passed here at all (the candidate is rejected outright before
+        this is ever called), so this list only ever carries the genuinely
+        ambiguous, advisory case, same as the AI-generated illustration
+        path's own `source_grounding_findings`."""
         is_svg = meta.get("mime") == "image/svg+xml"
         if is_svg:
             extension = "svg"
@@ -1701,10 +1816,48 @@ class ImageService:
             "license_url": meta.get("license_url", ""),
             "attribution_text": meta.get("attribution_text", ""),
             "wikimedia_title": meta.get("wikimedia_title", ""),
+            "visual_qa_findings": visual_qa_findings or [],
         }
 
+    @staticmethod
+    def _wikimedia_category_b_findings(
+        check: WikimediaCandidateCheck, source_excerpt: str,
+    ) -> tuple[bool, list[dict]]:
+        """Category A/B hardening pass. Category A (`information_bearing`
+        False - an ordinary photograph) makes no checkable factual claims,
+        so this is skipped entirely: no new source-grounding call, exactly
+        the existing relevance/licensing/metadata gates. Category B gets the
+        SAME deterministic numeric/identifier check an AI-generated diagram
+        or illustration's own brief gets (app.services.numeric_consistency_qa,
+        zero extra AI calls - `check.visible_numeric_labels` was already
+        transcribed by the one vision call every candidate gets regardless).
+
+        Returns `(confirmed_contradiction, review_findings)`: a CONFIRMED
+        contradiction means the caller must reject this candidate outright
+        (never publish an information-bearing image whose own labels
+        contradict the course's text); `review_findings` carries only the
+        genuinely ambiguous case, for the caller to attach advisory-only,
+        mirroring `ImageService._generate_illustration`'s own
+        `source_grounding_findings` handling for the AI-generated path."""
+        if not check.information_bearing or not check.visible_numeric_labels.strip() or not source_excerpt.strip():
+            return False, []
+        claim_text = check.visible_numeric_labels
+        if find_numeric_contradictions(claim_text, source_excerpt):
+            return True, []
+        review: list[dict] = []
+        for issue in find_identifier_value_issues(claim_text, source_excerpt):
+            if issue.reason == IDENTIFIER_VALUE_NEEDS_REVIEW:
+                review.extend(
+                    visual_qa_finding_entries(
+                        [(issue.reason, issue.detail, False)], resolution="source_grounding_unsupported",
+                    )
+                )
+            else:
+                return True, []
+        return False, review
+
     async def _wikimedia_result_for_query(
-        self, query: str, *, course_id: str, course_title: str, brief: str
+        self, query: str, *, course_id: str, course_title: str, brief: str, source_excerpt: str = "",
     ) -> dict | None:
         """One query's own full pipeline: cache check, then (on a miss)
         search -> deterministic filter -> bounded vision-check -> cache the
@@ -1713,8 +1866,48 @@ class ImageService:
         cached = self.storage.load_wikimedia_cache_entry(query)
         if cached is not None:
             data, meta = cached
-            log.info("Wikimedia cache hit for query %r (%s)", query, meta.get("wikimedia_title"))
-            return self._materialize_wikimedia_result(data, meta, course_id=course_id)
+            # Root-cause fix (cross-course cache safety audit): this cache is
+            # deliberately COURSE-INDEPENDENT (see `storage.
+            # wikimedia_cache_dir`'s own comment - "reused across every
+            # later course that asks an equivalent topic") and keyed by an
+            # exact normalised query STRING, not by anything about the
+            # course that originally validated it. The entry's own bytes
+            # already passed `evaluate_candidate`/`candidate_passed` once -
+            # but only against WHICHEVER course first populated it; a cache
+            # hit used to serve those same bytes to a different, later
+            # course with zero re-check against THIS course's own
+            # `brief`/`course_title`, on the unstated assumption that an
+            # identical search string always means an identical need. A
+            # cache hit now gets exactly the same scrutiny a fresh,
+            # never-seen candidate already gets below - never trusted on
+            # faith just because the bytes were fetched once before.
+            is_svg = meta.get("mime") == "image/svg+xml"
+            if is_svg:
+                vision_bytes = await wikimedia_provider.rasterize_svg_for_vision(data, settings=self.settings)
+            else:
+                vision_bytes = data
+            still_relevant = False
+            category_b_findings: list[dict] = []
+            if vision_bytes is not None:
+                check = await evaluate_candidate(
+                    vision_bytes, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
+                )
+                still_relevant = candidate_passed(check)
+                if still_relevant:
+                    confirmed_contradiction, category_b_findings = self._wikimedia_category_b_findings(
+                        check, source_excerpt
+                    )
+                    still_relevant = not confirmed_contradiction
+            if still_relevant:
+                log.info("Wikimedia cache hit for query %r (%s)", query, meta.get("wikimedia_title"))
+                return self._materialize_wikimedia_result(
+                    data, meta, course_id=course_id, visual_qa_findings=category_b_findings,
+                )
+            log.info(
+                "Wikimedia cache hit for query %r (%s) failed re-validation against this course's own "
+                "brief - falling through to a fresh search instead of serving it",
+                query, meta.get("wikimedia_title"),
+            )
 
         candidates = await wikimedia_provider.search_commons(
             query, limit=self.settings.wikimedia_search_candidates, settings=self.settings
@@ -1759,10 +1952,21 @@ class ImageService:
             )
             if not candidate_passed(check):
                 continue
+            confirmed_contradiction, category_b_findings = self._wikimedia_category_b_findings(
+                check, source_excerpt
+            )
+            if confirmed_contradiction:
+                log.info(
+                    "Wikimedia candidate %r rejected: its own labels contradict this course's source "
+                    "text (Category B information-bearing check)", candidate.title,
+                )
+                continue
             meta = self._wikimedia_metadata(candidate)
             extension = "svg" if is_svg else self._detect_extension(data)
             self.storage.save_wikimedia_cache_entry(query, data, meta, extension=extension)
-            return self._materialize_wikimedia_result(data, meta, course_id=course_id)
+            return self._materialize_wikimedia_result(
+                data, meta, course_id=course_id, visual_qa_findings=category_b_findings,
+            )
         return None
 
     async def _try_wikimedia_image(
@@ -1774,6 +1978,7 @@ class ImageService:
         chapter_title: str,
         section_title: str,
         key_concept: str,
+        source_excerpt: str = "",
     ) -> dict | None:
         """The one, correct insertion point for "search Wikimedia Commons
         before ever calling an AI image model" - see this module's own
@@ -1820,7 +2025,8 @@ class ImageService:
             try:
                 async with limiter.slot():
                     result = await self._wikimedia_result_for_query(
-                        query, course_id=course_id, course_title=course_title, brief=brief
+                        query, course_id=course_id, course_title=course_title, brief=brief,
+                        source_excerpt=source_excerpt,
                     )
             except Exception as exc:  # noqa: BLE001 - never block course generation on a Wikimedia failure
                 log.warning(
@@ -2028,6 +2234,7 @@ class ImageService:
         section_title: str = "",
         key_concept: str = "",
         force_text_free: bool = False,
+        source_excerpt: str = "",
     ) -> bool:
         """`force_text_free` is set when this is a FALLBACK from a failed
         diagram/concept_experience attempt (see generate_for_block) - that
@@ -2079,6 +2286,7 @@ class ImageService:
             chapter_title=chapter_title,
             section_title=section_title,
             key_concept=key_concept,
+            source_excerpt=source_excerpt,
         )
         if wikimedia_result is not None:
             block.content = merge_content(block.type, block.content, wikimedia_result)
@@ -2309,6 +2517,7 @@ class ImageService:
         # kind of error). Skipped for the deliberately-generic safety
         # fallback (see `is_safety_fallback`'s own comment above).
         relevance_findings: list[dict] = []
+        source_grounding_findings: list[dict] = []
         if not is_safety_fallback:
             brief = "\n".join(
                 part for part in (
@@ -2317,8 +2526,20 @@ class ImageService:
                     str(block.content.get("caption") or ""),
                 ) if part
             )[:MAX_PROMPT_CHARS]
+            # Canonical Visual Spec milestone: a `section_intro` illustration
+            # is a deliberately generic, decorative scene-setter (see this
+            # function's own section_intro short-circuit above) - it carries
+            # no specific factual claim about the subject to check against
+            # the source text in the first place, so source-grounding is a
+            # deliberate no-op here (an empty excerpt), never a forced check
+            # on content that was never meant to assert anything checkable.
+            grounding_excerpt = (
+                "" if (block.content.get("illustration_style") or "").strip().lower() == "section_intro"
+                else source_excerpt
+            )
             relevance = await self._verify_image_relevance(
                 data, brief=brief, course_title=course_title, textbook_style=is_textbook,
+                source_excerpt=grounding_excerpt,
             )
 
             def _relevance_failed(check: ImageRelevanceCheck) -> bool:
@@ -2343,7 +2564,7 @@ class ImageService:
                 # at its True default, since nothing stops a model (or a
                 # test double) from setting it False on a field it was
                 # never actually asked to judge.
-                return check.errored or not (
+                return check.errored or check.contradicts_source_text or not (
                     check.on_topic and check.genuinely_educational and check.labels_legible
                     and (check.style_compliant or not is_textbook)
                 )
@@ -2388,11 +2609,18 @@ class ImageService:
                         "no glow/gradient background, and every element fully inside the frame with margin."
                         if is_textbook and not relevance.style_compliant else ""
                     )
+                    contradiction_note = (
+                        f" The previous attempt also contradicted the course's own text "
+                        f"({relevance.contradicts_source_text_detail or 'a stated fact or relationship'}) - "
+                        "correct this specific conflict; depict only what is consistent with the course's "
+                        "own material."
+                        if relevance.contradicts_source_text else ""
+                    )
                     retry_prompt = (
                         f"{prompt}\n\nIMPORTANT: the previous attempt did not clearly depict the actual "
                         f"subject. This image MUST specifically, unmistakably depict: {brief or course_title}. "
                         f"Do not produce a generic or decorative image unrelated to this exact subject."
-                        f"{legibility_note}{style_note}"
+                        f"{legibility_note}{style_note}{contradiction_note}"
                     )
                     try:
                         retried_data = await self._draw(
@@ -2400,6 +2628,7 @@ class ImageService:
                         )
                         retried_relevance = await self._verify_image_relevance(
                             retried_data, brief=brief, course_title=course_title, textbook_style=is_textbook,
+                            source_excerpt=grounding_excerpt,
                         )
                         data, relevance, prompt = retried_data, retried_relevance, retry_prompt
                         if not _relevance_failed(relevance):
@@ -2438,7 +2667,76 @@ class ImageService:
                             or "Image does not follow the required flat 2D vector textbook style.",
                             False,
                         ))
+                    if relevance.contradicts_source_text:
+                        issues.append((
+                            "contradicts_source_text",
+                            relevance.contradicts_source_text_detail
+                            or "Image depicts something that contradicts the course's own text.",
+                            False,
+                        ))
                     relevance_findings = visual_qa_finding_entries(issues, resolution="image_relevance_unverified")
+            # Canonical Visual Spec milestone: a claim the source excerpt
+            # simply doesn't ADDRESS (neither confirms nor contradicts) is a
+            # genuinely different, less severe case than the confirmed
+            # relevance failures above - never withheld (this must NOT feed
+            # `confirmed_relevance_failure`, hence its own separate list,
+            # only ever merged into the SUCCESS path's `visual_qa_findings`
+            # below), but never silently invisible either. Routes to the
+            # REVIEW outcome (a `"blocker"`-severity, `deterministic=False`
+            # finding - see quality_framework.py's `review_findings`), the
+            # same "flag for a human, don't auto-approve, don't auto-reject"
+            # treatment the matching `diagram_content_qa` field gets. Still
+            # inside `if not is_safety_fallback` (where `relevance` is
+            # actually defined) but OUTSIDE `if _relevance_failed(...)` -
+            # an otherwise-clean image can still carry an unsupported claim.
+            if relevance.unsupported_claims:
+                source_grounding_findings = visual_qa_finding_entries(
+                    [(
+                        "source_grounding_unsupported",
+                        "The course's own text doesn't address: " + "; ".join(relevance.unsupported_claims[:5]),
+                        False,
+                    )],
+                    resolution="source_grounding_unsupported",
+                )
+            # Phase 2/5 (Canonical Visual Spec milestone): the same
+            # deterministic, zero-API-call numeric check `diagram_content_qa.
+            # evaluate_content` runs for a structured diagram, applied here
+            # to the raster path's own BRIEF (what the image was ASKED to
+            # depict) against the grounding excerpt - see
+            # app.services.numeric_consistency_qa's own docstring on why
+            # this is a source-CONSISTENCY check, never a truth check. A
+            # confirmed, high-confidence mismatch is at least as
+            # disqualifying as a confirmed LLM-judged contradiction above -
+            # folded into the SAME `relevance_findings` list (resolution
+            # "image_relevance_unverified"), which already drives
+            # `confirmed_relevance_failure` and withholding below,
+            # unchanged mechanism, never a new one.
+            numeric_issues = find_numeric_contradictions(brief, grounding_excerpt)
+            if numeric_issues:
+                relevance_findings = relevance_findings + visual_qa_finding_entries(
+                    [(issue.reason, issue.detail, True) for issue in numeric_issues],
+                    resolution="image_relevance_unverified",
+                )
+            # Short-identifier hardening (Canonical Visual Spec milestone):
+            # same split as `diagram_content_qa._numeric_contradiction_
+            # issues` - a CONFIRMED identifier mismatch (Si=28 vs the
+            # source's own Si=14) joins the same hard-block path as the
+            # plain numeric case just above; an AMBIGUOUS one (identifier
+            # never resolves confidently) is NOT a block - it folds into
+            # `source_grounding_findings` instead, the same "flag for
+            # review, ship anyway" treatment `unsupported_claims` already
+            # gets a few lines up, never `confirmed_relevance_failure`.
+            for issue in find_identifier_value_issues(brief, grounding_excerpt):
+                if issue.reason == IDENTIFIER_VALUE_NEEDS_REVIEW:
+                    source_grounding_findings = source_grounding_findings + visual_qa_finding_entries(
+                        [(issue.reason, issue.detail, False)],
+                        resolution="source_grounding_unsupported",
+                    )
+                else:
+                    relevance_findings = relevance_findings + visual_qa_finding_entries(
+                        [(issue.reason, issue.detail, True)],
+                        resolution="image_relevance_unverified",
+                    )
         if (block.content.get("illustration_style") or "").strip().lower() == "section_intro":
             data = self._resize_section_intro(data)
         # Mathematical/scientific correctness of a depicted governing
@@ -2663,7 +2961,7 @@ class ImageService:
                 "text_verified": text_verified,
                 "formula_verified": formula_verified,
                 "overlay_labels": overlay_labels,
-                "visual_qa_findings": existing_findings + formula_findings + relevance_findings,
+                "visual_qa_findings": existing_findings + formula_findings + relevance_findings + source_grounding_findings,
                 "generation_mode": "mock" if self.ai.is_mock else "real",
             },
         )
@@ -2726,7 +3024,9 @@ class ImageService:
         job_id = job_id or str(uuid.uuid4())
 
         async def worker(block: Block) -> bool:
-            chapter_title, section_title, key_concept = context_map.get(block.id, ("", "", ""))
+            chapter_title, section_title, key_concept, source_excerpt = context_map.get(
+                block.id, ("", "", "", "")
+            )
             async with limiter.slot():
                 ok = await self.generate_for_block(
                     course_id=document.course_id,
@@ -2736,6 +3036,7 @@ class ImageService:
                     chapter_title=chapter_title,
                     section_title=section_title,
                     key_concept=key_concept,
+                    source_excerpt=source_excerpt,
                 )
                 if ok:
                     # Marks this block as validated during THIS job - see

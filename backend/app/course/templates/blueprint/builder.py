@@ -60,10 +60,19 @@ MAX_EXAMPLES = 12
 _RULES_HEADING_RE = re.compile(
     r"\b(rules?|guidelines?|instructions?|style guide|writing style|tone( of voice)?|voice|"
     r"how to (write|use)|notes? (to|for) (the )?(writer|author|ai)|requirements|conventions|standards|"
-    r"specifications?|guidance)\b",
+    r"specifications?|guidance|checklists?|production notes?|author notes?|editor notes?)\b",
     re.IGNORECASE,
 )
 _EXAMPLE_HEADING_RE = re.compile(r"\b(example|sample|worked example|model answer|specimen)s?\b", re.IGNORECASE)
+# A labelled "Audience | <value>" table row (this builder's own table-node
+# text is one line per row, cells joined by " | " - see the `zone == "rules"`
+# table handling below) - deliberately a narrow, additive, read-only scan
+# over EVERY table in the document (not gated to any zone/section), so it
+# never changes what a table is classified as (rule/example/section) for
+# any existing, already-tested behaviour. Only the FIRST such row found is
+# used; a template stating no audience at all (the common case) leaves
+# `CourseTemplate.audience` blank, never a guess.
+_AUDIENCE_ROW_RE = re.compile(r"^\s*audience\s*\|\s*(.+?)\s*$", re.IGNORECASE)
 _VISUAL_TOPIC_RE = re.compile(r"\b(visual|image|diagram|illustration|figure|graphic|picture)s?\b", re.IGNORECASE)
 
 _MARKER_RE = re.compile(
@@ -1016,12 +1025,25 @@ def build_template(
         review_focus.append("Every required visual from the template blueprint is present, in its section and position.")
     review_focus.append("The chapter follows the template's patterns without copying its example wording.")
 
+    audience = ""
+    for node in nodes:
+        if node.kind != "table":
+            continue
+        for row in node.text.splitlines():
+            match = _AUDIENCE_ROW_RE.match(row)
+            if match:
+                audience = _clip(match.group(1), 300)
+                break
+        if audience:
+            break
+
     theme = extracted_theme if (extracted_theme is not None and blueprint.design.applied) else TemplateTheme()
     template = CourseTemplate(
         template_id=template_id,
         kind=kind,
         name=name,
         description=description or f"Uploaded {source_format.upper()} template ({len(sections)} sections)",
+        audience=audience,
         sections=sections,
         allowed_block_types=[],
         required_block_types=required_blocks,

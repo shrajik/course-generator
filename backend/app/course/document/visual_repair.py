@@ -268,6 +268,14 @@ async def _plan_and_generate_one_page(
         chapter_title=chapter_title,
         section_title=section_title,
         key_concept=key_concept,
+        # This page's own real text, already fetched above for the planner
+        # itself - more directly relevant for a repair-inserted visual than
+        # `chapter_section_context`'s section-wide lookup (that reference
+        # block may be mid-section; this page's own text is exactly what the
+        # new visual is meant to illustrate). Same source-grounding
+        # verification path every other visual goes through (see
+        # ImageService.generate_for_block's own `source_excerpt` param).
+        source_excerpt=_page_text(page.blocks)[:4000],
     )
     if not ok:
         return page, None, {
@@ -381,7 +389,9 @@ async def audit_and_repair_visuals(
             async def _run_one(page: Page) -> tuple[Page, Block | None, dict | None]:
                 nonlocal done_in_pass
                 reference = page.blocks[-1]
-                chapter_title, section_title, key_concept = context_map.get(reference.id, ("", "", ""))
+                chapter_title, section_title, key_concept, _ = context_map.get(
+                    reference.id, ("", "", "", "")
+                )
                 async with limiter.slot():
                     result = await _plan_and_generate_one_page(
                         page=page, document=document, template=template, images=images, ai=ai,

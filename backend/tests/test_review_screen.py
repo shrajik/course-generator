@@ -230,6 +230,25 @@ def test_the_brief_lists_advisories_a_person_should_weigh():
     assert "1 AI-generated image" in text and "Quality checks failing" in text and "must confirm" in text
 
 
+def test_the_brief_shows_an_unverified_blocker_as_a_review_item_not_a_block():
+    """Root-cause fix (visual-accuracy architecture audit): a
+    `severity == "blocker" AND verification_status == "unverified"` finding
+    (genuine, undecided uncertainty - e.g. a vision-model check that came
+    back inconclusive) must still reach the reviewer distinctly, never
+    silently approved as if it passed and never conflated with a confirmed
+    failure in `blockers`."""
+    document = _document([])
+    brief = build_review_brief(
+        document=document, audit=None, compliance=build_report(document), has_sources=False,
+        review_status="in_review",
+        quality_review_items=["Chapter 2: hallucinated label (unverified - needs a human look before you rely on it)."],
+    )
+    assert brief["ready_to_approve"] is True  # never gates approval
+    assert brief["blockers"] == []  # never conflated with a confirmed failure
+    assert any("unverified" in a and "Chapter 2" in a for a in brief["advisories"])
+    assert "deserve a look" in brief["headline"]
+
+
 def test_the_brief_says_so_when_there_is_nothing_to_check_against():
     brief = _brief(None, has_sources=False)
     assert brief["ready_to_approve"] is True and brief["stats"]["fact_checked"] is False

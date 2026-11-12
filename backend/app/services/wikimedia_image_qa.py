@@ -50,13 +50,34 @@ class WikimediaCandidateCheck(BaseModel):
     english_labels_detail: str = ""
     scientifically_accurate: bool = True
     scientifically_accurate_detail: str = ""
+    # Category A/B split (Final Implementation hardening pass): an ordinary
+    # photograph (a circuit board, a lab bench, a piece of equipment, a
+    # historical photo) carries no checkable factual claims of its own - the
+    # checks above are enough. An INFORMATION-BEARING candidate (a labelled
+    # diagram, a circuit schematic, a periodic table, an annotated
+    # illustration, a graph/chart, a formula diagram, an infographic) makes
+    # claims the SAME way an AI-generated diagram/illustration does, and
+    # must get the SAME source-grounding content check - see
+    # `visible_numeric_labels` below. Classified by this SAME vision call
+    # (one extra field), never a second, dedicated classification call.
+    information_bearing: bool = False
+    # Populated ONLY when `information_bearing` is True: every short
+    # identifier-value pair or standalone numeric/scientific claim actually
+    # baked into the image's own labels, transcribed as plain text (e.g.
+    # "Si = 14, Fe = 26" or "R1 = 10 kOhm, boiling point = 100 C"). Left
+    # blank whenever there is nothing of the kind to transcribe (including
+    # every Category A photograph) - deliberately never guessed or padded,
+    # since app.services.numeric_consistency_qa.find_identifier_value_issues/
+    # find_numeric_contradictions (run against this text, zero extra AI
+    # calls) treats an EMPTY string exactly like "no claims to check".
+    visible_numeric_labels: str = ""
     errored: bool = False
 
 
 CANDIDATE_CHECK_SYSTEM = """\
 You are a strict reviewer deciding whether a candidate image found on \
 Wikimedia Commons is suitable to use, AS IS, as an educational illustration \
-in a course. Look at the attached image and judge four things:
+in a course. Look at the attached image and judge these things:
 
 - `on_topic`: does the image's actual visual content genuinely, specifically \
 depict the stated brief - not a generic, unrelated, or merely thematically- \
@@ -75,6 +96,19 @@ nothing to check.
 - `scientifically_accurate`: so far as you can tell, is the image free of \
 obvious scientific, technical or factual errors in what it depicts or \
 labels?
+- `information_bearing`: is this an ordinary photograph (equipment, a lab \
+bench, a circuit board, a historical scene) with no checkable facts of its \
+own, or is it an INFORMATION-BEARING visual - a labelled diagram, circuit \
+schematic, periodic table, annotated illustration, graph/chart, formula \
+diagram, or infographic - that itself asserts specific facts, labels or \
+values? Mark it True only for the latter.
+- `visible_numeric_labels`: ONLY if `information_bearing` is True, \
+transcribe every short identifier-value pair or standalone numeric/ \
+scientific value actually baked into the image's own labels as plain text \
+(for example "Si = 14, Fe = 26" or "R1 = 10 kOhm, V1 = 5 V"). Leave this \
+blank for every Category A photograph, and blank if there is genuinely \
+nothing of the kind - never invent or approximate a value you cannot \
+actually read in the image.
 
 Be concrete in every detail field: name exactly what the image shows and \
 why it does or doesn't meet each bar, never a bare "could be better". If the \

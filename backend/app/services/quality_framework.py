@@ -447,6 +447,25 @@ _IMAGE_RELEVANCE_FINDING_TYPES = frozenset({"off_topic_image", "decorative_not_e
 # layer's judgment, so it gets its own source rather than falling into the
 # resolution-based legacy inference below.
 _IMAGE_WITHHELD_FINDING_TYPES = frozenset({"image_withheld_after_qa_failure"})
+# Canonical Visual Spec milestone: `contradicts_source_text`/
+# `source_grounding_unsupported` are the ONE check shared verbatim (same type
+# strings, same resolution-pairing contract) between `diagram_content_qa.
+# evaluate_content` and `ImageService._verify_image_relevance` - deliberately
+# ONE unified category across both visual-generation paths (see each
+# module's own docstring), not two independently-named checks that happen to
+# collide. Giving it its own dedicated source name here sidesteps this
+# dispatch's own stated rule exactly - "never guess source from resolution
+# alone" existed because two UNRELATED checks once collided on one string;
+# this is the opposite case, one check deliberately reused on purpose, so a
+# single shared source value is the accurate answer, not an ambiguity to
+# resolve.
+_SOURCE_GROUNDING_FINDING_TYPES = frozenset({"contradicts_source_text", "source_grounding_unsupported"})
+# `numeric_contradicts_source_text` (app.services.numeric_consistency_qa) is
+# its own dedicated, deterministic, non-LLM check - given its own source
+# value for the same reason the other dispatch entries above are, rather
+# than falling through to the resolution-based legacy inference (which
+# would mislabel it "diagram_qa", a module this check never touches).
+_NUMERIC_CONSISTENCY_FINDING_TYPES = frozenset({"numeric_contradicts_source_text"})
 
 
 def _visual_qa_source(entry_type: str, resolution: str) -> str:
@@ -460,6 +479,10 @@ def _visual_qa_source(entry_type: str, resolution: str) -> str:
         return "image_relevance_qa"
     if entry_type in _IMAGE_WITHHELD_FINDING_TYPES:
         return "image_service"
+    if entry_type in _SOURCE_GROUNDING_FINDING_TYPES:
+        return "source_grounding_qa"
+    if entry_type in _NUMERIC_CONSISTENCY_FINDING_TYPES:
+        return "numeric_consistency_qa"
     # Legacy inference, unchanged for every entry type this already covered
     # correctly: diagram_render_qa's geometry kinds ("fell_back_to_
     # illustration") and concept_qa's own reason codes ("rendered_with_
@@ -572,6 +595,24 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
             # treats as "blocker") - this deliberately mirrors that, rather
             # than defaulting to "minor", since a page missing its image
             # needs the same reviewer attention either way.
+            severity = "blocker"
+        elif resolution == "source_grounding_unsupported":
+            # Canonical Visual Spec milestone: a claim the course's own
+            # source text simply doesn't address (neither confirms nor
+            # contradicts) - genuinely different, and less certain, than a
+            # CONFIRMED contradiction (which stays in the existing
+            # `image_relevance_unverified`/`fell_back_to_illustration`
+            # buckets above, unchanged). "blocker" here is deliberate, not a
+            # mistake: combined with this entry's own `deterministic=False`
+            # (an LLM judgment call, never a proven fact - set below) ->
+            # `verification_status="unverified"`, this lands EXACTLY in
+            # `QualityReport.review_findings` (severity=="blocker" AND
+            # verification_status=="unverified") - flagged for a human
+            # reviewer, but explicitly excluded from `approval_blocking_
+            # findings` (which requires verification_status != "unverified"),
+            # so it can never silently auto-block approval on its own. The
+            # same "blocker"+"unverified" combination `review_findings`
+            # already exists to catch.
             severity = "blocker"
         elif resolution in (
             "rendered_with_unresolved_issues", "image_relevance_unverified", "formula_verification_failed",
@@ -740,6 +781,28 @@ class QualityReport(BaseModel):
             f
             for f in self.findings
             if f.severity == "blocker" and f.verification_status != "unverified"
+        ]
+
+    @property
+    def review_findings(self) -> list[QualityFinding]:
+        """Root-cause fix (visual-accuracy architecture audit): the exact
+        middle case `approval_blocking_findings` above deliberately excludes
+        - `severity == "blocker" AND verification_status == "unverified"` -
+        used to vanish entirely once excluded from that list: not a
+        confirmed pass (nothing here claims the underlying claim is true),
+        not a confirmed failure either, but genuine, undecided uncertainty a
+        human should still SEE before trusting the course - previously
+        silently treated as if it had passed, with no third outward state
+        anywhere recording that difference. This is that missing REVIEW
+        bucket: never gates approval (that contract is intentionally
+        unchanged, see `approval_blocking_findings` above), always visible
+        to a reviewer (see `app.course.review_brief.
+        quality_gate_review_items`, the review-brief surface this property
+        feeds)."""
+        return [
+            f
+            for f in self.findings
+            if f.severity == "blocker" and f.verification_status == "unverified"
         ]
 
     def by_dimension(self) -> dict[str, list[QualityFinding]]:

@@ -10,12 +10,14 @@ call count actually dropped, not just that the end result still looks right.
 
 from __future__ import annotations
 
+from app.agents.prompts import WRITER_SYSTEM
 from app.core.config import get_settings
 from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
+from app.schemas.diagram import DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS, DIAGRAM_KINDS
 from app.schemas.document import Block
 from app.services import mock_ai as mock_ai_module
-from app.services.diagram_service import DiagramService
+from app.services.diagram_service import DIAGRAM_SYSTEM, DiagramService
 from app.services.mock_ai import MockAIClient
 
 
@@ -116,3 +118,34 @@ async def test_a_clean_first_attempt_needs_no_retry_at_all(monkeypatch):
 
     assert ok is True
     assert calls["n"] == 1
+
+
+def test_every_diagram_kind_is_mentioned_in_both_model_facing_prompts():
+    """Root-cause regression guard (kind-selection drift, confirmed twice
+    this session): `WRITER_SYSTEM` (decides WHICH kind to request) and
+    `DIAGRAM_SYSTEM` (tells the spec-authoring model HOW to build one) each
+    independently, by hand, enumerate/describe the diagram kinds - nothing
+    previously stopped a newly-added kind from silently going missing from
+    one of them. Confirmed real at the time this test was written: 7 kinds
+    (`spectrum`, `iceberg`, `feedback_loop_process`, `causal_loop`,
+    `input_process_output`, `ranked_bars`, plus the dead `conceptual` alias)
+    had a full authoring bullet in `DIAGRAM_SYSTEM` but no mention at all in
+    `WRITER_SYSTEM` - meaning the model that decides which kind to request
+    could never have picked them. `DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS` is
+    the reviewed, explained list of kinds that legitimately never need a
+    mention (a dead alias; a kind authored through an entirely separate
+    pipeline) - a future exception must be added there, with a reason, not
+    silently skipped here."""
+    for kind in DIAGRAM_KINDS:
+        if kind in DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS:
+            continue
+        assert kind in WRITER_SYSTEM, (
+            f"'{kind}' is in DIAGRAM_KINDS but WRITER_SYSTEM never mentions it - the writer "
+            "model can never request this kind. Add a `diagram_kind: {kind}` bullet to "
+            "WRITER_SYSTEM, or add it to DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS with a reason."
+        )
+        assert kind in DIAGRAM_SYSTEM, (
+            f"'{kind}' is in DIAGRAM_KINDS but DIAGRAM_SYSTEM never mentions it - the "
+            "spec-authoring model has no idea how to build one. Add an authoring bullet to "
+            "DIAGRAM_SYSTEM, or add it to DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS with a reason."
+        )

@@ -17,7 +17,7 @@ import pytest
 from app.course.templates.registry import load_template
 from app.render.diagram_renderer import render_diagram_svg
 from app.schemas.diagram import DiagramEdge, DiagramNode, DiagramSpec
-from app.services.diagram_render_qa import _node_boxes, validate_rendered_svg
+from app.services.diagram_render_qa import _node_boxes, label_overlaps_node_issues, validate_rendered_svg
 
 THEME = load_template("technical").theme
 
@@ -455,13 +455,22 @@ def test_a_five_spoke_concept_map_with_long_labels_renders_clean():
     This is also exactly the ceiling the new design brief itself asks
     for ("don't make more than ~6 nodes; split into multiple diagrams
     instead") - not an arbitrary number chosen just to make this pass.
+
+    Labels are short topical phrases, not full sentences - every real
+    concept_map this session actually produced (quantum numbers, course
+    assessment structure, Zeff/I1/EA relationships) names a satellite with
+    a short noun phrase, never a 40+ character sentence; a prior version
+    of this fixture used full sentences on all 5 satellites at once, which
+    is what a real writer agent's own authoring guidance already asks it
+    not to do - this test's own purpose is the NODE-COUNT ceiling (5 vs 8),
+    not a label-length stress test, so it should reflect realistic content.
     """
     labels = [
-        "Greenhouse gas emissions from fossil fuels",
-        "Rising sea levels threaten coastal cities",
-        "Extreme weather events increase in frequency",
-        "Deforestation reduces carbon absorption capacity",
-        "Ocean acidification harms marine ecosystems",
+        "Greenhouse gases",
+        "Sea level rise",
+        "Extreme weather",
+        "Deforestation",
+        "Ocean acidity",
     ]
     nodes = [DiagramNode(id="c", label="Climate Change", level=0)]
     edges = []
@@ -474,6 +483,79 @@ def test_a_five_spoke_concept_map_with_long_labels_renders_clean():
     # RING_LABEL_SIZE (concept_map's own, smaller wheel-node font size) and
     # not LABEL_SIZE, the unrelated box-renderer constant it would
     # otherwise fall back to - see validate_rendered_svg's own docstring.
+    assert validate_rendered_svg(_render(spec), kind="concept_map") == []
+
+
+def test_a_label_pill_forced_onto_a_real_node_circle_is_caught():
+    """Root-cause fix (production course audit): nothing in this file ever
+    checked whether a label's own drawn pill overlaps a NODE shape - a real
+    concept_map shipped with a relationship label sitting almost entirely on
+    top of its target circle's own text, and `validate_rendered_svg`
+    returned a clean `[]` on it (confirmed directly against that exact
+    diagram, before this check existed). Hand-crafted here the same way the
+    file's other known-violation fixtures are (see `test_two_overlapping_
+    node_boxes_are_caught` above) - a real node circle, then a label pill
+    forced squarely on top of it - not relying on any particular layout
+    function happening to reproduce the bug."""
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[DiagramNode(id="c", label="Centre", level=0), DiagramNode(id="a", label="A", level=1)],
+        edges=[DiagramEdge(source="a", target="c", label="x")],
+    )
+    svg_bytes = _render(spec)
+    root = ET.fromstring(svg_bytes)
+    circle = root.find(".//{http://www.w3.org/2000/svg}circle")
+    cx, cy = float(circle.get("cx")), float(circle.get("cy"))
+    forced = svg_bytes.decode("utf-8").replace(
+        "</svg>",
+        f'<rect class="diagram-edge-label" x="{cx - 20:.1f}" y="{cy - 10:.1f}" width="40" height="20"/></svg>',
+    )
+    root2 = ET.fromstring(forced.encode("utf-8"))
+    assert label_overlaps_node_issues(root2) != []
+    # A label nowhere near any shape must never be flagged - this is an
+    # overlap check, not a blanket "any edge label exists" trip-wire.
+    far = svg_bytes.decode("utf-8").replace(
+        "</svg>", '<rect class="diagram-edge-label" x="5000" y="5000" width="40" height="20"/></svg>'
+    )
+    assert label_overlaps_node_issues(ET.fromstring(far.encode("utf-8"))) == []
+
+
+def test_convergent_satellite_edges_sharing_a_target_render_clean():
+    """Root-cause fix (production course audit, doc_49ee6e2b31c4): 2 of 5
+    real concept_map diagrams had several satellite-to-satellite edges
+    converging on the SAME one or two targets - e.g. "Shells"/"Anomalies"
+    both relating to BOTH "I1" and "EA" (this exact shape); separately,
+    "orbital_4s"/"orbital_3d" both modifying "orbital_baseline". Confirmed
+    by direct render: the shared-target labels landed on top of each other
+    and on top of the target circle's own text, while `validate_rendered_
+    svg` still returned a clean `[]` (no check existed for a label
+    overlapping a node - see `label_overlaps_node_issues` above, and no
+    check compared label positions against each OTHER's real bounding
+    boxes either). Fixed in `_layout_concept_wheel` by explicitly fanning
+    out a hub node's converging edges' bulge angles apart BY CONSTRUCTION
+    (before the existing collision-retry loop even runs), with the retry
+    loop's own angle (not just distance) now also varied as a secondary
+    safety net."""
+    nodes = [
+        DiagramNode(id="zeff", label="Zeff", level=0),
+        DiagramNode(id="z", label="Z", level=1),
+        DiagramNode(id="screening", label="Screening", level=1),
+        DiagramNode(id="shells", label="Shells", level=1),
+        DiagramNode(id="i1", label="I1", level=1),
+        DiagramNode(id="ea", label="EA", level=1),
+        DiagramNode(id="anomalies", label="Anomalies", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="z", target="zeff", label="increases"),
+        DiagramEdge(source="screening", target="zeff", label="reduces"),
+        DiagramEdge(source="zeff", target="i1", label="increases"),
+        DiagramEdge(source="zeff", target="ea", label="increases"),
+        DiagramEdge(source="shells", target="i1", label="depends on n, l; penetration & occupancy"),
+        DiagramEdge(source="shells", target="ea", label="depends on n, l; penetration & occupancy"),
+        DiagramEdge(source="anomalies", target="i1", label="local deviations: subshell filling"),
+        DiagramEdge(source="anomalies", target="ea", label="local deviations: subshell filling"),
+    ]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
     assert validate_rendered_svg(_render(spec), kind="concept_map") == []
 
 

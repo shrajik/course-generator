@@ -9,7 +9,7 @@ from app.course.document.layout import (
     MAX_DIAGRAM_IMAGE_HEIGHT,
     MAX_IMAGE_HEIGHT,
     MISSING_IMAGE_BOX_HEIGHT,
-    _NEAR_FIT_TOLERANCE,
+    NEAR_FIT_TOLERANCE,
     estimate_height,
     flow_blocks,
     image_box_height,
@@ -89,15 +89,15 @@ def test_blocks_flow_onto_a_single_page_when_they_fit():
 
 def test_long_content_paginates():
     """The `+ 1` was the old exact-fit tolerance (float rounding only); a
-    block may now legitimately land up to `_NEAR_FIT_TOLERANCE` past the
+    block may now legitimately land up to `NEAR_FIT_TOLERANCE` past the
     nominal content bottom - a deliberate, footer-verified-safe allowance
-    (see _NEAR_FIT_TOLERANCE's own docstring) that stops a near-miss
+    (see NEAR_FIT_TOLERANCE's own docstring) that stops a near-miss
     estimate from forfeiting an entire page's worth of real estate."""
     pages = flow_blocks([_paragraph(60) for _ in range(20)])
     assert len(pages) > 1
     for page in pages:
         last = page[-1]
-        assert last.layout.y + last.layout.height <= PAGE_MARGIN_TOP + CONTENT_HEIGHT + _NEAR_FIT_TOLERANCE + 1
+        assert last.layout.y + last.layout.height <= PAGE_MARGIN_TOP + CONTENT_HEIGHT + NEAR_FIT_TOLERANCE + 1
 
 
 def test_no_blocks_overlap_within_a_page():
@@ -487,7 +487,7 @@ def test_visual_run_height_matches_the_naive_sum_when_theres_no_pairing():
 
 def test_near_fit_tolerance_lets_a_small_miss_place_on_the_current_page(monkeypatch):
     """Direct test of the tolerance mechanism itself (see
-    _NEAR_FIT_TOLERANCE's own docstring), via a patched `estimate_height`
+    NEAR_FIT_TOLERANCE's own docstring), via a patched `estimate_height`
     so the second block's "needed" height is a precise, controlled few
     pixels over what's left - real paragraph text wraps in whole-line
     jumps far coarser than the tolerance window, so this is the reliable
@@ -497,9 +497,9 @@ def test_near_fit_tolerance_lets_a_small_miss_place_on_the_current_page(monkeypa
     import app.course.document.layout as layout_module
 
     filler, second = _paragraph(1), _paragraph(1)
-    remaining_after_filler = 10.0  # arbitrary, well inside (0, _NEAR_FIT_TOLERANCE)
+    remaining_after_filler = 10.0  # arbitrary, well inside (0, NEAR_FIT_TOLERANCE)
     filler_height = CONTENT_HEIGHT - BLOCK_GAP - remaining_after_filler
-    second_height = remaining_after_filler + (layout_module._NEAR_FIT_TOLERANCE - 5.0)  # misses, but within tolerance
+    second_height = remaining_after_filler + (layout_module.NEAR_FIT_TOLERANCE - 5.0)  # misses, but within tolerance
     real_estimate = layout_module.estimate_height
 
     def fake(block: Block) -> float:
@@ -516,7 +516,7 @@ def test_near_fit_tolerance_lets_a_small_miss_place_on_the_current_page(monkeypa
 
 def test_near_fit_tolerance_still_breaks_for_a_miss_beyond_it(monkeypatch):
     """The other half of the same contract: the tolerance is bounded, not
-    unlimited (see _NEAR_FIT_TOLERANCE's own footer-gap derivation) - a
+    unlimited (see NEAR_FIT_TOLERANCE's own footer-gap derivation) - a
     miss larger than it must still move the block to a fresh page, exactly
     as before this fix."""
     import app.course.document.layout as layout_module
@@ -524,7 +524,7 @@ def test_near_fit_tolerance_still_breaks_for_a_miss_beyond_it(monkeypatch):
     filler, second = _paragraph(1), _paragraph(1)
     remaining_after_filler = 10.0
     filler_height = CONTENT_HEIGHT - BLOCK_GAP - remaining_after_filler
-    second_height = remaining_after_filler + (layout_module._NEAR_FIT_TOLERANCE + 5.0)  # misses BEYOND tolerance
+    second_height = remaining_after_filler + (layout_module.NEAR_FIT_TOLERANCE + 5.0)  # misses BEYOND tolerance
     real_estimate = layout_module.estimate_height
 
     def fake(block: Block) -> float:

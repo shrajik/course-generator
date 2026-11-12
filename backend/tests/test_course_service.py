@@ -231,6 +231,7 @@ async def test_per_image_save_during_generation_never_persists_overlapping_block
 
     from PIL import Image
 
+    from app.course.document.layout import NEAR_FIT_TOLERANCE
     from app.course.document.layout_validator import page_overflow
 
     record = await service.create_course(technical_input)
@@ -326,7 +327,15 @@ async def test_per_image_save_during_generation_never_persists_overlapping_block
     for snapshot in saved_snapshots:
         for page in snapshot.pages:
             overflow = page_overflow(page)
-            assert overflow <= 2.0, (
+            # NEAR_FIT_TOLERANCE, not a stricter hardcoded number: a block
+            # landing up to NEAR_FIT_TOLERANCE past a page's own nominal
+            # boundary is exactly what flow_blocks's own placement check
+            # already decided was safe (see that constant's own docstring
+            # in layout.py) - not the "overlapping blocks" bug this test is
+            # actually about. A real block genuinely overlapping another is
+            # caught by layout_validator.overlapping_pairs's own strict 2px
+            # check instead, unaffected by this.
+            assert overflow <= NEAR_FIT_TOLERANCE, (
                 f"page {page.page_number} had overlapping blocks "
                 f"(overflow={overflow:.1f}px) in a document saved mid-generation"
             )

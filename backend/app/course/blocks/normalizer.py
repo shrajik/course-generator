@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.core.ids import block_id as new_block_id
@@ -14,6 +15,39 @@ from app.schemas.template import CourseTemplate
 
 log = get_logger(__name__)
 
+# Defense-in-depth (real, confirmed production case): a course generated
+# against an uploaded "Kids Course Template" shipped "SME VERIFICATION"
+# callouts carrying bracket tags like "[G2.1]" scattered through learner-
+# facing pages. The real, defined citation system (see app.course.fact_
+# check's own `_REF_TOKEN_RE = re.compile(r"[SG]\d+\.\d+")`) technically
+# recognises a "G" prefix shape alongside the genuinely-wired-up "S" prefix
+# (an `[S1.3]`-style reference to an uploaded source excerpt, resolved
+# against a real `SourceLibrary` passage) - but nowhere in this codebase is
+# a "G" reference ever POPULATED with real backing content (no registry, no
+# grounding step comparable to source-excerpt retrieval). A thorough search
+# turned up no legitimate producer of a "G" tag at all, which means every
+# "[G...]" token actually seen in output is the writer model independently
+# inventing a citation-shaped tag (echoing the `[S1.3]` convention it WAS
+# taught, applied to the course's own "every claim needs SME sign-off"
+# brief) with nothing behind it - never a real, resolvable reference the
+# way an `[S...]` tag is. Stripped here, at the single chokepoint every
+# draft block's free text passes through before becoming persisted content,
+# rather than taught as a new rule to the writer (a prompt instruction is
+# not a guarantee - this is the enforcement backstop). `[S...]` tags are
+# deliberately left completely untouched: they are the real, working
+# citation mechanism and must survive to reach the editor's citation UI.
+_FAKE_CITATION_TAG_RE = re.compile(r"\[G\d+(?:\.\d+)?\]")
+
+
+def _strip_fake_citation_tags(value: Any) -> Any:
+    if isinstance(value, str):
+        return _FAKE_CITATION_TAG_RE.sub("", value)
+    if isinstance(value, list):
+        return [_strip_fake_citation_tags(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _strip_fake_citation_tags(item) for key, item in value.items()}
+    return value
+
 
 def _first(*values: str) -> str:
     for value in values:
@@ -23,7 +57,14 @@ def _first(*values: str) -> str:
 
 
 def draft_to_content(draft: DraftBlock) -> dict[str, Any]:
-    """Map the superset draft fields onto the content model for its type."""
+    """Map the superset draft fields onto the content model for its type.
+
+    Every returned value passes through `_strip_fake_citation_tags` before
+    reaching the caller - see that function's own comment for why."""
+    return _strip_fake_citation_tags(_draft_to_content(draft))
+
+
+def _draft_to_content(draft: DraftBlock) -> dict[str, Any]:
     t = draft.type
 
     if t is BlockType.HEADING:

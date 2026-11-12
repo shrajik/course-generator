@@ -61,6 +61,28 @@ def quality_gate_blockers(inventory_issues: Sequence[Any], blocking_findings: Se
     return reasons
 
 
+def quality_gate_review_items(review_findings: Sequence[Any]) -> list[str]:
+    """Root-cause fix (visual-accuracy architecture audit): a `severity ==
+    "blocker" AND verification_status == "unverified"` finding - genuine,
+    undecided uncertainty a reviewer-model opinion raised that nothing has
+    independently confirmed OR disproved - never blocks approval (see
+    `QualityReport.approval_blocking_findings`'s own docstring, unchanged),
+    but it must not vanish from the reviewer's view either, the way it
+    silently did before this existed. Phrased for the SAME `advisories` list
+    `build_review_brief` already shows for its own "a person must confirm"
+    QA-check items below, not for `blockers` - this never gates approval."""
+    items: list[str] = []
+    for finding in review_findings:
+        what = str(getattr(finding, "reason", "") or "").replace("_", " ")
+        detail = str(getattr(finding, "description", "") or "")
+        items.append(
+            f"{_where(str(getattr(finding, 'artifact', '')))}: {what}"
+            + (f" - {detail}" if detail else "")
+            + " (unverified - needs a human look before you rely on it)."
+        )
+    return items
+
+
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
@@ -73,9 +95,10 @@ def build_review_brief(
     has_sources: bool,
     review_status: str,
     quality_blockers: Sequence[str] = (),
+    quality_review_items: Sequence[str] = (),
 ) -> dict[str, Any]:
     blockers = [*quality_blockers, *approval_blockers(has_sources=has_sources, audit=audit)]
-    advisories: list[str] = []
+    advisories: list[str] = [*quality_review_items]
 
     open_findings = [f for f in (audit.findings if audit else []) if f.status == "open"]
     medium = sum(1 for f in open_findings if f.severity == "medium")
@@ -119,7 +142,7 @@ def build_review_brief(
         headline = blockers[0]
     elif review_status == "approved":
         headline = "This course has been approved."
-    elif medium or failed:
+    elif medium or failed or quality_review_items:
         headline = "No blocking issues, but some statements and checks still deserve a look before approving."
     else:
         headline = "Nothing is blocking final approval."

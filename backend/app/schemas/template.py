@@ -130,6 +130,18 @@ class CourseTemplate(BaseModel):
     kind: str  # technical | non_technical
     name: str
     description: str = ""
+    # The audience this template's own uploaded document states it is FOR
+    # (e.g. "Children aged 6 to 11 (Class 1 to 5)") - extracted verbatim
+    # from a labelled table row ("Audience | ...") when the uploaded file
+    # states one, blank otherwise (every built-in template, and most
+    # uploaded ones). Never guessed or inferred - see `build_template`'s own
+    # extraction for why this is deliberately conservative. Used only to let
+    # `CourseService.create_course` catch a real, confirmed production
+    # failure: a course's own `target_audience` ("advanced researchers")
+    # created against a template whose own document says it is for
+    # "Children aged 6 to 11" - nothing caught that contradiction before
+    # this field existed, because there was nowhere to even compare against.
+    audience: str = ""
     sections: list[TemplateSection] = Field(default_factory=list)
     allowed_block_types: list[BlockType] = Field(default_factory=list)
     required_block_types: list[BlockType] = Field(default_factory=list)

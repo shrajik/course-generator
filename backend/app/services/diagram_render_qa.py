@@ -46,6 +46,7 @@ from app.render.diagram_renderer import (
     _ORG_CHART_LABEL_SIZE,
     _PETAL_LABEL_SIZE,
     _PIE_LABEL_SIZE,
+    _PT_SYMBOL_SIZE,
     _PROGRESS_RING_LABEL_SIZE,
     _PUZZLE_LABEL_SIZE,
     _RANKED_BAR_LABEL_SIZE,
@@ -625,6 +626,98 @@ _ARROWHEAD_SIDE_TOLERANCE = 6.0
 _DUPLICATE_LANDING_TOLERANCE = 20.0
 
 
+def label_overlaps_node_issues(root: ET.Element) -> list[RenderQAIssue]:
+    """A text label's own drawn pill (`class="diagram-edge-label"`, the rect
+    `app.render.diagram_renderer._edge_label` draws for a concept_map/wheel-
+    style edge relationship) sitting on top of a NODE shape it isn't
+    actually naming.
+
+    Root-cause fix (production course audit): a real course's concept_map
+    had several satellite-to-satellite edges converging on the same target
+    (e.g. "Shells"/"Anomalies" both relating to BOTH "I1" and "EA") - the
+    in-process layout retry (`_layout_concept_wheel`'s own `_curve_clears_
+    nodes`/`_label_collides`) only checked the thin CURVE path and other
+    LABELS' positions, never whether the much wider label PILL itself
+    overlapped an uninvolved node's circle, so a label ended up sitting
+    almost entirely on top of a target circle's own text - and this file
+    had no check that would ever have caught it: `validate_rendered_svg`
+    returned a clean `[]` on that exact diagram. This closes that gap as an
+    independent, final verification pass (the layout retry loop's own
+    avoidance logic is a best-effort first line of defence, not proof).
+
+    Uses the same circle-aware containment reasoning `_point_in_shape`
+    already established (a circle's axis-aligned bounding SQUARE is a bad
+    stand-in for its real shape - a label could sit well outside the
+    circle while still falling inside that square) via a closest-point-on-
+    rect-to-circle-centre test, not a naive bbox-vs-bbox overlap, for a
+    circle node; a plain bbox overlap otherwise, matching `_boxes_overlap`'s
+    existing convention for every other shape kind this file already
+    understands."""
+    issues: list[RenderQAIssue] = []
+    labels = [el for el in root.iter() if "diagram-edge-label" in (el.get("class") or "").split()]
+    if not labels:
+        return issues
+    shapes = _node_shapes(root)
+    for label_el in labels:
+        lx, ly = _f(label_el, "x"), _f(label_el, "y")
+        lw, lh = _f(label_el, "width"), _f(label_el, "height")
+        label_box = (lx, ly, lx + lw, ly + lh)
+        for shape in shapes:
+            if _local(shape.tag) == "circle":
+                cx, cy, r = _f(shape, "cx"), _f(shape, "cy"), _f(shape, "r")
+                closest_x = min(max(cx, label_box[0]), label_box[2])
+                closest_y = min(max(cy, label_box[1]), label_box[3])
+                if _distance((cx, cy), (closest_x, closest_y)) < r - _NODE_INSET:
+                    issues.append(RenderQAIssue(
+                        "label_overlaps_node",
+                        f"edge label {tuple(round(v, 1) for v in label_box)} overlaps circle "
+                        f"(cx={cx:.1f}, cy={cy:.1f}, r={r:.1f})",
+                    ))
+                    break
+            else:
+                box = _shape_bbox(shape)
+                if box is not None and _boxes_overlap(label_box, box):
+                    issues.append(RenderQAIssue(
+                        "label_overlaps_node",
+                        f"edge label {tuple(round(v, 1) for v in label_box)} overlaps node {box}",
+                    ))
+                    break
+    return issues
+
+
+def label_overlaps_label_issues(root: ET.Element) -> list[RenderQAIssue]:
+    """Two edge-relationship label pills (`class="diagram-edge-label"`)
+    sitting on top of EACH OTHER - a different defect from `label_overlaps_
+    node_issues` just above (a label vs. a node circle), confirmed as its
+    own, separately-occurring gap: a real course's concept_map had several
+    edges converging on the same hub get long enough labels that the
+    in-process layout retry's `_label_collides` check (a cheap midpoint-
+    distance estimate, used only to decide whether to keep growing a
+    curve's bulge) exhausted its bounded attempts without finding a fully
+    clear position and shipped its best, still-overlapping attempt - and,
+    exactly like the node-overlap gap this file already closed once,
+    nothing here ever verified the two PILLS' own real rectangles against
+    each other afterward as an independent, final check. Plain bbox overlap
+    is correct here (unlike the circle case above) - a label pill is always
+    an axis-aligned rect, never a circle."""
+    issues: list[RenderQAIssue] = []
+    labels = [el for el in root.iter() if "diagram-edge-label" in (el.get("class") or "").split()]
+    boxes = []
+    for label_el in labels:
+        lx, ly = _f(label_el, "x"), _f(label_el, "y")
+        lw, lh = _f(label_el, "width"), _f(label_el, "height")
+        boxes.append((lx, ly, lx + lw, ly + lh))
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if _boxes_overlap(boxes[i], boxes[j]):
+                issues.append(RenderQAIssue(
+                    "label_overlaps_label",
+                    f"edge label {tuple(round(v, 1) for v in boxes[i])} overlaps "
+                    f"edge label {tuple(round(v, 1) for v in boxes[j])}",
+                ))
+    return issues
+
+
 def duplicate_arrowhead_issues(root: ET.Element) -> list[RenderQAIssue]:
     """Two arrows landing on (nearly) the same spot on the same node side
     are visually indistinguishable, reading as a single ambiguous
@@ -688,6 +781,8 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
       `occupancy_issues`),
     - two different edges running along the same segment (see
       `shared_segment_issues`),
+    - an edge's own relationship-label pill sitting on top of a node circle
+      or box it isn't naming (see `label_overlaps_node_issues`),
     - an edge running collinear with an unrelated node's border (see
       `border_collinear_issues`),
     - a node side receiving more than one arrowhead (see
@@ -798,6 +893,8 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
         label_base_size = _RANKED_BAR_LABEL_SIZE
     elif kind == "circuit_schematic":
         label_base_size = _CIRCUIT_LABEL_SIZE
+    elif kind == "periodic_table":
+        label_base_size = _PT_SYMBOL_SIZE
     else:
         # iceberg/feedback_loop_process/input_process_output all draw
         # their node content through `_node_block` at LABEL_SIZE, same as
@@ -808,6 +905,16 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
         *readability_issues(canvas_w, base_font_size=label_base_size),
         *occupancy_issues(root, canvas_w, canvas_h),
         *shared_segment_issues(root),
+        # Gated to the wheel-style kinds this fix actually targeted and
+        # verified (concept_map/conceptual) - a broader rollout surfaced a
+        # genuine but entirely unrelated, unverified pre-existing overlap
+        # in `feedback_loop_process`'s long-label backward edge, out of
+        # this fix's own scope to investigate or fix; narrowing here avoids
+        # turning on a new failure for a kind nobody has checked against it
+        # yet, same reasoning several of this function's other per-kind
+        # exemptions below already use.
+        *(label_overlaps_node_issues(root) if kind in ("concept_map", "conceptual") else []),
+        *(label_overlaps_label_issues(root) if kind in ("concept_map", "conceptual") else []),
         # Same reasoning as the edge_crosses_node exemption just below:
         # gantt_chart's tick gridlines are DESIGNED to run collinear with
         # (behind) every task bar in their column - that's the standard

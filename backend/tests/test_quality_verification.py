@@ -611,6 +611,98 @@ def test_an_image_relevance_failure_is_attributed_to_image_relevance_qa_and_is_m
     assert findings[0].verifier is None
 
 
+def test_a_source_grounding_unsupported_finding_lands_in_review_not_approval_blocking():
+    """Canonical Visual Spec milestone: a claim the course's own source
+    excerpt simply doesn't address (neither confirms nor contradicts) must
+    be severity="blocker" + `deterministic=False` -> `verification_status=
+    "unverified"` - exactly the combination `QualityReport.review_findings`
+    exists to catch (flagged for a human reviewer) while being explicitly
+    EXCLUDED from `approval_blocking_findings` (which requires
+    verification_status != "unverified"), so it can never silently auto-
+    block approval on its own. Shared verbatim between the raster
+    (ImageService._verify_image_relevance) and structured-diagram
+    (diagram_content_qa.evaluate_content) paths - this fixture could come
+    from either, `source` is deliberately their own shared name rather than
+    a guess at which one it was."""
+    document = _document(
+        [
+            _image_block(
+                kind="illustration",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "source_grounding_unsupported",
+                        "detail": "The course's own text doesn't address: the valve is rated for 300 PSI",
+                        "resolution": "source_grounding_unsupported",
+                        "deterministic": False,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "source_grounding_qa"
+    assert findings[0].severity == "blocker"
+    assert findings[0].verification_status == "unverified"
+    assert findings[0].verifier is None
+
+    report = QualityReport(course_id="c1", findings=findings)
+    assert report.approval_blocking_findings == []  # never silently auto-blocks on its own
+    assert len(report.review_findings) == 1  # but never silently invisible either
+
+
+def test_a_confirmed_source_text_contradiction_is_attributed_to_source_grounding_qa():
+    """The CONFIRMED-contradiction counterpart (never withheld via this
+    resolution directly on the diagram side - see diagram_service.py's own
+    `garbled_types` set, which instead reuses `fell_back_to_illustration` -
+    but shares the same dedicated `source` attribution either way)."""
+    document = _document(
+        [
+            _image_block(
+                kind="illustration",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "contradicts_source_text",
+                        "detail": "Image depicts the valve open; the text says it stays closed.",
+                        "resolution": "image_relevance_unverified",
+                        "deterministic": False,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "source_grounding_qa"
+    assert findings[0].severity == "major"  # same bucket every other relevance finding uses, unchanged
+
+
+def test_a_numeric_contradiction_finding_is_attributed_to_numeric_consistency_qa():
+    document = _document(
+        [
+            _image_block(
+                kind="diagram",
+                generated=True,
+                error=None,
+                visual_qa_findings=[
+                    {
+                        "type": "numeric_contradicts_source_text",
+                        "detail": 'This visual states "75%", but the course\'s own text states "25%".',
+                        "resolution": "fell_back_to_illustration",
+                        "deterministic": True,
+                    }
+                ],
+            )
+        ]
+    )
+    findings = visual_findings(document)
+    assert findings[0].source == "numeric_consistency_qa"
+    assert findings[0].verification_status == "independently_verified"
+    assert findings[0].verifier == "numeric_consistency_qa:numeric_contradicts_source_text"
+
+
 def test_visual_finding_derivation_failure_is_isolated_to_that_block(monkeypatch):
     def _boom(artifact, content):
         raise RuntimeError("malformed image content")

@@ -83,13 +83,65 @@ DIAGRAM_KINDS = (
     # (which terminals are actually tied to which node), not a sequence. See
     # its own comment below RELATIONSHIP_KINDS.
     "circuit_schematic",
+    # periodic_table: the real, fixed 118-element grid (app.render.
+    # periodic_table_data) - a REFERENCE, not a structure or a sequence the
+    # model authors at all (same reasoning `toc` is never AI-authored -
+    # app.course.document.builder's TOC page - applied here: a periodic
+    # table has exactly one scientifically correct layout, so the model
+    # only ever supplies WHICH cells to highlight/annotate via `nodes`,
+    # never the grid itself). Root-cause fix (production course audit): two
+    # real courses generated a periodic table as a raster `illustration`
+    # instead, and the image model fabricated plausible-looking but
+    # chemically WRONG pictures - duplicated element symbols, duplicated/
+    # wrong group numbers - which no existing check caught (text-legibility
+    # and topical-relevance QA, not scientific-correctness QA). Joins
+    # neither SEQUENTIAL_KINDS nor RELATIONSHIP_KINDS below, same reasoning
+    # "graph" already documents - it's a third family, not a sequence or an
+    # arbitrary labelled-relationship network.
+    "periodic_table",
 )
+
+# Root-cause fix (kind-selection drift, confirmed twice this session: a
+# newly-added kind silently missing its own mention in one of the two
+# model-facing prompts that need to know about it - `app.agents.prompts.
+# WRITER_SYSTEM`, which decides WHICH kind to request, and
+# `app.services.diagram_service.DIAGRAM_SYSTEM`, which tells the
+# spec-authoring model HOW to actually build one). A real, confirmed case
+# when this registry was introduced: 7 kinds (`conceptual`, `spectrum`,
+# `iceberg`, `feedback_loop_process`, `causal_loop`, `input_process_output`,
+# `ranked_bars`) had a full authoring bullet in `DIAGRAM_SYSTEM` but were
+# NEVER mentioned in `WRITER_SYSTEM` at all - meaning the model that decides
+# which kind to request could never have picked them, regardless of how
+# well `DIAGRAM_SYSTEM` would have handled one. `test_diagram_service.py`'s
+# drift-guard test asserts every kind in `DIAGRAM_KINDS` is mentioned by
+# name in BOTH prompt strings, with exactly the two deliberate, documented
+# exceptions below - not a loophole, a reviewed list, so a future exception
+# has to be added here explicitly (and explain why) rather than the test
+# just silently stop checking a kind.
+DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS = {
+    # A pre-existing alias for `concept_map` (identical renderer/dispatch -
+    # see `_layout_concept_wheel`'s own `kind in ("concept_map",
+    # "conceptual")` dispatch) kept only so a document saved under the old
+    # name still renders - never something new content should be authored
+    # as, so neither prompt ever needs to tell a model to pick it.
+    "conceptual",
+    # Not authored through this file's `diagram_kind` pipeline at all -
+    # `image_kind: concept_experience` is a separate, purpose-built system
+    # (`app.services.concept_visual_service`) for one nameable technical
+    # concept (a class/object, a data structure, a protocol handshake);
+    # `WRITER_SYSTEM` tells the model to pick it explicitly BEFORE it would
+    # ever reach `diagram_kind`/`DIAGRAM_SYSTEM`, so `DIAGRAM_SYSTEM` itself
+    # never needs its own mention of it.
+    "concept_experience",
+}
 
 # "graph" is its own, third family - neither a sequence nor a labelled-box
 # relationship, so it deliberately joins neither SEQUENTIAL_KINDS nor
 # RELATIONSHIP_KINDS below. _kind_conflicts (app.services.diagram_service)
 # only ever flags a conflict for a hint that IS in one of those two tuples,
 # so leaving "graph" out of both is what keeps it safely inert there.
+# periodic_table joins neither for the same reason - see its own comment in
+# DIAGRAM_KINDS above.
 
 # Kinds that show a SEQUENCE (steps happen in this order) - as opposed to
 # concept_map, which shows a STRUCTURE (things and how they relate, with no
@@ -368,6 +420,17 @@ class DiagramNode(BaseModel):
     # stroke pair - "" (default, or anything that doesn't parse as a real
     # hex colour) keeps the existing fixed _FLOW_ROLE_COLORS palette exactly
     # as it was before this field existed.
+    # periodic_table: an optional "#rrggbb"/"#rgb" highlight fill for ONE
+    # real element's cell, identified by `id` (its symbol, e.g. "Na" -
+    # case-insensitive, matched against app.render.periodic_table_data's
+    # real dataset; an id that isn't a real element symbol is simply
+    # ignored, never an error). `label` is unused (the cell already shows
+    # the real symbol); `detail`, if set, is this highlight's one-line
+    # reason, shown in a small legend below the grid. A periodic_table spec
+    # with NO nodes at all still draws the complete, correct, unhighlighted
+    # grid - highlighting is purely optional annotation, never what makes
+    # the table usable (see DiagramSpec.is_usable's own periodic_table
+    # case).
     color: str = ""
     # gantt_chart only: this task's own bar, in whatever time unit the
     # brief uses (day/week/sprint number - never a literal calendar date,
@@ -993,6 +1056,14 @@ class DiagramSpec(BaseModel):
                     return False
                 return all(len(s.values) == len(self.categories) for s in self.series)
             return False
+
+        if kind == "periodic_table":
+            # The grid itself is the real, fixed 118-element dataset (see
+            # DIAGRAM_KINDS' own comment above) - never authored by the
+            # model - so unlike every other kind checked below, an empty
+            # `nodes` list (no highlights/annotations requested) is still a
+            # perfectly usable, complete request, not a degenerate one.
+            return True
 
         labelled = [n for n in self.nodes if n.label.strip()]
         # See max_nodes_for: er_diagram's node count includes attributes,

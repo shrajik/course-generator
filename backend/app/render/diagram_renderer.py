@@ -686,6 +686,30 @@ EDGE_LABEL_MAX_WIDTH = 200.0
 EDGE_LABEL_LINE_GAP = 14.0  # vertical distance between wrapped lines
 
 
+def _edge_label_pill_width(text: str, *, max_width: float = EDGE_LABEL_MAX_WIDTH) -> float:
+    """The real pixel width `_edge_label` will draw this exact text's pill
+    at - extracted so a caller can reserve layout space based on what a
+    label ACTUALLY needs (a real, confirmed case: `_layout_concept_wheel`
+    reserving a flat worst-case gap on every spoke, regardless of that
+    diagram's own label lengths, pushed several ordinary short-label
+    diagrams' canvases wide enough to fail the readability floor that a
+    tighter, label-driven gap would have cleared easily). Returns 0.0 for
+    blank text - the same "nothing to draw" contract `_edge_label` itself
+    uses, so a caller can tell "no label, use the plain default gap" from
+    "a real but short label, a small gap suffices" without duplicating
+    this function's own blank-check."""
+    text = text.strip()
+    if not text:
+        return 0.0
+    font_size = _scaled_font_size(EDGE_LABEL_FONT_SIZE)
+    inner_w = max_width - 16.0
+    lines = _wrap(text, font_size=font_size, width=inner_w, max_lines=2)
+    if not lines:
+        return 0.0
+    longest = max(len(line) for line in lines)
+    return min(max(longest * font_size * _SANS_RATIO + 14, 40.0), max_width)
+
+
 def _edge_label(x: float, y: float, text: str, theme: TemplateTheme, *, max_width: float = EDGE_LABEL_MAX_WIDTH) -> str:
     """A small pill sitting on an edge, naming the relationship it
     represents. Wraps to at most 2 lines instead of overflowing its pill -
@@ -701,7 +725,6 @@ def _edge_label(x: float, y: float, text: str, theme: TemplateTheme, *, max_widt
     lines = _wrap(text, font_size=font_size, width=inner_w, max_lines=2)
     if not lines:
         return ""
-    longest = max(len(line) for line in lines)
     # Same calibration _wrap already uses for every node box (confirmed
     # against real browser rendering - see _wrap's own docstring), not an
     # independent estimate: a mismatched ratio here left label pills ~27%
@@ -709,7 +732,7 @@ def _edge_label(x: float, y: float, text: str, theme: TemplateTheme, *, max_widt
     # got clipped by whichever node box painted over it afterward (a real,
     # confirmed case: "Charge <-> Queue item" rendered as "harge <-> Queue
     # item" in an exported PDF).
-    width = min(max(longest * font_size * _SANS_RATIO + 14, 40.0), max_width)
+    width = _edge_label_pill_width(text, max_width=max_width)
     height = base_height if len(lines) == 1 else base_height + line_gap
     rect = (
         f'<rect class="diagram-edge-label" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
@@ -2364,16 +2387,52 @@ def _layout_ring_process(
     return elements, canvas_w, (ring_bottom + key_gap + key_h - top)
 
 
+def _shorten_to_circle_edge(
+    p1: tuple[float, float], p2: tuple[float, float], *, r1: float, r2: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Circle-radius equivalent of `_shorten_to_box_edge` - pulls a
+    connecting line back from two circles' CENTRES to their actual edges,
+    along the straight line between them, so an arrow (and any label
+    placed on the line/curve) touches the circles instead of crossing into
+    them. A bowed satellite-to-satellite curve (see `_layout_concept_wheel`)
+    shortens along this same straight chord rather than its own curved
+    tangent - the same deliberate simplification `_layout_concept_map`
+    already used for its box version, carried over unchanged."""
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    dist = max(math.hypot(dx, dy), 1.0)
+    ux, uy = dx / dist, dy / dist
+    start = (p1[0] + ux * r1, p1[1] + uy * r1)
+    end = (p2[0] - ux * r2, p2[1] - uy * r2)
+    return start, end
+
+
 def _layout_concept_wheel(
     nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
 ) -> tuple[list[str], float, float]:
     """Textbook-style concept wheel for concept_map: a focal subject at the
     centre, its parts/properties/components as numbered circles around it
-    in a fixed, cycling colour palette - deliberately no connecting lines
-    or edge labels at all. A wheel communicates "these belong to X" by
-    proximity and colour, not by a drawn relationship line, which is
-    exactly what sidesteps edge labels entirely (there's nothing to label
-    - see this module's "no text on arrows" rule)."""
+    in a fixed, cycling colour palette.
+
+    Root-cause fix (production course audit - a real course had 5 separate
+    concept_map diagrams, several with genuine, specifically-labelled
+    causal relationships BETWEEN SATELLITES, e.g. "z --increases--> zeff",
+    "zeff --increases--> I1" - rendered as a set of isolated circles with
+    NO lines/arrows at all, discarding every edge the spec actually
+    carried): an earlier version of this function drew no edges
+    whatsoever, reasoning that "these belong to X" is conveyed by
+    proximity/colour alone and a relationship line is never needed - true
+    ONLY for a pure "parts of X" concept map where every edge is a plain,
+    undifferentiated focal-to-satellite membership. It breaks completely
+    for a satellite-to-satellite edge (no proximity relationship exists
+    between two ring positions at all - the information is simply lost)
+    and for any edge whose LABEL carries real, specific meaning ("reduces"
+    vs "increases" vs "moderates" - indistinguishable by position alone).
+    Edges are drawn again now, reusing the exact same straight-spoke /
+    outward-bowed-satellite-curve approach the dead `_layout_concept_map`
+    (box-node version, nothing currently calls it) already proved - adapted
+    to circles via `_shorten_to_circle_edge` instead of `_shorten_to_box_edge`.
+    The wheel's own circular layout, colours and key table are unchanged.
+    """
     if not nodes:
         return [], CANVAS_WIDTH, 0.0
     focal = _focal_node(nodes, edges)
@@ -2381,44 +2440,314 @@ def _layout_concept_wheel(
     count = max(len(satellites), 1)
 
     sat_radius, focal_radius = 60.0, 76.0
-    # Same real-size-aware neighbour-clearance math as _layout_ring_process
-    # (see its own docstring for the measured bug this closes) - a focal
-    # with a long label, or satellites with long labels, can each grow
-    # well past their own min_radius; sizing the ring from the FIXED
-    # radii only let a grown satellite's circle spill past the canvas
-    # bounds entirely (confirmed: an 8-satellite concept map with long
-    # labels drew a point outside its own declared canvas).
-    max_sat_radius = max(
-        (_circle_node_size(sat.label, min_radius=sat_radius, font_size=RING_LABEL_SIZE)[1] for sat in satellites),
-        default=sat_radius,
-    )
+    # Each satellite's OWN real sizing is kept (not just the single overall
+    # max) - needed below to shorten that satellite's edges to its actual
+    # drawn radius, and passed back into `_circle_node` as `sizing` so it's
+    # never re-derived a second time (see that function's own docstring on
+    # why re-deriving from a different `min_radius` can grow a mismatched,
+    # larger circle than the one geometry was planned around).
+    sat_sizings = [_circle_node_size(sat.label, min_radius=sat_radius, font_size=RING_LABEL_SIZE) for sat in satellites]
+    max_sat_radius = max((s[1] for s in sat_sizings), default=sat_radius)
     focal_sizing = _circle_node_size(focal.label, min_radius=focal_radius, font_size=14.5)
     focal_radius = focal_sizing[1]
     neighbour_clearance_radius = (
         (2 * max_sat_radius + 50.0) / (2 * math.sin(math.pi / count)) if count >= 2 else 0.0
     )
+    focal_id = focal.id or "__focal__"
     ring_radius = max(190.0, focal_radius + max_sat_radius + 50.0, neighbour_clearance_radius)
+    # The focal-to-satellite gap must fit whatever edge LABEL actually gets
+    # drawn on that spoke, not a flat buffer - a real, confirmed bug: a flat
+    # 50.0px gap let a long label pill visibly overlap INTO both the focal
+    # and satellite circles whenever either circle grew past the default
+    # radius. Checked and grown ONLY when actually needed, never
+    # unconditionally added to the formula above - a real, confirmed
+    # regression a first attempt at this fix introduced: forcing every
+    # diagram's gap up to fit its worst-case label (even a short, ordinary
+    # one like "affects") widened `ring_radius` past what `neighbour_
+    # clearance_radius` alone already provided for a diagram with several
+    # satellites, uselessly inflating canvas width (and so shrinking
+    # on-page font) for a diagram whose real spacing was already generous
+    # enough. Only focal<->satellite spokes matter here - a satellite-to-
+    # satellite edge bows outward on its own bulge instead (see the
+    # edge-drawing loop below), never through this radial gap.
+    max_spoke_label_width = max(
+        (
+            _edge_label_pill_width(edge.label, max_width=CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH)
+            for edge in edges
+            if focal_id in (edge.source, edge.target)
+        ),
+        default=0.0,
+    )
+    if max_spoke_label_width > 0:
+        # +20.0 margin, not the box-layout's +40.0 (see CONCEPT_MAP_LABEL_GAP) -
+        # a circle's edge curves away from the spoke on both sides of the
+        # label pill, unlike a box's flat edge, so a label sitting on a
+        # circle-to-circle spoke needs less extra clearance than the same
+        # label would on a box-to-box one to read as clearly not touching
+        # either shape; confirmed by direct visual check at this margin.
+        needed_gap = max_spoke_label_width + 20.0
+        available_gap = ring_radius - focal_radius - max_sat_radius
+        if available_gap < needed_gap:
+            ring_radius = focal_radius + max_sat_radius + needed_gap
     cx = ring_radius + max_sat_radius + 50.0
     cy = top + ring_radius + max_sat_radius + 50.0
     canvas_w = max(CANVAS_WIDTH, 2 * cx)
+
+    sat_ids: list[str] = []
+    # id -> (x, y, radius) for every node, and each satellite's own ring
+    # angle - both needed by the edge-drawing pass below, computed up front
+    # (before anything is drawn) exactly as `_layout_concept_map` does for
+    # its box version.
+    positions: dict[str, tuple[float, float, float]] = {focal_id: (cx, cy, focal_radius)}
+    sat_angles: dict[str, float] = {}
+    for index, sat in enumerate(satellites):
+        angle = (2 * math.pi * index / count) - math.pi / 2
+        sx = cx + ring_radius * math.cos(angle)
+        sy = cy + ring_radius * math.sin(angle)
+        sat_id = sat.id or f"__sat{index}__"
+        sat_ids.append(sat_id)
+        positions[sat_id] = (sx, sy, sat_sizings[index][1])
+        sat_angles[sat_id] = angle
+
+    # Relationship lines first, so the node circles sit cleanly on top of
+    # their stub ends (same ordering/reasoning as `_layout_concept_map`) -
+    # edge LABELS are collected separately and painted last, after every
+    # circle, so a label near a circle's edge is never clipped underneath
+    # one painted on top of it.
+    elements = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    edge_labels: list[str] = []
+
+    # --- convergence fan-out for satellite-to-satellite edges -----------
+    # Root-cause fix (production course audit): several real course
+    # diagrams have 2+ satellite-to-satellite edges converging on (or
+    # diverging from) the SAME one node - e.g. "Shells"/"Anomalies" both
+    # relating to BOTH "I1" and "EA"; "orbital_4s"/"orbital_3d" both
+    # modifying "orbital_baseline". Their natural bisecting angles land
+    # close together (both are "pointing roughly toward the same hub"), so
+    # the bounded collision-retry below - which only grows ONE edge's own
+    # bulge AWAY from labels/curves already placed earlier in this same
+    # loop, a greedy, order-dependent pass - was observed leaving a later
+    # edge's label sitting almost entirely on top of the shared target's
+    # own circle, confirmed by direct render (not caught by `validate_
+    # rendered_svg`, which has no "label overlaps a node" check at all
+    # until this fix - see `_label_clears_circles` below). Fixed by
+    # construction instead of by luck: every satellite-to-satellite edge
+    # that shares its "hub" (the more-converged-upon of its two endpoints)
+    # with at least one sibling edge gets its bulge angle spread apart
+    # from those siblings BEFORE the retry loop runs at all - the retry
+    # loop remains a secondary safety net for whatever this fan-out alone
+    # doesn't resolve, not the only thing standing between a dense wheel
+    # and overlapping labels.
+    sat_sat_edges = [e for e in edges if focal_id not in (e.source, e.target)]
+    hub_degree: dict[str, int] = {}
+    for e in sat_sat_edges:
+        hub_degree[e.source] = hub_degree.get(e.source, 0) + 1
+        hub_degree[e.target] = hub_degree.get(e.target, 0) + 1
+
+    def _hub_of(e: DiagramEdge) -> str:
+        # Whichever endpoint is converged-upon by more edges - a tie
+        # (equal degree, including the common "neither is shared" case of
+        # degree 1 each) favours the target, matching the "several
+        # relationships converge on one target" shape this fixes.
+        return e.target if hub_degree.get(e.target, 0) >= hub_degree.get(e.source, 0) else e.source
+
+    hub_groups: dict[str, list[DiagramEdge]] = {}
+    for e in sat_sat_edges:
+        hub_groups.setdefault(_hub_of(e), []).append(e)
+    # Each edge's (fan_index, fan_count) within its own hub group - a hub
+    # with only one edge touching it gets (0, 1), spreading by exactly
+    # zero, so the common, non-converging case renders identically to
+    # before this fix.
+    fan_slot: dict[int, tuple[int, int]] = {}
+    for group in hub_groups.values():
+        for i, e in enumerate(group):
+            fan_slot[id(e)] = (i, len(group))
+    _FAN_ANGLE_STEP = math.radians(34.0)
+
+    def _label_clears_circles(mid: tuple[float, float], label: str, max_width: float) -> bool:
+        """Does this label's OWN rendered pill - not just the thin curve/
+        spoke line it sits on, which `_curve_clears_nodes` already checks -
+        clear every node circle in the diagram? A real, confirmed gap: a
+        curve sampled at 7 points can clear a node circle by its own
+        required 6px margin while the much WIDER label pill drawn at that
+        same midpoint (up to 150px wide, vs. the curve's few-px stroke)
+        still overlaps that circle significantly. Uses the same width/
+        line-wrapping `_edge_label` itself computes (`_edge_label_pill_
+        width`/`_wrap`), so this checks against the label's real drawn
+        size, never a guess. Checked against EVERY node (focal and every
+        satellite), not only the two this edge connects - a label can sit
+        clear of its own curve while still landing on an uninvolved third
+        satellite's circle in a crowded wheel."""
+        text = label.strip()
+        if not text:
+            return True
+        width = _edge_label_pill_width(text, max_width=max_width)
+        font_size = _scaled_font_size(EDGE_LABEL_FONT_SIZE)
+        lines = _wrap(text, font_size=font_size, width=max_width - 16.0, max_lines=2)
+        base_height = _scaled_font_size(18.0)
+        height = base_height if len(lines) <= 1 else base_height + _scaled_font_size(EDGE_LABEL_LINE_GAP)
+        half_w, half_h = width / 2.0, height / 2.0
+        for nx, ny, nr in positions.values():
+            closest_x = min(max(nx, mid[0] - half_w), mid[0] + half_w)
+            closest_y = min(max(ny, mid[1] - half_h), mid[1] + half_h)
+            if math.hypot(nx - closest_x, ny - closest_y) < nr + 4.0:
+                return False
+        return True
+    # Where each already-placed label's pill actually landed - a dense
+    # concept map (several satellites all pointing into the same one or two
+    # targets - a real, confirmed case: "shells"/"anoms" both relating to
+    # BOTH "I1" and "EA") bows more than one satellite-satellite curve
+    # through nearly the same lower-middle region, piling their labels on
+    # top of each other into illegible overlapping text. Checked below so a
+    # genuinely colliding curve's bulge grows until its label clears every
+    # label already placed - a non-colliding diagram (the common case)
+    # never grows past its normal, original bulge at all.
+    placed_label_mids: list[tuple[float, float]] = []
+    # Full typical pill width/height (NOT half) - a real, confirmed bug: two
+    # pill CENTRES only need to be farther apart than the SUM of both
+    # pills' own half-extents to avoid overlapping, but this used a single
+    # pill's half-extent as the whole threshold - roughly half of what two
+    # genuinely wide, two-line-wrapped pills (confirmed: several real
+    # course labels wrap to the full CONCEPT_MAP_LABEL_MAX_WIDTH at 2 lines,
+    # ~32-40px tall) actually need, so the in-process retry below judged a
+    # position "clear" that the real drawn pills still visibly overlapped
+    # at (closed by `label_overlaps_label_issues` in diagram_render_qa.py,
+    # the independent final check this exact case exposed as missing).
+    label_half_w, label_half_h = CONCEPT_MAP_LABEL_MAX_WIDTH + 12.0, 40.0
+
+    def _label_collides(mid: tuple[float, float]) -> bool:
+        return any(
+            abs(mid[0] - other[0]) < label_half_w and abs(mid[1] - other[1]) < label_half_h
+            for other in placed_label_mids
+        )
+
+    def _curve_clears_nodes(
+        p0: tuple[float, float], ctrl: tuple[float, float], p2: tuple[float, float],
+        *, skip_ids: tuple[str, str],
+    ) -> bool:
+        """A bulge big enough to clear every placed LABEL can still swing
+        the curve itself straight through an uninvolved node's circle in a
+        dense wheel (a real, confirmed case: several satellite-to-satellite
+        curves all converging on the same two targets - I1/EA - bowed right
+        through each other's target circles, 70 separate `edge_crosses_
+        node` findings from this module's own render-QA checker on one
+        real diagram). Sampled at several points along the ACTUAL drawn
+        quadratic curve (not just estimated from its endpoints/midpoint the
+        way the label-collision check above is) against every OTHER node's
+        real position/radius - the two nodes this edge actually connects
+        are deliberately excluded, since the curve legitimately touches
+        both of those at its own ends."""
+        # Sampled far more densely than the original 7 fixed points - a
+        # real, confirmed gap: the final deterministic render-QA check
+        # (`edge_crosses_node` in app.services.diagram_render_qa) samples
+        # the actual drawn path every ~4px of arc length, fine enough to
+        # catch a brief dip into a node between two of this function's old
+        # sparse t-values; this in-process check must sample at least that
+        # densely too, or it can approve a curve the final QA check still
+        # rejects (confirmed: the convergence fan-out fix above moved a
+        # curve close enough to a node that exactly this happened).
+        for i in range(1, 40):
+            t = i / 40.0
+            mt = 1.0 - t
+            x = mt * mt * p0[0] + 2 * mt * t * ctrl[0] + t * t * p2[0]
+            y = mt * mt * p0[1] + 2 * mt * t * ctrl[1] + t * t * p2[1]
+            for node_id, (nx, ny, nr) in positions.items():
+                if node_id in skip_ids:
+                    continue
+                if math.hypot(x - nx, y - ny) < nr + 6.0:
+                    return False
+        return True
+
+    for edge in edges:
+        p1 = positions.get(edge.source)
+        p2 = positions.get(edge.target)
+        if not p1 or not p2:
+            continue
+        start, end = _shorten_to_circle_edge((p1[0], p1[1]), (p2[0], p2[1]), r1=p1[2], r2=p2[2])
+        if focal_id in (edge.source, edge.target):
+            # A spoke to/from the focal node: straight - these never cross
+            # anything else since every satellite sits on the same ring
+            # around the one shared centre.
+            elements.append(
+                f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+                f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+            mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+        else:
+            # A relationship between two satellites, not through the focal
+            # node - a straight chord would cut across the focal circle and
+            # any satellite in between, so it bows outward instead, along
+            # the direction that bisects the two satellites' own ring
+            # angles (never their averaged position, which collapses
+            # toward the centre for near-opposite satellites and gives no
+            # usable outward direction).
+            theta = _bisecting_angle(sat_angles[edge.source], sat_angles[edge.target])
+            fan_i, fan_n = fan_slot.get(id(edge), (0, 1))
+            if fan_n > 1:
+                theta += (fan_i - (fan_n - 1) / 2.0) * _FAN_ANGLE_STEP
+            base_bulge = ring_radius * 0.55 + 30.0
+            # Grows the bulge in bounded steps while EITHER this curve
+            # itself clips another node, or its label would collide with
+            # one already placed, or its label's own pill overlaps a node
+            # circle - most satellite-satellite edges never iterate past
+            # the first, original bulge at all. Keeps the LAST attempt
+            # even if nothing ever fully clears (an unusual topology
+            # genuinely has no clean bulge) rather than looping forever -
+            # the same bounded-retry-then-ship-best-effort contract this
+            # codebase already uses elsewhere.
+            #
+            # Also nudges the ANGLE, not only the distance - a real,
+            # confirmed gap the convergence fan-out above exposed: a fixed
+            # fan-shifted angle can point straight at an uninvolved node
+            # regardless of bulge distance, so growing distance alone along
+            # that same bad angle never clears it (every attempt kept
+            # landing on the identical crossing). Cycles a small set of
+            # angle offsets together with the growing distance so a bad
+            # fixed angle has real alternatives to try, not just "further
+            # away in the same wrong direction".
+            _ANGLE_JITTERS = (0.0, 10.0, -10.0, 18.0, -18.0)
+            for attempt in range(10):
+                bulge = base_bulge + attempt * 42.0
+                this_theta = theta + math.radians(_ANGLE_JITTERS[attempt % len(_ANGLE_JITTERS)])
+                ctrl = (cx + bulge * math.cos(this_theta), cy + bulge * math.sin(this_theta))
+                mid = (
+                    0.25 * start[0] + 0.5 * ctrl[0] + 0.25 * end[0],
+                    0.25 * start[1] + 0.5 * ctrl[1] + 0.25 * end[1],
+                )
+                if (
+                    _curve_clears_nodes(start, ctrl, end, skip_ids=(edge.source, edge.target))
+                    and not _label_collides(mid)
+                    and _label_clears_circles(mid, edge.label, CONCEPT_MAP_LABEL_MAX_WIDTH)
+                ):
+                    break
+            elements.append(
+                f'<path d="M{start[0]:.1f},{start[1]:.1f} Q{ctrl[0]:.1f},{ctrl[1]:.1f} '
+                f'{end[0]:.1f},{end[1]:.1f}" fill="none" stroke="{theme.accent_color}" '
+                f'stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+        placed_label_mids.append(mid)
+        label_width_budget = (
+            CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH if focal_id in (edge.source, edge.target) else CONCEPT_MAP_LABEL_MAX_WIDTH
+        )
+        edge_labels.append(_edge_label(mid[0], mid[1], edge.label, theme, max_width=label_width_budget))
 
     focal_svg, _ = _circle_node(
         focal.label, cx=cx, cy=cy, theme=theme, number="",
         fill=theme.accent_soft, stroke=theme.accent_color, min_radius=focal_radius, font_size=14.5,
         detail=focal.detail, sizing=focal_sizing,
     )
-    elements = [focal_svg]
+    elements.append(focal_svg)
 
     for index, sat in enumerate(satellites):
-        angle = (2 * math.pi * index / count) - math.pi / 2
-        sx = cx + ring_radius * math.cos(angle)
-        sy = cy + ring_radius * math.sin(angle)
+        sx, sy, _ = positions[sat_ids[index]]
         fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
         svg, _ = _circle_node(
             sat.label, cx=sx, cy=sy, theme=theme, number=str(index + 1),
             fill=fill, stroke=stroke, min_radius=sat_radius, detail=sat.detail,
+            sizing=sat_sizings[index],
         )
         elements.append(svg)
+    elements.extend(edge_labels)
 
     wheel_bottom = cy + ring_radius + max_sat_radius + 40.0
     key_entries = [("", focal.label, focal.detail)] + [
@@ -2883,6 +3212,21 @@ def _bisecting_angle(a1: float, a2: float) -> float:
 
 
 CONCEPT_MAP_LABEL_MAX_WIDTH = 150.0  # narrower than the default pill - leaves room beside neighbouring spokes
+# A straight focal<->satellite SPOKE (unlike a bowed satellite-satellite
+# curve, which has the whole outward bulge to spread into) sits directly on
+# the radial gap this same label forces `_layout_concept_wheel` to reserve
+# - so a wide label pill there has a DIRECT, immediate cost: every extra
+# pixel of width widens that gap (and so the whole canvas) by the same
+# amount, which a scaled-down display then has to re-shrink, risking the
+# readability floor (a real, confirmed regression: widening the gap to the
+# full `CONCEPT_MAP_LABEL_MAX_WIDTH` budget to stop a prior overlap bug
+# pushed even short, ordinary spoke labels like "relates to" past that
+# floor). Wrapping the same text to 2 narrower lines (`_edge_label` already
+# supports this) instead of 1 wide line keeps it just as legible while
+# costing far less width - used ONLY for a spoke's own gap/label sizing,
+# never for a satellite-satellite curve's label (that one keeps the wider
+# budget, since its bulge already has room to spare).
+CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH = 108.0
 # The reserved gap between focal/satellite box edges must comfortably fit
 # the label pill *and* its own left/right margin - a gap merely equal to
 # the label's own max width still lets it touch (or, for a near-horizontal
@@ -4251,6 +4595,120 @@ def _layout_circuit_schematic(
         y += row_height + _CIRCUIT_ROW_GAP
 
     return elements, y - _CIRCUIT_ROW_GAP - top
+
+
+# --- periodic_table: the real, fixed 118-element grid -----------------------
+# (app.render.periodic_table_data) - see DIAGRAM_KINDS' own comment in
+# app.schemas.diagram for why this is a hardcoded reference table, never
+# authored by a model, the same way `toc` is a deterministic page nothing
+# ever asks the writer agent to invent.
+
+# 16.0, not a smaller value that first looked tempting - the readability
+# floor this whole module's render-QA checker enforces (MIN_READABLE_PX,
+# app.services.diagram_render_qa) is checked AFTER scaling this diagram's
+# own CANVAS_WIDTH (880) down to the page's real display width
+# (CONTENT_WIDTH, 666) - a real, confirmed case: 14.0 scaled to ~10.6px,
+# just under the 11.0px floor, failing every real generation attempt.
+# 16.0 scales to ~12.1px, comfortably clear.
+# 43.0, not 46.0 (first tried, before 16.0's extra width pushed the 18th
+# column past CANVAS_WIDTH - a real, confirmed `out_of_canvas` finding):
+# (CANVAS_WIDTH - 2*MARGIN - _PT_GUTTER) / 18 columns, exactly - leaves the
+# same right-hand margin every other kind's canvas already keeps.
+_PT_CELL_W = 43.0
+_PT_CELL_H = 50.0
+_PT_GUTTER = 26.0  # narrow left column for period numbers
+_PT_SYMBOL_SIZE = 16.0
+_PT_NUMBER_SIZE = 9.0
+_PT_STRIP_GAP = 18.0  # blank row between the main grid and the f-block strips
+
+
+def _pt_cell(
+    x: float, y: float, *, symbol: str, atomic_number: int, fill: str, stroke: str, theme: TemplateTheme,
+    highlight_detail: str = "",
+) -> str:
+    tooltip = f"{symbol} ({atomic_number})"
+    if highlight_detail:
+        tooltip = f"{tooltip} — {highlight_detail}"
+    parts = [
+        f"<title>{escape(tooltip)}</title>",
+        f'<rect class="diagram-box" x="{x:.1f}" y="{y:.1f}" width="{_PT_CELL_W - 3:.1f}" '
+        f'height="{_PT_CELL_H - 3:.1f}" rx="4" fill="{fill}" stroke="{stroke}" stroke-width="1.3"/>',
+        f'<text x="{x + 5:.1f}" y="{y + _PT_NUMBER_SIZE + 4:.1f}" font-size="{_PT_NUMBER_SIZE:.1f}" '
+        f'fill="{theme.muted_color}" text-anchor="start" font-family="{escape(theme.font_family)}">'
+        f"{atomic_number}</text>",
+        f'<text x="{x + (_PT_CELL_W - 3) / 2:.1f}" y="{y + _PT_CELL_H / 2 + 10:.1f}" '
+        f'font-size="{_PT_SYMBOL_SIZE:.1f}" font-weight="700" fill="{theme.text_color}" '
+        f'text-anchor="middle" font-family="{escape(theme.font_family)}">{escape(symbol)}</text>',
+    ]
+    return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
+
+
+def _layout_periodic_table(
+    nodes: list[DiagramNode], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float]:
+    """The real 118-element grid, always drawn complete and scientifically
+    correct from `app.render.periodic_table_data.ELEMENTS` - `nodes` never
+    supplies the grid itself (see DiagramSpec.is_usable's own periodic_table
+    case), only an OPTIONAL small set of highlighted cells: a node whose
+    `id` matches a real element symbol (case-insensitive) gets its own
+    `color` as a fill override and, if `detail` is set, a line in the small
+    legend below the grid - exactly the "which cells to annotate, never the
+    grid itself" contract DIAGRAM_KINDS' own periodic_table comment
+    describes."""
+    from app.render.periodic_table_data import ACTINIDES, BY_SYMBOL, LANTHANIDES, MAIN_GRID, block_fill
+
+    highlights = {
+        n.id.strip().lower(): n for n in nodes if n.id and n.id.strip().lower() in BY_SYMBOL
+    }
+
+    grid_x0 = MARGIN + _PT_GUTTER
+    elements: list[str] = []
+
+    def _draw_row(items: list, *, row_top: float, col_of) -> None:
+        for el in items:
+            col = col_of(el)
+            x = grid_x0 + (col - 1) * _PT_CELL_W
+            highlight = highlights.get(el.symbol.lower())
+            fill = (highlight.color.strip() if highlight and highlight.color.strip() else block_fill(el.block))
+            stroke = theme.border_color if not highlight else theme.accent_color
+            elements.append(
+                _pt_cell(
+                    x, row_top, symbol=el.symbol, atomic_number=el.atomic_number,
+                    fill=fill, stroke=stroke, theme=theme,
+                    highlight_detail=highlight.detail if highlight else "",
+                )
+            )
+
+    for period in range(1, 8):
+        row_top = top + (period - 1) * _PT_CELL_H
+        _draw_row([e for e in MAIN_GRID if e.period == period], row_top=row_top, col_of=lambda e: e.group)
+
+    grid_bottom = top + 7 * _PT_CELL_H
+    lant_top = grid_bottom + _PT_STRIP_GAP
+    act_top = lant_top + _PT_CELL_H
+    _draw_row(LANTHANIDES, row_top=lant_top, col_of=lambda e: (e.f_index or 0) + 2)
+    _draw_row(ACTINIDES, row_top=act_top, col_of=lambda e: (e.f_index or 0) + 2)
+
+    cursor_y = act_top + _PT_CELL_H + 10.0
+
+    if any(n.detail.strip() for n in highlights.values()):
+        cursor_y += 10.0
+        for symbol_id, node in [(sid, n) for sid, n in highlights.items() if n.detail.strip()]:
+            element = BY_SYMBOL[symbol_id]
+            swatch_color = node.color.strip() if node.color.strip() else block_fill(element.block)
+            elements.append(
+                f'<rect x="{MARGIN:.1f}" y="{cursor_y - 11:.1f}" width="14" height="14" rx="3" '
+                f'fill="{swatch_color}" stroke="{theme.border_color}" stroke-width="1"/>'
+            )
+            label_svg, label_h = _text(
+                MARGIN + 22, cursor_y, [f"{element.symbol} ({element.name}) — {node.detail.strip()}"],
+                font_size=_scaled_font_size(12.5), weight=500, color=theme.text_color,
+                font_family=theme.font_family, anchor="start",
+            )
+            elements.append(label_svg)
+            cursor_y += max(label_h, 18.0) + 6.0
+
+    return elements, cursor_y - top
 
 
 # --- graph/chart (kind == "graph") -------------------------------------------
@@ -7695,6 +8153,8 @@ def _render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme, *, gap_scale: f
         elements, content_h = _layout_comparison(spec.nodes, theme=theme, top=top)
     elif kind == "circuit_schematic":
         elements, content_h = _layout_circuit_schematic(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "periodic_table":
+        elements, content_h = _layout_periodic_table(spec.nodes, theme=theme, top=top)
     elif kind in ("concept_map", "conceptual"):
         elements, canvas_w, content_h = _layout_concept_wheel(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "er_diagram":

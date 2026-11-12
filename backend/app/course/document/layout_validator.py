@@ -28,7 +28,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.course.document.layout import BLOCK_GAP
+from app.course.document.layout import BLOCK_GAP, NEAR_FIT_TOLERANCE
 from app.schemas.blocks import VISUAL_BLOCK_TYPES, BlockType
 from app.schemas.document import PAGE_MARGIN_BOTTOM, PAGE_MARGIN_TOP, Block, CourseDocument, Page
 
@@ -85,6 +85,14 @@ def original_id(block_id: str) -> str:
 # multiplier) but are still estimates, not a text-shaping engine - a couple
 # of px of rounding drift is expected and harmless. Flag only a genuinely
 # meaningful overflow/overlap, not sub-pixel noise.
+#
+# This is a MATH-correctness guard (did the pipeline's own numbers round-trip
+# cleanly), not a product/rendering-acceptability one - keep it strict and
+# keep using it for `overlapping_pairs` below, a genuinely different
+# question (do two DIFFERENT blocks collide) that NEAR_FIT_TOLERANCE has
+# nothing to say about. `validate_page_structured`'s own "content overflows
+# this page" check, just below, uses NEAR_FIT_TOLERANCE instead - see that
+# call site's own comment for why.
 _TOLERANCE = 2.0
 
 # A content page holding less than this much total rendered height is
@@ -182,7 +190,18 @@ def validate_page_structured(page: Page) -> list[LayoutFinding]:
     findings: list[LayoutFinding] = []
 
     overflow = page_overflow(page)
-    if overflow > _TOLERANCE:
+    # NEAR_FIT_TOLERANCE (layout.py), not the stricter _TOLERANCE above: a
+    # block landing up to NEAR_FIT_TOLERANCE past this page's own nominal
+    # boundary is exactly what flow_blocks's own placement check already
+    # decided was safe to put here (nothing else below it on this page,
+    # still short of the real printed footer - see NEAR_FIT_TOLERANCE's own
+    # docstring) - not a structural defect to flag a second time. A real,
+    # confirmed bug this closes: before NEAR_FIT_TOLERANCE existed, this
+    # check's _TOLERANCE=2 threshold was never wrong (flow_blocks never
+    # deliberately left that much slack); once it did, this stayed stuck on
+    # the old, stricter number and started flagging a page flow_blocks
+    # itself already considered fine.
+    if overflow > NEAR_FIT_TOLERANCE:
         findings.append(
             LayoutFinding(
                 reason="page_overflow",

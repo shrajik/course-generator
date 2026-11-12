@@ -1123,8 +1123,19 @@ def _diagram_spec(user: str) -> dict[str, Any]:
     requested = _line(re.compile(r"REQUESTED DIAGRAM TYPE:\s*(\S+)"), user, "")
 
     if requested in ("concept_map", "conceptual", "hierarchy"):
+        # The focal/root node gets a short, fixed label - never the full
+        # (sometimes 60-char) derived `title` sentence. A real writer agent
+        # names a focal concept_map node with a short noun phrase (every
+        # real generated example this mock stands in for does the same -
+        # "Assessment", "Quantum numbers"), never a full sentence; reusing
+        # `title` here was an unrepresentative mock quirk that inflated the
+        # focal circle's own radius far beyond anything a real diagram
+        # produces, which the renderer's own (correct) label-overlap fix
+        # then had to reserve genuine extra gap for - exposing this mock
+        # fixture as an unrealistically large edge case rather than the
+        # ordinary one it's meant to represent.
         nodes = [
-            {"id": "subject", "label": title or "Subject", "detail": "", "level": 0},
+            {"id": "subject", "label": "Subject", "detail": "", "level": 0},
             {"id": "part_a", "label": "Component A", "detail": "", "level": 1},
             {"id": "part_b", "label": "Component B", "detail": "", "level": 1},
             {"id": "part_c", "label": "Component C", "detail": "", "level": 1},

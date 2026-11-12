@@ -57,6 +57,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.config import Settings, get_settings
 from app.schemas.diagram import DiagramSpec
 from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult, _looks_garbled
+from app.services.numeric_consistency_qa import (
+    IDENTIFIER_VALUE_NEEDS_REVIEW,
+    NUMERIC_CONTRADICTS_SOURCE_TEXT,
+    find_identifier_value_issues,
+    find_numeric_contradictions,
+)
 from app.services.openai_service import AIClient, get_ai_client
 
 OFF_TOPIC = "off_topic"
@@ -74,11 +80,33 @@ MISSPELLED_OR_GARBLED_TEXT = "misspelled_or_garbled_text"
 # unambiguous by construction - the check itself (`_looks_garbled`) is still
 # the exact same reused function, only the persisted label differs.
 STRUCTURALLY_GARBLED_TEXT = "structurally_garbled_text"
+# Canonical Visual Spec milestone: a diagram that actively CONTRADICTS the
+# course's own written text is treated exactly like garbled text above - a
+# confirmed defect that falls back to the raster illustration path rather
+# than shipping (see `evaluate_content`'s caller, `DiagramService.
+# generate_for_block`'s `garbled_types` set), never the "ship anyway, flagged
+# for review" treatment `off_topic`/`generic_content`/`missing_key_concept`
+# get. `source_grounding_unsupported` is the deliberately DIFFERENT, less
+# severe case - a claim the source excerpt simply doesn't address either way
+# (neither confirms nor contradicts) - which DOES still ship, flagged for a
+# human reviewer (reuses `app.services.quality_framework`'s existing
+# `review_findings` bucket, the same `severity="blocker"`+
+# `verification_status="unverified"` combination that field already defines
+# - see that module's own docstring). These two resolution strings are
+# shared with `ImageService._verify_image_relevance`'s matching raster-side
+# fields - one unified category across both visual-generation paths, not a
+# diagram-specific duplicate.
+CONTRADICTS_SOURCE_TEXT = "contradicts_source_text"
+SOURCE_GROUNDING_UNSUPPORTED = "source_grounding_unsupported"
 
 # Kinds this module ever grades - every other normalised_kind() (schematic,
 # concept_experience) already has its own dedicated semantic check and is a
 # deliberate no-op here, never a silent double-charge of two LLM calls for
-# the same spec.
+# the same spec. `periodic_table` joins that deliberate-no-op set for a
+# different reason: its grid is real, hardcoded ground truth (app.render.
+# periodic_table_data), never model-authored - there is nothing for an LLM
+# to grade, and asking one to "verify" a fixed, already-correct dataset only
+# risks a false content-QA complaint about something that was never wrong.
 _GRADED_KINDS = frozenset(
     {
         "flow_chart", "process", "cycle", "hierarchy", "comparison", "smart_art",
@@ -106,6 +134,20 @@ class ContentCritique(BaseModel):
     missing_concepts: list[str] = Field(default_factory=list)
     text_legible: bool = True
     text_legible_detail: str = ""
+    # Canonical Visual Spec milestone: these two mirror `ImageRelevanceCheck`'s
+    # matching fields exactly (see that model's own docstring for the full
+    # reasoning) - only ever asked about when a non-blank `source_excerpt` is
+    # given (see `_critique_user_prompt`'s own grounding_question), so they
+    # stay at their safe defaults (no claim) whenever no excerpt was
+    # available to check against. IMPORTANT: this judges CONSISTENCY with
+    # the course's own text, never independent scientific/factual truth - a
+    # diagram can be `contradicts_source_text=False` while still being
+    # objectively wrong about the real world, if the course's own source
+    # text happens to share that same error; that is a different problem
+    # this field does not and must never claim to catch.
+    contradicts_source_text: bool = False
+    contradicts_source_text_detail: str = ""
+    unsupported_claims: list[str] = Field(default_factory=list)
 
 
 CONTENT_CRITIQUE_SYSTEM = """\
@@ -115,7 +157,7 @@ are never judging layout, spacing or visual style (a separate check already
 does that). You see only the diagram's text (title, node labels, edge
 labels) - never a rendered picture.
 
-Judge four things:
+Judge these things:
 - `on_topic`: do the labels actually describe THIS brief's subject - not a
   generic, unrelated, or placeholder topic a model might default to when it
   didn't really engage with the brief?
@@ -139,8 +181,30 @@ Be concrete and specific in every detail field: name exactly what's wrong,
 in one sentence, never a bare "could be better". If the diagram is
 genuinely good, say so plainly - do not manufacture a problem."""
 
+# Canonical Visual Spec milestone: appended to CONTENT_CRITIQUE_SYSTEM only
+# when a source excerpt is actually available (see `_critique_user_prompt`'s
+# own conditional) - mirrors ImageService._verify_image_relevance's
+# `grounding_question` exactly, same wording/intent, applied to a diagram's
+# labels instead of a rendered picture.
+_GROUNDING_QUESTION = """
 
-def _critique_user_prompt(spec: DiagramSpec, *, brief: str, course_title: str) -> str:
+Also judge source-grounding: the course's own written text (given below as
+SOURCE TEXT) describes this subject. Does this diagram's labels/edges state
+any entity, relationship, direction, or value that DIRECTLY CONTRADICTS
+something the source text says (not merely absent from it - a reasonable
+illustrative detail a textbook author would add is NOT a contradiction)?
+Set `contradicts_source_text` true only for a genuine, specific conflict,
+and name it exactly in `contradicts_source_text_detail`. Separately, list in
+`unsupported_claims` any specific thing a label/edge clearly states as fact
+that the source text simply does not address either way (neither confirms
+nor denies) - leave this empty if every claim is either confirmed by the
+source text or is ordinary, reasonable illustrative elaboration. IMPORTANT:
+this is judging CONSISTENCY with the course's own text, never independent
+scientific truth - if the source text itself were wrong, that is a
+different problem this judgment does not cover."""
+
+
+def _critique_user_prompt(spec: DiagramSpec, *, brief: str, course_title: str, source_excerpt: str = "") -> str:
     nodes = "\n".join(
         f"- {node.label}" + (f": {node.detail}" if node.detail.strip() else "")
         for node in spec.nodes
@@ -150,6 +214,11 @@ def _critique_user_prompt(spec: DiagramSpec, *, brief: str, course_title: str) -
         f"- {edge.source} -> {edge.target}" + (f" ({edge.label})" if edge.label.strip() else "")
         for edge in spec.edges
     ) or "(none)"
+    source_block = (
+        f"\n\nSOURCE TEXT (the course's own ground truth to check consistency against - "
+        f"not an external authority, just what this course itself already says):\n{source_excerpt}"
+        if source_excerpt.strip() else ""
+    )
     return f"""\
 COURSE: {course_title}
 
@@ -164,6 +233,7 @@ NODE LABELS:
 
 EDGES:
 {edges}
+{source_block}
 
 Judge whether this diagram's labels genuinely, specifically teach the brief above.
 """
@@ -197,6 +267,55 @@ def _garbled_label_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
     )]
 
 
+def _numeric_contradiction_issues(spec: DiagramSpec, source_excerpt: str) -> tuple[list[DiagramQAIssue], list[DiagramQAIssue]]:
+    """Layer 0 (Canonical Visual Spec milestone): the same deterministic,
+    zero-API-call reasoning `_garbled_label_issues` already uses above,
+    applied to `app.services.numeric_consistency_qa`'s own conservative
+    number-vs-source-text and identifier-vs-source-text checks instead of
+    garbled-text detection. A no-op whenever there's no `source_excerpt` to
+    check against (the common case for a block whose section has no real
+    prose - see `chapter_section_context`'s own docstring) - absence of an
+    excerpt is never itself a reason to flag anything here.
+
+    Returns `(confirmed, review)` - two SEPARATE lists, never one merged
+    list, because the two have different downstream treatment (see this
+    module's own `evaluate_content`): a CONFIRMED mismatch
+    (`NUMERIC_CONTRADICTS_SOURCE_TEXT`/`IDENTIFIER_VALUE_CONTRADICTS_SOURCE_
+    TEXT`, `deterministic=True`) is at least as disqualifying as garbled
+    text and short-circuits the LLM call exactly like that does. A short-
+    identifier case Layer 0 could only resolve as AMBIGUOUS
+    (`IDENTIFIER_VALUE_NEEDS_REVIEW`, `deterministic=False` - see that
+    reason's own docstring on why this field is deliberately set to False
+    for a pure-Python finding: `quality_framework`'s dispatch reads
+    `deterministic` as "is this CONFIRMED", not literally "was a model
+    involved", and an ambiguous finding must route to `review_findings`,
+    never a hard block) must NOT short-circuit - the whole point of the
+    hard requirement "use the existing LLM call as a backstop for cases
+    that cannot be confidently resolved" is that Layer 1 still gets to run
+    and add its own judgment; this finding is merged into whatever Layer 1
+    separately decides, never a replacement for it."""
+    if not source_excerpt.strip():
+        return [], []
+    claim_text = "\n".join(
+        part for part in (
+            spec.title,
+            *(f"{n.label} {n.detail}" for n in spec.nodes),
+            *(e.label for e in spec.edges),
+        ) if part and part.strip()
+    )
+    confirmed = [
+        DiagramQAIssue(issue.reason, issue.detail, deterministic=True)
+        for issue in find_numeric_contradictions(claim_text, source_excerpt)
+    ]
+    review: list[DiagramQAIssue] = []
+    for issue in find_identifier_value_issues(claim_text, source_excerpt):
+        if issue.reason == IDENTIFIER_VALUE_NEEDS_REVIEW:
+            review.append(DiagramQAIssue(issue.reason, issue.detail, deterministic=False))
+        else:
+            confirmed.append(DiagramQAIssue(issue.reason, issue.detail, deterministic=True))
+    return confirmed, review
+
+
 async def evaluate_content(
     spec: DiagramSpec,
     *,
@@ -204,6 +323,7 @@ async def evaluate_content(
     course_title: str,
     ai: AIClient | None = None,
     settings: Settings | None = None,
+    source_excerpt: str = "",
 ) -> DiagramQAResult:
     """A no-op for schematic/concept_experience (each already has its own
     dedicated semantic check elsewhere) and for a blank brief (nothing to
@@ -215,7 +335,15 @@ async def evaluate_content(
     Layer 0 (deterministic) runs first and short-circuits on its own, the
     same structural-then-semantic ordering `concept_qa` uses - a spec with
     already-confirmed garbled text is never worth spending an LLM call to
-    grade on top of."""
+    grade on top of.
+
+    `source_excerpt` (Canonical Visual Spec milestone), when given, folds the
+    source-grounding judgment (`contradicts_source_text`/`unsupported_
+    claims`) into this SAME existing content-critique call - zero new API
+    calls for the common case, exactly the reasoning `ImageService.
+    _verify_image_relevance` documents for its own matching fields. Blank
+    (the default) skips asking the grounding question at all, same as an
+    empty `brief` already skips the whole call."""
     if spec.normalised_kind() not in _GRADED_KINDS or not brief.strip():
         return DiagramQAResult()
 
@@ -223,10 +351,23 @@ async def evaluate_content(
     if garbled:
         return DiagramQAResult(issues=garbled)
 
+    # Layer 0 continued: a deterministic, high-confidence numeric or
+    # identifier-value mismatch against the course's own text is at least as
+    # disqualifying as garbled text - stronger evidence than the LLM's own
+    # `contradicts_source_text` judgment below, not weaker - so a CONFIRMED
+    # one gets the exact same short-circuit (never worth an LLM call on top
+    # of an already-confirmed defect). An AMBIGUOUS short-identifier finding
+    # is different (see `_numeric_contradiction_issues`'s own docstring) -
+    # it does NOT short-circuit, it rides along into the LLM critique below
+    # and gets merged with whatever that call separately finds.
+    numeric_confirmed, numeric_review = _numeric_contradiction_issues(spec, source_excerpt)
+    if numeric_confirmed:
+        return DiagramQAResult(issues=numeric_confirmed)
+
     critique = await (ai or get_ai_client()).structured(
         schema=ContentCritique,
-        system=CONTENT_CRITIQUE_SYSTEM,
-        user=_critique_user_prompt(spec, brief=brief, course_title=course_title),
+        system=CONTENT_CRITIQUE_SYSTEM + (_GROUNDING_QUESTION if source_excerpt.strip() else ""),
+        user=_critique_user_prompt(spec, brief=brief, course_title=course_title, source_excerpt=source_excerpt),
         model=(settings or get_settings()).diagram_model,
         purpose=f"diagram_content_qa:{spec.normalised_kind()}",
         phase="image",
@@ -236,6 +377,19 @@ async def evaluate_content(
     # class default - see DiagramQAIssue.deterministic's own docstring: this
     # is an AI model's judgment call about content, not a proven Python
     # structural fact, and must never be mistaken downstream for one.
+    if critique.contradicts_source_text:
+        issues.append(DiagramQAIssue(
+            CONTRADICTS_SOURCE_TEXT,
+            critique.contradicts_source_text_detail
+            or "This diagram depicts something that contradicts the course's own text.",
+            deterministic=False,
+        ))
+    if critique.unsupported_claims:
+        issues.append(DiagramQAIssue(
+            SOURCE_GROUNDING_UNSUPPORTED,
+            "The course's own text doesn't address: " + "; ".join(critique.unsupported_claims[:5]),
+            deterministic=False,
+        ))
     if not critique.on_topic:
         issues.append(DiagramQAIssue(
             OFF_TOPIC,
@@ -264,4 +418,8 @@ async def evaluate_content(
             or "This diagram's labels contain misspelled or garbled text.",
             deterministic=False,
         ))
+    # Merged in, never short-circuited - see `_numeric_contradiction_
+    # issues`'s own docstring on why an ambiguous short-identifier finding
+    # must still let this LLM critique run, rather than replacing it.
+    issues.extend(numeric_review)
     return DiagramQAResult(issues=issues)

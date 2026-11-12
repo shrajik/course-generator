@@ -15,10 +15,19 @@ from app.schemas.draft import GeneratedChapter
 from app.services.quality_framework import (
     QUALITY_STANDARDS_STATUS,
     QUALITY_STANDARDS_VERSION,
+    QualityFinding,
     QualityReport,
     build_course_quality_report,
     chapter_findings,
 )
+
+
+def _finding(*, severity: str, verification_status: str, artifact: str = "chapter:chapter_2") -> QualityFinding:
+    return QualityFinding(
+        artifact=artifact, dimension="accuracy", severity=severity, reason="hallucinated_label",
+        description="A label this check could not confirm or rule out.",
+        verification_status=verification_status,
+    )
 
 
 def _chapter(review: dict) -> GeneratedChapter:
@@ -140,6 +149,52 @@ def test_report_passed_is_true_with_only_warnings():
     report = QualityReport(course_id="c1", findings=chapter_findings(_chapter(review)))
     assert report.passed is True
     assert len(report.warnings) == 1
+
+
+# --- the REVIEW bucket (visual-accuracy architecture audit) ----------------
+
+
+def test_a_course_with_only_confirmed_pass_findings_approves_cleanly():
+    """No-regression guard: a report with no blocker-severity findings at
+    all (the ordinary "everything checked out fine" case) must keep
+    approving cleanly - `review_findings` existing at all must never, by
+    itself, change this."""
+    report = QualityReport(
+        course_id="c1",
+        findings=[_finding(severity="minor", verification_status="unverified")],
+    )
+    assert report.approval_blocking_findings == []
+    assert report.review_findings == []
+    assert report.passed is True
+
+
+def test_a_confirmed_verification_failed_blocker_still_blocks_exactly_as_before():
+    """No-regression guard: `approval_blocking_findings`'s own existing
+    contract (blocks on anything severity=="blocker" whose verification
+    isn't "unverified") must be completely unchanged by adding the new
+    `review_findings` bucket alongside it."""
+    report = QualityReport(
+        course_id="c1",
+        findings=[_finding(severity="blocker", verification_status="verification_failed")],
+    )
+    assert len(report.approval_blocking_findings) == 1
+    assert report.review_findings == []  # not the new bucket - still the old one
+
+
+def test_an_unverified_blocker_surfaces_as_review_not_a_silent_pass():
+    """The actual new behaviour: a `severity == "blocker" AND
+    verification_status == "unverified"` finding - previously excluded from
+    `approval_blocking_findings` and therefore invisible anywhere - now
+    shows up in the new, distinct `review_findings` bucket, while still
+    correctly NOT blocking approval (that part of the contract is
+    deliberately unchanged)."""
+    report = QualityReport(
+        course_id="c1",
+        findings=[_finding(severity="blocker", verification_status="unverified")],
+    )
+    assert report.approval_blocking_findings == []  # still never blocks, unchanged
+    assert len(report.review_findings) == 1  # but no longer invisible
+    assert report.review_findings[0].reason == "hallucinated_label"
 
 
 def test_by_dimension_groups_across_all_five_dimensions():

@@ -132,3 +132,29 @@ def test_a_diagram_kind_image_is_never_tagged_section_intro():
     blocks = [_heading(), Block(type=BlockType.IMAGE, content={"kind": "diagram"}), _paragraph()]
     tag_section_intro_illustrations(blocks)
     assert blocks[1].content.get("illustration_style") in (None, "")
+
+
+# Real, confirmed production case: a course generated against an uploaded
+# "Kids Course Template" shipped "SME VERIFICATION" callouts carrying
+# fabricated citation-shaped tags like "[G2.1]" on learner-facing pages -
+# nothing in this codebase ever populates a "G"-prefixed reference with real
+# backing content (unlike "[S1.3]", a genuine reference to an uploaded
+# source excerpt), so every such tag is the writer model inventing a
+# citation shape with nothing behind it.
+def test_a_fabricated_g_prefixed_citation_tag_is_stripped():
+    draft = DraftBlock(
+        type=BlockType.PARAGRAPH,
+        text="All claims must be checked by an SME before publication [G2.1].",
+    )
+    content = draft_to_content(draft)
+    assert "[G2.1]" not in content["text"]
+    assert content["text"] == "All claims must be checked by an SME before publication ."
+
+
+def test_a_real_source_citation_tag_survives_the_same_filter():
+    draft = DraftBlock(
+        type=BlockType.PARAGRAPH,
+        text="Refunds take 30 days [S1.3].",
+    )
+    content = draft_to_content(draft)
+    assert "[S1.3]" in content["text"]

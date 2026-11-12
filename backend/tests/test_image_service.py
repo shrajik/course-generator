@@ -1233,6 +1233,145 @@ async def test_an_image_that_fails_relevance_after_retry_is_withheld_not_replace
     )
 
 
+async def test_a_confirmed_source_text_contradiction_is_withheld_like_any_other_relevance_failure(monkeypatch):
+    """Canonical Visual Spec milestone: `contradicts_source_text=True` must
+    feed the SAME `confirmed_relevance_failure`/withholding mechanism every
+    other relevance failure already uses - never a softer outcome just
+    because the defect is about source-consistency rather than on-topic-ness."""
+    svc = ImageService()
+    draw_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        draw_calls["n"] += 1
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                contradicts_source_text=True,
+                contradicts_source_text_detail="Shows the valve opening when the text says it stays closed.",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A diagram of the safety valve")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_contradiction", block=block, template=template, course_title="Engineering",
+        source_excerpt="During a pressure spike, the safety valve remains closed until manually released.",
+    )
+
+    assert ok is False
+    assert block.content.get("generated") is False
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    assert "contradicts_source_text" in types
+    assert "image_withheld_after_qa_failure" in types
+
+
+async def test_an_unsupported_claim_ships_the_image_flagged_for_review_not_withheld(monkeypatch):
+    """The softer, genuinely-different case: a claim the source excerpt
+    simply doesn't address (neither confirms nor contradicts) must NOT
+    withhold the image - it ships normally, with a separate, non-blocking
+    `source_grounding_unsupported` finding for a human reviewer."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return _real_image_bytes("PNG")
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(unsupported_claims=["the valve is rated for 300 PSI"])
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(svc, "_verify_generated_text", _no_missing_labels)
+
+    block = _image_block(purpose="A diagram of the safety valve")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_unsupported", block=block, template=template, course_title="Engineering",
+        source_excerpt="During a pressure spike, the safety valve remains closed until manually released.",
+    )
+
+    assert ok is True
+    assert block.content.get("generated") is True
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    matching = [f for f in findings if f["type"] == "source_grounding_unsupported"]
+    assert len(matching) == 1
+    assert matching[0]["resolution"] == "source_grounding_unsupported"
+    assert "300 PSI" in matching[0]["detail"]
+
+
+async def test_section_intro_illustrations_skip_source_grounding_entirely(monkeypatch):
+    """A `section_intro` illustration is deliberately generic/decorative -
+    see `_generate_illustration`'s own `grounding_excerpt` short-circuit -
+    so it must never be asked the grounding question at all, regardless of
+    how real `source_excerpt` is."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return _real_image_bytes("PNG")
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            assert kwargs.get("user", "") == "" or "COURSE'S OWN TEXT" not in kwargs.get("user", "")
+            return ImageRelevanceCheck()
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(svc, "_verify_generated_text", _no_missing_labels)
+
+    block = _image_block(purpose="A scene-setting illustration", illustration_style="section_intro")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_section_intro", block=block, template=template, course_title="Engineering",
+        source_excerpt="Some completely unrelated real chapter prose that must never be checked here.",
+    )
+    assert ok is True
+
+
+async def test_numeric_contradiction_in_the_brief_withholds_without_an_llm_confirmed_contradiction(monkeypatch):
+    """Phase 2/5: the deterministic numeric check must fire even when the
+    vision model's OWN judgment call says everything else is clean - it is
+    a separate, independent signal, not a duplicate of `contradicts_source_
+    text`."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck()  # a clean pass on every LLM-judged dimension
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="The reaction yield was 75% under these conditions")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_numeric", block=block, template=template, course_title="Chemistry",
+        source_excerpt="Under these exact conditions, the reaction yield was only 25%.",
+    )
+
+    assert ok is False
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    assert "numeric_contradicts_source_text" in types
+
+
 async def test_the_full_fallback_cascade_tries_wikimedia_before_withholding(monkeypatch):
     """The exact cascade the fallback system must follow, end to end: (1)
     Wikimedia Commons is tried FIRST, before any AI model call at all; (2)
@@ -2184,11 +2323,11 @@ def test_chapter_section_context_walks_the_document_in_order():
         pages=[Page(blocks=blocks)],
     )
     context = chapter_section_context(document)
-    assert context[img1.id] == ("Chapter 1: Python Basics", "Learning Objectives", "")
-    assert context[img2.id] == ("Chapter 1: Python Basics", "Concept", "")
+    assert context[img1.id] == ("Chapter 1: Python Basics", "Learning Objectives", "", "")
+    assert context[img2.id] == ("Chapter 1: Python Basics", "Concept", "", "")
     # Chapter 2's own heading resets the section back to blank - no stale
     # section title leaking across a chapter boundary.
-    assert context[img3.id] == ("Chapter 2: Functions", "", "")
+    assert context[img3.id] == ("Chapter 2: Functions", "", "", "")
 
 
 def test_key_concept_is_found_even_when_the_objectives_block_comes_after_the_image():
@@ -2217,8 +2356,56 @@ def test_key_concept_is_found_even_when_the_objectives_block_comes_after_the_ima
     context = chapter_section_context(document)
     assert context[img.id] == (
         "Newton's Laws of Motion", "Learning Objectives",
-        "Explain how force relates to acceleration for a fixed mass",
+        "Explain how force relates to acceleration for a fixed mass", "",
     )
+
+
+def test_source_excerpt_gathers_the_whole_sections_prose_both_before_and_after_the_image():
+    """Hard requirement (Canonical Visual Spec milestone): source-grounding
+    verification must not incorrectly flag a true claim just because it
+    wasn't in the one paragraph immediately before the image - the whole
+    section's real prose must be available, regardless of document order
+    relative to the image block itself."""
+    from app.schemas.blocks import BlockType as BT
+    from app.schemas.document import CourseDocument, Page
+
+    blocks = [
+        Block(type=BT.HEADING, content={"text": "Thermodynamics", "level": 1}),
+        Block(type=BT.HEADING, content={"text": "The First Law", "level": 2}),
+        Block(type=BT.PARAGRAPH, content={"text": "Energy cannot be created or destroyed."}),
+        (img := _image_block()),
+        # This sentence comes AFTER the image in document order - must still
+        # be included in img's own source_excerpt.
+        Block(type=BT.PARAGRAPH, content={"text": "The total internal energy change equals Q minus W."}),
+        Block(type=BT.HEADING, content={"text": "The Second Law", "level": 2}),
+        # A DIFFERENT section's prose must NOT leak into img's excerpt.
+        Block(type=BT.PARAGRAPH, content={"text": "Entropy of an isolated system never decreases."}),
+    ]
+    document = CourseDocument(
+        document_id="d", course_id="c", course_title="Physics", template_id="technical",
+        pages=[Page(blocks=blocks)],
+    )
+    context = chapter_section_context(document)
+    excerpt = context[img.id][3]
+    assert "Energy cannot be created or destroyed" in excerpt
+    assert "total internal energy change equals Q minus W" in excerpt
+    assert "Entropy" not in excerpt
+
+
+def test_source_excerpt_is_empty_when_the_section_has_no_real_prose():
+    from app.schemas.blocks import BlockType as BT
+    from app.schemas.document import CourseDocument, Page
+
+    blocks = [
+        Block(type=BT.HEADING, content={"text": "Chapter", "level": 1}),
+        (img := _image_block()),
+    ]
+    document = CourseDocument(
+        document_id="d", course_id="c", course_title="Course", template_id="technical",
+        pages=[Page(blocks=blocks)],
+    )
+    context = chapter_section_context(document)
+    assert context[img.id][3] == ""
 
 
 def test_key_concept_falls_back_to_summary_key_takeaways_when_no_objectives_exist():
@@ -3042,6 +3229,116 @@ async def test_wikimedia_candidate_with_non_english_labels_is_rejected(monkeypat
     assert len(ai_image_calls) == 1
 
 
+async def test_wikimedia_category_a_photo_skips_the_source_grounding_check(monkeypatch):
+    """Final Implementation hardening pass: an ordinary photograph
+    (`information_bearing=False`, the default) must never be held to the
+    source-grounding bar at all, even when the course's own text disagrees
+    with something incidental - that's explicitly Category B's job, never
+    Category A's."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        return [_wikimedia_candidate()]
+
+    async def fake_fetch(url, *, settings, transport=None):
+        return _real_image_bytes("PNG")
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is WikimediaCandidateCheck:
+            return schema(information_bearing=False)
+        return schema()
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+    monkeypatch.setattr(image_service.wikimedia_provider, "fetch_image_bytes", fake_fetch)
+    svc.ai.structured = fake_structured  # type: ignore[method-assign]
+
+    block = _image_block(purpose="A lab bench with an oscilloscope")
+    ok = await svc._generate_illustration(
+        course_id="course_wm_category_a", block=block, template=load_template("technical"), course_title="Physics",
+        source_excerpt="Nothing in this excerpt matters to an ordinary photograph.",
+    )
+    assert ok is True
+    assert block.content["image_source"] == "wikimedia"
+    assert block.content["visual_qa_findings"] == []
+
+
+async def test_wikimedia_category_b_confirmed_contradiction_is_rejected(monkeypatch):
+    """Final Implementation hardening pass: an information-bearing
+    candidate (a labelled diagram/schematic/periodic table/etc) whose own
+    transcribed labels CONTRADICT this course's source text must never be
+    published - rejected the same way a non-English-labelled candidate is,
+    falling through to the AI model instead."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        return [_wikimedia_candidate()]
+
+    async def fake_fetch(url, *, settings, transport=None):
+        return _real_image_bytes("PNG")
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is WikimediaCandidateCheck:
+            return schema(information_bearing=True, visible_numeric_labels="Si = 28")
+        return schema()
+
+    ai_image_calls: list[str] = []
+
+    async def fake_ai_image(*, prompt, size=None, phase="image", provider=None):
+        ai_image_calls.append(prompt)
+        return b"png-bytes"
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+    monkeypatch.setattr(image_service.wikimedia_provider, "fetch_image_bytes", fake_fetch)
+    svc.ai.structured = fake_structured  # type: ignore[method-assign]
+    svc.ai.image = fake_ai_image  # type: ignore[method-assign]
+
+    block = _image_block(purpose="A periodic table highlighting silicon")
+    ok = await svc._generate_illustration(
+        course_id="course_wm_category_b_fail", block=block, template=load_template("technical"),
+        course_title="Chemistry", source_excerpt="Silicon (Si) has atomic number Si = 14.",
+    )
+    assert ok is True
+    assert block.content["image_source"] == "generated"
+    assert len(ai_image_calls) == 1
+
+
+async def test_wikimedia_category_b_ambiguous_identifier_is_flagged_but_not_rejected(monkeypatch):
+    """An information-bearing candidate whose transcribed label only
+    conflicts on UNIT (never a confirmed numeric contradiction - see
+    numeric_consistency_qa.find_identifier_value_issues' own REVIEW
+    contract) must still be used, but with the ambiguity recorded as an
+    advisory `visual_qa_findings` entry - never silently treated as
+    resolved, and never a hard rejection on a guess."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        return [_wikimedia_candidate()]
+
+    async def fake_fetch(url, *, settings, transport=None):
+        return _real_image_bytes("PNG")
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is WikimediaCandidateCheck:
+            return schema(information_bearing=True, visible_numeric_labels="V1 = 5 ohms")
+        return schema()
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+    monkeypatch.setattr(image_service.wikimedia_provider, "fetch_image_bytes", fake_fetch)
+    svc.ai.structured = fake_structured  # type: ignore[method-assign]
+
+    block = _image_block(purpose="A labelled circuit schematic")
+    ok = await svc._generate_illustration(
+        course_id="course_wm_category_b_review", block=block, template=load_template("technical"),
+        course_title="Electronics", source_excerpt="In this circuit, V1 = 5 volts.",
+    )
+    assert ok is True
+    assert block.content["image_source"] == "wikimedia"
+    findings = block.content["visual_qa_findings"]
+    assert len(findings) == 1
+    assert findings[0]["type"] == "identifier_value_ambiguous_needs_review"
+    assert findings[0]["deterministic"] is False
+
+
 async def test_wikimedia_candidate_below_the_resolution_floor_is_rejected_without_a_vision_call(monkeypatch):
     """Scenario 4 (part 1): a deterministic rejection - too small to be a
     real textbook-quality image - costs zero AI calls; never even
@@ -3322,6 +3619,97 @@ async def test_wikimedia_cache_hit_skips_search_and_download(monkeypatch, storag
     assert block.content["image_source"] == "wikimedia"
     assert block.content["wikimedia_title"] == "File:X.png"
     assert search_calls == []  # cache hit - never even searched
+
+
+class _FakeAIRejectingCachedCandidate(_FakeAI):
+    """Like `_FakeAI`, but fails ONLY the `WikimediaCandidateCheck` schema
+    (as if the cached image doesn't actually suit THIS course's own brief) -
+    every other structured call (text-free/relevance checks on whatever the
+    fallback path generates afterward) still gets `_FakeAI`'s normal,
+    uneventful passing default, so only the cache re-validation itself is
+    under test."""
+
+    async def structured(self, *, schema, **kwargs):
+        if schema is WikimediaCandidateCheck:
+            return schema(on_topic=False, on_topic_detail="Shows an unrelated diagram for this course's brief.")
+        return await super().structured(schema=schema, **kwargs)
+
+
+async def test_wikimedia_cache_hit_still_relevant_to_this_course_is_served_normally(monkeypatch, storage):
+    """Root-cause fix (cross-course cache safety audit): a cache hit is now
+    re-validated against THIS course's own brief before being served - the
+    common case (the cached image genuinely still fits) must keep working
+    exactly as before, just with one extra, passing re-validation call."""
+    data = _real_image_bytes("PNG")
+    meta = {
+        "image_source": "wikimedia",
+        "source_url": "https://commons.wikimedia.org/wiki/File:X.png",
+        "license_name": "CC BY-SA 4.0",
+        "license_url": "https://creativecommons.org/licenses/by-sa/4.0",
+        "attribution_text": "Jane Doe — CC BY-SA 4.0, via Wikimedia Commons",
+        "wikimedia_title": "File:X.png",
+    }
+    storage.save_wikimedia_cache_entry("depicts mitosis stages", data, meta, extension="png")
+
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings(), storage=storage)
+    search_calls: list[str] = []
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        search_calls.append(query)
+        return []
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+
+    block = _image_block(purpose="Depicts mitosis stages")
+    ok = await svc._generate_illustration(
+        course_id="course_wm_cache_fresh", block=block, template=load_template("technical"), course_title="Biology",
+    )
+    assert ok is True
+    assert block.content["image_source"] == "wikimedia"
+    assert block.content["wikimedia_title"] == "File:X.png"
+    assert search_calls == []  # still relevant - served from cache, never re-searched
+
+
+async def test_wikimedia_cache_hit_irrelevant_to_a_different_course_falls_through_to_a_fresh_search(
+    monkeypatch, storage
+):
+    """Root-cause fix (cross-course cache safety audit): this cache is
+    course-INDEPENDENT (see `storage.wikimedia_cache_dir`'s own docstring) -
+    a later, unrelated course whose query happens to normalise to the exact
+    same cache key must NOT be served that image on faith just because the
+    bytes were already fetched once for a different course's brief. A
+    cache hit that fails re-validation against THIS course's own brief must
+    fall through to the ordinary fresh-search path (the same one a genuine
+    cache miss already uses), not silently serve the stale image."""
+    data = _real_image_bytes("PNG")
+    meta = {
+        "image_source": "wikimedia",
+        "source_url": "https://commons.wikimedia.org/wiki/File:X.png",
+        "license_name": "CC BY-SA 4.0",
+        "license_url": "https://creativecommons.org/licenses/by-sa/4.0",
+        "attribution_text": "Jane Doe — CC BY-SA 4.0, via Wikimedia Commons",
+        "wikimedia_title": "File:X.png",
+    }
+    storage.save_wikimedia_cache_entry("depicts mitosis stages", data, meta, extension="png")
+
+    svc = ImageService(ai=_FakeAIRejectingCachedCandidate(is_mock=True), settings=_wikimedia_settings(), storage=storage)
+    search_calls: list[str] = []
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        search_calls.append(query)
+        return []  # the fresh search also finds nothing suitable here - not what's under test
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+
+    block = _image_block(purpose="Depicts mitosis stages")
+    ok = await svc._generate_illustration(
+        course_id="course_wm_cache_stale", block=block, template=load_template("technical"), course_title="Biology",
+    )
+    assert ok is True
+    # Rejected the stale cached image instead of serving it...
+    assert block.content["image_source"] != "wikimedia"
+    # ...and actually fell through to a real fresh search, same as a genuine miss.
+    assert search_calls == ["Depicts mitosis stages"]
 
 
 async def test_wikimedia_is_never_tried_for_a_section_intro_illustration(monkeypatch):

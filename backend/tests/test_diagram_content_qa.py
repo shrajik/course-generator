@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from app.services import mock_ai as mock_ai_module
 from app.services.diagram_content_qa import (
+    CONTRADICTS_SOURCE_TEXT,
     GENERIC_CONTENT,
     MISSING_KEY_CONCEPT,
     MISSPELLED_OR_GARBLED_TEXT,
+    NUMERIC_CONTRADICTS_SOURCE_TEXT,
     OFF_TOPIC,
+    SOURCE_GROUNDING_UNSUPPORTED,
     STRUCTURALLY_GARBLED_TEXT,
     evaluate_content,
 )
@@ -120,3 +123,107 @@ async def test_text_legible_false_produces_an_issue(monkeypatch):
     spec = _spec()
     result = await evaluate_content(spec, brief="Explain the request flow.", course_title="T", ai=MockAIClient(None))
     assert {issue.reason for issue in result.issues} == {MISSPELLED_OR_GARBLED_TEXT}
+
+
+# Canonical Visual Spec milestone: source-grounding fields on ContentCritique.
+
+
+async def test_no_source_excerpt_never_asks_the_grounding_question(monkeypatch):
+    """The default `source_excerpt=""` must never trip either new field,
+    even if a careless critique builder set them - the grounding question is
+    never even asked without a real excerpt to check against (see
+    `evaluate_content`'s own docstring)."""
+    def over_eager_critique(user: str) -> dict:
+        assert "SOURCE TEXT" not in user, "grounding block must not appear in the prompt with no excerpt"
+        return {}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", over_eager_critique)
+    spec = _spec()
+    result = await evaluate_content(spec, brief="Explain the request flow.", course_title="T", ai=MockAIClient(None))
+    assert result.passed
+
+
+async def test_contradicts_source_text_produces_a_non_deterministic_issue(monkeypatch):
+    def contradiction_critique(user: str) -> dict:
+        assert "SOURCE TEXT" in user
+        return {
+            "contradicts_source_text": True,
+            "contradicts_source_text_detail": "The diagram shows the client retrying 5 times; the text says 3.",
+        }
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", contradiction_critique)
+    spec = _spec()
+    result = await evaluate_content(
+        spec, brief="Explain the request flow.", course_title="T", ai=MockAIClient(None),
+        source_excerpt="The client retries up to 3 times before giving up.",
+    )
+    assert not result.passed
+    assert {issue.reason for issue in result.issues} == {CONTRADICTS_SOURCE_TEXT}
+    assert all(issue.deterministic is False for issue in result.issues)
+    assert "retrying 5 times" in result.feedback()
+
+
+async def test_unsupported_claims_produces_a_separate_issue_type(monkeypatch):
+    def unsupported_critique(user: str) -> dict:
+        return {"unsupported_claims": ["the server caches responses for 60 seconds"]}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", unsupported_critique)
+    spec = _spec()
+    result = await evaluate_content(
+        spec, brief="Explain the request flow.", course_title="T", ai=MockAIClient(None),
+        source_excerpt="The server processes the request and returns a response.",
+    )
+    assert not result.passed
+    assert {issue.reason for issue in result.issues} == {SOURCE_GROUNDING_UNSUPPORTED}
+    assert "caches responses" in result.feedback()
+
+
+async def test_contradiction_and_unsupported_claim_both_reported_independently(monkeypatch):
+    """Genuinely different cases (a confirmed conflict vs. an unaddressed
+    claim) must never collapse into one finding type - each is persisted
+    and routed separately downstream (quality_framework.py)."""
+    def both_critique(user: str) -> dict:
+        return {
+            "contradicts_source_text": True,
+            "contradicts_source_text_detail": "Conflict.",
+            "unsupported_claims": ["Something else unaddressed."],
+        }
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", both_critique)
+    spec = _spec()
+    result = await evaluate_content(
+        spec, brief="Explain the request flow.", course_title="T", ai=MockAIClient(None),
+        source_excerpt="Some real course text.",
+    )
+    assert {issue.reason for issue in result.issues} == {CONTRADICTS_SOURCE_TEXT, SOURCE_GROUNDING_UNSUPPORTED}
+
+
+async def test_numeric_contradiction_short_circuits_before_any_ai_call():
+    """Layer 0 (deterministic numeric check) catches a high-confidence
+    mismatch against the source excerpt and never spends the LLM critique
+    call - same short-circuit contract as the garbled-text check."""
+    spec = _spec(nodes=[
+        DiagramNode(id="a", label="Reaction yield", detail="75% under these conditions"),
+        DiagramNode(id="b", label="Result"),
+    ])
+    result = await evaluate_content(
+        spec, brief="Explain the reaction yield.", course_title="T", ai=_ExplodingAI(None),
+        source_excerpt="Under these exact conditions, the reaction yield was only 25%.",
+    )
+    assert not result.passed
+    assert {issue.reason for issue in result.issues} == {NUMERIC_CONTRADICTS_SOURCE_TEXT}
+    assert all(issue.deterministic for issue in result.issues)
+
+
+async def test_numeric_equivalent_representation_does_not_short_circuit(monkeypatch):
+    """0.5 vs 50% vs 1/2 are the SAME value - must reach the (happy-path)
+    LLM critique rather than being misflagged as a numeric contradiction."""
+    spec = _spec(nodes=[
+        DiagramNode(id="a", label="Success rate", detail="50% in this scenario"),
+        DiagramNode(id="b", label="Result"),
+    ])
+    result = await evaluate_content(
+        spec, brief="Explain the success rate.", course_title="T", ai=MockAIClient(None),
+        source_excerpt="Research shows the success probability is 0.5 for this exact scenario.",
+    )
+    assert result.passed

@@ -95,7 +95,21 @@ _MIN_CONTENT_BEFORE_EARLY_BREAK = 150.0
 # FRESH, empty page" checks (those stay exact - a block that's genuinely
 # too large for an entire page is a different problem this tolerance isn't
 # meant to paper over).
-_NEAR_FIT_TOLERANCE = 20.0
+#
+# Public (not `_`-prefixed): app.course.document.builder's own _page_size_for
+# needs this SAME number - a real, confirmed bug otherwise: flow_blocks
+# places a block ending just inside this tolerance and calls the page done,
+# but _page_size_for used a stricter, zero-tolerance "fits" check of its
+# own, so it grew that page's OWN declared size past the fixed print sheet
+# height for a block flow_blocks had already decided needed no such thing -
+# and a `.page` div taller than the sheet makes Chromium's print engine
+# insert its own, uncontrolled page break, stranding whatever's left on a
+# near/fully-blank extra PDF page (confirmed by rendering a real export:
+# a page ending 17.9px into this tolerance - safely short of the footer -
+# still grew to 1140.86px, 17.86px past the 1123px sheet, producing exactly
+# one genuinely blank physical PDF page). Keeping both checks reading the
+# same constant is what keeps them from drifting apart like this again.
+NEAR_FIT_TOLERANCE = 20.0
 
 # How many upcoming non-visual blocks this module will bridge over to find a
 # pending visual worth protecting. The writer rarely stacks more than one or
@@ -330,7 +344,9 @@ _MIN_SHRINK_WIDTH_FRACTION = 0.55
 _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION = 0.70
 
 
-def shrink_image_width_to_fit(block: Block, available: float) -> float | None:
+def shrink_image_width_to_fit(
+    block: Block, available: float, *, min_fraction_override: float | None = None
+) -> float | None:
     """If `block` (an ordinary photo/illustration image with a known real
     aspect ratio) doesn't fit in `available` px at its normal full width, but
     would fit at some narrower width that's still a legible picture, return
@@ -351,6 +367,13 @@ def shrink_image_width_to_fit(block: Block, available: float) -> float | None:
     narrower width keeps the image, its aspect ratio and its caption's own
     wrap width all self-consistent through the ordinary, unchanged code path
     instead of this function having to special-case any of them.
+
+    `min_fraction_override`, when given, replaces the normal per-kind floor
+    below - app.course.document.diagram_compaction's own last-resort lever
+    uses a lower one than this function's ordinary, every-page floor, since
+    by the time it calls this the alternative is already a page confirmed
+    (by the PDF spacing QA gate) to be wasting up to ~80% of its own space,
+    a worse outcome than a narrower-than-usual diagram.
     """
     content = block.content
     kind = content.get("kind")
@@ -371,7 +394,10 @@ def shrink_image_width_to_fit(block: Block, available: float) -> float | None:
     # moves it whole to a fresh page, where it renders at its real full
     # width) rather than the small-decorative-photo floor.
     is_label_dense = kind == "diagram" or (content.get("illustration_style") or "") == "textbook"
-    min_fraction = _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION if is_label_dense else _MIN_SHRINK_WIDTH_FRACTION
+    if min_fraction_override is not None:
+        min_fraction = min_fraction_override
+    else:
+        min_fraction = _MIN_DIAGRAM_SHRINK_WIDTH_FRACTION if is_label_dense else _MIN_SHRINK_WIDTH_FRACTION
     min_width = full_width * min_fraction
     pad = _padding(block)
     aspect = float(intrinsic_h) / float(intrinsic_w)
@@ -512,6 +538,17 @@ def estimate_height(block: Block) -> float:
         is_intro = _is_section_intro(block)
         caption = 0.0 if is_intro else caption_height(block)
         width_hint = SECTION_INTRO_IMAGE_WIDTH if is_intro else None
+        # Same reasoning as the section_intro case just above - a diagram
+        # diagram_compaction.py already narrowed (see its own module
+        # docstring, and the matching lookup in flow_blocks's own width-
+        # assignment) must be estimated at ITS real, persisted width here
+        # too, or this lookahead would overestimate its height and bridge
+        # it away again right after compaction narrowed it specifically to
+        # avoid that.
+        if width_hint is None and content.get("kind") == "diagram":
+            compacted_width = content.get("compacted_display_width")
+            if compacted_width:
+                width_hint = float(compacted_width)
         return image_box_height(block, width_hint=width_hint) + caption + 2 * pad + 8
 
     if t is BlockType.QUOTE:
@@ -998,7 +1035,7 @@ def flow_blocks(
             combined_h = _section_intro_pair_height(block, paragraph, image_h)
             gap = (BLOCK_GAP if current else 0.0)
 
-            if y + gap + combined_h <= bottom + _NEAR_FIT_TOLERANCE:
+            if y + gap + combined_h <= bottom + NEAR_FIT_TOLERANCE:
                 block.layout.y = y + gap
                 block.layout.height = round(image_h, 2)
                 block.layout.z_index = 1  # paints over the paragraph in the (non-floating) editor canvas
@@ -1026,6 +1063,39 @@ def flow_blocks(
         # a page-wide 665x465 picture. A width _pending_visual_run already
         # pre-decided for this exact block (see its own call site) wins over
         # both - it already accounted for what's left on the page.
+        # A width diagram_compaction.py already decided on for THIS diagram
+        # (see its own module docstring) - persisted on the block itself
+        # (unlike `preset_widths`, which only survives one flow_blocks call)
+        # so it keeps applying across every future reflow, exactly like
+        # SECTION_INTRO_IMAGE_WIDTH's own unconditional-by-kind override
+        # just below. Real, confirmed gap this closes: compaction's own
+        # gap_scale lever (render_diagram_svg_fitting) is a no-op for any
+        # diagram kind outside the ring-process family (concept_map,
+        # circuit_schematic, periodic_table...), so those kinds never got a
+        # second chance to avoid stranding a page's remainder.
+        compacted_width = (
+            block.content.get("compacted_display_width")
+            if block.type is BlockType.IMAGE and block.content.get("kind") == "diagram"
+            else None
+        )
+        if compacted_width:
+            block.layout.x = margin_x + (content_width - float(compacted_width)) / 2
+            block.layout.width = float(compacted_width)
+            height = estimate_height(block)
+            gap = 0.0
+            if current:
+                gap = SECTION_GAP if block.type is BlockType.HEADING else BLOCK_GAP
+            if y + gap + height <= bottom + NEAR_FIT_TOLERANCE:
+                block.layout.y = y + gap
+                block.layout.height = round(height, 2)
+                current.append(block)
+                y = block.layout.y + height
+                continue
+            # Didn't actually fit (budget stale/wrong) - fall through to the
+            # ordinary full-width handling below rather than trust a number
+            # that's no longer accurate.
+            block.content.pop("compacted_display_width", None)
+
         preset_width = preset_widths.pop(block.id, None)
         if preset_width is not None:
             # A real, confirmed bug: left at margin_x (the line just below,
@@ -1070,7 +1140,7 @@ def flow_blocks(
             if visual_pair is not None:
                 pair_height = _visual_run_height(visual_pair, queue)
                 space_here = bottom - (y + gap)
-                would_strand_pair = pair_height > space_here + _NEAR_FIT_TOLERANCE
+                would_strand_pair = pair_height > space_here + NEAR_FIT_TOLERANCE
                 pair_fits_a_fresh_page = pair_height <= box.content_height
                 if would_strand_pair and not try_shrink_trailing_visual(visual_pair, space_here) and pair_fits_a_fresh_page:
                     start_new_page()
@@ -1098,13 +1168,13 @@ def flow_blocks(
             if run is not None:
                 run_height = _visual_run_height(run, queue)
                 space_here = bottom - (y + gap)
-                would_strand_visual = run_height > space_here + _NEAR_FIT_TOLERANCE
+                would_strand_visual = run_height > space_here + NEAR_FIT_TOLERANCE
                 fits_a_fresh_page = run_height <= box.content_height
                 if would_strand_visual and not try_shrink_trailing_visual(run, space_here) and fits_a_fresh_page:
                     start_new_page()
                     gap = 0.0
 
-        if y + gap + height <= bottom + _NEAR_FIT_TOLERANCE:
+        if y + gap + height <= bottom + NEAR_FIT_TOLERANCE:
             block.layout.y = y + gap
             block.layout.height = round(height, 2)
             current.append(block)

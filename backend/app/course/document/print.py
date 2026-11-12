@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from app.core.ids import page_id
 from app.course.document.builder import _page_size_for
-from app.course.document.layout import flow_blocks
+from app.course.document.layout import NEAR_FIT_TOLERANCE, flow_blocks
 from app.course.document.layout_validator import page_overflow
 from app.core.logging import get_logger
 from app.schemas.blocks import BlockType
@@ -33,6 +33,9 @@ from app.schemas.template import CourseTemplate, PageGeometry
 log = get_logger(__name__)
 
 # Estimates err high by design; a couple of px of drift is not an overflow.
+# A genuine math-correctness guard (did a GROWN page's own size round-trip
+# cleanly) - not the question NEAR_FIT_TOLERANCE answers below, so this stays
+# strict and is never used for the page_overflow check.
 _TOLERANCE = 2.0
 
 
@@ -41,7 +44,18 @@ def _needs_repagination(page: Page, sheet: PageGeometry) -> bool:
         return False  # cover and contents pages are generated at sheet size
     if page.size.height > sheet.height + _TOLERANCE:
         return True
-    return page_overflow(page) > _TOLERANCE
+    # NEAR_FIT_TOLERANCE (layout.py), not _TOLERANCE: a page whose content
+    # lands up to NEAR_FIT_TOLERANCE past its own nominal boundary is
+    # exactly what flow_blocks's own placement check already decided was
+    # safe to leave there (see that constant's own docstring) - re-flowing
+    # it for print would be a no-op (the same engine, the same inputs,
+    # reproducing the identical placement) that only wastes a pass. Real,
+    # confirmed bug this closes: before NEAR_FIT_TOLERANCE existed this
+    # strict a number was never wrong; once flow_blocks started using it,
+    # this call site didn't follow, so it kept flagging pages flow_blocks
+    # itself already considered print-safe (confirmed via a real export -
+    # no clipping, footer renders cleanly below the content either way).
+    return page_overflow(page) > NEAR_FIT_TOLERANCE
 
 
 def _reading_order(page: Page):

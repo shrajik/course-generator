@@ -9,7 +9,7 @@ literal mechanism this codebase uses for it.
 from __future__ import annotations
 
 from app.course.document.builder import _page_size_for, reflow_document
-from app.course.document.layout import CONTENT_HEIGHT, flow_blocks, page_visual_fraction
+from app.course.document.layout import CONTENT_HEIGHT, CONTENT_WIDTH, NEAR_FIT_TOLERANCE, flow_blocks, page_visual_fraction
 from app.course.document.layout_validator import (
     DOCUMENT_LEVEL,
     content_integrity_report,
@@ -26,6 +26,7 @@ from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
 from app.schemas.document import (
     Block,
+    BlockLayout,
     BlockMeta,
     BlockStyle,
     CourseDocument,
@@ -319,6 +320,48 @@ def test_an_oversized_visual_gets_a_page_grown_to_actually_contain_it():
 
 
 # ---------------------------------------------------------------------------
+# PDF/export fidelity: a page flow_blocks already considers a safe near-fit
+# (see layout.NEAR_FIT_TOLERANCE) must never have its OWN declared size grown
+# past the real print sheet height. A real, confirmed bug: `_page_size_for`
+# used to require clearing the FULL margin reserve a second time before
+# calling a page done, disagreeing with flow_blocks's own, already-applied
+# tolerance - so a page flow_blocks placed perfectly safely still grew a few
+# px past the fixed sheet size. A `.page` div taller than the print sheet
+# makes Chromium's print-to-PDF engine insert its own, uncontrolled page
+# break when exporting - confirmed by rendering a real export to page images
+# and finding a genuinely blank extra physical page where this fired.
+# ---------------------------------------------------------------------------
+
+
+def test_a_near_fit_tolerance_page_is_never_grown_past_the_real_print_sheet():
+    from app.schemas.template import PageGeometry
+
+    geometry = PageGeometry()
+    nominal_bottom = geometry.height - geometry.margin_bottom
+
+    # A block whose own bottom edge lands just inside NEAR_FIT_TOLERANCE of
+    # the nominal content boundary - exactly the shape flow_blocks itself
+    # already considers a safe fit (see NEAR_FIT_TOLERANCE's own docstring),
+    # not a genuinely oversized block.
+    from app.course.document.layout import NEAR_FIT_TOLERANCE
+
+    within_tolerance = Block(
+        type=BlockType.PARAGRAPH, content={"text": "x"},
+        layout=BlockLayout(
+            x=geometry.margin_x, y=geometry.margin_top,
+            width=geometry.content_width, height=(nominal_bottom - geometry.margin_top) + NEAR_FIT_TOLERANCE - 2.0,
+        ),
+    )
+
+    size = _page_size_for([within_tolerance], geometry)
+
+    assert size.height == geometry.height, (
+        "a block flow_blocks already considers a safe near-fit must not grow the page's own "
+        "declared size past the real, fixed print sheet height"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Test 10: content integrity - every original block present exactly once,
 # in order, after a heavy multi-split reflow
 # ---------------------------------------------------------------------------
@@ -556,3 +599,86 @@ def test_validate_page_and_validate_document_return_shapes_are_unchanged():
     assert isinstance(problems, dict)
     assert all(isinstance(k, int) for k in problems)
     assert all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in problems.values())
+
+
+# ---------------------------------------------------------------------------
+# PDF/export fidelity follow-up: layout_validator.validate_page_structured
+# and print._needs_repagination both used to measure a page's own trailing
+# overflow against the strict, math-correctness-only _TOLERANCE (2px) -
+# wrong once NEAR_FIT_TOLERANCE (20px) became a real, deliberate placement
+# allowance flow_blocks itself relies on (see that constant's own docstring).
+# These three tests prove the reconciliation is exactly scoped: a near-fit
+# page is accepted as safe by BOTH callers, a genuinely too-large overflow is
+# still flagged by both, and a REAL block-to-block overlap is still caught
+# by the untouched, still-strict 2px check - nothing here was weakened.
+# ---------------------------------------------------------------------------
+
+
+def _single_trailing_block_page(overflow_px: float) -> Page:
+    """One page whose only block's bottom edge lands `overflow_px` past the
+    nominal content boundary (PAGE_MARGIN_TOP + CONTENT_HEIGHT) - the exact
+    shape flow_blocks itself accepts up to NEAR_FIT_TOLERANCE, and the exact
+    shape `test_per_image_save_during_generation_never_persists_overlapping_
+    blocks` (test_course_service.py) hit for real."""
+    from app.schemas.document import PAGE_MARGIN_TOP, PageSize
+
+    nominal_bottom = PAGE_MARGIN_TOP + CONTENT_HEIGHT
+    block = Block(
+        type=BlockType.PARAGRAPH, content={"text": "x"},
+        layout=BlockLayout(x=64, y=PAGE_MARGIN_TOP, width=CONTENT_WIDTH, height=(nominal_bottom - PAGE_MARGIN_TOP) + overflow_px),
+    )
+    return Page(id="page_1", page_number=1, kind="content", size=PageSize(), blocks=[block])
+
+
+def test_an_overflow_within_near_fit_tolerance_is_accepted_as_safe_everywhere():
+    from app.course.document.print import _needs_repagination
+    from app.schemas.template import PageGeometry
+
+    page = _single_trailing_block_page(NEAR_FIT_TOLERANCE - 2.0)
+
+    assert page_overflow(page) <= NEAR_FIT_TOLERANCE
+    findings = validate_page_structured(page)
+    assert not any(f.reason == "page_overflow" for f in findings), (
+        "a block within NEAR_FIT_TOLERANCE must not be reported as a structural finding"
+    )
+    assert _needs_repagination(page, PageGeometry()) is False, (
+        "a block within NEAR_FIT_TOLERANCE must not trigger a (wasted, no-op) print-time repagination"
+    )
+
+
+def test_an_overflow_beyond_near_fit_tolerance_is_still_flagged_everywhere():
+    from app.course.document.print import _needs_repagination
+    from app.schemas.template import PageGeometry
+
+    page = _single_trailing_block_page(NEAR_FIT_TOLERANCE + 15.0)
+
+    assert page_overflow(page) > NEAR_FIT_TOLERANCE
+    findings = validate_page_structured(page)
+    assert any(f.reason == "page_overflow" for f in findings), (
+        "a block genuinely past NEAR_FIT_TOLERANCE must still be reported as a structural finding"
+    )
+    assert _needs_repagination(page, PageGeometry()) is True, (
+        "a block genuinely past NEAR_FIT_TOLERANCE must still trigger print-time repagination"
+    )
+
+
+def test_a_genuine_block_to_block_overlap_is_still_caught_by_the_strict_tolerance():
+    """Proves the reconciliation above did NOT touch overlapping_pairs's own
+    strict 2px check: two sibling blocks overlapping by 10px - well inside
+    NEAR_FIT_TOLERANCE's 20px, but 5x the strict 2px _TOLERANCE - must still
+    be flagged. If this ever started passing silently, the strict check
+    would have been accidentally weakened by the near-fit reconciliation."""
+    a = _paragraph(20)
+    a.layout.y = 100.0
+    a.layout.height = 60.0
+    b = _paragraph(20)
+    b.layout.y = 150.0  # starts 10px before `a` actually ends (100+60=160)
+
+    pairs = overlapping_pairs([a, b])
+    assert pairs == [(a.id, b.id)], "a genuine, well-within-NEAR_FIT_TOLERANCE block overlap must still be caught"
+
+    page = Page(id="page_1", page_number=1, kind="content", blocks=[a, b])
+    findings = validate_page_structured(page)
+    assert any(f.reason == "overlap" for f in findings), (
+        "validate_page_structured must still surface a genuine block-to-block overlap"
+    )

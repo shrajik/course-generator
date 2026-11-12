@@ -474,11 +474,16 @@ def test_standard_flowchart_draws_a_side_connector_for_a_non_consecutive_edge():
     assert "marker-end" in text and "<path d=" in text
 
 
-def test_concept_wheel_draws_no_connecting_lines_between_focal_and_satellites():
-    """A wheel communicates "parts of X" by proximity/colour only - no
-    connecting line or arrow between the focal centre and any satellite,
-    and so no edge label anywhere either (see _layout_concept_wheel's own
-    docstring)."""
+def test_concept_wheel_draws_real_connecting_lines_and_edge_labels():
+    """Root-cause fix (production course audit): an earlier version of
+    _layout_concept_wheel drew no edges at all, reasoning that "parts of X"
+    is conveyed by proximity/colour alone - true only for a plain
+    membership edge, and a real, confirmed regression for a real course's
+    specifically-labelled relationships (several satellite-to-satellite
+    edges with real causal meaning like "increases"/"reduces", which
+    proximity cannot convey at all - the information was silently lost).
+    Every edge - focal spoke or satellite-to-satellite - must now draw a
+    real connector with its own label."""
     spec = DiagramSpec(
         kind="concept_map",
         nodes=[
@@ -493,12 +498,8 @@ def test_concept_wheel_draws_no_connecting_lines_between_focal_and_satellites():
     )
     svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
     text = svg_bytes.decode("utf-8")
-    # The Key table below legitimately draws plain <line> divider rules
-    # between rows - what must never exist is a connector, which always
-    # carries an arrowhead marker (every <line>/<path> this module ever
-    # draws as a connector does - see _curved_connector).
-    assert 'marker-end="url(#diagram-arrow' not in text
-    assert "belongs to" not in text
+    assert 'marker-end="url(#diagram-arrow' in text
+    assert "belongs to" in text
 
 
 def test_render_diagram_svg_hierarchy_layout():
@@ -1832,12 +1833,12 @@ async def test_diagram_service_retries_once_when_hint_is_ignored(service):
     assert len(calls) == 2  # the corrective retry actually happened
     assert "REQUESTED DIAGRAM TYPE: concept_map" in calls[1]
     svg_path = service.storage.asset_abs_path("course_kind_retry", block.content["path"])
-    # The corrected spec's own node labels were rendered - not its edge
-    # label ("acts on"), which concept_map's new wheel layout never draws
-    # anywhere (no connecting lines between focal and satellite at all -
-    # see _layout_concept_wheel's own docstring).
+    # The corrected spec's own node labels were rendered, AND its edge
+    # label ("acts on") - _layout_concept_wheel now draws every edge (see
+    # its own docstring on the root-cause fix this closed).
     rendered = svg_path.read_text(encoding="utf-8")
     assert "Subject" in rendered and "Component" in rendered
+    assert "acts on" in rendered
 
 
 async def test_diagram_service_still_produces_a_diagram_after_a_persistent_mismatch(service):
@@ -5447,3 +5448,77 @@ def test_circuit_schematic_globally_duplicate_ids_across_panels_dont_cross_wire(
         and (el.get("d") or "").count("L") == 3
     ]
     assert len(wire_paths) == 4
+
+
+# periodic_table: the real, fixed 118-element grid - never model-authored,
+# see app.render.periodic_table_data and DIAGRAM_KINDS' own comment for the
+# root cause this closes (a raster-generated periodic table shipped with
+# duplicated element symbols and duplicated/wrong group numbers).
+
+
+def test_periodic_table_is_registered_and_joins_neither_kind_family():
+    from app.schemas.diagram import DIAGRAM_KINDS, RELATIONSHIP_KINDS, SEQUENTIAL_KINDS
+
+    assert "periodic_table" in DIAGRAM_KINDS
+    # A reference grid, not a sequence or an arbitrary relationship network
+    # - same reasoning "graph" already gets, see DIAGRAM_KINDS' own comment.
+    assert "periodic_table" not in RELATIONSHIP_KINDS
+    assert "periodic_table" not in SEQUENTIAL_KINDS
+
+
+def test_periodic_table_is_usable_with_zero_nodes():
+    """Unlike every other kind, an empty `nodes` list (no highlights
+    requested) is still a perfectly usable, complete request - the grid
+    itself is always drawn regardless."""
+    assert DiagramSpec(kind="periodic_table", nodes=[], edges=[]).is_usable()
+
+
+def test_periodic_table_renders_all_118_real_elements_with_no_duplicates():
+    from app.render.periodic_table_data import ELEMENTS
+
+    theme = load_template("technical").theme
+    spec = DiagramSpec(kind="periodic_table", title="Fig. 1: Periodic Table", nodes=[])
+    svg_bytes, _w, _h = render_diagram_svg(spec, theme)
+    svg = svg_bytes.decode("utf-8")
+
+    tooltips = re.findall(r"<title>([A-Za-z]+) \((\d+)\)", svg)
+    rendered = {(sym, int(num)) for sym, num in tooltips}
+    real = {(e.symbol, e.atomic_number) for e in ELEMENTS}
+    assert rendered == real
+    symbols = [sym for sym, _ in tooltips]
+    assert len(symbols) == len(set(symbols)) == 118
+    assert validate_rendered_svg(svg_bytes, kind="periodic_table") == []
+
+
+def test_periodic_table_highlight_overrides_fill_and_adds_a_legend_entry():
+    theme = load_template("technical").theme
+    spec = DiagramSpec(
+        kind="periodic_table",
+        nodes=[DiagramNode(id="Na", color="#fbbf24", detail="Highly reactive alkali metal")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, theme)
+    svg = svg_bytes.decode("utf-8")
+    assert "#fbbf24" in svg
+    assert "Highly reactive alkali metal" in svg
+    assert "Na (Sodium)" in svg
+
+
+def test_periodic_table_unknown_highlight_id_is_ignored_not_an_error():
+    theme = load_template("technical").theme
+    spec = DiagramSpec(kind="periodic_table", nodes=[DiagramNode(id="Zzz", color="#fbbf24", detail="not real")])
+    svg_bytes, _w, _h = render_diagram_svg(spec, theme)
+    assert validate_rendered_svg(svg_bytes, kind="periodic_table") == []
+    assert "not real" not in svg_bytes.decode("utf-8")
+
+
+def test_periodic_table_symbol_text_clears_the_readability_floor_once_scaled():
+    """A real, confirmed case: the first working render passed every other
+    check but failed `text_too_small_after_scaling` - CANVAS_WIDTH (880)
+    scaled down to the page's real display width shrank the symbol font
+    just under the floor. Pinned here as a permanent regression guard."""
+    from app.schemas.document import CONTENT_WIDTH
+    from app.services.diagram_render_qa import MIN_READABLE_PX, effective_font_size
+    from app.render.diagram_renderer import _PT_SYMBOL_SIZE
+
+    effective = effective_font_size(CANVAS_WIDTH, base_font_size=_PT_SYMBOL_SIZE, display_width=CONTENT_WIDTH)
+    assert effective >= MIN_READABLE_PX

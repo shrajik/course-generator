@@ -7,7 +7,7 @@ import re
 from app.core.ids import block_id as new_block_id
 from app.core.ids import document_id_for_course, page_id, utc_now_iso
 from app.core.logging import get_logger
-from app.course.document.layout import estimate_height, flow_blocks, page_visual_fraction
+from app.course.document.layout import NEAR_FIT_TOLERANCE, estimate_height, flow_blocks, page_visual_fraction
 from app.course.document.layout_validator import validate_document
 from app.render.toc_renderer import TocChapter, TocSection, estimate_toc_pixel_size, render_toc_html
 from app.schemas.blocks import BlockType, merge_content
@@ -80,7 +80,26 @@ def _page_size_for(page_blocks: list[Block], geometry=None) -> PageSize:
     and taller than a page" fallback - but when it does, growing this ONE
     page's declared height (never the global default the rest of the
     document uses) is what actually keeps that content visible instead of
-    quietly losing it."""
+    quietly losing it.
+
+    `content_bottom` landing inside `NEAR_FIT_TOLERANCE` of the nominal
+    boundary (`box.height - box.margin_bottom`) is NOT one of those cases -
+    `flow_blocks` itself already placed that block there on purpose, fully
+    expecting it to land safely inside the margin reserve (see
+    NEAR_FIT_TOLERANCE's own docstring). A real, confirmed bug this closes:
+    this function used to require `content_bottom` to clear the FULL margin
+    reserve a second time (`content_bottom + box.margin_bottom <= box.
+    height`, equivalent to zero tolerance) before calling a page done,
+    disagreeing with flow_blocks's own, already-applied tolerance - so a
+    page flow_blocks considered perfectly safe still got its OWN declared
+    size grown a few px past the real print sheet height. A `.page` div
+    taller than the sheet makes Chromium's print engine insert its own,
+    uncontrolled page break when exporting to PDF - confirmed via a real
+    export: a page ending 17.9px into the tolerance (same shape as the
+    courses that triggered this investigation) grew to 1140.86px, 17.86px
+    past the 1123px sheet, and the overflow landed on a genuinely blank
+    extra physical page, not just a cosmetically short one.
+    """
     from app.schemas.template import PageGeometry
 
     box = geometry or PageGeometry()
@@ -88,6 +107,9 @@ def _page_size_for(page_blocks: list[Block], geometry=None) -> PageSize:
     if not page_blocks:
         return default
     content_bottom = max(b.layout.y + b.layout.height for b in page_blocks)
+    nominal_bottom = box.height - box.margin_bottom
+    if content_bottom <= nominal_bottom + NEAR_FIT_TOLERANCE:
+        return default
     needed_height = content_bottom + box.margin_bottom
     if needed_height <= box.height:
         return default

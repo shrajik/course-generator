@@ -47,14 +47,18 @@ from app.render.diagram_renderer import render_diagram_svg
 from app.render.schematic_layout import resolve_schematic_layout
 from app.render.visual_blueprints import apply_blueprint_defaults
 from app.schemas.blocks import merge_content
-from app.schemas.diagram import RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
+from app.schemas.diagram import DIAGRAM_KINDS, RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
 from app.services.diagram_content_qa import (
+    CONTRADICTS_SOURCE_TEXT,
     MISSPELLED_OR_GARBLED_TEXT,
+    NUMERIC_CONTRADICTS_SOURCE_TEXT,
+    SOURCE_GROUNDING_UNSUPPORTED,
     STRUCTURALLY_GARBLED_TEXT,
     evaluate_content,
 )
+from app.services.numeric_consistency_qa import IDENTIFIER_VALUE_CONTRADICTS_SOURCE_TEXT
 from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
 from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
@@ -174,6 +178,39 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   `level: 1`. Every edge must carry a short, precise relationship `label`
   naming what happens between the two nodes - a direction, a force, a cause,
   a flow (e.g. "moving toward", "induces", "opposes", "flows into").
+- The brief is specifically about a REAL PERIODIC TABLE OF THE ELEMENTS
+  (groups/periods/blocks, trends across the table, which elements belong to
+  a family) -> periodic_table. The grid itself is NEVER authored here - it
+  is a fixed, always scientifically correct 118-element dataset the
+  renderer draws directly every time, regardless of what `nodes` contains.
+  `nodes` is ONLY an optional, short list of cells to highlight/annotate:
+  one `DiagramNode` per highlighted element, `id` set to that element's
+  real symbol (e.g. "Na", "Cl" - an id that isn't a real element symbol is
+  simply ignored), an optional `color` ("#rrggbb") as that cell's highlight
+  fill, and `detail` as the one-line reason it's highlighted (shown in a
+  small legend below the grid). Leave `nodes` completely empty for a plain,
+  complete, unannotated table - never try to construct the grid's own 118
+  cells as nodes, and leave `edges` empty always (nothing is ever wired
+  between elements here).
+- The brief is specifically about REAL ELECTRICAL/WIRING TOPOLOGY - which
+  components connect to which shared nodes, a circuit's actual wiring (a
+  series/parallel reduction, a bench measurement setup, a sensor's wiring) ->
+  circuit_schematic. Each node is a real electrical JUNCTION, drawn as a
+  small labelled dot (e.g. "A", "B") that components wire to - leave `label`
+  short (a node letter/name), never a sentence. An edge's `label` names the
+  component ON that wire via a leading tag: "R:<value>" draws a resistor
+  ("R:220Ω"), "C:<value>" a capacitor, "L:<value>" an inductor, "V:<value>"
+  or "B:<value>" a battery/voltage source, "SW" or "SW:<value>" a switch -
+  anything else (blank, or no recognised tag) draws a plain wire. Comparing
+  several scenarios (valid vs. invalid wiring) in one figure: give every
+  node a `lane` naming which panel/scenario it belongs to (panels draw left
+  to right, wrapping into rows, in the order first seen) - node `id`s must
+  stay globally unique ACROSS panels, never reused between two different
+  scenarios' own "A"/"B" even if they represent analogous points, or wires
+  will cross between panels. Add one `shape_role: "caption"` node per panel
+  (not a real junction, never touched by an edge) with `label` its short
+  verdict ("Valid", "Invalid - extra branch") and `detail` the one-sentence
+  reason why.
 - `schematic` is PERMANENTLY RETIRED - never produce it, regardless of what
   the brief describes. A real, recognisable physical shape/arrangement (a
   chemistry reaction, a biology structure, an astronomy scene, a mechanical
@@ -184,15 +221,7 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   drawing. If a brief like this still reaches you, the caller already
   rejects a `schematic` answer unconditionally and falls back to that
   illustration path anyway - so treat this prompt's remaining kinds
-  (concept_map, hierarchy, comparison, flow_chart/process/cycle,
-  feedback_loop_process, causal_loop, data_flow_diagram, er_diagram,
-  swimlane, smart_art, graph, pyramid, funnel, honeycomb, puzzle_pieces,
-  gears_process, matrix, radial_mindmap, venn, chevron_process, timeline,
-  staircase_process, balance_comparison, nested_circles, network_mesh,
-  decision_tree, fishbone, layered_diagram, gantt_chart, donut_segments,
-  pie_wedge, wavy_journey_path, progress_rings, orbit_diagram,
-  bridge_process, chain_links, flower_petal, hourglass_diagram, org_chart,
-  spectrum, iceberg, input_process_output, ranked_bars) as the complete
+  (__DIAGRAM_KIND_ENUM__) as the complete
   list; none of them is
   "physical shape and arrangement," and that's fine - this call was
   reached in error for that brief.
@@ -582,6 +611,22 @@ exact field usage):
 
 """
 
+# Root-cause fix (kind-selection drift, confirmed twice this session: a
+# model-facing prompt silently missing a newly-added kind - `periodic_table`
+# was initially missing from this very enumeration, and `circuit_schematic`
+# had NO authoring bullet at all here for a while after it shipped). The
+# bullet-by-bullet authoring guidance above still has to stay hand-written
+# (each kind's real field conventions are too bespoke to generate), but this
+# one enumeration - "every kind other than the retired `schematic`" - has no
+# bespoke content of its own, so it's computed from `DIAGRAM_KINDS` (the
+# actual source of truth) instead of hand-typed, making it structurally
+# impossible for a newly-added kind to go missing from THIS list again. See
+# `test_diagram_service.py`'s drift-guard test for the complementary check
+# that every kind still has its OWN authoring bullet somewhere above.
+DIAGRAM_SYSTEM = DIAGRAM_SYSTEM.replace(
+    "__DIAGRAM_KIND_ENUM__", ", ".join(k for k in DIAGRAM_KINDS if k != "schematic")
+)
+
 _KIND_PIN_INSTRUCTION = """
 
 The brief above already specifies the required `kind`: "{hint}". Use exactly
@@ -965,6 +1010,7 @@ class DiagramService:
         block: Block,
         template: CourseTemplate,
         course_title: str,
+        source_excerpt: str = "",
     ) -> bool:
         content = block.content
         purpose = str(content.get("purpose") or "")
@@ -1217,7 +1263,10 @@ class DiagramService:
         # (never unlimited) and still feeds back the latest failure's exact
         # reasons each time, same as the one-retry version did.
         brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
-        content_result = await evaluate_content(spec, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings)
+        content_result = await evaluate_content(
+            spec, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings,
+            source_excerpt=source_excerpt,
+        )
         # `spec`/`content_result` always track the BEST attempt seen so far
         # (never regress to a worse one at the end), but the retry loop
         # itself keeps spending its bounded budget off the MOST RECENT
@@ -1249,7 +1298,8 @@ class DiagramService:
                 if retried.normalised_kind() != spec.normalised_kind() or not retried.is_usable():
                     break
                 retried_result = await evaluate_content(
-                    retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings
+                    retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings,
+                    source_excerpt=source_excerpt,
                 )
                 latest_result = retried_result
                 if retried_result.passed or len(retried_result.issues) < len(content_result.issues):
@@ -1262,20 +1312,37 @@ class DiagramService:
         # BROKEN (corrupted homoglyphs, or an LLM-confirmed misspelled/
         # scrambled label) is never shippable regardless of how on-topic it
         # otherwise is - that still falls back to the raster illustration
-        # path exactly as before. But every OTHER content-QA issue
-        # (off_topic/generic_content/missing_key_concept) is a judgment call
+        # path exactly as before. Canonical Visual Spec milestone: a
+        # CONFIRMED contradiction with the course's own source text
+        # (`contradicts_source_text`) joins this same "never shippable,
+        # reuse the existing fallback mechanism" bucket - it is exactly as
+        # disqualifying as broken text, never the softer "ship anyway,
+        # flagged" treatment below. But every OTHER content-QA issue
+        # (off_topic/generic_content/missing_key_concept/a claim the source
+        # excerpt simply doesn't address either way) is a judgment call
         # about how WELL the diagram covers the brief, not a claim its real,
-        # legible, correctly-spelled labels are wrong - see this module's own
-        # docstring for why shipping that anyway, flagged for review, beats
-        # discarding it for an illustration fallback that has nothing
-        # structured left to fall back on itself.
+        # legible, correctly-spelled, source-consistent labels are wrong -
+        # see this module's own docstring for why shipping that anyway,
+        # flagged for review, beats discarding it for an illustration
+        # fallback that has nothing structured left to fall back on itself.
         content_qa_unresolved: list[dict] = []
         if not content_result.passed:
-            garbled_types = {STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT}
+            garbled_types = {
+                STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT,
+                CONTRADICTS_SOURCE_TEXT, NUMERIC_CONTRADICTS_SOURCE_TEXT,
+                # Short-identifier hardening (Canonical Visual Spec milestone):
+                # a CONFIRMED Si=28-vs-Si=14-style mismatch is exactly as
+                # disqualifying as the plain numeric case above - same
+                # fallback treatment. The AMBIGUOUS sibling,
+                # IDENTIFIER_VALUE_NEEDS_REVIEW, is deliberately NOT in this
+                # set - it must ship (flagged for review), never fall back.
+                IDENTIFIER_VALUE_CONTRADICTS_SOURCE_TEXT,
+            }
             if any(issue.reason in garbled_types for issue in content_result.issues):
                 log.info(
-                    "Diagram for %s still has garbled/misspelled text after %s retries - "
-                    "falling back to illustration", block.id, _MAX_CONTENT_QA_RETRIES,
+                    "Diagram for %s still has garbled/misspelled text or a confirmed source-text "
+                    "contradiction after %s retries - falling back to illustration",
+                    block.id, _MAX_CONTENT_QA_RETRIES,
                 )
                 block.content = merge_content(
                     block.type,
@@ -1293,9 +1360,27 @@ class DiagramService:
                 "attempt anyway, flagged for review, rather than discarding a real, topic-grounded diagram "
                 "for an unrelated illustration", block.id, _MAX_CONTENT_QA_RETRIES,
             )
+            # Split out of the general "ship anyway, flagged" bucket below:
+            # a claim the source excerpt doesn't address (ambiguous, not
+            # contradicted) is a genuinely different, less-severe case that
+            # must route to `app.services.quality_framework`'s existing
+            # `review_findings` bucket specifically (the same
+            # `severity="blocker"` + `verification_status="unverified"`
+            # combination that field already defines), not get silently
+            # folded into `rendered_with_unresolved_issues`'s own, separately
+            # mapped severity - never conflated with a confirmed failure
+            # above, and never a reason to reject an otherwise-sound,
+            # legitimately-elaborating diagram. See quality_framework.py's
+            # own resolution->severity mapping for the `source_grounding_
+            # unsupported` entry this relies on.
+            grounding_issues = [i for i in content_result.issues if i.reason == SOURCE_GROUNDING_UNSUPPORTED]
+            other_issues = [i for i in content_result.issues if i.reason != SOURCE_GROUNDING_UNSUPPORTED]
             content_qa_unresolved = visual_qa_finding_entries(
-                [(issue.reason, issue.detail, issue.deterministic) for issue in content_result.issues],
+                [(issue.reason, issue.detail, issue.deterministic) for issue in other_issues],
                 resolution="rendered_with_unresolved_issues",
+            ) + visual_qa_finding_entries(
+                [(issue.reason, issue.detail, issue.deterministic) for issue in grounding_issues],
+                resolution="source_grounding_unsupported",
             )
 
         if spec.normalised_kind() == "schematic":
