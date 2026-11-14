@@ -2787,13 +2787,18 @@ _MIN_DECISION_BOX_H = 130.0
 
 def _draw_process_box(
     node: DiagramNode, *, cx: float, cy: float, width: float, height: float, theme: TemplateTheme,
-    colors: tuple[str, str],
+    colors: tuple[str, str], base_size: float = STANDARD_FLOWCHART_LABEL_SIZE,
+    min_size: float = STANDARD_FLOWCHART_LABEL_SIZE,
 ) -> str:
     """An ordinary process step - a plain rounded rectangle, label only.
     Never `node.detail` inside the box - a node's full explanation belongs
     in the Key table below (_key_table_rows), the same rule the ring/wheel
     rendering already follows; `detail`, when set, still reaches the hover
-    tooltip."""
+    tooltip. `base_size`/`min_size` default to the fixed flowchart label
+    size every pre-existing caller already relied on - only
+    `_layout_decision_tree`'s own proactive shrink-to-fit (see its own
+    comment) passes a smaller, already-computed pair, so every other
+    caller is unaffected."""
     tooltip = node.label.strip()
     if node.detail.strip():
         tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
@@ -2807,21 +2812,33 @@ def _draw_process_box(
         _fit_boxed_text(
             cx, cy, node.label, width=width * 0.85, height=height * 0.7,
             color=theme.text_color, theme=theme,
-            base_size=STANDARD_FLOWCHART_LABEL_SIZE, min_size=STANDARD_FLOWCHART_LABEL_SIZE,
+            base_size=base_size, min_size=min_size,
         )
     )
     return f'<g class="diagram-node" tabindex="0" role="group">{"".join(parts)}</g>'
 
 
-def _ideal_process_box_size(node: DiagramNode) -> tuple[float, float]:
+def _ideal_process_box_size(node: DiagramNode, *, font_size: float | None = None) -> tuple[float, float]:
     """Sizes the box to its own label - the box grows to fit the text
     (never the other way around), the same "enlarge the shape, don't
     shrink or truncate the text" rule every shape in this module follows;
     `_fit_boxed_text`'s own shrink-to-fit inside `_draw_process_box` is
     only ever a defensive last resort once this already gave it generous
-    room."""
+    room. `font_size`, when given, overrides the usual `_scaled_font_size
+    (STANDARD_FLOWCHART_LABEL_SIZE)` - only `_layout_decision_tree`'s own
+    proactive shrink-to-fit loop passes one, to size a box at the SAME
+    smaller font it will actually be drawn at. The wrap-width budget and
+    the min/max box width both scale down WITH it (not just the font) -
+    a real, confirmed bug in an earlier version of this shrink-to-fit:
+    `_wrap`'s own 300px budget was a fixed pixel value, so a long,
+    already-wrapping label just packed more characters per line at the
+    smaller font and kept the SAME ~390px box width regardless of how far
+    the font shrank, making the whole shrink loop a no-op for exactly the
+    multi-word labels it most needed to help."""
     label = node.label.strip() or "—"
-    font_size = _scaled_font_size(STANDARD_FLOWCHART_LABEL_SIZE)
+    requested = font_size if font_size is not None else STANDARD_FLOWCHART_LABEL_SIZE
+    box_scale = min(1.0, requested / STANDARD_FLOWCHART_LABEL_SIZE)
+    font_size = _scaled_font_size(requested)
     # max_lines deliberately unbounded (999, not a real cap) - a real,
     # confirmed bug: an earlier version capped this at 3, so _wrap ITSELF
     # silently truncated an unusually long label with "…" right here,
@@ -2829,16 +2846,16 @@ def _ideal_process_box_size(node: DiagramNode) -> tuple[float, float]:
     # got a chance to give it room - the box was being sized to an
     # already-mutilated line list. Mirrors _circle_node's own fix for the
     # identical class of bug.
-    lines = _wrap(label, font_size=font_size, width=300.0, max_lines=999, bold=True) or [label]
+    lines = _wrap(label, font_size=font_size, width=300.0 * box_scale, max_lines=999, bold=True) or [label]
     longest = max(len(line) for line in lines)
     line_w = longest * font_size * _BOLD_RATIO
     text_h = len(lines) * font_size * LINE_HEIGHT
-    width = max(_MIN_PROCESS_BOX_W, min(_MAX_PROCESS_BOX_W, (line_w + 32.0) / 0.85))
-    height = max(_MIN_PROCESS_BOX_H, (text_h + 24.0) / 0.7)
+    width = max(_MIN_PROCESS_BOX_W * box_scale, min(_MAX_PROCESS_BOX_W * box_scale, (line_w + 32.0) / 0.85))
+    height = max(_MIN_PROCESS_BOX_H * box_scale, (text_h + 24.0) / 0.7)
     return width, height
 
 
-def _ideal_decision_box_size(node: DiagramNode) -> tuple[float, float]:
+def _ideal_decision_box_size(node: DiagramNode, *, font_size: float | None = None) -> tuple[float, float]:
     """Mirrors `_layout_flow_chart`'s own (still kept, still used for
     backward compatibility) `_ideal_decision_size` - reimplemented
     standalone here, deliberately not extracted/shared, so this change can
@@ -2847,13 +2864,20 @@ def _ideal_decision_box_size(node: DiagramNode) -> tuple[float, float]:
     rhombus is only that wide/tall at its own midline - so the diamond is
     sized well past the label's own raw footprint. max_lines deliberately
     unbounded - see _ideal_process_box_size's own comment on the identical
-    truncate-during-sizing bug this avoids."""
+    truncate-during-sizing bug this avoids. `font_size`, when given,
+    overrides the usual `_scaled_font_size(STANDARD_FLOWCHART_LABEL_SIZE)` -
+    see _ideal_process_box_size's matching parameter, and its own comment
+    on why the wrap budget and min/max width below scale down WITH it
+    (not just the font), for why."""
     label = node.label.strip() or "?"
-    font_size = _scaled_font_size(STANDARD_FLOWCHART_LABEL_SIZE)
-    lines = _wrap(label, font_size=font_size, width=260.0, max_lines=999, bold=True) or [label]
+    requested = font_size if font_size is not None else STANDARD_FLOWCHART_LABEL_SIZE
+    box_scale = min(1.0, requested / STANDARD_FLOWCHART_LABEL_SIZE)
+    font_size = _scaled_font_size(requested)
+    wrap_budget = 260.0 * box_scale
+    lines = _wrap(label, font_size=font_size, width=wrap_budget, max_lines=999, bold=True) or [label]
     longest = max(len(line) for line in lines)
     line_w = longest * font_size * _BOLD_RATIO
-    width = max(_MIN_DECISION_BOX_W, min(_MAX_DECISION_BOX_W, (line_w + 24.0) / 0.5))
+    width = max(_MIN_DECISION_BOX_W * box_scale, min(_MAX_DECISION_BOX_W * box_scale, (line_w + 24.0) / 0.5))
     # A real, confirmed bug (pre-dating this specific function - it was
     # already live in flow_chart's own decision diamonds, just never hit
     # by a long-enough label in that kind's own tests): the wrap above
@@ -2865,11 +2889,26 @@ def _ideal_decision_box_size(node: DiagramNode) -> tuple[float, float]:
     # REAL usable width once it's known; height has no cap, so it simply
     # grows to fit however many lines that turns out to need, same "grow,
     # never truncate" rule every shape in this module already follows.
-    usable_w = width * 0.5
-    if usable_w < 260.0:
+    #
+    # The 12.0 subtracted here is _fit_boxed_text's own 2*padding (default
+    # padding=6.0) - a real, confirmed bug: `_draw_diamond` hands
+    # `_fit_boxed_text` a usable area of (width*0.5, height*0.5), but
+    # `_fit_boxed_text` itself then shrinks THAT by another 2*padding
+    # before wrapping. Comparing/re-wrapping against the bare `width*0.5`
+    # here (without that same 12px) let this function believe a label
+    # would fit in fewer lines than `_fit_boxed_text` actually had room
+    # for at draw time - sizing the box exactly one line too short and
+    # triggering `_fit_boxed_text`'s own last-resort ellipsis truncation
+    # even though simply growing the box one line taller (which this
+    # function is free to do - height has no cap) would have avoided it
+    # entirely. Confirmed via a real decision_tree case: a 65-character
+    # root-decision label truncated mid-sentence at EVERY font size this
+    # function was asked to size at, always exactly one line short.
+    usable_w = max(width * 0.5 - 12.0, 10.0)
+    if usable_w < wrap_budget:
         lines = _wrap(label, font_size=font_size, width=usable_w, max_lines=999, bold=True) or [label]
     text_h = len(lines) * font_size * LINE_HEIGHT
-    height = max(_MIN_DECISION_BOX_H, (text_h + 24.0) / 0.5)
+    height = max(_MIN_DECISION_BOX_H * box_scale, (text_h + 24.0) / 0.5)
     return width, height
 
 
@@ -6229,6 +6268,10 @@ def _layout_network_mesh(
 
 _DECISION_TREE_ROW_GAP = 70.0
 _DECISION_TREE_COL_GAP = 24.0
+# Clearly more than diagram_render_qa's own _DUPLICATE_LANDING_TOLERANCE
+# (20px) - two convergent landings spaced this far apart read as visually
+# distinct, never as one ambiguous overlapping arrowhead.
+_DUPLICATE_LANDING_SPACING = 24.0
 
 
 def _layout_decision_tree(
@@ -6264,25 +6307,86 @@ def _layout_decision_tree(
             return override
         return "decision" if out_edges.get(node.id) else "outcome"
 
-    def size_of(node: DiagramNode) -> tuple[float, float]:
-        return _ideal_decision_box_size(node) if role_of(node) == "decision" else _ideal_process_box_size(node)
+    def size_of(node: DiagramNode, font_size: float) -> tuple[float, float]:
+        return (
+            _ideal_decision_box_size(node, font_size=font_size)
+            if role_of(node) == "decision"
+            else _ideal_process_box_size(node, font_size=font_size)
+        )
 
     rows: dict[int, list[DiagramNode]] = {}
     for node in nodes:
         rows.setdefault(max(node.level, 0), []).append(node)
     levels = sorted(rows)
-    row_sizes = {level: [size_of(n) for n in rows[level]] for level in levels}
-    row_widths = {
-        level: sum(w for w, _h in sizes) + _DECISION_TREE_COL_GAP * (len(sizes) - 1)
-        for level, sizes in row_sizes.items()
-    }
-    max_row_width = max(row_widths.values(), default=0.0)
-    canvas_w = max(max_row_width + 2 * MARGIN, CANVAS_WIDTH)
+
+    # Group every row's nodes so each parent's own children sit in
+    # CONTIGUOUS columns, ordered to match that parent's own left-to-right
+    # position in the row above - a real, confirmed bug (PDF/visual-pipeline
+    # audit, doc_81d0b1d44cae): `node.level` is author-supplied and this
+    # function used to position a row purely in `spec.nodes`' own list
+    # order, with no regard for which parent a node actually belongs to. An
+    # authored spec that lists a level's nodes in narrative order rather
+    # than per-subtree order (e.g. two sibling decisions' "first" outcomes
+    # listed together, then both "second" outcomes) interleaves unrelated
+    # hubs' children into the same row. The elbow-routing below draws one
+    # shared horizontal "bus" per hub spanning from its own leftmost to
+    # rightmost CHILD COLUMN - a bus that spans across a different hub's
+    # children (sitting between them purely because of list order) either
+    # overlaps that other hub's own bus (`shared_edge_segment`) or visually
+    # crosses its trunk/drop line - reproduced directly: two sibling hubs
+    # each with 2 children, listed interleaved, draws two buses that run
+    # collinear and overlap for a real stretch. Sorting every level by
+    # (parent's own column index in the level above, original relative
+    # order among true siblings - a stable sort preserves this) before any
+    # sizing/position math runs guarantees every hub's children are
+    # adjacent columns, so its bus only ever spans its own family.
+    parent_of: dict[str, str] = {}
+    for edge in edges:
+        if edge.target not in parent_of:
+            parent_of[edge.target] = edge.source
+    for level in levels[1:]:
+        prior_index = {n.id: i for i, n in enumerate(rows[level - 1]) if n.id}
+        fallback = len(prior_index)
+        rows[level] = sorted(
+            rows[level],
+            key=lambda n: prior_index.get(parent_of.get(n.id, ""), fallback),
+        )
+
+    def _size_at(font_size: float) -> tuple[dict[int, list[tuple[float, float]]], dict[int, float], float]:
+        row_sizes = {level: [size_of(n, font_size) for n in rows[level]] for level in levels}
+        row_widths = {
+            level: sum(w for w, _h in sizes) + _DECISION_TREE_COL_GAP * (len(sizes) - 1)
+            for level, sizes in row_sizes.items()
+        }
+        max_row_width = max(row_widths.values(), default=0.0)
+        canvas_w = max(max_row_width + 2 * MARGIN, CANVAS_WIDTH)
+        return row_sizes, row_widths, canvas_w
+
+    # Proactive shrink-to-fit, same stopping condition and loop shape as
+    # _layout_network_mesh's own font-size loop (see its comment for the
+    # full reasoning): an unbounded branching row (several sibling
+    # decisions/outcomes at the same level, each already capped at
+    # _MAX_DECISION_BOX_W/_MAX_PROCESS_BOX_W individually) can still sum to
+    # a canvas wider than what stays readable once the page scales it down
+    # to CONTENT_WIDTH - a real, confirmed case: a 3-way physics method
+    # split pushed canvas_w to ~1005-1038px, scaling its 15px label text
+    # down to ~9.6-9.9px, under the 11px floor, and this kind had no
+    # mitigation at all (every OTHER wide-growing kind in this module -
+    # network_mesh, hierarchy's row fan-out, concept_map's spoke placement -
+    # already does this; decision_tree was the one gap). Shrinking every
+    # row's font together (not just the offending row) keeps every level
+    # visually consistent, exactly as network_mesh shrinks every node's
+    # label together rather than just the outlier.
+    font_size = STANDARD_FLOWCHART_LABEL_SIZE
+    row_sizes, row_widths, canvas_w = _size_at(font_size)
+    while canvas_w * _MIN_READABLE_PX > font_size * CONTENT_WIDTH and font_size > _RING_MIN_LABEL_SIZE:
+        font_size = max(_RING_MIN_LABEL_SIZE, font_size * 0.92)
+        row_sizes, row_widths, canvas_w = _size_at(font_size)
 
     outcome_palette = _cycling_palette(theme)
     elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
-    # id -> (cx, top_y, bottom_y)
-    positions: dict[str, tuple[float, float, float]] = {}
+    # id -> (cx, top_y, bottom_y, own_box_width)
+    positions: dict[str, tuple[float, float, float, float]] = {}
     key_entries: list[tuple[str, str, str]] = []
     outcome_index = 0
     y = top
@@ -6300,7 +6404,7 @@ def _layout_decision_tree(
                 colors = _node_colors(node, "decision")
                 svg = _draw_diamond(
                     node, cx=node_cx, cy=node_cy, width=w, height=h, theme=theme, colors=colors,
-                    base_size=STANDARD_FLOWCHART_LABEL_SIZE, min_size=STANDARD_FLOWCHART_LABEL_SIZE,
+                    base_size=font_size, min_size=font_size,
                 )
             else:
                 if _HEX_RE.match(node.color.strip()):
@@ -6309,10 +6413,13 @@ def _layout_decision_tree(
                 else:
                     colors = outcome_palette[outcome_index % len(outcome_palette)]
                     outcome_index += 1
-                svg = _draw_process_box(node, cx=node_cx, cy=node_cy, width=w, height=h, theme=theme, colors=colors)
+                svg = _draw_process_box(
+                    node, cx=node_cx, cy=node_cy, width=w, height=h, theme=theme, colors=colors,
+                    base_size=font_size, min_size=font_size,
+                )
             elements.append(svg)
             if node.id:
-                positions[node.id] = (node_cx, y, y + h)
+                positions[node.id] = (node_cx, y, y + h, w)
             key_entries.append((str(len(key_entries) + 1), node.label, node.detail))
             x += w + _DECISION_TREE_COL_GAP
         y += row_height + _DECISION_TREE_ROW_GAP
@@ -6332,6 +6439,24 @@ def _layout_decision_tree(
         if edge.source in positions and edge.target in positions:
             edges_by_source.setdefault(edge.source, []).append(edge)
 
+    # Two DIFFERENT decisions converging on the same shared outcome (a
+    # legitimate, common pattern - "otherwise, see the fallback") is grouped
+    # by SOURCE above, so each converging edge is drawn by a separate loop
+    # iteration that has no idea another source ALSO lands on this exact
+    # target - both ending up with an identical `child[0]` x, they drew the
+    # exact same final drop segment (`shared_edge_segment`) landing at the
+    # exact same point (`duplicate_arrowhead_side`, confirmed 0px apart).
+    # Counting incoming edges per target up front and giving each one past
+    # the first a distinct, symmetric x-offset along the target's own top
+    # border - capped so it can never land outside the box - keeps every
+    # convergent arrow visually distinct while still clearly entering the
+    # same shared node, the standard flowchart convention for a merge.
+    landing_total: dict[str, int] = {}
+    for child_edges in edges_by_source.values():
+        for edge in child_edges:
+            landing_total[edge.target] = landing_total.get(edge.target, 0) + 1
+    landing_seen: dict[str, int] = {}
+
     for source_id, child_edges in edges_by_source.items():
         parent = positions[source_id]
         children = [(edge, positions[edge.target]) for edge in child_edges]
@@ -6348,8 +6473,16 @@ def _layout_decision_tree(
                 f'stroke="{theme.accent_color}" stroke-width="2"/>'
             )
         for edge, child in children:
+            total = landing_total.get(edge.target, 1)
+            land_x = child[0]
+            if total > 1:
+                idx = landing_seen.get(edge.target, 0)
+                landing_seen[edge.target] = idx + 1
+                spacing = min(_DUPLICATE_LANDING_SPACING, child[3] / total)
+                land_x += (idx - (total - 1) / 2) * spacing
             elements.append(
-                f'<path d="M{child[0]:.1f},{mid_y:.1f} L{child[0]:.1f},{child[1] - 2:.1f}" '
+                f'<path d="M{child[0]:.1f},{mid_y:.1f} L{land_x:.1f},{mid_y:.1f} '
+                f'L{land_x:.1f},{child[1] - 2:.1f}" '
                 f'fill="none" stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
             )
             if edge.label.strip() and edge.target in by_id:

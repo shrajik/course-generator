@@ -186,6 +186,21 @@ def test_generation_endpoint_enforces_ownership(owner_client):
     assert blocked.status_code == 403
 
 
+def test_an_author_cannot_export_their_own_unapproved_course_to_pdf(owner_client):
+    """New gate: an author (the default role from registration) may not
+    export a PDF before the course has passed final SME approval - even for
+    a course they own outright. Admin/other-role access is unaffected; see
+    test_admin_can_access_any_users_course below."""
+    _register(owner_client, _email("author-export"))
+    course = _create_course(owner_client)
+    document_id = course["document_id"]
+
+    assert owner_client.post(f"/api/documents/{document_id}/export/pdf").status_code == 403
+    assert (
+        owner_client.get(f"/api/documents/{document_id}/export/pdf/download").status_code == 403
+    )
+
+
 def test_admin_can_access_any_users_course(owner_client, monkeypatch):
     admin_email = _email("owner-admin")
     monkeypatch.setenv("INITIAL_ADMIN_EMAIL", admin_email)

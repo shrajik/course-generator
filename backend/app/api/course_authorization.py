@@ -80,3 +80,32 @@ async def check_document_owner(
     course_id = document_service.resolve_course_id(document_id)
     await get_owned_course(course_id, current_user, course_service)
     return course_id
+
+
+def user_can_export_pdf(user: User, record: CourseRecord) -> bool:
+    """An author or editor/reviewer may export the PDF only once the course
+    has passed final SME approval (`review_status == "approved"`) - the same
+    gate the review screen's "Final SME approval" action sets. They can
+    still view/edit a draft; they just can't ship an unapproved PDF straight
+    from the editor. Admins (and any other role with course access) are
+    unaffected, matching `Permission.EXPORT_ANY_CONTENT` in app.core.roles."""
+    if user.role in (Role.AUTHOR.value, Role.EDITOR_REVIEWER.value):
+        return record.review_status == "approved"
+    return True
+
+
+async def check_document_owner_for_pdf_export(
+    document_id: str,
+    current_user: User | None,
+    course_service: CourseService,
+    document_service: DocumentService,
+) -> str:
+    """Like `check_document_owner`, plus the approval gate from
+    `user_can_export_pdf`. Used only by the PDF export routes."""
+    course_id = document_service.resolve_course_id(document_id)
+    record = await get_owned_course(course_id, current_user, course_service)
+    if current_user is not None and not user_can_export_pdf(current_user, record):
+        raise ForbiddenError(
+            "PDF export is only available once this course has passed final SME approval."
+        )
+    return course_id

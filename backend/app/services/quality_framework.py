@@ -466,6 +466,14 @@ _SOURCE_GROUNDING_FINDING_TYPES = frozenset({"contradicts_source_text", "source_
 # than falling through to the resolution-based legacy inference (which
 # would mislabel it "diagram_qa", a module this check never touches).
 _NUMERIC_CONSISTENCY_FINDING_TYPES = frozenset({"numeric_contradicts_source_text"})
+# Visual-generation policy fix: the one-shot `genuinely_educational`/
+# `on_topic` check ImageService now runs on its own deliberately-generic
+# content-safety fallback image - a distinct ImageService decision, not the
+# richer, retried relevance check `_IMAGE_RELEVANCE_FINDING_TYPES` covers,
+# so it gets its own source rather than falling into the resolution-based
+# legacy inference (which would mislabel it "concept_qa", a module this
+# check never touches).
+_SAFETY_FALLBACK_FINDING_TYPES = frozenset({"safety_fallback_relevance_unconfirmed"})
 
 
 def _visual_qa_source(entry_type: str, resolution: str) -> str:
@@ -483,6 +491,8 @@ def _visual_qa_source(entry_type: str, resolution: str) -> str:
         return "source_grounding_qa"
     if entry_type in _NUMERIC_CONSISTENCY_FINDING_TYPES:
         return "numeric_consistency_qa"
+    if entry_type in _SAFETY_FALLBACK_FINDING_TYPES:
+        return "image_service"
     # Legacy inference, unchanged for every entry type this already covered
     # correctly: diagram_render_qa's geometry kinds ("fell_back_to_
     # illustration") and concept_qa's own reason codes ("rendered_with_
@@ -613,6 +623,32 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
             # so it can never silently auto-block approval on its own. The
             # same "blocker"+"unverified" combination `review_findings`
             # already exists to catch.
+            severity = "blocker"
+        elif resolution == "text_defect_preserved_with_mapping":
+            # Best Candidate Image Tracking / Strategy D (text-preservation
+            # fix, ImageService._generate_illustration): a `textbook`-style
+            # image confirmed scientifically/structurally sound but with an
+            # unresolved HOLISTIC text defect (vision-judged, never OCR-
+            # confirmed) was shipped anyway rather than withheld - the exact
+            # same "blocker"+`deterministic=False`->"unverified" combination
+            # as `source_grounding_unsupported`/`safety_fallback_relevance_
+            # unconfirmed` above, for the identical reason: lands exactly in
+            # `QualityReport.review_findings`, visible to a human, never
+            # auto-blocking approval on an LLM opinion alone - there is a
+            # real, good diagram here, just one a human should double-check
+            # the wording of before relying on it.
+            severity = "blocker"
+        elif resolution == "safety_fallback_relevance_unconfirmed":
+            # Visual-generation policy fix: a deliberately-generic emergency
+            # image (the one bounded retry after a content-safety rejection
+            # - see ImageService._safety_fallback_prompt) that also failed
+            # its own `genuinely_educational`/`on_topic` check. Same
+            # "blocker"+`deterministic=False`->"unverified" combination as
+            # `source_grounding_unsupported` above, for the same reason:
+            # lands exactly in `QualityReport.review_findings`, visible to a
+            # human, never auto-blocking approval on an LLM opinion alone -
+            # there is no better alternative image to ship here, so this
+            # flags it rather than silently shipping it as if confirmed fine.
             severity = "blocker"
         elif resolution in (
             "rendered_with_unresolved_issues", "image_relevance_unverified", "formula_verification_failed",

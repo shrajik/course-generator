@@ -408,6 +408,46 @@ def test_d_an_unsupported_screenshot_is_reported_never_requested_or_checked():
     assert not [item for item in missing if screenshot.id in item]
 
 
+def test_d_a_required_visual_is_not_starved_by_an_optional_one_sharing_its_pool():
+    """A template line that merely mentions diagrams in passing (a quality
+    note, not an "add one" instruction) can still be mis-parsed into a
+    non-required VisualRule. Real bug: with the old first-come-first-served
+    claiming order, that harmless rule ate real diagram blocks from the
+    shared chapter pool, starving a genuinely REQUIRED rule of blocks that
+    already existed - the course reported "missing a diagram" even though
+    the chapter had enough of them. Required rules must claim first."""
+    from app.schemas.template_blueprint import TemplateBlueprint, VisualRule
+
+    template = CourseTemplate(
+        template_id="uploaded:starvation-test",
+        kind="non_technical",
+        name="Starvation Test",
+        blueprint=TemplateBlueprint(
+            visuals=[
+                VisualRule(id="V1", kind="diagram", required=False, count=1, instruction="Diagrams use a clean grid."),
+                VisualRule(id="V2", kind="diagram", required=False, count=1, instruction="All diagrams fit the page."),
+                VisualRule(id="V4", kind="diagram", required=True, count=2, instruction="Include 2 diagrams per module."),
+            ]
+        ),
+    )
+    blocks = [
+        _block(BlockType.IMAGE, "", kind="diagram", prompt="Step one"),
+        _block(BlockType.IMAGE, "", kind="diagram", prompt="Step two"),
+    ]
+    missing, _ = blueprint_review(blocks, template)
+    assert not [item for item in missing if "V4" in item]
+
+
+def test_d_the_visual_plan_brief_tells_the_writer_never_to_narrate_it_to_the_reader():
+    """Real bug: the writer echoed this planning list into the chapter as a
+    "Visuals and template requirements" paragraph, visible to the learner,
+    with self-contradictory counts. The brief must explicitly forbid that."""
+    template = _md_template()
+    brief = blueprint_brief(template)
+    assert "never summarise, restate, or mention it in the chapter's own text" in brief
+    assert "reader must never see the template's visual plan described to them" in brief
+
+
 def test_d_decorative_section_openers_are_dropped_when_the_template_forbids_them():
     template = _md_template()
     drafts = [

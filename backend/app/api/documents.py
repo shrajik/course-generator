@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
-from app.api.course_authorization import check_document_owner
+from app.api.course_authorization import check_document_owner, check_document_owner_for_pdf_export
 from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.ids import slugify
 from app.course.companions import companion_deliverables
@@ -294,7 +294,7 @@ async def export_pdf(
     current_user: User | None = Depends(get_current_user_if_db_enabled),
 ) -> Any:
     """Render the current Course Document JSON to PDF via HTML + Playwright."""
-    await check_document_owner(document_id, current_user, course_service, service)
+    await check_document_owner_for_pdf_export(document_id, current_user, course_service, service)
     path, document = await service.export_pdf(document_id)
     if current_user is not None:
         await course_service.record_activity(
@@ -342,7 +342,7 @@ async def download_exported_pdf(
     this endpoint only serves what's already on disk, never regenerates it,
     so GETting it before an export has ever run is a 404, not silent
     nonsense."""
-    course_id = await check_document_owner(document_id, current_user, course_service, service)
+    course_id = await check_document_owner_for_pdf_export(document_id, current_user, course_service, service)
     path = service.storage.pdf_path(course_id)
     if not path.exists():
         from app.core.errors import NotFoundError

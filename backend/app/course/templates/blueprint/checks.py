@@ -131,7 +131,18 @@ def blueprint_review(blocks: list[Block], template: CourseTemplate) -> tuple[lis
     issues: list[ReviewIssue] = []
     claimed: set[int] = set()
 
-    for rule in blueprint.visuals:
+    # Required rules claim blocks from the shared pool before optional ones,
+    # so a template rule that merely mentions a visual in passing (e.g. a
+    # style/quality note rather than a real "add one here" instruction) can
+    # never starve a REQUIRED rule of a block that already exists to satisfy
+    # it. Stable within each group (ties keep the blueprint's own V1/V2/...
+    # order), so a template with no required/optional contention behaves
+    # exactly as before.
+    ordered_visuals = sorted(
+        enumerate(blueprint.visuals), key=lambda item: (not item[1].required, item[0])
+    )
+
+    for _, rule in ordered_visuals:
         if rule.support == "none":
             continue
         if rule.scope == "section":

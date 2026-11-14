@@ -136,7 +136,11 @@ def blueprint_brief(template: CourseTemplate, *, planner: bool = False) -> str:
         out.append(
             "VISUALS THE TEMPLATE ASKS FOR (each is an `image` block in the stated place; the visual must "
             "show exactly what the neighbouring text explains, about THIS course's topic - never the "
-            "template's own subject):"
+            "template's own subject). This list is internal planning information for deciding where to put "
+            "image blocks - never summarise, restate, or mention it in the chapter's own text: no sentence "
+            "or section describing how many diagrams/illustrations this chapter has, what the IDs below "
+            "(V1, V2, ...) stand for, or that the chapter \"meets\" or \"includes\" a visual requirement. "
+            "The reader must never see the template's visual plan described to them:"
         )
         out.extend(_visual_line(rule) for rule in usable)
     if unusable:

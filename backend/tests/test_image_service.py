@@ -21,6 +21,7 @@ from app.schemas.blocks import BlockType
 from app.schemas.diagram import DiagramEdge, DiagramNode, DiagramSpec
 from app.schemas.document import Block
 from app.services import image_service
+from app.services import image_text_ocr as ocr_module
 from app.services.image_service import (
     DEFAULT_ILLUSTRATION_GUIDANCE,
     MAI_IMAGE_MAX_PROMPT_TOKENS,
@@ -244,10 +245,14 @@ def test_sanitize_expected_labels_drops_a_clause_after_a_colon():
     assert sanitize_expected_labels(labels) == ["ε: induced emf"]
 
 
-def test_sanitize_expected_labels_caps_the_count_at_six():
-    labels = [f"Label {i}" for i in range(12)]
+def test_sanitize_expected_labels_caps_the_count_at_twenty_four():
+    """Raised from 6 (visual-generation-quality fix): the count ceiling was
+    never what prevented garbling (per-label quality rules above already
+    catch that) - a content-rich apparatus can genuinely need more than a
+    handful of labels. 24 is a generous ceiling, not a target."""
+    labels = [f"Label {i}" for i in range(40)]
     out = sanitize_expected_labels(labels)
-    assert out == labels[:6]
+    assert out == labels[:24]
 
 
 def test_sanitize_expected_labels_keeps_a_long_plain_english_phrase():
@@ -352,9 +357,10 @@ async def test_generate_with_text_check_returns_the_first_attempt_when_it_alread
     svc.ai.image = fake_image  # type: ignore[method-assign]
     svc._verify_generated_text = fake_verify  # type: ignore[method-assign]
 
-    data, verified = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
+    data, verified, missing_labels = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
     assert data == b"first-attempt-bytes"
     assert verified is True
+    assert missing_labels == []
     assert calls["n"] == 1
 
 
@@ -375,9 +381,10 @@ async def test_generate_with_text_check_retries_once_then_accepts_a_corrected_at
     svc.ai.image = fake_image  # type: ignore[method-assign]
     svc._verify_generated_text = fake_verify  # type: ignore[method-assign]
 
-    data, verified = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
+    data, verified, missing_labels = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
     assert data == b"attempt-2"
     assert verified is True
+    assert missing_labels == []
     assert len(prompts_used) == 2
     assert "Label A" in prompts_used[1]  # the retry's prompt names the exact mistake
 
@@ -404,9 +411,10 @@ async def test_generate_with_text_check_falls_back_to_a_verified_text_free_image
     svc.ai.image = fake_image  # type: ignore[method-assign]
     svc._verify_generated_text = fake_verify  # type: ignore[method-assign]
 
-    data, verified = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
+    data, verified, missing_labels = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
     assert data == b"attempt-3"
     assert verified is True
+    assert missing_labels == []
     assert len(prompts_used) == 3
     assert "do not render any text" in prompts_used[2].lower()
     # 4, not 3: the text-free attempt's first "clean" verdict (call 3) is
@@ -651,9 +659,10 @@ async def test_generate_with_text_check_makes_one_final_emphatic_attempt_if_text
     svc.ai.image = fake_image  # type: ignore[method-assign]
     svc._verify_generated_text = fake_verify  # type: ignore[method-assign]
 
-    data, verified = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
+    data, verified, missing_labels = await svc._generate_with_text_check("a prompt", ["Label A"], block_id="b1")
     assert data == b"attempt-4"
     assert verified is False  # honestly reported as unverified, not claimed correct
+    assert missing_labels == ["Label A"]  # real ground truth for a later correction pass
     assert len(prompts_used) == 4  # bounded - never a fifth attempt
     assert "zero text" in prompts_used[3].lower()
 
@@ -859,6 +868,51 @@ async def test_a_content_safety_rejection_retries_once_with_a_generic_safe_promp
     assert block.content.get("error") is None
     # The persisted prompt reflects what was ACTUALLY sent, not the rejected one.
     assert block.content.get("prompt") == prompts_used[1]
+
+
+async def test_the_safety_fallback_prompt_is_block_specific_not_shared_per_chapter():
+    """Visual-generation policy fix, real confirmed bug (Atomic Theory
+    course, doc_81d0b1d44cae): `key_concept` is computed once per CHAPTER,
+    so before this fix, several structurally-unrelated blocks in the same
+    chapter that all hit the content-safety fallback received the exact
+    same generic topic and ended up as the same generic image (three
+    different decision workflows all rendered as one identical abstract
+    picture). The fallback topic must come from the block's OWN purpose/
+    caption first, so two different blocks in the same chapter - sharing
+    the same chapter_title/key_concept - get two different, block-specific
+    fallback images."""
+    svc = ImageService()
+    template = load_template("technical")
+    prompts_by_block: dict[str, str] = {}
+
+    async def run_once(block_id: str, purpose: str) -> None:
+        captured: list[str] = []
+
+        async def fake_image(*, prompt, size=None, phase="image", provider=None):
+            captured.append(prompt)
+            if len(captured) == 1:
+                raise AIServiceError(
+                    'Azure FLUX.2-flex request failed with status 400: '
+                    '{"error":{"code":"content_safety_violation","message":"Content violated RAI policy."}}'
+                )
+            return b"png-bytes"
+
+        svc.ai.image = fake_image  # type: ignore[method-assign]
+        block = _image_block(purpose=purpose)
+        await svc._generate_illustration(
+            course_id=f"course_{block_id}", block=block, template=template, course_title="Atomic Theory",
+            chapter_title="Chapter 2", key_concept="Atomic units eliminate clutter.",
+        )
+        prompts_by_block[block_id] = captured[1]
+
+    await run_once("units_workflow", "Step-by-step workflow for choosing and applying atomic units.")
+    await run_once("eigen_solver", "Decision tree selecting iterative versus direct eigen-solvers.")
+
+    # Two different blocks, same chapter/key_concept - the fallback topic
+    # must still differ, each reflecting its OWN block's purpose.
+    assert prompts_by_block["units_workflow"] != prompts_by_block["eigen_solver"]
+    assert "atomic units" in prompts_by_block["units_workflow"].lower()
+    assert "eigen-solvers" in prompts_by_block["eigen_solver"].lower()
 
 
 async def test_a_content_safety_rejection_that_fails_again_ships_as_failed_not_crashed():
@@ -1646,6 +1700,572 @@ async def test_style_compliant_is_never_checked_for_a_non_textbook_illustration(
     assert block.content.get("visual_qa_findings") == []  # never flagged - the check never applied
 
 
+async def test_misspelled_textbook_image_retries_once_and_succeeds_on_a_cleaner_retry(monkeypatch):
+    """Visual-generation-quality fix: `text_accurately_spelled` closes the
+    real gap where a `textbook`-style image with no `image_expected_labels`
+    populated (the writer's own field, not always filled in) previously
+    shipped with its baked-in text completely unverified - this reuses the
+    SAME existing relevance call (zero new LLM calls) so spelling is checked
+    regardless of whether an expected-labels list was ever given."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            if image_calls["n"] == 1:
+                return ImageRelevanceCheck(
+                    text_accurately_spelled=False, text_accurately_spelled_detail="'Irrlstior' instead of 'Indicator'",
+                )
+            return ImageRelevanceCheck()
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    # Deliberately no `expected_labels` - the whole point of this test.
+    block = _image_block(purpose="A simple pulley system", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_spelling_retry", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert image_calls["n"] == 2  # exactly one retry, never unbounded
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_persistently_misspelled_but_scientifically_sound_textbook_image_ships_flagged_not_withheld(monkeypatch):
+    """Best Candidate Image Tracking / Strategy D (text-preservation fix):
+    a confirmed, persistent HOLISTIC spelling failure on an otherwise
+    scientifically/structurally sound image (every other `ImageRelevanceCheck`
+    field at its clean default) is now shipped anyway, flagged for human
+    review, rather than withheld - a good diagram must never be destroyed
+    over one bad word. (Behaviour intentionally changed from the previous
+    "withheld, not shipped garbled" contract - see the task that introduced
+    Best Candidate Image Tracking.)"""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                text_accurately_spelled=False, text_accurately_spelled_detail="still garbled after retry",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A simple pulley system", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_spelling_fails", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True  # shipped, not withheld - the good diagram is preserved
+    assert block.content.get("generated") is True
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    assert types == {"text_misspelled_or_garbled"}
+    finding = next(f for f in findings if f["type"] == "text_misspelled_or_garbled")
+    assert finding["resolution"] == "text_defect_preserved_with_mapping"
+    assert finding["deterministic"] is False  # a vision judgment, never claimed independently verified
+    assert "still garbled after retry" in finding["detail"]
+
+
+async def test_declared_label_failure_ships_via_the_existing_text_unverified_finding_not_a_new_one(monkeypatch):
+    """Best Candidate Image Tracking / Strategy D, declared-label variant:
+    a confirmed, persistent DECLARED-LABEL mismatch on an otherwise
+    scientifically/structurally sound image ships anyway - no NEW finding
+    is needed for this specific case, since the pre-existing
+    `image_text_unverified` quality_framework finding (keyed off
+    `content['text_verified']` directly, and already naming the correct
+    expected labels) already does exactly this job."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_verify_generated_text(image, expected_labels):
+        return ["Occupy"]  # confirmed wrong/missing on every bounded attempt
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck()  # scientifically AND holistically clean
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    svc._verify_generated_text = fake_verify_generated_text  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(
+        purpose="Atomic model energy-level panel", illustration_style="textbook",
+        expected_labels=["Occupy", "Electron"],
+    )
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_declared_label_fails", block=block, template=template, course_title="Chemistry",
+    )
+
+    assert ok is True
+    assert block.content.get("generated") is True
+    assert block.content.get("omitted_after_qa_failure") is False
+    assert block.content.get("text_verified") is False  # honestly recorded, never reset to None
+    # No new `visual_qa_findings` entry - the existing `image_text_unverified`
+    # mechanism (reading `text_verified` directly) already covers this.
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_a_retry_that_fixes_spelling_but_breaks_style_loses_to_the_original_scientific_candidate(monkeypatch):
+    """Best Candidate Image Tracking: scientific/structural correctness
+    strictly outranks text correctness. A retry that happens to fix the
+    original's spelling defect must still LOSE the comparison if it
+    introduces a confirmed scientific/structural regression (here, drifting
+    out of the required flat-vector textbook style) the original didn't
+    have - this is also the concrete case for a retry that "fixes text but
+    changes composition/style": `style_compliant` is exactly the signal
+    that catches a composition/rendering drift, so it is already part of
+    the scientific/structural axis this comparison protects."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return f"attempt-{image_calls['n']}".encode()
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            if image_calls["n"] == 1:
+                # original: scientifically/structurally clean, text defect only
+                return ImageRelevanceCheck(
+                    text_accurately_spelled=False, text_accurately_spelled_detail="'oucupy' instead of 'occupy'",
+                )
+            # every retry: text now clean, but drifted out of the required style
+            return ImageRelevanceCheck(
+                style_compliant=False, style_compliant_detail="rendered as a photorealistic 3D scene",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="Atomic model energy-level panel", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_candidate_priority", block=block, template=template, course_title="Chemistry",
+    )
+
+    assert ok is True
+    assert image_calls["n"] == 3  # 1 original + 2 bounded retries, both worse, never a 4th
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    # The ORIGINAL (scientifically clean, text defect) is selected and
+    # shipped - never a retry whose "fix" cost real structural correctness.
+    assert types == {"text_misspelled_or_garbled"}
+    assert not any(f["type"] == "textbook_style_not_followed" for f in findings)
+
+
+async def test_a_middle_retry_is_selected_over_a_worse_final_retry_no_recency_bias(monkeypatch):
+    """Best Candidate Image Tracking: explicitly proves no recency bias -
+    the middle attempt (scientifically clean, only a text defect) is
+    selected over the final, scientifically-worse retry, even though the
+    final one was generated most recently and nothing in this comparison
+    ever simply takes "whatever was drawn last"."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return f"attempt-{image_calls['n']}".encode()
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            if image_calls["n"] == 1:
+                return ImageRelevanceCheck(on_topic=False, on_topic_detail="unrelated scene")
+            if image_calls["n"] == 2:
+                return ImageRelevanceCheck(
+                    text_accurately_spelled=False, text_accurately_spelled_detail="minor garble",
+                )
+            return ImageRelevanceCheck(on_topic=False, on_topic_detail="drifted off-topic again")
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A labelled diagram of the water cycle", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_middle_best", block=block, template=template, course_title="Earth Science",
+    )
+
+    assert ok is True  # the best (middle) candidate ships, flagged, not withheld
+    assert image_calls["n"] == 3  # full bound reached - no candidate was ever fully clean
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    assert types == {"text_misspelled_or_garbled"}  # the MIDDLE candidate's own defect
+    assert not any(f["type"] == "off_topic_image" for f in findings)  # never the LAST attempt's defect
+
+
+async def test_a_scientific_defect_never_wins_even_as_the_only_clean_text_candidate(monkeypatch):
+    """Best Candidate Image Tracking: a candidate with a confirmed
+    scientific/structural defect must never be selected as best merely
+    because it is the only one with clean text - proven with the clean-
+    text-but-scientifically-bad candidate generated FIRST and the garbled-
+    text-but-scientifically-clean candidate generated SECOND, so neither a
+    naive "prefer clean text" nor a naive "prefer whatever's first" rule
+    would land on the correct answer by accident."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return f"attempt-{image_calls['n']}".encode()
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            if image_calls["n"] == 1:
+                # clean text, but confirmed off-topic
+                return ImageRelevanceCheck(on_topic=False, on_topic_detail="unrelated scene")
+            # confirmed garbled text, but scientifically/structurally clean
+            return ImageRelevanceCheck(
+                text_accurately_spelled=False, text_accurately_spelled_detail="a garbled label",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A labelled diagram", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_scientific_priority", block=block, template=template, course_title="Biology",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    # The scientifically-clean candidate wins - never the clean-text-but-
+    # off-topic one, regardless of generation order.
+    assert types == {"text_misspelled_or_garbled"}
+    assert not any(f["type"] == "off_topic_image" for f in findings)
+
+
+async def test_the_new_text_defect_preserved_finding_lands_in_review_not_approval_blocking(monkeypatch):
+    """Reuse-the-existing-framework requirement: the new
+    `text_defect_preserved_with_mapping` resolution must route through the
+    SAME `QualityFinding`/`QualityReport` severity/verification-status model
+    as every other visual QA finding - landing exactly in the existing
+    `review_findings` bucket (blocker + unverified: visible to a human,
+    never silently invisible) and explicitly NEVER in
+    `approval_blocking_findings` (an LLM judgment call must never auto-block
+    approval on its own) - no parallel/duplicate decision system."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                text_accurately_spelled=False, text_accurately_spelled_detail="a garbled word",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A simple pulley system", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_review_bucket", block=block, template=template, course_title="Physics",
+    )
+    assert ok is True
+
+    from app.services.quality_framework import QualityReport, _visual_findings_for_block
+
+    findings = _visual_findings_for_block(f"image:{block.id}", block.content)
+    text_finding = next(f for f in findings if f.reason == "visual_qa_text_misspelled_or_garbled")
+    assert text_finding.severity == "blocker"
+    assert text_finding.verification_status == "unverified"
+
+    report = QualityReport(course_id="c1", findings=findings)
+    assert report.review_findings == [text_finding]
+    assert report.approval_blocking_findings == []  # never auto-blocks on an LLM opinion alone
+
+
+# --- OCR phase integration tests -------------------------------------------
+# All use synthetic, directly-constructed `OcrResult` fixtures via a
+# monkeypatched `image_service.run_ocr` - never a live Tesseract call.
+
+
+def _ocr_clean(text: str = "Occupy", confidence: float = 95.0) -> ocr_module.OcrResult:
+    return ocr_module.OcrResult(
+        words=[ocr_module.OcrWord(text=text, confidence=confidence, left=0, top=0, width=10, height=10)],
+        average_confidence=confidence,
+    )
+
+
+async def test_ocr_confirmed_mismatch_triggers_a_retry_vision_alone_missed(monkeypatch):
+    """Case 10/11/12: Vision QA reports the text as accurately spelled on
+    every attempt, but OCR independently confirms a real, ground-truth-
+    backed mismatch (against the course's own source text, since no
+    declared labels exist here) on the first attempt - this must still
+    trigger Strategy A's retry (OCR can confirm a text issue Vision QA
+    missed), and OCR is genuinely re-run against the retry's own new bytes
+    (not reused from the first attempt) to confirm the fix."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+    prompts_used: list[str] = []
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        prompts_used.append(prompt)
+        return f"attempt-{image_calls['n']}".encode()
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck()  # Vision QA reports fully clean every time
+        return schema()
+
+    def fake_run_ocr(data: bytes):
+        if data == b"attempt-1":
+            return _ocr_clean("Oucupy", 90.0)  # a real, confirmable near-miss
+        return _ocr_clean("Occupy", 95.0)  # the retry is genuinely clean
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(image_service, "run_ocr", fake_run_ocr)
+
+    block = _image_block(purpose="Atomic model panel", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_ocr_triggers_retry", block=block, template=template, course_title="Chemistry",
+        source_excerpt="Electrons occupy fixed energy levels around the nucleus.",
+    )
+
+    assert ok is True
+    assert image_calls["n"] == 2  # Vision alone would have accepted attempt 1; OCR forced a retry
+    assert "Oucupy" in prompts_used[1]  # the OCR-confirmed defect was fed into Strategy A's retry prompt
+    assert block.content.get("visual_qa_findings") == []  # re-run OCR on the retry confirmed it clean
+
+
+async def test_ocr_persistent_mismatch_exhausts_retries_then_ships_via_strategy_d(monkeypatch):
+    """Case 13: OCR confirms the SAME ground-truth-backed mismatch on every
+    bounded attempt (Vision QA stays clean throughout) - retries are
+    exhausted (never unbounded), and the scientifically-sound image still
+    ships, flagged, via Strategy D - never discarded solely for an OCR-
+    confirmed text-only issue. The finding is marked independently verified
+    (deterministic), not just an LLM opinion, since real ground truth
+    backed it."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return f"attempt-{image_calls['n']}".encode()
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck()
+        return schema()
+
+    def fake_run_ocr(_data: bytes):
+        return _ocr_clean("Oucupy", 90.0)  # never clears, on any attempt
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(image_service, "run_ocr", fake_run_ocr)
+
+    block = _image_block(purpose="Atomic model panel", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_ocr_persistent", block=block, template=template, course_title="Chemistry",
+        source_excerpt="Electrons occupy fixed energy levels around the nucleus.",
+    )
+
+    assert ok is True  # shipped, not withheld
+    assert block.content.get("generated") is True
+    assert block.content.get("omitted_after_qa_failure") is False
+    assert image_calls["n"] == 3  # 1 original + 2 bounded retries, never more
+    findings = block.content.get("visual_qa_findings")
+    finding = next(f for f in findings if f["type"] == "text_misspelled_or_garbled")
+    assert finding["resolution"] == "text_defect_preserved_with_mapping"
+    # OCR backing upgrades this specific finding to deterministic/confirmed
+    # - a real severity/confidence upgrade over a vision-only opinion.
+    assert finding["deterministic"] is True
+    assert "Oucupy" in finding["detail"]
+
+
+async def test_a_scientific_defect_never_wins_over_an_ocr_only_text_defect(monkeypatch):
+    """Case 14: a candidate with a confirmed scientific/structural defect
+    must never be selected as best merely because OCR found no text
+    problem with it - proven with the scientifically-bad-but-OCR-clean
+    candidate generated FIRST and the OCR-confirmed-defective-but-
+    scientifically-clean candidate generated SECOND."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return f"attempt-{image_calls['n']}".encode()
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            if image_calls["n"] == 1:
+                return ImageRelevanceCheck(on_topic=False, on_topic_detail="unrelated scene")
+            return ImageRelevanceCheck()  # scientifically clean
+        return schema()
+
+    def fake_run_ocr(data: bytes):
+        if data == b"attempt-1":
+            return _ocr_clean("Occupy", 95.0)  # OCR-clean, but the image itself is off-topic
+        return _ocr_clean("Oucupy", 90.0)  # OCR-confirmed defect, but scientifically sound
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(image_service, "run_ocr", fake_run_ocr)
+
+    block = _image_block(purpose="A labelled diagram", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_ocr_scientific_priority", block=block, template=template, course_title="Biology",
+        source_excerpt="Electrons occupy fixed energy levels around the nucleus.",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    # The scientifically-clean candidate wins, even though OCR flagged its
+    # text - never the OCR-clean-but-off-topic first attempt.
+    assert types == {"text_misspelled_or_garbled"}
+    assert not any(f["type"] == "off_topic_image" for f in findings)
+
+
+async def test_no_unnecessary_retry_when_vision_and_ocr_both_already_agree_clean(monkeypatch):
+    """Case 15: an already-correct image (Vision QA clean AND OCR confirms
+    no mismatch) must not trigger any retry - the bounded retry loop exists
+    for real defects, never spent on an image that's already fine."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck()
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(image_service, "run_ocr", lambda _data: _ocr_clean("Occupy", 95.0))
+
+    block = _image_block(purpose="Atomic model panel", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_already_clean", block=block, template=template, course_title="Chemistry",
+        source_excerpt="Electrons occupy fixed energy levels around the nucleus.",
+    )
+
+    assert ok is True
+    assert image_calls["n"] == 1  # no retry spent
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_ocr_unavailable_mid_flow_never_crashes_and_vision_only_behaviour_is_unaffected(monkeypatch):
+    """Case 17 (explicit, monkeypatched variant - also proven for real
+    against the actual pre-rebuild container, where pytesseract is
+    genuinely absent, by this entire test file passing unchanged): if
+    `run_ocr` itself is unavailable/fails (returns `None`, the real
+    contract `image_text_ocr.run_ocr` guarantees for any failure), the
+    pipeline must behave EXACTLY as it did before the OCR phase existed -
+    Vision QA's own judgment alone decides the outcome."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                text_accurately_spelled=False, text_accurately_spelled_detail="still garbled after retry",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    monkeypatch.setattr(image_service, "run_ocr", lambda _data: None)  # OCR unavailable
+
+    block = _image_block(purpose="A simple pulley system", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_ocr_unavailable", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True  # same outcome as the pre-OCR-phase vision-only test
+    findings = block.content.get("visual_qa_findings")
+    finding = next(f for f in findings if f["type"] == "text_misspelled_or_garbled")
+    assert finding["deterministic"] is False  # never falsely upgraded when OCR gave no real backing
+    assert finding["resolution"] == "text_defect_preserved_with_mapping"
+
+
+async def test_text_accurately_spelled_is_never_checked_for_a_non_textbook_illustration(monkeypatch):
+    """A plain/default-style illustration is already required to be
+    completely text-free (and separately confirmed so by `_confirm_text_
+    free`) - `text_accurately_spelled` must stay unasked (and so never fail
+    the publication gate) for anything other than `illustration_style:
+    "textbook"`, even if a model answered it false anyway."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                text_accurately_spelled=False, text_accurately_spelled_detail="irrelevant here",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A scenic photo-style illustration")  # no illustration_style set
+
+    async def no_text_found(self, data):
+        return []
+
+    monkeypatch.setattr(ImageService, "_confirm_text_free", no_text_found)
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_spelling_irrelevant", block=block, template=template, course_title="Geography",
+    )
+
+    assert ok is True
+    assert block.content.get("visual_qa_findings") == []  # never flagged - the check never applied
+
+
 async def test_a_qa_failure_is_still_omitted_when_the_relevance_retry_also_fails_technically(monkeypatch):
     """The relevance-recheck retry is one more bounded attempt, not an
     unlimited guarantee - if the provider itself is genuinely unreachable
@@ -1695,11 +2315,15 @@ async def test_a_qa_failure_is_still_omitted_when_the_relevance_retry_also_fails
     assert not any(f["type"] == "generic_fallback_used" for f in findings)
 
 
-async def test_the_content_safety_fallback_skips_the_relevance_check():
-    """The emergency safety-fallback image is deliberately generic/abstract
-    by design (see `_safety_fallback_prompt`'s own docstring) - checking
-    "is this specifically on-topic" against a picture built NOT to be
-    specific would always fail and waste a retry it can never pass."""
+async def test_the_content_safety_fallback_still_runs_the_educational_relevance_check():
+    """Visual-generation policy fix: the emergency safety-fallback image is
+    deliberately generic/abstract by design (see `_safety_fallback_prompt`'s
+    own docstring), but it is no longer shipped unchecked - a single,
+    un-retried `genuinely_educational`/`on_topic` check still runs on it (a
+    real, confirmed gap: this image is exactly the one most likely to read
+    as generic decorative art, and used to be the one case nothing ever
+    verified). A clean check (the default mock result) ships the image with
+    no finding and no wasted retry-and-redraw."""
     svc = ImageService()
     calls = {"image": 0, "structured": 0}
 
@@ -1729,27 +2353,61 @@ async def test_the_content_safety_fallback_skips_the_relevance_check():
 
     assert ok is True
     assert calls["image"] == 2  # the original attempt plus the safety retry
-    assert calls["structured"] == 0  # relevance check never spent on the deliberately-generic fallback
+    assert calls["structured"] == 1  # one un-retried relevance check, now run on this path too
+    assert not block.content.get("visual_qa_findings")  # clean check, no finding
 
 
-async def test_a_failed_diagram_cannot_bypass_relevance_qa_by_falling_back_to_a_raster_image(monkeypatch):
-    """Release-readiness audit, item 4 (fallback integrity) - updated for the
-    fallback-cascade root-cause fix: an off-topic-ONLY diagram content-QA
-    failure no longer falls back to a raster illustration at all (see
-    diagram_service.py's own docstring) - a real, legible, correctly-spelled
-    diagram ships flagged for review instead. The two-stage fallback this
-    test originally exercised (diagram fails -> falls back to illustration
-    -> illustration ALSO fails relevance) still exists for a GARBLED-text
-    diagram failure specifically (text itself broken, never shippable
-    regardless of topic coverage) - exercised here instead. That fallback
-    illustration must NOT silently ship unchecked just because it changed
-    code paths - it goes through the exact same `_verify_image_relevance`
-    gate as any other illustration, proven here by making BOTH checks fail
-    and confirming the final result still carries a real, visible finding
-    from EACH stage. Per the fallback-cascade root-cause fix, the illustration
-    stage's own confirmed relevance failure, with no Wikimedia match either,
-    now WITHHOLDS the image (no generic, unrelated AI picture published in
-    its place) rather than shipping a decorative placeholder."""
+async def test_a_failing_safety_fallback_relevance_check_ships_flagged_for_review():
+    """Visual-generation policy fix: when the safety-fallback image's own
+    `genuinely_educational`/`on_topic` check fails, there is no better
+    alternative to ship (this is already the last-resort emergency path) -
+    it ships anyway, with a review-findings-bucket finding attached, rather
+    than either silently shipping clean or discarding the only image the
+    block has."""
+    svc = ImageService()
+    calls = {"image": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        calls["image"] += 1
+        if calls["image"] == 1:
+            raise AIServiceError(
+                'Azure FLUX.2-flex request failed with status 400: '
+                '{"error":{"code":"content_safety_violation","message":"Content violated RAI policy."}}'
+            )
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return schema(on_topic=False, on_topic_detail="generic abstract shapes, no real subject")
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    svc.ai.structured = fake_structured  # type: ignore[method-assign]
+
+    block = _image_block(purpose="A depiction of a dangerous industrial failure")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_safety_fallback_flagged", block=block, template=template, course_title="Safety",
+    )
+
+    assert ok is True  # shipped anyway - no better alternative after a content-safety rejection
+    assert block.content.get("path") is not None
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["type"] == "safety_fallback_relevance_unconfirmed" for f in findings)
+
+
+async def test_a_garbled_diagram_never_reaches_the_raster_illustration_path(monkeypatch):
+    """Visual-generation policy fix: a structured diagram kind (flow_chart,
+    decision_tree, etc.) must never silently become an unrelated AI
+    illustration, under any QA-failure mode - including confirmed garbled/
+    misspelled text, which used to be the one failure mode this exact test
+    proved DID fall back (see this test's own history). Through the real
+    `ImageService.generate_for_block` entrypoint (not the DiagramService
+    unit alone), this proves the raster `image()` call is never invoked at
+    all for this case - the block is withheld, with the diagram stage's own
+    finding preserved, confirmed via a real, legible 2-node flow_chart spec
+    whose text is confirmed garbled."""
     svc = ImageService()
     image_calls = {"n": 0}
 
@@ -1766,16 +2424,11 @@ async def test_a_failed_diagram_cannot_bypass_relevance_qa_by_falling_back_to_a_
         if schema.__name__ == "ContentCritique":
             # diagram_content_qa: labels confirmed misspelled/garbled, even
             # after its own one bounded retry inside DiagramService.
-            # generate_for_block - the one content-QA failure mode that
-            # still falls back to the raster illustration path.
+            # generate_for_block - withheld, never a reason to fall back.
             return schema(
                 on_topic=True, specific_enough=True, missing_concepts=[],
                 text_legible=False, text_legible_detail="'Stpe 1' is garbled",
             )
-        if schema is ImageRelevanceCheck:
-            # The RASTER FALLBACK's own relevance check also fails, both
-            # the first attempt and its own one bounded retry.
-            return ImageRelevanceCheck(on_topic=False, on_topic_detail="still does not depict the brief")
         return schema()
 
     async def fake_image(*, prompt, size=None, phase="image", provider=None):
@@ -1795,48 +2448,37 @@ async def test_a_failed_diagram_cannot_bypass_relevance_qa_by_falling_back_to_a_
         course_id="course_fallback_integrity", block=block, template=template, course_title="Earth Science",
     )
 
-    # The raster fallback's OWN relevance check also fails, confirmed, after
-    # its own bounded retry, and there is no Wikimedia match either - the
-    # image is withheld rather than replaced with an unrelated generic
-    # picture, so the page is left with no image, honestly reported.
-    assert ok is False
+    # Handled (withheld) - never a raster illustration standing in for the
+    # diagram, and the raster image provider is never even called.
+    assert ok is True
+    assert image_calls["n"] == 0
     assert block.content.get("generated") is False
     assert block.content.get("path") is None
     assert block.content.get("omitted_after_qa_failure") is True
     assert block.content.get("error") is None  # a confirmed QA failure, not a technical/provider failure
     findings = block.content.get("visual_qa_findings")
-    assert findings, "the diagram stage's own finding must still be visible, not silently dropped"
-    # Both stages' findings coexist, by design - image_service.py's own
-    # `_stale_resolutions` filter only clears a STALE finding from an
-    # earlier RE-RENDER of the same block (formula/relevance results that
-    # would become wrong once the problem is fixed), never diagram_
-    # service.py's own "fell_back_to_illustration" entry, which describes a
-    # DIFFERENT, earlier stage (the diagram attempt) - genuinely accurate,
-    # still-true context, not something a later illustration-stage finding
-    # should silently erase. The illustration stage's OWN relevance finding
-    # is KEPT (not replaced) now that nothing is shipped in its place - it
-    # is exactly why the image was withheld.
-    assert any(f["resolution"] == "fell_back_to_illustration" for f in findings)
-    assert any(f["resolution"] == "image_withheld_after_qa_failure" for f in findings)
-    assert any(f["type"] == "off_topic_image" for f in findings)
-    assert not any(f["resolution"] == "generic_fallback_published" for f in findings)
+    assert any(f["type"] == "misspelled_or_garbled_text" for f in findings)
+    assert any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
 
 
-async def test_the_real_induced_current_garble_is_caught_through_the_full_pipeline_today(monkeypatch):
-    """Release-readiness audit, item 3: the EXACT real, confirmed artifact
-    this session found on disk (a genuine Azure-generated textbook
-    illustration whose caption rendered as "Inducd crrrent creates
-    opposing field (Lenz)" instead of "Induced current creates opposing
-    field (Lenz)" - the same real case `test_verify_generated_text_reports_
-    a_simulated_garbled_read` above already proves `_verify_generated_text`
-    catches in isolation). This test proves the SAME real defect is caught
-    end-to-end through the actual production call path
-    (`_generate_illustration` -> `_generate_with_text_check`), including
-    the worst case where even the one bounded retry still comes back
-    garbled (matching what was actually observed in the real asset - both
-    a garbled and a corrected caption baked into the same image, meaning
-    the model never fully self-corrected even once prompted with the exact
-    mistake)."""
+async def test_the_real_induced_current_garble_now_ships_preserved_via_the_existing_text_unverified_finding(monkeypatch):
+    """Release-readiness audit, item 3, UPDATED for Best Candidate Image
+    Tracking / Strategy D (text-preservation fix): the EXACT real, confirmed
+    artifact this session found on disk (a genuine Azure-generated textbook
+    illustration whose caption rendered as "Inducd crrrent creates opposing
+    field (Lenz)" instead of "Induced current creates opposing field
+    (Lenz)"). This image is scientifically/structurally sound throughout
+    (the relevance check's own fields all default clean - only the
+    declared-label check ever fails) - exactly the case Strategy D exists
+    for: the diagram itself is good, only one caption's spelling is wrong,
+    so it now SHIPS (flagged for review) instead of being thrown away.
+
+    INTENTIONAL BEHAVIOUR CHANGE from this test's previous assertions (it
+    used to assert `ok is False`/withheld): this is not a weakened check -
+    the defect is still just as confirmed and still just as visibly flagged,
+    via the SAME pre-existing `image_text_unverified` quality_framework
+    finding (which already names the correct expected text), just no
+    longer destroying an otherwise-good diagram to do so."""
     svc = ImageService()
     real_garbled = "Inducd crrrent creates opposing field (Lenz)"
     real_correct = "Induced current creates opposing field (Lenz)"
@@ -1868,40 +2510,37 @@ async def test_the_real_induced_current_garble_is_caught_through_the_full_pipeli
         course_title="Electromagnetic Induction",
     )
 
-    # Bounded retries are exhausted (not infinite), and the confirmed-wrong
-    # labelled attempt is never published. Fallback-cascade root-cause fix:
-    # this used to then draw a further, deliberately generic/label-free
-    # fallback and ship it instead - the image is now withheld. `text_
-    # verified` resets to None (not False): no image is being published at
-    # all, so there is nothing left to claim "unverified" about.
-    assert ok is False
-    assert block.content.get("generated") is False
-    assert block.content.get("path") is None
-    assert block.content.get("omitted_after_qa_failure") is True
-    assert block.content.get("text_verified") is None
+    # Shipped, not withheld - the diagram itself is good, only the caption's
+    # spelling is confirmed wrong, and Strategy D preserves it.
+    assert ok is True
+    assert block.content.get("generated") is True
+    assert block.content.get("path") is not None
+    assert block.content.get("omitted_after_qa_failure") is False
+    # The real, honest signal - never silently reset to None/True just
+    # because the image shipped.
+    assert block.content.get("text_verified") is False
 
-    # And the persisted state is exactly what app.services.quality_framework
+    # The persisted state is exactly what app.services.quality_framework
     # reads to build a real, human-visible finding - confirmed by feeding
     # this exact block through the same function the quality report uses.
     from app.services.quality_framework import _visual_findings_for_block
 
     findings = _visual_findings_for_block(f"image:{block.id}", block.content)
-    # The old "expected labels unverified" blocker no longer applies - no
-    # image was shipped to make that claim about.
-    assert not any(f.reason == "image_text_unverified" for f in findings)
-    withheld_findings = [f for f in findings if f.reason == "visual_qa_image_withheld_after_qa_failure"]
-    assert len(withheld_findings) == 1
-    # No image exists at all now - the same "blocker" severity a technical
-    # generation failure already gets (see quality_framework.py), not the
-    # old fallback's "minor" (which assumed a picture, however generic,
-    # still shipped). verification_status is "independently_verified", not
-    # "unverified" (production-readiness audit fix) - the FACT that no
-    # image exists is directly checkable, not an AI judgment call, so this
-    # "blocker" finding is never silently excluded from `QualityReport.
-    # approval_blocking_findings`' `verification_status != "unverified"`
-    # gate the way an unverified blocker would be.
-    assert withheld_findings[0].severity == "blocker"
-    assert withheld_findings[0].verification_status == "independently_verified"
+    # The pre-existing `image_text_unverified` finding (reads `text_verified`
+    # directly, independent of `visual_qa_findings`) is what surfaces this -
+    # no new resolution was needed for the declared-label case specifically.
+    text_findings = [f for f in findings if f.reason == "image_text_unverified"]
+    assert len(text_findings) == 1
+    # Names the CORRECT text (the one real, known ground truth available
+    # without OCR) - "Induced current creates opposing field (Lenz)" - so a
+    # reviewer knows exactly what the caption should say, even though the
+    # exact garbled variant actually rendered isn't independently confirmed.
+    assert real_correct in text_findings[0].description
+    # Never silently indistinguishable from a genuinely verified image - a
+    # vision-model judgment call, never claimed independently verified.
+    assert text_findings[0].verification_status == "unverified"
+    # No image was withheld this time.
+    assert not any(f.reason == "visual_qa_image_withheld_after_qa_failure" for f in findings)
 
 
 async def test_an_ordinary_generation_failure_is_not_mistaken_for_a_content_safety_rejection():
@@ -1997,11 +2636,14 @@ async def test_a_content_rich_textbook_illustration_gets_a_wider_canvas():
     assert sizes_used[0] == "1536x1024"
 
 
-async def test_a_sparse_textbook_illustration_keeps_the_default_square_canvas():
-    """Regression guard: a typical 1-3 label picture (a single apparatus,
-    not a multi-icon composition) must keep using the default size -
-    widening every textbook illustration regardless of content would be
-    wasteful and pointless for a picture that was never cramped."""
+async def test_a_sparse_textbook_illustration_still_gets_the_landscape_default():
+    """Visual-generation-quality fix: landscape is now the DEFAULT for every
+    textbook-style image (the old expected_labels-count/prompt-length
+    heuristic was itself unreliable - see the wide-canvas test above) - even
+    a modest 1-3 label picture gets the same real breathing room a genuine
+    textbook/Playground-style diagram is actually composed with. Only the
+    genuinely simple, single-panel case (no labels, no formula, short
+    prompt - see the test below) falls back to a square canvas."""
     svc = ImageService()
     sizes_used: list[str | None] = []
 
@@ -2010,9 +2652,6 @@ async def test_a_sparse_textbook_illustration_keeps_the_default_square_canvas():
         return b"png-bytes"
 
     svc.ai.image = fake_image  # type: ignore[method-assign]
-    # Same reasoning as the wider-canvas test above - stub a clean text pass
-    # so the fail-closed publication gate doesn't omit this image over the
-    # default mock's "nothing detected" vision response.
     svc._verify_generated_text = _no_missing_labels  # type: ignore[method-assign]
 
     block = _image_block(illustration_style="textbook", expected_labels=["N", "S", "B"])
@@ -2023,7 +2662,100 @@ async def test_a_sparse_textbook_illustration_keeps_the_default_square_canvas():
     )
 
     assert ok is True
+    assert sizes_used[0] == "1536x1024"
+
+
+async def test_a_genuinely_simple_single_panel_textbook_illustration_keeps_the_square_canvas():
+    """Regression guard for the one case that should still default small:
+    no expected labels, no governing formula, and a short writer prompt - a
+    single centred subject with nothing to label doesn't need the extra
+    width, and forcing every textbook image to landscape regardless of
+    content would be wasteful for a picture that was never cramped."""
+    svc = ImageService()
+    sizes_used: list[str | None] = []
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        sizes_used.append(size)
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+
+    block = _image_block(illustration_style="textbook", prompt="A single leaf cell.")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_simple_square_canvas", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
     assert sizes_used[0] != "1536x1024"
+
+
+# ---------------------------------------------------------------------------
+# Visual-generation-density fix (agents.prompts.WRITER_SYSTEM): a writer now
+# instructed to name a multi-faceted topic's real facets (working principle,
+# governing law, characteristic output, energy conversion, ...) in its own
+# `image_prompt`. These tests exercise the OTHER half of that fix - the
+# downstream prompt-assembly pipeline (build_prompt/TEXTBOOK_ILLUSTRATION_
+# GUIDANCE's own multi-panel rule) genuinely carries a facet-rich prompt
+# through intact rather than trimming or diluting it, and does not inflate a
+# genuinely simple, single-facet prompt. There is no mocked LLM call here -
+# WRITER_SYSTEM is prompt TEXT, not code - so these simulate what a
+# well-instructed writer's own `image_prompt` output now looks like (the
+# same AC generator worked example WRITER_SYSTEM itself now gives) and
+# confirm the rest of the pipeline treats it correctly; see
+# test_diagram_service.py for the instruction-text-level regression guards.
+# ---------------------------------------------------------------------------
+
+_FACET_RICH_AC_GENERATOR_PROMPT = (
+    "A textbook working-principle diagram of an AC generator (alternator), covering its real "
+    "facets: (1) the apparatus itself - a rectangular coil rotating between a north (N) and "
+    "south (S) pole magnet, connected via slip rings and carbon brushes to an external circuit; "
+    "(2) the governing law - Faraday's law of electromagnetic induction; (3) its characteristic "
+    "output - the resulting sinusoidal voltage/current waveform over time; (4) the energy "
+    "conversion involved - mechanical rotation converted into electrical energy."
+)
+
+
+def test_a_facet_rich_writer_prompt_survives_build_prompt_completely_intact():
+    """Every real facet a well-instructed writer names (per WRITER_SYSTEM's
+    new AC generator worked example) must reach the final generation prompt
+    untouched - the whole point of enriching `image_prompt` upstream is
+    wasted if the facets get trimmed or diluted downstream."""
+    template = load_template("technical")
+    block = _image_block(
+        illustration_style="textbook",
+        prompt=_FACET_RICH_AC_GENERATOR_PROMPT,
+        expected_labels=["N pole", "S pole", "Coil", "Slip rings", "Carbon brushes"],
+    )
+    prompt = ImageService.build_prompt(block, template, "Electromagnetic Induction")
+    assert _FACET_RICH_AC_GENERATOR_PROMPT in prompt
+    # The multi-panel composition rule must also be present - this is what
+    # lets the model actually turn 4 named facets into 4 real panels.
+    assert "MULTI-PANEL COMPOSITIONS" in prompt
+    assert "Use as many panels as the subject genuinely organizes into" in prompt
+
+
+def test_a_simple_single_facet_prompt_is_not_artificially_expanded():
+    """The other half of the same fix: nothing in this pipeline inflates a
+    genuinely simple, single-facet description - a plain one-sentence
+    writer prompt must reach the final generation prompt byte-for-byte, with
+    nothing appended or injected around it. (The fixed style guidance's own
+    generic worked example legitimately uses words like "governing law" for
+    every textbook request regardless of topic - that's pre-existing, fixed
+    boilerplate, not something this fix adds per-topic, so the real
+    invariant to check is that the writer's own prompt text is never
+    rewritten, not that certain words can never appear anywhere else in the
+    assembled prompt.)"""
+    template = load_template("technical")
+    simple_prompt = "A single plant cell with a visible nucleus and cell wall."
+    block = _image_block(illustration_style="textbook", prompt=simple_prompt)
+    prompt = ImageService.build_prompt(block, template, "Cell Biology")
+    # The writer's own sentence appears exactly once, verbatim - nothing
+    # appended directly after it to pad it into multiple facets.
+    assert prompt.count(simple_prompt) == 1
+    tail = prompt.split(simple_prompt, 1)[1]
+    assert tail.strip() == "" or tail.lstrip().startswith("Educational context")
 
 
 async def test_generate_for_block_forces_text_free_when_the_diagram_path_fails(monkeypatch):
@@ -2772,6 +3504,42 @@ async def test_real_generation_is_recorded_as_real():
 # 3), so label-carrying textbook illustrations never inherit a weaker
 # default just because that's what decorative illustrations are set to use.
 # ---------------------------------------------------------------------------
+
+
+async def test_a_legitimate_anatomy_textbook_illustration_still_generates_normally():
+    """Hard requirement for the visual-generation policy fix: none of the
+    structured-diagram-fallback changes in this fix may weaken or restrict a
+    genuine textbook-style illustration request (anatomy, chemistry,
+    physics, geography, mechanical/technical illustrations, molecular
+    structures). This is `kind == "illustration"` end to end (never touches
+    `DiagramService` at all), with real expected-label text verification,
+    exercised through the real `ImageService.generate_for_block` entrypoint,
+    not just `_generate_illustration` in isolation."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    svc._verify_generated_text = _no_missing_labels  # type: ignore[method-assign]
+    block = _image_block(
+        kind="illustration",
+        illustration_style="textbook",
+        purpose="Show the layered structure of human skin: epidermis, dermis, hypodermis.",
+        caption="Layers of human skin.",
+        expected_labels=["Epidermis", "Dermis", "Hypodermis"],
+    )
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_anatomy_textbook", block=block, template=template, course_title="Human Biology",
+    )
+
+    assert ok is True
+    assert block.content.get("generated") is True
+    assert block.content.get("path") is not None
+    assert block.content.get("error") is None
+    assert not block.content.get("visual_qa_findings")
 
 
 async def test_textbook_illustration_uses_the_textbook_image_provider_override():

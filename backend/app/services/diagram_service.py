@@ -14,25 +14,40 @@ doesn't actually match gets one corrective retry before being accepted, so a
 requested conceptual/relationship diagram never silently turns into a
 flowchart just because that's what the model defaulted to.
 
-Any failure here (bad/unusable spec, rendering error, garbled/misspelled
-text) is left to the caller (`ImageService`) to fall back to the raster
-illustration path - a diagram is a *preference*, not a requirement, and a
-block must never end up with nothing. The one deliberate exception
-(fallback cascade root-cause fix): a spec that is structurally sound and
-has real, legible, correctly-spelled labels, but whose content-relevance
-LLM critique still finds it under-specific/off-topic/missing a concept
-after every bounded retry, is rendered and shipped anyway, flagged `major`
-for human review - see `generate_for_block`'s own comment on why. Discarding
-a real, topic-grounded, correctly-spelled diagram for the raster
-illustration fallback is a worse outcome than shipping it flagged: that
-fallback has no structured content of its own to fall back on again, and a
-real, confirmed production case showed it frequently ALSO failing its own
-relevance check and ending up shipping an unrelated, generic AI picture -
-exactly the "generic decorative placeholder" this pipeline must never use
-as a substitute for real educational content. Mirrors
+Visual-generation policy fix: a block authored with a structured diagram
+kind (`diagram_kind` set to flow_chart/decision_tree/process/cycle/
+hierarchy/tree/concept_map/etc.) NEVER falls back to the raster AI
+illustration path, regardless of why the structured attempt had trouble -
+confirmed, real production cases showed that fallback routinely producing
+a vague, textless, unrelated picture standing in for what should have been
+a labelled diagram (e.g. a flowchart's own content-safety-filtered
+fallback image sharing one generic, chapter-wide prompt across several
+structurally-unrelated blocks). Two outcomes only:
+
+1. The spec is genuinely unusable (no usable structure, a generation/
+   rendering exception, confirmed garbled/misspelled text) -> the image is
+   WITHHELD entirely (see `_withhold_structured_diagram`), the same
+   `omitted_after_qa_failure`/blocker-severity state `ImageService`'s own
+   illustration path already uses for its equivalent case. Never a
+   fabricated replacement picture just to avoid shipping nothing.
+2. The spec is structurally sound and legible, but a QA check (rendered
+   geometry, content-relevance, a confirmed source-text contradiction)
+   still has an unresolved issue after its bounded retry -> it is rendered
+   and shipped anyway, flagged `major`/`review_findings` for a human, per
+   `generate_for_block`'s own comments on each check. Discarding a real,
+   topic-grounded, legible diagram would be a worse outcome than shipping
+   it flagged: an AI illustration has no structured content of its own to
+   fall back on, and is exactly the "generic decorative placeholder" this
+   pipeline must never use as a substitute for real educational content.
+
+`schematic` is the one exception: it is a permanently-retired kind that is
+rerouted to the illustration path BEFORE any structured attempt is ever
+made (see `generate_for_block`'s own "Phase 2 card-grid audit" comment) -
+that is a deliberate classification decision, not a QA-failure fallback,
+so it is unaffected by the policy above. Mirrors
 `concept_visual_service.py`'s own already-established "no fallback on
-content-QA failure" contract, which this diagram path did not share until
-this fix.
+content-QA failure" contract, extended here to cover every failure mode
+this module can hit, not just content-QA.
 """
 
 from __future__ import annotations
@@ -51,14 +66,11 @@ from app.schemas.diagram import DIAGRAM_KINDS, RELATIONSHIP_KINDS, SEQUENTIAL_KI
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
 from app.services.diagram_content_qa import (
-    CONTRADICTS_SOURCE_TEXT,
     MISSPELLED_OR_GARBLED_TEXT,
-    NUMERIC_CONTRADICTS_SOURCE_TEXT,
     SOURCE_GROUNDING_UNSUPPORTED,
     STRUCTURALLY_GARBLED_TEXT,
     evaluate_content,
 )
-from app.services.numeric_consistency_qa import IDENTIFIER_VALUE_CONTRADICTS_SOURCE_TEXT
 from app.services.diagram_qa import DiagramQAResult, evaluate_blueprint, evaluate_schematic
 from app.services.diagram_render_qa import validate_rendered_svg
 from app.services.memory_service import MemoryService, get_memory_service
@@ -577,6 +589,29 @@ chain_links/flower_petal/hourglass_diagram/org_chart:
   overflowing, wrapping badly or crowding its neighbours.
 - Base every label and detail only on the brief below. Do not invent facts,
   numbers or names that were not given to you. No markdown, no quotes.
+  This still applies when you personally know the standard formula, number
+  or procedure from general domain knowledge and the brief's own wording
+  merely implies or gestures at it - a diagram label is read as a direct
+  claim about THIS course's content, not a textbook fact in general, so
+  "filling in" a correct-but-ungrounded specific (a formula the brief never
+  wrote out, a numeric value, a named method like "secant" or "Newton-
+  Raphson" the brief never named, an integral or convergence criterion the
+  brief never stated) fails this course's own source-grounding check even
+  when the added detail is true - state only what the brief itself already
+  says, in your own words, never a textbook-standard elaboration on top of
+  it.
+- Never write dense inline mathematical notation as a label or detail -
+  subscripts/superscripts, Greek letters, LaTeX-style markup, or a packed
+  symbolic expression (e.g. "P_l^m(cosθ)", "Y_{lm}(θ,φ)=N·P_l^m(cosθ)·
+  e^{imφ}", "Δℓ=±1,Δm=0,±1"). This renderer draws labels as plain flat SVG
+  text with no real typesetting, so notation like this does not render as
+  math at all - it renders as a cramped run of underscores, carets and
+  symbols that reads as corrupted text, not an equation, and fails this
+  pipeline's own garbled-text check. Say the same thing in plain words
+  instead (e.g. "Associated Legendre function", "spherical harmonic",
+  "angular momentum selection rule: Δℓ = ±1"), and if a real rendered
+  formula is genuinely essential, that belongs in the surrounding prose as
+  a proper formula block, never baked into a diagram node's label/detail.
 - For smart_art/chevron_process/funnel/honeycomb/puzzle_pieces specifically,
   optionally set a node's `icon` to ONE of these exact keywords when it
   genuinely fits that node's own concept - a small pictogram badge draws
@@ -748,6 +783,51 @@ def _kind_conflicts(hint: str, actual: str) -> bool:
     if hint in ("comparison", "smart_art"):
         return actual in SEQUENTIAL_KINDS or (hint == "comparison" and actual != "comparison")
     return False
+
+
+def _withhold_structured_diagram(
+    block: Block, *, detail: str, extra_findings: list[dict] | None = None
+) -> None:
+    """Skip this block's image entirely rather than let `generate_for_block`
+    return `False` and have `ImageService` silently convert it into an
+    unrelated AI-generated illustration (visual-generation policy fix: a
+    block authored as a structured diagram kind - flow_chart, decision_tree,
+    process, etc. - must never become raster art just because the
+    structured renderer had trouble with THIS attempt). Reuses the exact
+    same withheld-image state/finding shape `ImageService.generate_for_block`
+    already uses for its own "every attempt failed, no Wikimedia match
+    either" case (`omitted_after_qa_failure=True`, `path=None`,
+    `image_withheld_after_qa_failure` finding, `deterministic=True` since
+    "no image exists for this block" is a directly-checkable fact, not a
+    judgment call) - one consistent "image missing" signal for a reviewer
+    regardless of which path produced it, and the same `severity="blocker"`
+    + `verification_status="independently_verified"` treatment (see
+    quality_framework.py), so a course with a genuinely missing diagram
+    cannot silently pass approval.
+
+    `extra_findings` (already-built via `visual_qa_finding_entries`)
+    preserves the SPECIFIC defect that caused the withholding - e.g. the
+    exact `misspelled_or_garbled_text` issue(s) - alongside the generic
+    "image withheld" summary, same two-entry shape `ImageService`'s own
+    withholding already uses (its specific `relevance_findings`/
+    `formula_findings` plus its own separate `withheld_findings` marker)."""
+    block.content = merge_content(
+        block.type,
+        block.content,
+        {
+            "path": None,
+            "asset_id": None,
+            "generated": False,
+            "error": None,
+            "omitted_after_qa_failure": True,
+            "width": None,
+            "height": None,
+            "visual_qa_findings": (extra_findings or []) + visual_qa_finding_entries(
+                [("image_withheld_after_qa_failure", detail, True)],
+                resolution="image_withheld_after_qa_failure",
+            ),
+        },
+    )
 
 
 # Kinds the new textbook-style ring/wheel renderer draws (see
@@ -1018,8 +1098,14 @@ class DiagramService:
         caption = str(content.get("caption") or "")
         kind_hint = str(content.get("diagram_kind") or "").strip().lower().replace(" ", "_")
         if not (purpose.strip() or prompt.strip()):
-            log.warning("Diagram block %s has no purpose/prompt - skipped", block.id)
-            return False
+            log.warning(
+                "Diagram block %s has no purpose/prompt - withholding rather than falling back to "
+                "an unrelated AI illustration", block.id,
+            )
+            _withhold_structured_diagram(
+                block, detail="This diagram block has no purpose or prompt text to generate from."
+            )
+            return True
 
         # Root-cause fix (Phase 2 card-grid audit): `schematic` is PERMANENTLY
         # RETIRED at this layer - DIAGRAM_SYSTEM above explicitly instructs
@@ -1146,9 +1232,10 @@ class DiagramService:
                 memory=memory_text, kind_hint=kind_hint, pin_kind=False, block_id=block.id,
                 existing_outline=existing_outline,
             )
-        except Exception as exc:  # noqa: BLE001 - caller falls back to illustration
+        except Exception as exc:  # noqa: BLE001 - withhold rather than fall back to illustration
             log.warning("Diagram spec generation failed for %s: %s", block.id, exc)
-            return False
+            _withhold_structured_diagram(block, detail=f"Diagram generation failed: {str(exc)[:200]}")
+            return True
 
         spec = self._normalise(spec)
 
@@ -1235,23 +1322,32 @@ class DiagramService:
 
         if not spec.is_usable():
             log.info(
-                "Diagram spec for %s (kind=%s) is not usable (%s nodes, %s edges) - falling back",
+                "Diagram spec for %s (kind=%s) is not usable (%s nodes, %s edges) - withholding "
+                "rather than falling back to an unrelated AI illustration",
                 block.id, spec.normalised_kind(), len(spec.nodes), len(spec.edges),
             )
-            return False
+            _withhold_structured_diagram(
+                block,
+                detail=(
+                    f"The generated {spec.normalised_kind()} diagram did not have enough usable "
+                    "structure (labelled nodes/edges) to render."
+                ),
+            )
+            return True
 
         # Structural usability (right number of labelled nodes/edges) says
         # nothing about whether the content is actually ABOUT the brief -
         # the gap behind "a flowchart with boxes but no meaningful
         # information". Bounded content-relevance retries, same shape as
-        # every other QA step here. A persistent GARBLED-TEXT failure still
-        # falls back to the raster illustration path, same as a persistent
-        # render-QA failure (see the garbled-text check right after this
-        # retry loop) - but a persistent off-topic/generic/missing-concept
-        # failure now ships the best attempt anyway, flagged for review
-        # (fallback-cascade root-cause fix - see this module's own
-        # docstring), since the retry loop below already always keeps the
-        # single best spec seen across every attempt.
+        # every other QA step here. A persistent GARBLED-TEXT failure is
+        # withheld rather than shipped unreadable or swapped for an
+        # unrelated illustration (visual-generation policy fix - see the
+        # garbled-text check right after this retry loop) - a persistent
+        # off-topic/generic/missing-concept/confirmed-contradiction failure
+        # ships the best attempt anyway, flagged for review (fallback-
+        # cascade root-cause fix - see this module's own docstring), since
+        # the retry loop below already always keeps the single best spec
+        # seen across every attempt.
         #
         # Up to _MAX_CONTENT_QA_RETRIES attempts (not just one): a real,
         # confirmed case showed a SINGLE retry wasn't always enough for the
@@ -1308,57 +1404,63 @@ class DiagramService:
                 log.warning("Diagram content-QA retry failed for %s: %s", block.id, exc)
                 break
 
-        # Fallback-cascade root-cause fix: a diagram whose text is actually
-        # BROKEN (corrupted homoglyphs, or an LLM-confirmed misspelled/
-        # scrambled label) is never shippable regardless of how on-topic it
-        # otherwise is - that still falls back to the raster illustration
-        # path exactly as before. Canonical Visual Spec milestone: a
-        # CONFIRMED contradiction with the course's own source text
-        # (`contradicts_source_text`) joins this same "never shippable,
-        # reuse the existing fallback mechanism" bucket - it is exactly as
-        # disqualifying as broken text, never the softer "ship anyway,
-        # flagged" treatment below. But every OTHER content-QA issue
-        # (off_topic/generic_content/missing_key_concept/a claim the source
-        # excerpt simply doesn't address either way) is a judgment call
-        # about how WELL the diagram covers the brief, not a claim its real,
-        # legible, correctly-spelled, source-consistent labels are wrong -
-        # see this module's own docstring for why shipping that anyway,
-        # flagged for review, beats discarding it for an illustration
-        # fallback that has nothing structured left to fall back on itself.
+        # Fallback-cascade root-cause fix, refined by the visual-generation
+        # policy fix: a diagram whose text is actually BROKEN (corrupted
+        # homoglyphs, or an LLM-confirmed misspelled/scrambled label) is
+        # never shippable regardless of how on-topic it otherwise is - that
+        # now withholds the image entirely rather than falling back to an
+        # unrelated illustration (a structured diagram kind must never
+        # become raster art). A CONFIRMED contradiction with the course's
+        # own source text (`contradicts_source_text`/`numeric_contradicts_
+        # source_text`/`identifier_value_contradicts_source_text`) is a
+        # genuinely different case from broken text: the diagram itself is
+        # still legible and structurally sound, it asserts something
+        # questionable - so it now joins the "ship anyway, flagged" bucket
+        # below with every other content-QA issue (off_topic/generic_
+        # content/missing_key_concept/a claim the source excerpt simply
+        # doesn't address either way), all of which are judgment calls
+        # about how WELL the diagram covers the brief, not a claim its
+        # real, legible labels are unreadable - see this module's own
+        # docstring for why shipping that anyway, flagged for review, beats
+        # discarding a correctly-shaped diagram for an unrelated
+        # illustration.
         content_qa_unresolved: list[dict] = []
         if not content_result.passed:
-            garbled_types = {
-                STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT,
-                CONTRADICTS_SOURCE_TEXT, NUMERIC_CONTRADICTS_SOURCE_TEXT,
-                # Short-identifier hardening (Canonical Visual Spec milestone):
-                # a CONFIRMED Si=28-vs-Si=14-style mismatch is exactly as
-                # disqualifying as the plain numeric case above - same
-                # fallback treatment. The AMBIGUOUS sibling,
-                # IDENTIFIER_VALUE_NEEDS_REVIEW, is deliberately NOT in this
-                # set - it must ship (flagged for review), never fall back.
-                IDENTIFIER_VALUE_CONTRADICTS_SOURCE_TEXT,
-            }
+            # Visual-generation policy fix: a structured diagram kind must
+            # NEVER fall back to an unrelated AI illustration, even when its
+            # text is confirmed garbled/misspelled after every bounded
+            # retry. Garbled/misspelled labels make the diagram itself
+            # genuinely unreadable (the same bar `is_usable()` already
+            # applies to structure), so this withholds the image entirely -
+            # the same treatment the raster-illustration path already gives
+            # "garbled text", and the honest alternative to either shipping
+            # unreadable labels or swapping in an unrelated picture.
+            garbled_types = {STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT}
             if any(issue.reason in garbled_types for issue in content_result.issues):
                 log.info(
-                    "Diagram for %s still has garbled/misspelled text or a confirmed source-text "
-                    "contradiction after %s retries - falling back to illustration",
+                    "Diagram for %s still has garbled/misspelled text after %s retries - withholding "
+                    "rather than falling back to an unrelated AI illustration",
                     block.id, _MAX_CONTENT_QA_RETRIES,
                 )
-                block.content = merge_content(
-                    block.type,
-                    block.content,
-                    {
-                        "visual_qa_findings": visual_qa_finding_entries(
-                            [(issue.reason, issue.detail, issue.deterministic) for issue in content_result.issues],
-                            resolution="fell_back_to_illustration",
-                        )
-                    },
+                garbled_findings = visual_qa_finding_entries(
+                    [
+                        (issue.reason, issue.detail, issue.deterministic)
+                        for issue in content_result.issues
+                        if issue.reason in garbled_types
+                    ],
+                    resolution="image_withheld_after_qa_failure",
                 )
-                return False
+                _withhold_structured_diagram(
+                    block,
+                    detail="; ".join(f["detail"] for f in garbled_findings)[:300],
+                    extra_findings=garbled_findings,
+                )
+                return True
             log.info(
-                "Diagram for %s still has content-coverage issues after %s retries - shipping the best "
-                "attempt anyway, flagged for review, rather than discarding a real, topic-grounded diagram "
-                "for an unrelated illustration", block.id, _MAX_CONTENT_QA_RETRIES,
+                "Diagram for %s still has content-coverage or source-consistency issues after %s "
+                "retries (%s) - shipping the best attempt anyway, flagged for review, rather than "
+                "falling back to an unrelated AI illustration",
+                block.id, _MAX_CONTENT_QA_RETRIES, [issue.reason for issue in content_result.issues],
             )
             # Split out of the general "ship anyway, flagged" bucket below:
             # a claim the source excerpt doesn't address (ambiguous, not
@@ -1366,13 +1468,16 @@ class DiagramService:
             # must route to `app.services.quality_framework`'s existing
             # `review_findings` bucket specifically (the same
             # `severity="blocker"` + `verification_status="unverified"`
-            # combination that field already defines), not get silently
-            # folded into `rendered_with_unresolved_issues`'s own, separately
-            # mapped severity - never conflated with a confirmed failure
-            # above, and never a reason to reject an otherwise-sound,
-            # legitimately-elaborating diagram. See quality_framework.py's
-            # own resolution->severity mapping for the `source_grounding_
-            # unsupported` entry this relies on.
+            # combination that field already defines). Every other
+            # content-QA issue - including a CONFIRMED source-text
+            # contradiction (`contradicts_source_text`/`numeric_contradicts_
+            # source_text`/`identifier_value_contradicts_source_text`), which
+            # used to fall back to illustration above - is a legible,
+            # structurally sound diagram whose CONTENT is in question, not
+            # its readability; it ships anyway, flagged `major`
+            # (`rendered_with_unresolved_issues`), never discarded for an
+            # unrelated illustration (visual-generation policy fix: never
+            # fall back for a structured diagram kind).
             grounding_issues = [i for i in content_result.issues if i.reason == SOURCE_GROUNDING_UNSUPPORTED]
             other_issues = [i for i in content_result.issues if i.reason != SOURCE_GROUNDING_UNSUPPORTED]
             content_qa_unresolved = visual_qa_finding_entries(
@@ -1392,9 +1497,10 @@ class DiagramService:
         spec = _with_figure_caption(spec, block)
         try:
             svg_bytes, width, height = render_diagram_svg(spec, template.theme)
-        except Exception as exc:  # noqa: BLE001 - rendering must not fail the block
+        except Exception as exc:  # noqa: BLE001 - withhold rather than fall back to illustration
             log.warning("Diagram rendering failed for %s: %s", block.id, exc)
-            return False
+            _withhold_structured_diagram(block, detail=f"Diagram rendering failed: {str(exc)[:200]}")
+            return True
 
         # Validate the ACTUAL rendered geometry - node overlap, an edge
         # crossing through an unrelated node's text, text overflowing its
@@ -1481,36 +1587,23 @@ class DiagramService:
             except Exception as exc:  # noqa: BLE001 - keep the first render, don't fail the block
                 log.warning("Diagram render-QA retry failed for %s: %s", block.id, exc)
 
+        # Visual-generation policy fix: a structured diagram kind must never
+        # fall back to an unrelated AI illustration, even when its rendered
+        # geometry still has issues after one corrective retry (an edge
+        # sharing a segment with another, a duplicate arrowhead, an edge
+        # crossing a node). The diagram is still a real, correctly-shaped,
+        # legible answer to the brief - a layout imperfection, not a reason
+        # to discard it for a textless, unrelated picture - so it ships
+        # anyway, flagged `major` (`rendered_with_unresolved_issues`, same
+        # bucket flow_chart-connectivity/drift findings already use below),
+        # exactly the "ship anyway, flagged for review" treatment this
+        # module already gives every other recoverable QA issue.
         if issues:
             log.info(
-                "Diagram for %s still has %s rendered layout issue(s) after retry - falling back",
+                "Diagram for %s still has %s rendered layout issue(s) after retry - shipping anyway, "
+                "flagged for review, rather than falling back to an unrelated AI illustration",
                 block.id, len(issues),
             )
-            # TASK 3 (quality audit follow-up) - persist the real structured
-            # issues onto the block BEFORE falling back, so the quality
-            # report can later show what happened here instead of this being
-            # visible only in this log line. The caller (ImageService) still
-            # owns this block and will overwrite its content with the
-            # fallback illustration's own fields - visual_qa_findings
-            # deliberately survives that (see merge_content/ImageContent,
-            # extra="allow" + an explicit field), since it describes this
-            # attempt, not the fallback's own result.
-            block.content = merge_content(
-                block.type,
-                block.content,
-                {
-                    "visual_qa_findings": visual_qa_finding_entries(
-                        # True (literal, quality-governance follow-up Phase
-                        # 3.7): RenderQAIssue (app.services.diagram_render_qa)
-                        # is pure SVG/geometry parsing - no AIClient import
-                        # anywhere in that module, so every issue here is
-                        # genuinely deterministic, never an LLM judgment call.
-                        [(issue.kind, issue.detail, True) for issue in issues],
-                        resolution="fell_back_to_illustration",
-                    )
-                },
-            )
-            return False
 
         relative = self.storage.save_asset(course_id, svg_bytes, extension="svg")
         # See _correction_drift_issue's own docstring - a no-op ([], None)
@@ -1519,6 +1612,11 @@ class DiagramService:
         # gets a finding here.
         drift_issue = _correction_drift_issue(existing_outline, spec)
         findings = [("flow_chart_connectivity", detail, True) for detail in unresolved_connectivity_issues]
+        # True (literal, quality-governance follow-up Phase 3.7): RenderQAIssue
+        # (app.services.diagram_render_qa) is pure SVG/geometry parsing - no
+        # AIClient import anywhere in that module, so every issue here is
+        # genuinely deterministic, never an LLM judgment call.
+        findings.extend((issue.kind, issue.detail, True) for issue in issues)
         if drift_issue:
             findings.append(("replace_image_correction_drift", drift_issue, True))
         block.content = merge_content(
@@ -1529,6 +1627,20 @@ class DiagramService:
                 "asset_id": relative.rsplit("/", 1)[-1],
                 "generated": True,
                 "error": None,
+                # Real, confirmed bug (PDF/visual-pipeline audit,
+                # doc_81d0b1d44cae): a block that was WITHHELD on an earlier
+                # attempt (`omitted_after_qa_failure: true`, no `path`) and
+                # later regenerates cleanly here kept that stale `true`
+                # forever - this success path never reset it, unlike
+                # `visual_qa_findings` just below, whose own comment already
+                # states the exact same "a re-render that resolves the
+                # problem must never leave a stale earlier-attempt marker"
+                # rule. `image_generation_failed()` happens to also check
+                # `path` itself, so the compact placeholder never actually
+                # reappeared - but the raw field stayed a live lie (a real
+                # image shipped while its own content claimed "withheld"),
+                # confirmed on a real regenerated block.
+                "omitted_after_qa_failure": False,
                 "width": width,
                 "height": height,
                 # What was actually drawn, so a later review can check the

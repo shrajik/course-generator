@@ -32,6 +32,7 @@ from app.schemas.template import CourseTemplate
 from app.services.concept_visual_service import ConceptVisualService
 from app.services.diagram_service import DiagramService
 from app.services.formula_qa import evaluate_formula
+from app.services.image_text_ocr import find_ground_truth_mismatches, run_ocr
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.numeric_consistency_qa import (
     IDENTIFIER_VALUE_NEEDS_REVIEW,
@@ -93,7 +94,25 @@ _PROVIDER_PROMPT_HARD_LIMIT = 19_000
 # `_` and `^` are included because a subscript/superscript baked into raster
 # text is exactly as unreliable as any other multi-symbol notation.
 _LABEL_OPERATOR_CHARS = "=/·*+^_∂∇×→∫Σ"
-_MAX_EXPECTED_LABELS = 6
+# Raised from 6 (visual-generation-quality fix): the original 6-label
+# ceiling was a blunt proxy for "don't let a raster model garble dense
+# text" - but the real, confirmed garbling cases (see this module's own
+# history) were never about the COUNT of labels, they were about individual
+# labels being equation-heavy, multi-clause, or built from hard-to-render
+# glyphs (all still screened out, per-label, by `_is_renderable_label`
+# below, completely unchanged). A content-rich apparatus (several
+# components, several directions/symbols) genuinely needs more than 6
+# short, simple labels to be properly taught - capping every image at 6
+# regardless of subject is exactly why this app's textbook images read as
+# sparser/less complete than a free-form Playground prompt with no such
+# ceiling. 24 is a generous upper bound, not a target - the writer still
+# only lists as many labels as a given apparatus genuinely needs (a simple
+# single-component picture should still use far fewer). The safety net
+# against garbling is now the mandatory verify-and-retry text-accuracy
+# check (`_relevance_failed`'s `text_accurately_spelled`, see
+# `ImageRelevanceCheck`), which runs regardless of label count, not a raw
+# count ceiling.
+_MAX_EXPECTED_LABELS = 24
 # How many extra attempts `_generate_illustration` gives a textbook image
 # that fails `_verify_image_relevance` before giving up and shipping a
 # generic fallback - see that retry loop's own comment for the real,
@@ -230,24 +249,34 @@ class _PromptSegment:
 
     Priority 1 - never truncated or dropped: the fixed style/negative-
     constraint rules (CRITICAL FRAMING RULE, STRICT NO-TEXT RULE, label-
-    overlap/formula-correctness requirements, "no watermarks" - every
-    "must"/"never" instruction the illustration's own correctness depends
-    on). This is the one hard invariant `_assemble_prompt_with_priority`
-    keeps.
+    overlap/formula-correctness requirements, "no watermarks") and the
+    expected-labels instruction - the labels list is promoted here
+    (visual-generation-quality fix) because its length is inherently
+    bounded (`_MAX_EXPECTED_LABELS` short, individually-capped entries), so
+    protecting it fully can never risk the hard provider character budget.
+    This is the one hard invariant `_assemble_prompt_with_priority` keeps.
 
     Priority 2 - preserved whenever the budget allows, shortened only under
-    genuine pressure (and then by dropping the least-essential labels from
-    the end of the list, never truncating a label mid-word): the expected-
-    labels instruction.
+    genuine pressure (and then by dropping whole segments from the end of
+    the list, never truncating one mid-word): currently unused by
+    `build_prompt`, kept as a real middle tier for any future segment that
+    genuinely warrants "preserve when possible, drop whole before
+    truncating" rather than "never drop" or "shorten first".
 
     Priority 3 - the only tier ever shortened to make room, and always via
     `_shorten_to_budget` (word/sentence-boundary aware), never a bare
-    slice: the per-block course/chapter/section/key_concept context line
-    and the writer's own free-text `image_prompt`/`purpose`/`caption` -
-    genuinely the most variable, least load-bearing-for-correctness content
-    in the prompt, and (per this fix's own brief) the first place "redundant
-    writer instructions" and "long descriptive context" should be optimised
-    before anything else."""
+    slice: the writer's own free-text `image_prompt`/`purpose`/`caption`
+    and the per-block course/chapter/section/key_concept `context` line.
+    Unlike `expected_labels`, the writer's own prompt has no length
+    ceiling, so it must stay in this gracefully-shortenable tier rather
+    than Priority 1 - but it is listed BEFORE `context` in `build_prompt`'s
+    own segment list (visual-generation-quality fix), and this function's
+    own Priority-3 handling grants earlier segments first claim on
+    whatever budget remains - so the writer's actual educational content
+    is shortened last and least, while `context` (a synthesized restatement
+    of information the writer's own prompt already carries in substance)
+    genuinely is the least load-bearing segment in the prompt, and absorbs
+    the cut first and most."""
 
     name: str
     text: str
@@ -320,9 +349,16 @@ def _assemble_prompt_with_priority(
     (never a mid-label cut) once nothing else is left to trim. Priority 3
     is the only tier ever shortened mid-segment, word/sentence-boundary
     aware (`_shorten_to_budget`), and only after every Priority 1/2 segment
-    already has its full space reserved - "redundant writer instructions"
-    and "long descriptive context" are deliberately the first and only
-    things this function will ever visibly trim.
+    already has its full space reserved - today that is the writer's own
+    free-text prompt and the synthesized course/chapter/section context
+    line (see `build_prompt`'s own segment list); EARLIER segments in this
+    tier get first claim on whatever budget remains, which is why
+    `build_prompt` lists the writer's own prompt before `context` - the
+    writer's actual content is shortened last and least, the synthesized
+    context line absorbs the cut first. The exact labels required
+    (`expected_labels`) are Priority 1 and are never the thing this
+    function trims at all, since that field's length is inherently
+    bounded and can never itself risk the hard character budget.
 
     Segments with empty text are dropped before anything else (matches the
     previous `if part` filter) and never counted as "shortened" or
@@ -662,6 +698,22 @@ class ImageRelevanceCheck(BaseModel):
     # `genuinely_educational` already document.
     style_compliant: bool = True
     style_compliant_detail: str = ""
+    # Visual-generation-quality fix: closes a real gap - `_verify_generated_
+    # text` can only check spelling against an EXPECTED label list, so a
+    # `textbook`-style image whose block never had `image_expected_labels`
+    # populated (the writer's own field, not always filled in) previously
+    # shipped with its baked-in text completely unverified. This reuses the
+    # SAME existing vision call (zero new LLM calls) to ask, generally,
+    # whether any text actually visible in the image is garbled/misspelled -
+    # no ground-truth list required, so it runs unconditionally for every
+    # `textbook_style` image regardless of whether expected_labels was ever
+    # set. Only ever asked about for `textbook_style` (every other style
+    # carries its own STRICT NO-TEXT RULE and is separately confirmed
+    # text-free by `_confirm_text_free`). Same safe-default contract as
+    # `style_compliant`/`on_topic`: defaults True so a vision-call failure
+    # never masquerades as a confirmed defect.
+    text_accurately_spelled: bool = True
+    text_accurately_spelled_detail: str = ""
     errored: bool = False
     # Canonical Visual Spec milestone - source-grounding, ONLY ever asked
     # about when a real `source_excerpt` (the course's own chapter prose)
@@ -774,17 +826,25 @@ TEXTBOOK_ILLUSTRATION_GUIDANCE = (
     "are a light annotation layer on top of it. Label each distinct part "
     "ONCE, at its clearest instance - never repeat the same label on every "
     "occurrence of a repeated element.\n"
-    "MULTI-PANEL COMPOSITIONS: when the brief covers 2-3 closely related "
+    "MULTI-PANEL COMPOSITIONS: when the brief covers several closely related "
     "sub-concepts that build on each other (e.g. a field around a source, "
-    "then the effect that field produces, then the governing law), compose "
-    "them as separate bordered panels arranged in a clean grid within the "
-    "one image, each panel with its own short, bold section title in a "
-    "colored header strip at its top (e.g. \"Magnetic Field\", \"Induced "
-    "Current\") and its own pastel background tint - this in-panel section "
-    "title is a structural label for that panel's own sub-topic, not the "
-    "image's overall course/chapter caption, so it's expected and welcome "
-    "here even though the rule below still applies to the course/chapter "
-    "name itself.\n"
+    "then the effect that field produces, then the governing law - or a "
+    "topic with several standard sub-sections, like a machine's principle, "
+    "its governing rule, its output waveform and its energy conversion), "
+    "compose them as separate bordered panels arranged in a clean grid "
+    "within the one image, each panel with its own short, bold section "
+    "title in a colored header strip at its top (e.g. \"Magnetic Field\", "
+    "\"Induced Current\") and its own pastel background tint - this "
+    "in-panel section title is a structural label for that panel's own "
+    "sub-topic, not the image's overall course/chapter caption, so it's "
+    "expected and welcome here even though the rule below still applies to "
+    "the course/chapter name itself. Use as many panels as the subject "
+    "genuinely organizes into - a simple single-mechanism concept needs "
+    "only one panel, while a multi-stage process or a topic with several "
+    "real, distinct sub-sections may need four or more; never pad a simple "
+    "concept with extra panels it doesn't need, and never cram several "
+    "unrelated sub-concepts into one panel just to keep the panel count "
+    "low.\n"
     "FORMULA BLOCK: if the concept has one key governing equation, you may "
     "include it once, in its own clearly bordered box (distinct from the "
     "illustration panels), set in large clean mathematical notation, with "
@@ -961,26 +1021,55 @@ class ImageService:
             else ""
         )
         # Priority-based assembly (see this module's own "image-generation
-        # prompt budget" section) - never a flat join-then-slice. Priority 1
-        # (style_guidance + the fixed negative-constraint line) is the full
-        # "must"/"never" rule set an image's own correctness depends on,
-        # CRITICAL FRAMING RULE included, and is never shortened or dropped.
-        # Priority 2 (labels_line) is preserved whenever the budget allows.
-        # Priority 3 (context_line, the writer's own free-text prompt) is
-        # the only tier `_assemble_prompt_with_priority` will ever shorten,
-        # and only word/sentence-boundary aware - see `_shorten_to_budget`.
+        # prompt budget" section) - never a flat join-then-slice.
+        #
+        # Visual-generation-quality fix: this used to rank `writer_prompt`
+        # (the writer's own subject-specific content - the actual diagram
+        # structure, components, relationships and scientific detail) at
+        # the SAME lowest-protected tier as the generic `context` line,
+        # reasoning it was "the most variable, least load-bearing-for-
+        # correctness content in the prompt" - backwards for what this app
+        # actually needs: under budget pressure, the one thing that should
+        # never be the first casualty is the content that makes THIS image
+        # teach THIS concept.
+        #
+        # `expected_labels` (the exact labels required) is promoted to
+        # Priority 1 - its length is inherently bounded (at most
+        # `_MAX_EXPECTED_LABELS` short entries, each capped at
+        # `_MAX_LABEL_CHARS`), so protecting it fully can never risk
+        # blowing the hard provider character budget the way an unbounded
+        # free-text field could.
+        #
+        # `writer_prompt` (the writer's own free-text description - the
+        # actual subject, structure, components and relationships) stays at
+        # Priority 3 - a writer-authored string has no length ceiling, so it
+        # must remain gracefully shortenable (`_shorten_to_budget`, word/
+        # sentence-boundary aware, never dropped outright) to preserve the
+        # hard "never exceed the provider's real character budget"
+        # guarantee (see the `build_prompt` worst-case tests below). What
+        # changes is its ORDER relative to `context`: it is listed BEFORE
+        # `context` now, and `_assemble_prompt_with_priority`'s own Priority-
+        # 3 handling grants EARLIER segments first claim on whatever budget
+        # remains - so `writer_prompt` is shortened last and least, and
+        # `context` (a synthesized course/chapter/section/key_concept line -
+        # genuinely redundant restatement of information the writer's own
+        # prompt already carries in substance) absorbs the cut first and
+        # most. In practice the total of all segments is almost always far
+        # under the 16,000-char budget, so this reordering is a correctness
+        # fix for the rare edge case, not something that visibly changes
+        # most prompts today.
         segments = [
             _PromptSegment("style_guidance", style_guidance, priority=1),
             _PromptSegment(
                 "negative_constraints", "Do not include watermarks, signatures or lorem ipsum text.", priority=1,
             ),
-            _PromptSegment("expected_labels", labels_line, priority=2),
-            _PromptSegment("context", context_line, priority=3),
+            _PromptSegment("expected_labels", labels_line, priority=1),
             _PromptSegment(
                 "writer_prompt",
                 content.get("prompt") or content.get("purpose") or content.get("caption") or "",
                 priority=3,
             ),
+            _PromptSegment("context", context_line, priority=3),
         ]
         result = _assemble_prompt_with_priority(segments)
         _validate_prompt_assembly(result, style=style)
@@ -1246,8 +1335,17 @@ class ImageService:
             "icon, label or text cut off at an edge."
             if textbook_style else ""
         )
+        spelling_question = (
+            " (5) `text_accurately_spelled` - if this image has ANY text, labels or callouts "
+            "baked into it, is every piece of it spelled correctly and legible letter-by-letter - "
+            "no garbled, reversed, duplicated or nonsensical characters (e.g. \"Irrlstior\" instead "
+            "of \"Indicator\")? Answer false if any word is misspelled or garbled, true if there is "
+            "no text at all or every piece of text is correctly spelled. Name the exact garbled "
+            "word in `text_accurately_spelled_detail`."
+            if textbook_style else ""
+        )
         grounding_question = (
-            " (5) `contradicts_source_text` - the course's own written text (below) describes "
+            " (6) `contradicts_source_text` - the course's own written text (below) describes "
             "this subject. Does this image depict any entity, relationship, direction, or value "
             "that DIRECTLY CONTRADICTS something the source text states (not merely absent from "
             "it - a reasonable illustrative detail a textbook author would add is NOT a "
@@ -1284,7 +1382,7 @@ class ImageService:
                     "partly covered by another label or box, or sits crammed on top of other "
                     "text so it's hard to read, means `labels_legible` is false. If the image "
                     "has no text at all, `labels_legible` is true by default - there is nothing "
-                    "to collide." + style_question + grounding_question + " Be concrete in every "
+                    "to collide." + style_question + spelling_question + grounding_question + " Be concrete in every "
                     "detail field: name exactly what the image actually shows and why that does "
                     "or doesn't match, never a bare \"could be better\"."
                 ),
@@ -1593,7 +1691,7 @@ class ImageService:
         block_id: str,
         provider: str | None = None,
         size: str | None = None,
-    ) -> tuple[bytes, bool]:
+    ) -> tuple[bytes, bool, list[str]]:
         """Generate a textbook illustration, verify its text is actually
         correct (see _verify_generated_text), and - if it isn't - retry ONCE
         with the specific mistakes fed back into the prompt plus a stronger
@@ -1608,23 +1706,32 @@ class ImageService:
         alongside whether it actually passed verification, so a caller can
         never mistake "we stopped retrying" for "this was confirmed
         correct" (see `_generate_illustration`'s `text_verified` field).
-        Returns (image bytes, text_verified). `text_verified` is True only
-        when some attempt's check GENUINELY completed and found every label
-        correct (`missing == []`) - a vision-check exception (`missing is
-        None`, see `_verify_generated_text`) is never treated the same as a
-        genuine pass, at any of the four bounded attempts below; it falls
-        through to the next attempt exactly like a confirmed wrong answer
-        would, and the final, honest `text_verified` is False either way.
-        A "clean" (`missing == []`) verdict from any of the four bounded
-        attempts below is itself double-checked via `_confirm_labels_
-        correct` before being trusted - see `_confirm_text_free`'s own
-        docstring for the real, confirmed false-negative case this
-        pattern closes."""
+        Returns (image bytes, text_verified, missing_labels). `text_verified`
+        is True only when some attempt's check GENUINELY completed and found
+        every label correct (`missing == []`) - a vision-check exception
+        (`missing is None`, see `_verify_generated_text`) is never treated
+        the same as a genuine pass, at any of the four bounded attempts
+        below; it falls through to the next attempt exactly like a
+        confirmed wrong answer would, and the final, honest `text_verified`
+        is False either way. A "clean" (`missing == []`) verdict from any of
+        the four bounded attempts below is itself double-checked via
+        `_confirm_labels_correct` before being trusted - see
+        `_confirm_text_free`'s own docstring for the real, confirmed
+        false-negative case this pattern closes.
+
+        `missing_labels` (Best Candidate Image Tracking / multi-error
+        correction fix) is the LAST bounded attempt's own `missing` list
+        (empty when `text_verified` is True, or when the check itself never
+        completed) - real, known ground truth (each entry is one of the
+        caller's OWN `expected_labels`, not a guess) that a caller can feed
+        into a LATER retry's correction prompt so a second, independent
+        correction pass addresses every confirmed-wrong label at once,
+        never just the first/most obvious one."""
         size = size or self.settings.image_size
         data = await self._draw(prompt=prompt, size=size, provider=provider)
         missing = await self._confirm_labels_correct(data, expected_labels)
         if missing == []:
-            return data, True
+            return data, True, []
 
         log.info(
             "Image text check failed for %s (missing/misspelled: %s) - retrying", block_id,
@@ -1640,7 +1747,7 @@ class ImageService:
         data = await self._draw(prompt=retry_prompt, size=size, provider=provider)
         missing = await self._confirm_labels_correct(data, expected_labels)
         if missing == []:
-            return data, True
+            return data, True, []
 
         log.info(
             "Image text check failed again for %s (%s) - attempting a text-free image", block_id,
@@ -1653,7 +1760,7 @@ class ImageService:
         # appearing wrong is exactly as bad as it was on a labelled attempt.
         missing = await self._confirm_labels_correct(data, expected_labels)
         if missing == []:
-            return data, True
+            return data, True, []
 
         log.info(
             "Text-free attempt for %s still unresolved (%s) - one final, more emphatic attempt",
@@ -1674,7 +1781,7 @@ class ImageService:
         # be True for `None` (a vision-check exception, Python's own
         # falsiness rule for None), silently treating "could not verify" as
         # "verified correct" - the exact conflation this fix exists to close.
-        return data, missing == []
+        return data, missing == [], (missing or [])
 
     @staticmethod
     def _safety_fallback_prompt(
@@ -1683,6 +1790,7 @@ class ImageService:
         chapter_title: str,
         section_title: str,
         key_concept: str,
+        block_topic: str = "",
         expected_labels: list[str] | None = None,
     ) -> str:
         """A generic, policy-conscious prompt for the ONE bounded retry after
@@ -1690,6 +1798,20 @@ class ImageService:
         docstring on why this drops the writer's free-text prompt entirely).
         Deliberately abstract/symbolic rather than depicting anything
         specific enough to risk the same or a different policy rule.
+
+        `block_topic` (visual-generation policy fix): a SHORT, block-specific
+        summary - this block's own `purpose`/`caption`, never the full
+        rejected `prompt` text itself (still dropped entirely, same
+        reasoning as always) - preferred over `key_concept` when available.
+        `key_concept` is computed once per CHAPTER (see `chapter_key_concept`
+        above), so several structurally-unrelated blocks in the same chapter
+        that all hit this fallback used to receive the exact same generic
+        topic and end up as the same generic image - a real, confirmed case
+        (three different decision workflows in one "Atomic Theory" chapter
+        all rendered as one identical abstract picture). A short caption/
+        purpose sentence is block-specific without being the detailed,
+        technical request most likely to have triggered the rejection in
+        the first place.
 
         `expected_labels` (a textbook illustration's essential part-labels,
         e.g. "Nucleus", "Cell wall") are preserved here rather than silently
@@ -1703,7 +1825,13 @@ class ImageService:
         abstract depiction is safe; the caller still verifies them with the
         same `_verify_generated_text` mechanism as every other labelled
         path, never trusted on faith."""
-        topic = key_concept.strip() or section_title.strip() or chapter_title.strip() or course_title.strip()
+        topic = (
+            block_topic.strip()[:_KEY_CONCEPT_CHAR_CAP]
+            or key_concept.strip()
+            or section_title.strip()
+            or chapter_title.strip()
+            or course_title.strip()
+        )
         base = (
             f"A clean, minimal textbook-style line diagram for the general theme of \"{topic}\" "
             f"in a course titled \"{course_title}\". Draw simple labeled geometric shapes or a "
@@ -2363,30 +2491,32 @@ class ImageService:
         # in TEXTBOOK_ILLUSTRATION_GUIDANCE as the safety net for whatever
         # composition the model still chooses).
         #
-        # `len(expected_labels) >= 4` alone is NOT a reliable density signal
-        # - a real, confirmed case: a dense 3-scene bench-wiring schematic
-        # (low-side shunt / high-side alternative / an inset plot, ~15 real
-        # labelled parts in the brief) had only 3 labels actually recovered
-        # into `expected_labels` (a best-effort extraction from free text,
-        # not a perfect count), so it missed this threshold entirely and
-        # got squeezed into the default 1024x1024 SQUARE canvas - every
-        # label crammed into a fraction of the space a wide canvas would
-        # have given it, which is exactly why its text rendered too small/
-        # blurry to read and the picture never filled a landscape display
-        # box either. The writer's own RAW prompt length is a much harder
-        # signal to under-count this way: a multi-scene/multi-component
-        # brief is long regardless of how many of its labels a downstream
-        # extraction step happened to catch - so it's checked here too, as
-        # a second, independent trigger for the same wide canvas.
-        # A shape the template asked for wins; otherwise a labelled/content-rich textbook picture gets real extra width.
+        # Visual-generation-quality fix: gating landscape on `len(expected_
+        # labels) >= 4 or raw_prompt_len > 1200` was itself the bug - the
+        # module's own prior comment already admitted this count is "NOT a
+        # reliable density signal" (a real, confirmed case: a dense 3-scene
+        # bench-wiring schematic with ~15 real labelled parts had only 3
+        # actually recovered into `expected_labels`, missed the threshold,
+        # and got squeezed into a square canvas anyway). Rather than lean
+        # harder on an already-unreliable heuristic, landscape is now the
+        # DEFAULT for every `textbook`-style image - matching how a real
+        # textbook/Playground-style diagram is actually composed - and only
+        # the genuinely simple, single-panel case (no labels requested, no
+        # governing formula, and a short writer prompt) falls back to a
+        # square canvas, where a single centred subject doesn't need the
+        # extra width.
         raw_prompt_len = len(str(block.content.get("prompt") or ""))
+        formula_expression = str(block.content.get("formula_expression") or "").strip()
+        is_simple_single_panel_textbook = (
+            is_textbook and not expected_labels and not formula_expression and raw_prompt_len <= 300
+        )
         image_size = (
             self._request_size(block)
             if block.content.get("aspect")
             else (
-                "1536x1024"
-                if is_textbook and (len(expected_labels) >= 4 or raw_prompt_len > 1200)
-                else None
+                "1024x1024"
+                if is_simple_single_panel_textbook
+                else ("1536x1024" if is_textbook else None)
             )
         )
         # None means "nothing was promised to verify" (no expected labels at
@@ -2399,6 +2529,17 @@ class ImageService:
         # whole point of forcing text-free is a real promise ("no text")
         # that's just as checkable as a labelled one.
         text_verified: bool | None = None
+        # Best Candidate Image Tracking / multi-error correction fix: real,
+        # known-correct ground truth (each entry is one of this block's own
+        # `expected_labels`) for whichever specific labels the declared-label
+        # check (`_generate_with_text_check`) confirmed still wrong/missing
+        # on its own last bounded attempt - `[]` whenever that path wasn't
+        # used, or was used and came back clean. Threaded into the
+        # relevance-retry loop below so a SECOND, independent correction
+        # pass can name every confirmed-wrong label explicitly, not just
+        # whatever the holistic vision check's own single `detail` string
+        # happens to mention.
+        declared_missing_labels: list[str] = []
         # Set True only inside the content-safety except-block below - skips
         # the topic-relevance check for that one, deliberately-generic/
         # abstract emergency image (see `_safety_fallback_prompt`'s own
@@ -2426,7 +2567,7 @@ class ImageService:
                     prompt, block_id=block.id, provider=provider, size=image_size
                 )
             elif expected_labels:
-                data, text_verified = await self._generate_with_text_check(
+                data, text_verified, declared_missing_labels = await self._generate_with_text_check(
                     prompt, expected_labels, block_id=block.id, provider=provider, size=image_size
                 )
             else:
@@ -2460,11 +2601,16 @@ class ImageService:
             # filter, which previously left the block with no image at all
             # (`generated: False`) for the rest of that course's lifetime -
             # see this module's own `_safety_fallback_prompt`.
+            block_topic = (
+                str(block.content.get("purpose") or "").strip()
+                or str(block.content.get("caption") or "").strip()
+            )
             safe_prompt = self._safety_fallback_prompt(
                 course_title=course_title,
                 chapter_title=chapter_title,
                 section_title=section_title,
                 key_concept=key_concept,
+                block_topic=block_topic,
                 expected_labels=expected_labels,
             )
             log.warning(
@@ -2502,7 +2648,8 @@ class ImageService:
         if text_verified is False:
             log.warning(
                 "Image for %s has confirmed-incorrect text after every bounded attempt - "
-                "will be omitted rather than published, not silently accepted as correct", block.id,
+                "not silently accepted as correct; see Best Candidate Image Tracking below for "
+                "whether it still ships (textbook style) or is withheld (text-free style)", block.id,
             )
         # Topic/educational relevance - the gap behind "a visually
         # attractive but irrelevant image must not pass merely because a
@@ -2514,10 +2661,48 @@ class ImageService:
         # replacing legitimately-correct content with a wrong "correction":
         # regenerating with a more specific prompt can only make the result
         # more on-topic or leave it equally generic, never introduce a new
-        # kind of error). Skipped for the deliberately-generic safety
-        # fallback (see `is_safety_fallback`'s own comment above).
+        # kind of error). The full retry-and-regenerate version of this
+        # check below is skipped for the deliberately-generic safety
+        # fallback (regenerating would most likely just reproduce the same
+        # provider rejection) - but a single, un-retried `genuinely_
+        # educational`/`on_topic` check still runs on it (visual-generation
+        # policy fix), in its own separate bucket below, so this emergency
+        # image is never silently shipped as if independently confirmed
+        # relevant just because it was never checked at all.
         relevance_findings: list[dict] = []
+        # Best Candidate Image Tracking / Strategy D (text-preservation
+        # fix): a confirmed HOLISTIC text-accuracy defect on the best
+        # available candidate is recorded HERE, separately from
+        # `relevance_findings` above - the two are never merged into one
+        # combined verdict, so a scientifically-sound-but-imperfectly-spelled
+        # image can ship (flagged) instead of being withheld outright.
+        text_findings: list[dict] = []
         source_grounding_findings: list[dict] = []
+        safety_fallback_relevance_findings: list[dict] = []
+        if is_safety_fallback:
+            safety_relevance = await self._verify_image_relevance(
+                data, brief=block_topic or course_title, course_title=course_title,
+            )
+            if not safety_relevance.errored and not (
+                safety_relevance.on_topic and safety_relevance.genuinely_educational
+            ):
+                log.warning(
+                    "Safety-fallback image for %s reads as generic/non-educational "
+                    "(on_topic=%s, genuinely_educational=%s) - shipping it anyway (no better "
+                    "alternative exists after a content-safety rejection), flagged for human review",
+                    block.id, safety_relevance.on_topic, safety_relevance.genuinely_educational,
+                )
+                safety_fallback_relevance_findings = visual_qa_finding_entries(
+                    [(
+                        "safety_fallback_relevance_unconfirmed",
+                        safety_relevance.on_topic_detail or safety_relevance.educational_detail or (
+                            "This emergency, content-safety-constrained image could not be confirmed "
+                            "as a specific, genuine teaching aid for this block's subject."
+                        ),
+                        False,
+                    )],
+                    resolution="safety_fallback_relevance_unconfirmed",
+                )
         if not is_safety_fallback:
             brief = "\n".join(
                 part for part in (
@@ -2542,59 +2727,117 @@ class ImageService:
                 source_excerpt=grounding_excerpt,
             )
 
-            def _relevance_failed(check: ImageRelevanceCheck) -> bool:
-                # `errored` is checked explicitly, alongside on_topic/
-                # genuinely_educational/labels_legible - a vision-call
-                # exception leaves all three at their safe default (True),
-                # so without this check an errored (never actually
-                # verified) attempt would silently fall straight through as
-                # if it had genuinely passed (production risk follow-up:
-                # the same ERROR-vs-PASS conflation fixed for the text-
-                # legibility checks above). `labels_legible` closes a
-                # separate, real gap: `_verify_generated_text` only checks
-                # that each expected label's text appears somewhere,
-                # verbatim - never whether it landed legibly, without
-                # colliding with another label or the image's own title -
-                # so a labelled illustration could pass that check while
-                # its callouts overlapped each other (confirmed on a real
-                # generated "rigid-body rotation" diagram). `style_compliant`
-                # is only ever asked about for a `textbook`-style generation
-                # (see `_verify_image_relevance`'s `textbook_style` param) -
-                # gated on `is_textbook` here too, not just trusted to stay
-                # at its True default, since nothing stops a model (or a
-                # test double) from setting it False on a field it was
-                # never actually asked to judge.
+            def _scientific_check_failed(check: ImageRelevanceCheck) -> bool:
+                """The STRUCTURAL/scientific half of relevance - deliberately
+                excludes `text_accurately_spelled` (see `_text_check_failed`
+                below, its sibling): Best Candidate Image Tracking fix - text
+                correctness and scientific/structural correctness must never
+                be merged into one combined verdict, so a candidate's
+                spelling can never outrank its own scientific validity (or
+                vice versa) when choosing the best of several attempts.
+                `errored`/`contradicts_source_text` are checked explicitly,
+                alongside on_topic/genuinely_educational/labels_legible - a
+                vision-call exception leaves all three at their safe default
+                (True), so without this check an errored (never actually
+                verified) attempt would silently fall straight through as if
+                it had genuinely passed (production risk follow-up: the same
+                ERROR-vs-PASS conflation fixed for the text-legibility checks
+                above). `labels_legible` closes a separate, real gap:
+                `_verify_generated_text` only checks that each expected
+                label's text appears somewhere, verbatim - never whether it
+                landed legibly, without colliding with another label or the
+                image's own title - so a labelled illustration could pass
+                that check while its callouts overlapped each other
+                (confirmed on a real generated "rigid-body rotation"
+                diagram). `style_compliant` is only ever asked about for a
+                `textbook`-style generation (see `_verify_image_relevance`'s
+                `textbook_style` param) - gated on `is_textbook` here too,
+                not just trusted to stay at its True default, since nothing
+                stops a model (or a test double) from setting it False on a
+                field it was never actually asked to judge."""
                 return check.errored or check.contradicts_source_text or not (
                     check.on_topic and check.genuinely_educational and check.labels_legible
                     and (check.style_compliant or not is_textbook)
                 )
 
-            if _relevance_failed(relevance):
-                # Bounded at _MAX_RELEVANCE_RETRIES (2), not the single
-                # retry every other dimension here uses - a real, confirmed
-                # case: `style_compliant` specifically (MAI-Image-2.6, like
-                # every current raster provider, has no negative-prompt/
-                # style parameter - see `ImageRelevanceCheck.style_
-                # compliant`'s own docstring) failed BOTH attempts on most
-                # of a chapter's textbook illustrations even after the
-                # `expected_labels` overload fix (see `sanitize_expected_
-                # labels`) resolved their text-legibility failures - a
-                # single retry wasn't enough to overcome this provider's
-                # genuine per-attempt style-drift rate, and every one of
-                # those blocks shipped a generic, off-topic placeholder
-                # instead of its real diagram. Still bounded (never
-                # unbounded) - the loop exits the moment an attempt passes,
-                # so a check that already reliably recovers on the first
-                # retry (on_topic/labels_legible, per this file's own
-                # regression tests) never spends the second one.
+            def _text_check_failed(check: ImageRelevanceCheck) -> bool:
+                """The holistic text-accuracy half of relevance - kept
+                entirely separate from `_scientific_check_failed` above (Best
+                Candidate Image Tracking fix). Only ever asked about for a
+                `textbook`-style generation, same reasoning as
+                `style_compliant` above."""
+                return is_textbook and not check.text_accurately_spelled
+
+            def _ocr_confirms_text_defect(candidate_data: bytes) -> tuple[bool, str]:
+                """OCR phase: a deterministic, LOCAL (zero-API-cost) second
+                opinion on text accuracy, additive to - never a replacement
+                for - the vision checks above. Only ever returns `True` when
+                real, known-correct ground truth (this block's own declared
+                `expected_labels`, or words actually present in the course's
+                own source text) backs a confident, specific mismatch - see
+                `image_text_ocr.find_ground_truth_mismatches`'s own
+                docstring for the exact conservative rules (never a generic
+                dictionary, never a guess, never confident on formula/Greek-
+                symbol content, never confident below a minimum OCR
+                confidence). `run_ocr` returning `None` (OCR unavailable,
+                failed, or errored) and an empty ground-truth set (a "no
+                source documents" course with no declared labels on this
+                block) both correctly fall through to `(False, "")` here -
+                UNCERTAIN, not a vote either way - so Vision QA's own
+                judgment is never second-guessed by an absence of evidence.
+                Only ever asked about for `textbook`-style generation, same
+                gating as `_text_check_failed` - OCR has nothing meaningful
+                to check on a style that is required to carry no text at
+                all in the first place."""
+                if not is_textbook:
+                    return False, ""
+                ocr_result = run_ocr(candidate_data)
+                if ocr_result is None:
+                    return False, ""
+                mismatches = find_ground_truth_mismatches(
+                    ocr_result, expected_labels=expected_labels, source_text=grounding_excerpt,
+                )
+                if not mismatches:
+                    return False, ""
+                return True, "; ".join(m.detail for m in mismatches[:3])
+
+            if _scientific_check_failed(relevance) or _text_check_failed(relevance) or _ocr_confirms_text_defect(data)[0]:
+                # Best Candidate Image Tracking (production quality-
+                # preservation fix): every attempt generated during this
+                # bounded retry loop - the original plus each retry - is now
+                # kept as its own candidate (the exact bytes, the exact
+                # prompt that produced them, and the relevance check actually
+                # run against THOSE bytes), instead of the previous behaviour
+                # of simply overwriting `data`/`relevance` with whatever the
+                # loop drew most recently. This is the direct fix for a real
+                # failure shape: a later retry can fix spelling while
+                # accidentally drifting off-topic or out of the required
+                # style - "last attempt wins" would ship that regression
+                # purely because it happened to be generated last. Bounded at
+                # _MAX_RELEVANCE_RETRIES (2), not the single retry every
+                # other dimension here uses - a real, confirmed case:
+                # `style_compliant` specifically (MAI-Image-2.6, like every
+                # current raster provider, has no negative-prompt/style
+                # parameter - see `ImageRelevanceCheck.style_compliant`'s own
+                # docstring) failed BOTH attempts on most of a chapter's
+                # textbook illustrations even after the `expected_labels`
+                # overload fix (see `sanitize_expected_labels`) resolved
+                # their text-legibility failures - a single retry wasn't
+                # enough to overcome this provider's genuine per-attempt
+                # style-drift rate. Still bounded (never unbounded) - the
+                # loop exits the moment an attempt is fully clean (neither
+                # scientific nor text issues), so a check that already
+                # reliably recovers on the first retry never spends the
+                # second one.
+                candidates: list[tuple[bytes, str, ImageRelevanceCheck]] = [(data, prompt, relevance)]
                 for attempt in range(_MAX_RELEVANCE_RETRIES):
                     log.info(
                         "Image relevance check failed for %s (on_topic=%s, genuinely_educational=%s, "
-                        "labels_legible=%s, style_compliant=%s, errored=%s) - retrying (attempt %s of %s) "
-                        "with the brief re-emphasised",
+                        "labels_legible=%s, style_compliant=%s, text_accurately_spelled=%s, errored=%s) - "
+                        "retrying (attempt %s of %s) with the brief re-emphasised",
                         block.id, relevance.on_topic, relevance.genuinely_educational,
-                        relevance.labels_legible, relevance.style_compliant, relevance.errored,
-                        attempt + 1, _MAX_RELEVANCE_RETRIES,
+                        relevance.labels_legible, relevance.style_compliant, relevance.text_accurately_spelled,
+                        relevance.errored, attempt + 1, _MAX_RELEVANCE_RETRIES,
                     )
                     legibility_note = (
                         f" The previous attempt also had labels/callouts overlapping or colliding with "
@@ -2609,6 +2852,40 @@ class ImageService:
                         "no glow/gradient background, and every element fully inside the frame with margin."
                         if is_textbook and not relevance.style_compliant else ""
                     )
+                    # Multi-error correction fix: names EVERY confirmed-wrong
+                    # piece of text this attempt is aware of, not just the
+                    # holistic vision check's own single `detail` string -
+                    # `declared_missing_labels` is real, known ground truth
+                    # (each entry is one of this block's own `expected_
+                    # labels`) from the earlier, independent declared-label
+                    # check, folded in here so a correction pass addresses
+                    # every confirmed defect at once, never just the
+                    # first/most obvious one.
+                    declared_label_note = (
+                        f" The following required labels were also confirmed wrong or missing and must "
+                        f"now appear, spelled correctly, exactly as given: {', '.join(declared_missing_labels)}."
+                        if declared_missing_labels else ""
+                    )
+                    # OCR phase (Strategy A integration): a deterministic,
+                    # ground-truth-backed mismatch this attempt's own bytes
+                    # confirmed - fed into the SAME correction prompt, never
+                    # a separate retry mechanism.
+                    ocr_confirmed_for_retry, ocr_detail_for_retry = _ocr_confirms_text_defect(data)
+                    ocr_note = (
+                        f" OCR also confirmed this specific text defect: {ocr_detail_for_retry}."
+                        if ocr_confirmed_for_retry else ""
+                    )
+                    spelling_note = (
+                        (
+                            f" The previous attempt also had misspelled or garbled text "
+                            f"({relevance.text_accurately_spelled_detail or 'a garbled word'}) - spell every "
+                            "piece of text correctly, letter-by-letter; simplify or shorten any label that "
+                            "keeps coming out wrong rather than repeating the same wording."
+                            if is_textbook and not relevance.text_accurately_spelled else ""
+                        )
+                        + declared_label_note
+                        + ocr_note
+                    )
                     contradiction_note = (
                         f" The previous attempt also contradicted the course's own text "
                         f"({relevance.contradicts_source_text_detail or 'a stated fact or relationship'}) - "
@@ -2620,7 +2897,7 @@ class ImageService:
                         f"{prompt}\n\nIMPORTANT: the previous attempt did not clearly depict the actual "
                         f"subject. This image MUST specifically, unmistakably depict: {brief or course_title}. "
                         f"Do not produce a generic or decorative image unrelated to this exact subject."
-                        f"{legibility_note}{style_note}{contradiction_note}"
+                        f"{legibility_note}{style_note}{spelling_note}{contradiction_note}"
                     )
                     try:
                         retried_data = await self._draw(
@@ -2630,51 +2907,147 @@ class ImageService:
                             retried_data, brief=brief, course_title=course_title, textbook_style=is_textbook,
                             source_excerpt=grounding_excerpt,
                         )
+                        candidates.append((retried_data, retry_prompt, retried_relevance))
                         data, relevance, prompt = retried_data, retried_relevance, retry_prompt
-                        if not _relevance_failed(relevance):
+                        # OCR phase: re-run OCR on the new candidate before
+                        # deciding whether to stop retrying - a candidate
+                        # vision calls "clean" must still keep retrying if
+                        # OCR confirms a real, ground-truth-backed defect
+                        # vision missed.
+                        if not (
+                            _scientific_check_failed(relevance) or _text_check_failed(relevance)
+                            or _ocr_confirms_text_defect(data)[0]
+                        ):
                             break
-                    except Exception as exc:  # noqa: BLE001 - keep the last good image, don't fail the block
+                    except Exception as exc:  # noqa: BLE001 - keep every candidate generated so far, don't fail the block
                         log.warning("Image relevance retry failed for %s: %s", block.id, exc)
                         break
-                if _relevance_failed(relevance):
-                    log.warning(
-                        "Image for %s still failed relevance check after retry - will be omitted "
-                        "rather than published, not silently accepted as correct", block.id,
-                    )
-                    issues: list[tuple[str, str, bool]] = []
-                    if relevance.errored:
-                        issues.append((
-                            "image_relevance_check_error",
-                            "The image relevance check could not be completed (vision call failed) "
-                            "after every bounded attempt - never treated as a confirmed pass.",
-                            False,
-                        ))
-                    if not relevance.on_topic:
-                        issues.append(("off_topic_image", relevance.on_topic_detail or "Image does not depict the requested topic.", False))
-                    if not relevance.labels_legible:
-                        issues.append((
-                            "overlapping_or_illegible_labels",
-                            relevance.labels_legible_detail
-                            or "Text labels/callouts overlap each other or other elements, unreadable.",
-                            False,
-                        ))
-                    if not relevance.genuinely_educational:
-                        issues.append(("decorative_not_educational", relevance.educational_detail or "Image reads as decorative, not educational.", False))
-                    if is_textbook and not relevance.style_compliant:
-                        issues.append((
-                            "textbook_style_not_followed",
-                            relevance.style_compliant_detail
-                            or "Image does not follow the required flat 2D vector textbook style.",
-                            False,
-                        ))
-                    if relevance.contradicts_source_text:
-                        issues.append((
-                            "contradicts_source_text",
-                            relevance.contradicts_source_text_detail
-                            or "Image depicts something that contradicts the course's own text.",
-                            False,
-                        ))
-                    relevance_findings = visual_qa_finding_entries(issues, resolution="image_relevance_unverified")
+
+                def _candidate_rank(candidate: tuple[bytes, str, ImageRelevanceCheck]) -> tuple[int, int]:
+                    """Scientific correctness strictly outranks text
+                    correctness: the first tuple element always dominates
+                    the second, so a candidate with a confirmed scientific/
+                    structural defect can never be selected as best purely
+                    because its text happens to be cleaner. The ranking
+                    SHAPE and priority order are unchanged by the OCR phase
+                    - OCR only enriches what counts as a text defect on the
+                    second axis (same as the holistic vision check already
+                    does), never adds a third axis and never touches the
+                    scientific axis at all."""
+                    candidate_data, _, check = candidate
+                    text_failed = _text_check_failed(check) or _ocr_confirms_text_defect(candidate_data)[0]
+                    return (1 if _scientific_check_failed(check) else 0, 1 if text_failed else 0)
+
+                # Best Candidate Image Tracking: explicitly compare every
+                # candidate generated above - never assume the most recently
+                # drawn one is the best. `min()` over an `enumerate()`d list
+                # is stable: on an exact tie it returns the FIRST (lowest-
+                # index) candidate, so the original image is preferred over
+                # an equally-good-or-worse later retry, while a genuinely
+                # later improvement (a strictly lower rank) still correctly
+                # wins - no recency bias in either direction.
+                best_index, (data, prompt, relevance) = min(
+                    enumerate(candidates), key=lambda item: _candidate_rank(item[1])
+                )
+                log.info(
+                    "Best Candidate Image Tracking selected candidate %s of %s for %s "
+                    "(scientific_failed=%s, text_failed=%s)",
+                    best_index + 1, len(candidates),
+                    block.id, _scientific_check_failed(relevance), _text_check_failed(relevance),
+                )
+
+            # Scientific/structural findings - deliberately never includes a
+            # text-accuracy issue (Best Candidate Image Tracking fix: that is
+            # its own separate list below, `text_findings`, with its own
+            # resolution/severity - the two must never be merged into one
+            # combined verdict). A confirmed defect here still withholds the
+            # image (unchanged from before this fix) - preserving a
+            # scientifically-wrong-or-off-topic image would never be a
+            # genuine improvement, unlike a spelling defect.
+            if _scientific_check_failed(relevance):
+                log.warning(
+                    "Image for %s still failed its scientific/structural relevance check after retry - "
+                    "will be omitted rather than published, not silently accepted as correct", block.id,
+                )
+                issues: list[tuple[str, str, bool]] = []
+                if relevance.errored:
+                    issues.append((
+                        "image_relevance_check_error",
+                        "The image relevance check could not be completed (vision call failed) "
+                        "after every bounded attempt - never treated as a confirmed pass.",
+                        False,
+                    ))
+                if not relevance.on_topic:
+                    issues.append(("off_topic_image", relevance.on_topic_detail or "Image does not depict the requested topic.", False))
+                if not relevance.labels_legible:
+                    issues.append((
+                        "overlapping_or_illegible_labels",
+                        relevance.labels_legible_detail
+                        or "Text labels/callouts overlap each other or other elements, unreadable.",
+                        False,
+                    ))
+                if not relevance.genuinely_educational:
+                    issues.append(("decorative_not_educational", relevance.educational_detail or "Image reads as decorative, not educational.", False))
+                if is_textbook and not relevance.style_compliant:
+                    issues.append((
+                        "textbook_style_not_followed",
+                        relevance.style_compliant_detail
+                        or "Image does not follow the required flat 2D vector textbook style.",
+                        False,
+                    ))
+                if relevance.contradicts_source_text:
+                    issues.append((
+                        "contradicts_source_text",
+                        relevance.contradicts_source_text_detail
+                        or "Image depicts something that contradicts the course's own text.",
+                        False,
+                    ))
+                relevance_findings = visual_qa_finding_entries(issues, resolution="image_relevance_unverified")
+
+            # Strategy D (text-preservation fix): a confirmed text defect on
+            # the best available candidate - from the HOLISTIC vision check
+            # (`text_accurately_spelled=False`) and/or the OCR phase's own
+            # deterministic, ground-truth-backed confirmation - as opposed
+            # to the separate declared-label `text_verified` signal (handled
+            # entirely via the pre-existing `image_text_unverified` quality_
+            # framework finding, keyed off `content["text_verified"]`
+            # directly) - no longer feeds `relevance_findings` above, so it
+            # can no longer trigger withholding on its own. It gets its own
+            # separate finding/resolution instead, carrying the best
+            # correction information actually available - a scientifically-
+            # sound diagram is shipped, flagged for a human, rather than
+            # discarded over a spelling defect.
+            #
+            # `deterministic` here is OCR's one real effect on the finding
+            # itself (never on the ship/withhold DECISION, which stays
+            # governed purely by scientific soundness): when OCR confirms a
+            # mismatch against real, known-correct ground truth, the finding
+            # is marked `deterministic=True` -> `verification_status=
+            # "independently_verified"` (quality_framework.py), correctly
+            # distinguishing "an LLM thought this might be wrong" from "a
+            # deterministic check confirmed this specific word against
+            # known-correct text" - a real severity/confidence upgrade, not
+            # a new decision path. Vision-only (no OCR backing, or OCR
+            # unavailable/uncertain) stays `deterministic=False`, byte-for-
+            # byte the same as before the OCR phase.
+            ocr_confirmed, ocr_detail = _ocr_confirms_text_defect(data)
+            if is_textbook and (_text_check_failed(relevance) or ocr_confirmed):
+                combined_detail = " ".join(
+                    part for part in (
+                        relevance.text_accurately_spelled_detail if _text_check_failed(relevance) else "",
+                        ocr_detail,
+                    ) if part
+                ) or "Text baked into the image is misspelled or garbled."
+                log.warning(
+                    "Image for %s still has a text-accuracy defect after retry (vision=%s, ocr_confirmed=%s, "
+                    "%s) - shipping the best available candidate anyway (scientifically/structurally sound), "
+                    "flagged for human review with the correction detail attached, rather than withheld",
+                    block.id, _text_check_failed(relevance), ocr_confirmed, combined_detail,
+                )
+                text_findings = visual_qa_finding_entries(
+                    [("text_misspelled_or_garbled", combined_detail, ocr_confirmed)],
+                    resolution="text_defect_preserved_with_mapping",
+                )
             # Canonical Visual Spec milestone: a claim the source excerpt
             # simply doesn't ADDRESS (neither confirms nor contradicts) is a
             # genuinely different, less severe case than the confirmed
@@ -2784,6 +3157,7 @@ class ImageService:
         _stale_resolutions = {
             "formula_verification_failed", "image_relevance_unverified",
             "generic_fallback_published", "image_withheld_after_qa_failure",
+            "safety_fallback_relevance_unconfirmed", "text_defect_preserved_with_mapping",
         }
         existing_findings = [
             entry for entry in (block.content.get("visual_qa_findings") or [])
@@ -2811,9 +3185,38 @@ class ImageService:
         # different defect class (bad raster text/relevance has no
         # "could silently replace correct content with a NEW wrong one"
         # risk the way an auto-corrected formula would).
-        confirmed_text_failure = text_verified is False
+        # Best Candidate Image Tracking / Strategy D (text-preservation
+        # fix): a purely TEXT defect on an otherwise scientifically/
+        # structurally sound, NORMALLY-generated `textbook`-style image no
+        # longer withholds the image - see the branch below. This still
+        # withholds (unchanged original behaviour) for every case where
+        # Strategy D's reasoning does not apply:
+        #   - force-text-free/non-"textbook" styles promise NO text at all
+        #     (see DEFAULT_ILLUSTRATION_GUIDANCE's STRICT NO-TEXT RULE) -
+        #     there is no "correct" text to map to or preserve when none was
+        #     ever supposed to exist.
+        #   - the content-safety emergency fallback (`is_safety_fallback`) is
+        #     a single-shot generation with no candidate comparison to prefer
+        #     a "scientifically sound" option from - shipping CONFIRMED-WRONG
+        #     required text here (e.g. a safety-critical label like "Pressure
+        #     Valve"/"Safety Interlock" on a dangerous-machinery diagram) is
+        #     never an improvement over no image at all, so this path keeps
+        #     its original, stricter contract unchanged.
+        confirmed_unexpected_text = (
+            (not is_textbook or force_text_free or is_safety_fallback) and text_verified is False
+        )
+        # Scientific/structural only (Best Candidate Image Tracking fix) -
+        # `relevance_findings` no longer contains a text-accuracy issue, see
+        # `_scientific_check_failed`/`_text_check_failed` above.
         confirmed_relevance_failure = bool(relevance_findings)
-        if confirmed_text_failure or confirmed_relevance_failure:
+        # Used only for logging and to keep the overlay-label-suggestion
+        # gate below correctly suppressed for a Strategy-D ship (a NEW
+        # overlay label should never be suggested for an image already
+        # known to carry a text defect) - never used to trigger withholding
+        # on its own; see `confirmed_unexpected_text` above for the one
+        # text-failure case that still does.
+        confirmed_text_failure = (text_verified is False) or bool(text_findings)
+        if confirmed_unexpected_text or confirmed_relevance_failure:
             # Fallback-cascade root-cause fix: every real attempt at the
             # actual brief failed its own bounded QA, and Wikimedia (tried
             # BEFORE any of this, at the very top of this method - see
@@ -2831,12 +3234,17 @@ class ImageService:
             # outcome - the course's text content is completely unaffected,
             # and exactly why is recorded in `visual_qa_findings` below for
             # a human reviewer, never papered over with a picture that
-            # doesn't actually depict anything real.
+            # doesn't actually depict anything real. A scientific/structural
+            # defect reaches here regardless of text status (Best Candidate
+            # Image Tracking never ships a scientifically-wrong diagram just
+            # because its text is clean); `confirmed_unexpected_text` is the
+            # one remaining text-only path that still withholds (see its own
+            # docstring above).
             log.warning(
-                "Image for %s failed confirmed QA after every bounded attempt (text_failed=%s, "
+                "Image for %s failed confirmed QA after every bounded attempt (unexpected_text=%s, "
                 "relevance_failed=%s) and no Wikimedia match was available - withholding the image "
                 "rather than publishing an unrelated generic picture in its place",
-                block.id, confirmed_text_failure, confirmed_relevance_failure,
+                block.id, confirmed_unexpected_text, confirmed_relevance_failure,
             )
             withheld_findings = visual_qa_finding_entries(
                 [(
@@ -2903,7 +3311,10 @@ class ImageService:
                     # that was never actually shipped.
                     "text_verified": None,
                     "formula_verified": formula_verified,
-                    "visual_qa_findings": existing_findings + formula_findings + relevance_findings + withheld_findings,
+                    "visual_qa_findings": (
+                        existing_findings + formula_findings + relevance_findings
+                        + safety_fallback_relevance_findings + text_findings + withheld_findings
+                    ),
                     "generation_mode": "mock" if self.ai.is_mock else "real",
                 },
             )
@@ -2961,11 +3372,27 @@ class ImageService:
                 "text_verified": text_verified,
                 "formula_verified": formula_verified,
                 "overlay_labels": overlay_labels,
-                "visual_qa_findings": existing_findings + formula_findings + relevance_findings + source_grounding_findings,
+                "visual_qa_findings": (
+                    existing_findings + formula_findings + relevance_findings
+                    + safety_fallback_relevance_findings + source_grounding_findings + text_findings
+                ),
                 "generation_mode": "mock" if self.ai.is_mock else "real",
             },
         )
-        log.info("Generated %s for block %s", relative, block.id)
+        if confirmed_text_failure:
+            # Strategy D (text-preservation fix): shipped despite a known
+            # text defect - the course's own `review_findings`/review-brief
+            # surface (quality_framework.py) now carries exactly why, via
+            # `image_text_unverified` (declared-label case, reads
+            # `expected_labels` directly) and/or the `text_findings` entry
+            # above (holistic case) - never silently indistinguishable from
+            # a genuinely clean ship.
+            log.info(
+                "Generated %s for block %s with a known, flagged text defect preserved "
+                "(scientifically/structurally sound) rather than withheld", relative, block.id,
+            )
+        else:
+            log.info("Generated %s for block %s", relative, block.id)
         return True
 
     @staticmethod

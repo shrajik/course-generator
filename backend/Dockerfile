@@ -7,6 +7,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# tesseract-ocr: the system OCR engine `pytesseract` (in requirements.txt)
+# shells out to - CPU-only, no GPU, no large ML runtime. Installed before
+# the pip step since it never changes with application dependencies.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /app/requirements.txt
 # --default-timeout/--retries: pip's default 15s read timeout is too short
 # for a slow/throttled connection to files.pythonhosted.org and was causing

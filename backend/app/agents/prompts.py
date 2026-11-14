@@ -875,23 +875,57 @@ How to produce blocks:
     unlabelled arrows and no indication of which one was B, which was the
     surface normal, or which direction was positive - technically a clean
     picture, but useless for actually teaching the mechanism, since nothing
-    in the image itself says what anything is. Identify AT MOST 6 real
-    labels this specific apparatus needs (component names, vector/quantity
-    symbols like "B", "n̂", "+"/"-", direction arrows) and set them in
-    `image_expected_labels` (see below) - do not leave this picture
-    unlabelled just because it's going through `illustration` instead of
-    `schematic`. This is a hard ceiling, not a suggestion: a raster image
-    model cannot reliably bake in more than a handful of short labels as
-    legible text, and a real, confirmed case shows why - a set of
-    illustrations each asked for 9-15 `image_expected_labels` (several of
-    them full multi-symbol equations) failed the post-generation text check
-    on nearly every attempt and shipped as generic, off-topic placeholder
-    pictures instead of the real diagram, for most of a chapter. If the
-    picture includes a formula block (exactly ONE key governing equation,
-    never more than one, with its symbols defined below it, e.g. "ε =
-    induced emf"), list each SHORT symbol-and-definition phrase from that
-    one equation in `image_expected_labels` too (still inside the same
-    6-label ceiling) - a real, confirmed case shipped a formula block with
+    in the image itself says what anything is. Before writing `image_prompt`,
+    consider whether this topic genuinely has more than one distinct
+    teachable facet worth showing in the SAME picture - not every topic
+    does, and forcing facets onto a simple, single-component subject is
+    exactly the padding the rest of this guidance warns against. When a
+    topic DOES genuinely organize into 2-4 distinct real facets (never
+    invented for density), name each one specifically in `image_prompt` -
+    draw from whichever of these genuinely apply, never all of them by
+    default: its working principle, the governing law/scientific rule
+    behind it, its main components/apparatus, how it actually works (the
+    mechanism/sequence), its characteristic output (a resulting waveform/
+    graph/reading), the energy conversion involved, and any real practical
+    application/consequence. For example, an AC generator genuinely has
+    several of these: the apparatus itself (coil/magnet/slip rings), the
+    governing law (Faraday's law, e = -N dΦ/dt), its characteristic output
+    (the sinusoidal waveform), and the energy conversion (mechanical to
+    electrical) - naming all of these briefly lets `illustration_style:
+    "textbook"`'s own multi-panel composition (see its own guidance) show
+    each as its own clearly labelled panel, instead of one generic single
+    scene. A genuinely single-facet topic (a single cell, a single simple
+    tool) should stay exactly that - one plain, accurate description, never
+    artificially split into facets it doesn't have. This is about making
+    ONE image's own `image_prompt` reflect the real richness of what it
+    depicts - it does not change the separate rule above about splitting a
+    chapter's distinct apparatuses/devices across their own separate
+    picture blocks. Identify every real label
+    this specific apparatus genuinely needs to be understood (component
+    names, vector/quantity symbols like "B", "n̂", "+"/"-", direction
+    arrows) and set them in `image_expected_labels` (see below) - do not
+    leave this picture unlabelled just because it's going through
+    `illustration` instead of `schematic`. There is a generous upper bound
+    (up to 24 labels - see `image_expected_labels`'s own cap) for a genuinely
+    content-rich apparatus with many real components, but that is a ceiling,
+    not a target: a simple apparatus with 3 real parts should list 3 labels,
+    never padded to look thorough. What actually prevents garbled text is
+    EVERY LABEL being short and simple, never raw count - a real, confirmed
+    case shows why: a set of illustrations asked for several full
+    multi-symbol EQUATIONS each listed as one "label" failed the
+    post-generation text check on nearly every attempt and shipped as
+    generic, off-topic placeholder pictures instead of the real diagram, for
+    most of a chapter. Keep every entry to one short symbol/term plus a
+    plain-word meaning (never a multi-operator equation, never a multi-word
+    clause - see the rules immediately below), and the system will
+    automatically verify every textbook image's actual rendered text after
+    generation and retry if anything is missing or misspelled, regardless
+    of how many labels it has. If the picture includes a formula block
+    (exactly ONE key governing equation, never more than one, with its
+    symbols defined below it, e.g. "ε = induced emf"), list each SHORT
+    symbol-and-definition phrase from that one equation in
+    `image_expected_labels` too (still inside the same overall label
+    budget) - a real, confirmed case shipped a formula block with
     "electromotive force" garbled into "electromotivie oforce" because
     only the diagram's own component labels were listed, leaving the
     formula's own text completely unverified even though it's exactly as

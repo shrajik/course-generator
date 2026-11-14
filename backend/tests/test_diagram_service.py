@@ -149,3 +149,45 @@ def test_every_diagram_kind_is_mentioned_in_both_model_facing_prompts():
             "spec-authoring model has no idea how to build one. Add an authoring bullet to "
             "DIAGRAM_SYSTEM, or add it to DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS with a reason."
         )
+
+
+def _normalized_whitespace(text: str) -> str:
+    """WRITER_SYSTEM is an `f\"\"\"...\"\"\"` literal - its source line-wraps are
+    real `\\n` characters in the final string, not collapsed. Prose-content
+    assertions should be robust to incidental line-wrapping (the same
+    sentence reads identically to a human, or to the model consuming it,
+    regardless of where the source happened to wrap), so phrase checks below
+    normalize whitespace first rather than depending on an exact line break
+    position that could shift on an unrelated future edit."""
+    return " ".join(text.split())
+
+
+def test_writer_system_instructs_naming_a_multi_faceted_topics_real_facets():
+    """Visual-generation-density fix: a real, confirmed gap - a textbook-
+    style illustration's `image_prompt` previously had no instruction to
+    identify a topic's distinct teachable facets (its working principle, the
+    governing law behind it, its characteristic output, the energy
+    conversion involved, etc.), so a genuinely multi-faceted apparatus (a
+    real case: an AC generator) came back as a single generic scene instead
+    of the richer, panel-worthy description a well-instructed writer could
+    have given it. WRITER_SYSTEM must now name at least a representative set
+    of these facet categories, with the AC generator worked example that
+    motivated this fix."""
+    normalized = _normalized_whitespace(WRITER_SYSTEM)
+    for facet_category in (
+        "working principle", "governing law", "characteristic output", "energy conversion",
+    ):
+        assert facet_category in normalized
+    assert "AC generator" in normalized
+    assert "Faraday's law" in normalized
+
+
+def test_writer_system_never_mandates_multiple_facets_for_a_simple_topic():
+    """The other half of the same fix: the instruction must be explicit that
+    a genuinely single-facet topic stays a single plain description - this
+    is an opt-in enrichment for topics that actually have real sub-concepts,
+    never a mandate to inflate every illustration's complexity."""
+    normalized = _normalized_whitespace(WRITER_SYSTEM)
+    assert "not every topic" in normalized
+    assert "never invented for density" in normalized
+    assert "single-facet topic" in normalized

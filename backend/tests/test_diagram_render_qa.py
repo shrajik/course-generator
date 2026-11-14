@@ -841,7 +841,11 @@ def test_a_five_task_gantt_chart_renders_clean():
 # ---------------------------------------------------------------------------
 
 
-async def test_diagram_service_falls_back_when_the_rendered_output_keeps_failing_qa(service, monkeypatch):
+async def test_diagram_service_ships_flagged_when_the_rendered_output_keeps_failing_qa(service, monkeypatch):
+    """Visual-generation policy fix: a structured diagram kind must never
+    fall back to an unrelated AI illustration, even when its rendered
+    geometry still has issues after one corrective retry - it ships as a
+    real SVG asset, flagged `rendered_with_unresolved_issues` for review."""
     from app.render import diagram_renderer as renderer_module
     from app.schemas.document import Block
     from app.schemas.blocks import BlockType
@@ -877,7 +881,11 @@ async def test_diagram_service_falls_back_when_the_rendered_output_keeps_failing
         course_id="course_render_qa_fallback", block=block, template=template, course_title="Test Course"
     )
 
-    assert ok is False  # caller falls back to a (now text-free) illustration, never a known-bad diagram
+    assert ok is True  # ships as a real diagram, never an unrelated illustration
+    assert block.content.get("path", "").endswith(".svg")
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
 
 
 # ---------------------------------------------------------------------------
@@ -978,11 +986,13 @@ async def test_a_real_unreadable_wide_hierarchy_triggers_repair_and_recovers(ser
     assert "Course Catalog" in svg_text
 
 
-async def test_a_persistently_unreadable_hierarchy_falls_back_after_the_bounded_retry(service, monkeypatch):
+async def test_a_persistently_unreadable_hierarchy_ships_flagged_after_the_bounded_retry(service, monkeypatch):
     """The other half of the same real path: if the retry ALSO comes back
-    genuinely too wide, the bounded (exactly one retry) design falls back
-    to illustration rather than looping or shipping a known-unreadable
-    diagram."""
+    genuinely too wide, the bounded (exactly one retry) design ships the
+    diagram anyway - a real, legible-at-its-own-canvas-size, correctly-
+    shaped answer to the brief, flagged `rendered_with_unresolved_issues`
+    for review - rather than looping, or falling back to an unrelated AI
+    illustration (visual-generation policy fix)."""
     from app.schemas.blocks import BlockType
     from app.schemas.document import Block
     from app.services.diagram_service import DiagramService
@@ -1009,5 +1019,11 @@ async def test_a_persistently_unreadable_hierarchy_falls_back_after_the_bounded_
         course_id="course_real_collision_persists", block=block, template=template, course_title="Test Course"
     )
 
-    assert ok is False
+    assert ok is True  # ships as a real diagram, never an unrelated illustration
     assert len(calls) == 2  # exactly one retry attempted - never unbounded
+    assert block.content.get("path", "").endswith(".svg")
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "text_too_small_after_scaling" and f["resolution"] == "rendered_with_unresolved_issues"
+        for f in findings
+    )

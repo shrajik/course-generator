@@ -1014,21 +1014,17 @@ async def test_diagram_garbled_text_retries_once_with_the_specific_bad_labels_fe
     assert feedback_seen and "Triggerted" in feedback_seen[0]
 
 
-async def test_diagram_garbled_text_falls_back_to_a_verified_text_free_illustration(service, monkeypatch):
-    """The full production path (release-readiness audit follow-up, Priority
-    1/2): a diagram whose labels are confirmed misspelled/garbled, after an
-    exhausted retry, falls back to the raster illustration path - and that
-    fallback is NOT trusted on faith. It goes through the pre-existing
-    `force_text_free`/`_generate_text_free_illustration` machinery, which
-    genuinely re-verifies (via a real, if mocked, vision call) whether any
-    text survived. Overriding ImageTextCheck to report leftover text here
-    (rather than relying on the default empty mock) proves that check is
-    actually invoked for this new reason code too, not silently skipped. A
-    confirmed `text_verified=False` on this raster fallback is never shipped
-    AS a verified image. Fallback-cascade root-cause fix: this used to then
-    publish a further, deliberately generic/label-free illustration instead
-    - the image is now withheld, with the diagram's own finding about its
-    labels still visible, never silently erased."""
+async def test_diagram_garbled_text_is_withheld_rather_than_shipped_as_an_illustration(service, monkeypatch):
+    """Visual-generation policy fix: a diagram whose labels are confirmed
+    misspelled/garbled, after an exhausted retry, is now WITHHELD entirely
+    (`DiagramService.generate_for_block` returns `True`, "handled") rather
+    than falling back to the raster illustration path - a structured
+    diagram kind must never become unrelated AI art, regardless of why the
+    structured attempt had trouble. `ImageService`'s own illustration
+    machinery is never even reached for this case any more (confirmed: no
+    `ImageTextCheck` mock needed here, unlike the old fallback-era version
+    of this test). The specific garbled-text finding survives alongside the
+    generic "withheld" marker, never silently erased."""
     template = load_template("technical")
     block = _diagram_block()
 
@@ -1038,32 +1034,84 @@ async def test_diagram_garbled_text_falls_back_to_a_verified_text_free_illustrat
             "text_legible": False, "text_legible_detail": "'Ambigeous' is misspelled",
         }
 
-    def leftover_text_found(user: str) -> dict:
-        return {"detected_text": ["Ambigeous"]}
-
     monkeypatch.setitem(mock_ai_module._BUILDERS, "ContentCritique", always_illegible_critique)
-    monkeypatch.setitem(mock_ai_module._BUILDERS, "ImageTextCheck", leftover_text_found)
 
     ok = await service.images.generate_for_block(
         course_id="course_garbled_text_fallback", block=block, template=template, course_title="Test Course"
     )
 
-    # The fallback illustration's OWN labelled/text-free attempts are both
-    # confirmed wrong, and no Wikimedia match exists in this mock either -
-    # the image is withheld rather than publishing an unrelated generic
-    # picture in its place.
-    assert ok is False
+    # Withheld is a "handled" outcome, not a failure of the block.
+    assert ok is True
     assert block.content.get("generated") is False
     assert block.content.get("path") is None
     assert block.content.get("omitted_after_qa_failure") is True
     assert block.content.get("error") is None  # a confirmed QA failure, not a technical/provider failure
     findings = block.content.get("visual_qa_findings")
     assert any(f["type"] == "misspelled_or_garbled_text" for f in findings)
-    assert any(f["resolution"] == "fell_back_to_illustration" for f in findings)
     assert any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
-    # No image is published at all - text_verified resets to None, not a
-    # stale False, since there is nothing left to make a text claim about.
-    assert block.content.get("text_verified") is None
+    assert all(f["resolution"] == "image_withheld_after_qa_failure" for f in findings)
+
+
+async def test_a_diagram_with_unresolved_render_qa_issues_ships_flagged_not_withheld(service, monkeypatch):
+    """Visual-generation policy fix: when the rendered SVG's own geometry QA
+    (node overlap, a shared edge segment, a duplicate arrowhead) still has
+    issues after one corrective retry, the diagram is a real, legible,
+    correctly-shaped answer to the brief - a layout imperfection, not a
+    reason to discard it. It ships anyway as a real SVG asset, flagged
+    `rendered_with_unresolved_issues` for human review, never falling back
+    to an unrelated AI illustration and never withheld (withholding is
+    reserved for a genuinely unusable/unreadable spec - see the garbled-text
+    and is_usable() tests above, a materially different case from this one)."""
+    import app.services.diagram_service as diagram_service_module
+    from app.services.diagram_render_qa import RenderQAIssue
+
+    forced_issue = RenderQAIssue(kind="shared_edge_segment", detail="forced for this test")
+    monkeypatch.setattr(
+        diagram_service_module, "validate_rendered_svg", lambda svg_bytes, kind: [forced_issue]
+    )
+
+    template = load_template("technical")
+    block = _diagram_block()
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_render_qa_ships_flagged", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    assert block.content.get("generated") is True
+    assert block.content.get("path", "").endswith(".svg")  # a real diagram, never a raster illustration
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "shared_edge_segment" and f["resolution"] == "rendered_with_unresolved_issues"
+        for f in findings
+    )
+
+
+async def test_a_clean_diagram_regeneration_clears_a_stale_withheld_flag(service):
+    """Real, confirmed bug (PDF/visual-pipeline audit, doc_81d0b1d44cae): a
+    block previously withheld (`omitted_after_qa_failure: true`, no `path`,
+    exactly `_generate_illustration`'s own withholding state) that later
+    regenerates a genuinely clean diagram kept that stale `true` forever -
+    `DiagramService.generate_for_block`'s success-path `merge_content` never
+    reset it, unlike `visual_qa_findings` right beside it (whose own comment
+    already states the identical "must never leave a stale earlier-attempt
+    marker" rule). `image_generation_failed()` also checks `path`, so the
+    compact placeholder never visibly reappeared - but the raw field stayed
+    a live lie: a real image shipped while its own content still claimed
+    "withheld". Confirmed via a real regenerated course block before this
+    fix (`omitted_after_qa_failure: True` alongside a real `path` and empty
+    `visual_qa_findings`)."""
+    template = load_template("technical")
+    block = _diagram_block(omitted_after_qa_failure=True, path=None, generated=False)
+
+    ok = await service.images.generate_for_block(
+        course_id="course_stale_withheld_flag", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert block.content.get("path", "").endswith(".svg")
+    assert block.content.get("omitted_after_qa_failure") is False
 
 
 async def test_diagram_content_qa_ships_the_best_attempt_flagged_after_exhausted_retry(service, monkeypatch):
@@ -1384,9 +1432,11 @@ async def test_illustration_blocks_are_unaffected(service):
     assert block.content["path"].endswith(".png")
 
 
-async def test_diagram_generation_falls_back_to_illustration_on_spec_failure(
-    service, monkeypatch
-):
+async def test_diagram_generation_is_withheld_on_spec_failure(service, monkeypatch):
+    """Visual-generation policy fix: a structured diagram kind must never
+    fall back to an unrelated AI illustration, even when the AI call that
+    builds its structure fails outright - the block is withheld instead
+    (a handled outcome, not a technical failure)."""
     template = load_template("technical")
     block = _diagram_block()
     original_structured = service.ai.structured
@@ -1406,11 +1456,17 @@ async def test_diagram_generation_falls_back_to_illustration_on_spec_failure(
     )
 
     assert ok is True
-    assert block.content["path"].endswith(".png")  # fell back to a raster illustration
+    assert block.content.get("path") is None  # withheld, never an unrelated illustration
+    assert block.content.get("omitted_after_qa_failure") is True
     assert block.content["kind"] == "diagram"  # the intent is preserved for next time
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
 
 
-async def test_diagram_with_too_few_nodes_falls_back_to_illustration(service, monkeypatch):
+async def test_diagram_with_too_few_nodes_is_withheld(service, monkeypatch):
+    """Visual-generation policy fix: a genuinely unusable spec (too few
+    labelled nodes/edges) is withheld, never routed to an unrelated AI
+    illustration."""
     template = load_template("technical")
     block = _diagram_block()
     original_structured = service.ai.structured
@@ -1430,7 +1486,8 @@ async def test_diagram_with_too_few_nodes_falls_back_to_illustration(service, mo
     )
 
     assert ok is True
-    assert block.content["path"].endswith(".png")
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
 
 
 async def test_diagram_with_too_many_nodes_gets_a_consolidation_retry(service, monkeypatch):
@@ -1479,7 +1536,11 @@ async def test_diagram_with_too_many_nodes_gets_a_consolidation_retry(service, m
     assert "Step 0" not in svg_text  # the over-budget attempt was discarded, not rendered
 
 
-async def test_diagram_falls_back_when_consolidation_retry_still_exceeds_the_cap(service, monkeypatch):
+async def test_diagram_is_withheld_when_consolidation_retry_still_exceeds_the_cap(service, monkeypatch):
+    """Visual-generation policy fix: when even the consolidation retry still
+    exceeds the kind's node cap (`is_usable()` false), the block is withheld
+    - never a silently truncated diagram, and never an unrelated AI
+    illustration."""
     template = load_template("technical")
     block = _diagram_block()
     original_structured = service.ai.structured
@@ -1499,7 +1560,9 @@ async def test_diagram_falls_back_when_consolidation_retry_still_exceeds_the_cap
         course_id="course_diagram_still_too_many", block=block, template=template, course_title="Test Course"
     )
 
-    assert ok is False  # caller falls back to illustration, never a silently truncated diagram
+    assert ok is True  # handled (withheld), not a failure the caller must fall back from
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
 
 
 async def test_diagram_generation_can_be_disabled_via_settings(service):
@@ -4464,6 +4527,261 @@ def test_decision_tree_never_truncates_a_long_label_with_an_ellipsis():
     )
     svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
     assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_decision_tree_root_needing_many_wrapped_lines_is_not_truncated():
+    """Real, confirmed bug (PDF/visual-pipeline audit, doc_81d0b1d44cae): a
+    65-character root-decision label that wraps to exactly 5 lines was
+    truncated with an ellipsis on its last line, at EVERY font size,
+    because `_ideal_decision_box_size` measured how many lines the label
+    needs using `width*0.5` as the diamond's usable text width, while
+    `_draw_diamond` -> `_fit_boxed_text` actually wraps at `width*0.5` MINUS
+    its own 2*padding (12px) - a narrower budget that needs one more line
+    than the sizing function predicted, so the box was sized exactly one
+    line too short. Reproduces even with no sibling row wide enough to
+    trigger the proactive shrink-to-fit loop at all."""
+    long_label = "Is the perturbation strong or weak relative to level spacing?"
+    spec = DiagramSpec(
+        kind="decision_tree", title="t",
+        nodes=[
+            DiagramNode(id="root", label=long_label, level=0),
+            DiagramNode(id="a", label="Outcome", level=1),
+        ],
+        edges=[DiagramEdge(source="root", target="a", label="Yes")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "…" not in text
+    for word in long_label.split():
+        assert word in text
+
+
+def test_decision_tree_with_several_wide_siblings_shrinks_to_stay_readable():
+    """Real, confirmed bug (same audit): a row of 3 sibling outcomes, each
+    independently capped at _MAX_PROCESS_BOX_W, still summed to a canvas
+    wide enough (~1000-1040px) that the page's own down-scale to
+    CONTENT_WIDTH shrank the fixed 15px label font under the 11px
+    readability floor - `text_too_small_after_scaling` on real courses,
+    every time, because decision_tree (unlike network_mesh/hierarchy/
+    concept_map) had no proactive shrink-to-fit at all. Every row's font
+    must now shrink together until the whole canvas is safely readable."""
+    nodes = [
+        DiagramNode(id="root", label="Is the perturbation strong or weak relative to level spacing?", level=0),
+        DiagramNode(id="a", label="Use nondegenerate perturbation theory", level=1),
+        DiagramNode(id="b", label="Use degenerate perturbation theory with diagonalization", level=1),
+        DiagramNode(id="c", label="Switch to a fully numerical diagonalization approach instead", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="a", label="weak, non-degenerate"),
+        DiagramEdge(source="root", target="b", label="weak, degenerate"),
+        DiagramEdge(source="root", target="c", label="strong coupling"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, width, _h = render_diagram_svg(spec, TemplateTheme())
+    issues = validate_rendered_svg(svg_bytes, kind="decision_tree")
+    assert not any(i.kind == "text_too_small_after_scaling" for i in issues)
+    assert "…" not in svg_bytes.decode("utf-8")
+
+
+def test_decision_tree_with_interleaved_sibling_children_has_no_overlapping_buses():
+    """Real, confirmed bug (B follow-up, PDF/visual-pipeline audit,
+    doc_81d0b1d44cae): `node.level` is author-supplied and this layout used
+    to position a row purely in `spec.nodes`' own list order, with no regard
+    for which parent a node actually belongs to. Two sibling decisions, each
+    with 2 children, whose children are listed INTERLEAVED (hub A's first
+    child, hub B's first child, hub A's second child, hub B's second child -
+    a realistic AI-authored narrative order, not per-subtree order) used to
+    draw each hub's shared horizontal "bus" spanning across the OTHER hub's
+    own child sitting between them, so the two buses ran collinear and
+    overlapped for a real stretch - `shared_edge_segment`."""
+    nodes = [
+        DiagramNode(id="root", label="Isolated?", level=0),
+        DiagramNode(id="momentum", label="Check p", level=1),
+        DiagramNode(id="angmom", label="Check L", level=1),
+        DiagramNode(id="mom_yes", label="p conserved", level=2),
+        DiagramNode(id="ang_yes", label="L conserved", level=2),
+        DiagramNode(id="mom_no", label="p not conserved", level=2),
+        DiagramNode(id="ang_no", label="L not conserved", level=2),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="momentum", label="Yes"),
+        DiagramEdge(source="root", target="angmom", label="No"),
+        DiagramEdge(source="momentum", target="mom_yes", label="No net force"),
+        DiagramEdge(source="momentum", target="mom_no", label="Net force acts"),
+        DiagramEdge(source="angmom", target="ang_yes", label="No net torque"),
+        DiagramEdge(source="angmom", target="ang_no", label="Net torque acts"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    issues = validate_rendered_svg(svg_bytes, kind="decision_tree")
+    assert not any(i.kind == "shared_edge_segment" for i in issues)
+    assert not any(i.kind == "edge_crosses_node" for i in issues)
+
+
+def test_decision_tree_hub_children_are_not_split_by_a_foreign_sibling():
+    """A different shape of the same interleaving bug: a wide hub (3
+    children) and a narrow sibling hub (1 child) whose single child is
+    listed BETWEEN two of the wide hub's own children - the wide hub's bus
+    used to span across the foreign child's own column. The current
+    geometry QA doesn't happen to flag this particular shape as an overlap
+    (the crossing is perpendicular, not collinear), so this asserts the
+    actual column order directly rather than relying on `validate_rendered_
+    svg` alone: hub A's own 3 children must land in 3 CONSECUTIVE columns,
+    with B1 pushed to one side, never sitting between them."""
+    nodes = [
+        DiagramNode(id="root", label="Root", level=0),
+        DiagramNode(id="hubA", label="Hub A", level=1),
+        DiagramNode(id="hubB", label="Hub B", level=1),
+        DiagramNode(id="a1", label="A1", level=2),
+        DiagramNode(id="b1", label="B1", level=2),
+        DiagramNode(id="a2", label="A2", level=2),
+        DiagramNode(id="a3", label="A3", level=2),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="hubA", label="X"),
+        DiagramEdge(source="root", target="hubB", label="Y"),
+        DiagramEdge(source="hubA", target="a1", label="1"),
+        DiagramEdge(source="hubB", target="b1", label="1"),
+        DiagramEdge(source="hubA", target="a2", label="2"),
+        DiagramEdge(source="hubA", target="a3", label="3"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    root = ET.fromstring(svg_bytes)
+    # Every node's own box is immediately followed in document order by its
+    # own label text (the node-drawing loop emits one right after the
+    # other), and every label here ("Root", "Hub A", "Hub B", "A1", "B1",
+    # "A2", "A3") is unique - so boxes and their own labels line up 1:1 in
+    # document order.
+    all_labels = ["Root", "Hub A", "Hub B", "A1", "B1", "A2", "A3"]
+    boxes = [
+        el for el in root.iter()
+        if "diagram-box" in (el.get("class") or "").split() and el.tag.endswith(("rect", "polygon"))
+    ]
+    texts = [
+        el for el in root.iter()
+        if el.tag.endswith("text") and "".join(el.itertext()).strip() in all_labels
+    ]
+    assert len(boxes) == len(texts) == len(all_labels)
+    centers: dict[str, float] = {}
+    for box, text_el in zip(boxes, texts):
+        label = "".join(text_el.itertext()).strip()
+        if box.tag.endswith("rect"):
+            centers[label] = float(box.get("x")) + float(box.get("width")) / 2
+        else:
+            pts = [tuple(map(float, p.split(","))) for p in box.get("points").split()]
+            centers[label] = sum(p[0] for p in pts) / len(pts)
+    level2_labels = ("A1", "B1", "A2", "A3")
+    ordered = sorted(level2_labels, key=lambda lbl: centers[lbl])
+    a_positions = sorted(ordered.index(lbl) for lbl in ("A1", "A2", "A3"))
+    assert a_positions == [a_positions[0], a_positions[0] + 1, a_positions[0] + 2], (
+        f"hub A's children are not in 3 consecutive columns: {ordered}"
+    )
+
+
+def test_decision_tree_convergent_outcome_from_two_hubs_gets_distinct_arrowheads():
+    """Real, confirmed bug (B follow-up): two different decisions converging
+    on the same shared outcome node (a legitimate, common pattern -
+    "otherwise, see the fallback") is grouped by SOURCE, so each converging
+    edge was drawn independently with no awareness another source ALSO lands
+    on the exact same target - both ended up with an identical landing
+    point, drawing the same final drop segment (`shared_edge_segment`) at
+    the exact same spot (`duplicate_arrowhead_side`, confirmed 0px apart)."""
+    nodes = [
+        DiagramNode(id="root", label="Root", level=0),
+        DiagramNode(id="hubA", label="Hub A", level=1),
+        DiagramNode(id="hubB", label="Hub B", level=1),
+        DiagramNode(id="a1", label="A1", level=2),
+        DiagramNode(id="shared", label="Fallback", level=2),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="hubA", label="X"),
+        DiagramEdge(source="root", target="hubB", label="Y"),
+        DiagramEdge(source="hubA", target="a1", label="1"),
+        DiagramEdge(source="hubA", target="shared", label="2"),
+        DiagramEdge(source="hubB", target="shared", label="1"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    issues = validate_rendered_svg(svg_bytes, kind="decision_tree")
+    assert not any(i.kind == "duplicate_arrowhead_side" for i in issues)
+    assert not any(i.kind == "shared_edge_segment" for i in issues)
+
+
+def test_decision_tree_triple_convergence_on_one_outcome_still_clears_qa():
+    """Same convergence bug, pushed to 3 different hubs all converging on one
+    shared outcome - the real production shape (3+ solution branches that
+    all route to one "verify against residual controls" step) - still needs
+    every landing point visually distinct."""
+    nodes = [
+        DiagramNode(id="root", label="Root", level=0),
+        DiagramNode(id="h1", label="H1", level=1),
+        DiagramNode(id="h2", label="H2", level=1),
+        DiagramNode(id="h3", label="H3", level=1),
+        DiagramNode(id="shared", label="Shared outcome", level=2),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="h1", label="a"),
+        DiagramEdge(source="root", target="h2", label="b"),
+        DiagramEdge(source="root", target="h3", label="c"),
+        DiagramEdge(source="h1", target="shared", label="1"),
+        DiagramEdge(source="h2", target="shared", label="1"),
+        DiagramEdge(source="h3", target="shared", label="1"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes, kind="decision_tree") == []
+
+
+def test_decision_tree_interleaved_children_plus_convergence_combined():
+    """Both B-follow-up bugs at once, in one tree - the realistic worst
+    case: sibling hubs with interleaved children THAT ALSO converge on a
+    shared outcome."""
+    nodes = [
+        DiagramNode(id="root", label="Root", level=0),
+        DiagramNode(id="hubA", label="Hub A", level=1),
+        DiagramNode(id="hubB", label="Hub B", level=1),
+        DiagramNode(id="a1", label="A1", level=2),
+        DiagramNode(id="shared", label="Shared", level=2),
+        DiagramNode(id="b1", label="B1", level=2),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="hubA", label="x"),
+        DiagramEdge(source="root", target="hubB", label="y"),
+        DiagramEdge(source="hubA", target="a1", label="1"),
+        DiagramEdge(source="hubA", target="shared", label="2"),
+        DiagramEdge(source="hubB", target="shared", label="1"),
+        DiagramEdge(source="hubB", target="b1", label="2"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes, kind="decision_tree") == []
+
+
+def test_decision_tree_deeply_nested_asymmetric_branch_stays_clean():
+    """Wide-vs-deep asymmetry: one branch goes 3 levels deep with its own
+    sub-decision, the sibling branch is a single outcome - exercises the
+    per-level parent-grouping fix against a non-uniform tree shape."""
+    nodes = [
+        DiagramNode(id="root", label="Root decision", level=0),
+        DiagramNode(id="left", label="Left branch", level=1),
+        DiagramNode(id="right", label="Right outcome", level=1),
+        DiagramNode(id="left_a", label="Left-A sub-decision", level=2),
+        DiagramNode(id="left_b", label="Left-B outcome", level=2),
+        DiagramNode(id="left_a1", label="Left-A-1 outcome", level=3),
+        DiagramNode(id="left_a2", label="Left-A-2 outcome", level=3),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="left", label="Yes"),
+        DiagramEdge(source="root", target="right", label="No"),
+        DiagramEdge(source="left", target="left_a", label="Yes"),
+        DiagramEdge(source="left", target="left_b", label="No"),
+        DiagramEdge(source="left_a", target="left_a1", label="Yes"),
+        DiagramEdge(source="left_a", target="left_a2", label="No"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", title="t", nodes=nodes, edges=edges)
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes, kind="decision_tree") == []
 
 
 def test_fishbone_draws_spine_and_one_bone_per_cause_category():
