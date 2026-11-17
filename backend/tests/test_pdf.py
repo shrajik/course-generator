@@ -70,6 +70,34 @@ def _document_with_every_block_type() -> CourseDocument:
     )
 
 
+def test_table_header_background_color_override_reaches_the_exported_html():
+    """A table block's `style.accent_color` (set via the editor's
+    PropertiesPanel "Header background" control, and the exact same field
+    the live editor's TableBlock.tsx already reads) must reach the
+    EXPORTED HTML's header row too - a real, confirmed bug where
+    `html_renderer.py`'s per-block context always sent the theme's fixed
+    `surface_color` for `accent_soft` (the one thing course.html.j2's
+    table header actually reads), silently ignoring any override that
+    looked correct in the live editor preview but reverted in the PDF."""
+    template = load_template("technical_v1")
+    style = template.style_for(BlockType.TABLE)
+    style["accent_color"] = "#ff6600"
+    block = Block(
+        type=BlockType.TABLE,
+        content={"columns": ["A", "B"], "rows": [{"cells": ["1", "2"]}]},
+        style=style,
+    )
+    document = CourseDocument(
+        document_id="doc_render",
+        course_id="crs_render",
+        course_title="Render Test",
+        template_id="technical_v1",
+        pages=[Page(id="page_1", page_number=1, kind="content", blocks=[block])],
+    )
+    html = render_document_html(document, template)
+    assert '<th style="background:#ff6600">' in html
+
+
 def test_html_renderer_handles_every_block_type():
     document = _document_with_every_block_type()
     html = render_document_html(document, load_template("technical_v1"))

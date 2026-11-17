@@ -103,7 +103,16 @@ def test_default_illustration_keeps_the_full_guidance_for_a_realistic_prompt():
     )
     block = _image_block(prompt=realistic_prompt)
     prompt = ImageService.build_prompt(block, template, "Advanced Biology")
-    assert len(prompt) < MAX_PROMPT_CHARS
+    # Audience/style propagation fix: this specific template DOES have its
+    # own `image_guidance` text, now intentionally appended (see
+    # `template_guidance_line`) - pushing this exact realistic-prompt case
+    # past the old, stale `MAX_PROMPT_CHARS` (4500, a different, unrelated
+    # QA-brief-truncation budget - see its own module-level comment) for the
+    # first time. The real invariant this test checks - full guidance AND
+    # the full realistic prompt both survive, untruncated - is the next two
+    # assertions; this one now checks against `build_prompt`'s own real,
+    # documented, verified budget instead.
+    assert len(prompt) < PROMPT_CHAR_BUDGET
     assert DEFAULT_ILLUSTRATION_GUIDANCE in prompt
     assert realistic_prompt in prompt
 
@@ -1024,11 +1033,13 @@ async def test_a_correct_formula_expression_is_verified_and_shipped_clean():
     assert block.content.get("visual_qa_findings") == []
 
 
-async def test_an_incorrect_formula_expression_is_flagged_but_the_image_still_ships():
-    """Mathematical correctness has no safe raster fallback (see formula_qa's
-    own docstring on why a false-positive mismatch must never silently
-    replace legitimate content) - the image ships as generated, but the
-    defect must be visible, not silently accepted as correct."""
+async def test_a_confirmed_incorrect_formula_is_withheld_not_shipped():
+    """Conditional-shipping policy fix (formula-correctness gap): a
+    CONFIRMED (`verifiable=True`) formula mismatch is a genuine scientific
+    error with a picture baked in that would actively teach the wrong
+    equation - critical, withheld, structurally unable to be downgraded to
+    `image_shipped_with_quality_flag`. The defect is still fully recorded
+    via `visual_qa_findings`, never silently lost."""
     svc = ImageService()
 
     async def fake_image(*, prompt, size=None, phase="image", provider=None):
@@ -1043,12 +1054,170 @@ async def test_an_incorrect_formula_expression_is_flagged_but_the_image_still_sh
         course_id="course_formula_wrong", block=block, template=template, course_title="Physics",
     )
 
-    assert ok is True  # ships anyway - no safe fallback for a formula defect
+    assert ok is False
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
     assert block.content.get("formula_verified") is False
     findings = block.content.get("visual_qa_findings")
-    assert findings and findings[0]["type"] == "formula_mismatch"
+    types = {f["type"] for f in findings}
+    assert "formula_mismatch" in types
+    assert "image_withheld_after_qa_failure" in types
+    formula_finding = next(f for f in findings if f["type"] == "formula_mismatch")
+    assert formula_finding["resolution"] == "formula_verification_failed"
+    assert formula_finding["deterministic"] is True
+    assert not any(f["resolution"] == "image_shipped_with_quality_flag" for f in findings)
+
+
+async def test_an_unverifiable_formula_still_ships_flagged_not_withheld():
+    """The genuinely-uncertain case must NOT be force-withheld: a
+    malformed/unparseable formula expression is `verifiable=False` (nothing
+    to confirm it wrong against), so it keeps the pre-existing, unchanged
+    `formula_verification_failed` treatment - flagged, never silently
+    accepted, but not withheld either, consistent with this pipeline's
+    "never guess either direction when genuinely unverifiable" pattern used
+    everywhere else (OCR low-coverage, unsupported_claims, etc.)."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+
+    block = _image_block(formula_expression="F == m * a")  # malformed (double equals)
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_formula_malformed", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert block.content.get("formula_verified") is False
+    findings = block.content.get("visual_qa_findings")
+    assert findings and findings[0]["type"] == "malformed_expression"
     assert findings[0]["resolution"] == "formula_verification_failed"
-    assert findings[0]["deterministic"] is True
+    assert not any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
+
+
+async def test_a_formula_with_no_matching_reference_is_unverifiable_and_ships(monkeypatch):
+    """Another genuinely-uncertain case: a well-formed formula whose
+    variable set matches no registry entry is honestly `verifiable=False`
+    (nothing to compare against, never silently treated as correct OR
+    wrong) - ships without any formula finding at all, exactly as before
+    this fix."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+
+    block = _image_block(formula_expression="q = x_1 * y_1")  # well-formed, no registry match
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_formula_unverifiable", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert block.content.get("formula_verified") is False
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_a_mathematically_equivalent_alternate_notation_ships_clean():
+    """Never reject a legitimate algebraic rearrangement of a known
+    reference formula - "a = F / m" is the exact same physical law as
+    Newton's second law ("F = m * a"), just solved for a different
+    variable (see `formula_qa._rearranged_forms`)."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+
+    block = _image_block(formula_expression="a = F / m")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_formula_rearranged", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert block.content.get("formula_verified") is True
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_a_correct_formula_plus_a_cosmetic_issue_ships_flagged(monkeypatch):
+    """A correct, confirmed formula co-occurring with a non-critical
+    cosmetic finding composes correctly with the ship+flag policy - the
+    cosmetic issue ships flagged, exactly as it would with no formula on
+    the block at all."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                genuinely_educational=False, educational_detail="reads as decorative",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(formula_expression="F = m * a", purpose="A correct, decorative-looking diagram")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_formula_correct_plus_cosmetic", block=block, template=template,
+        course_title="Physics",
+    )
+
+    assert ok is True
+    assert block.content.get("formula_verified") is True
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "decorative_not_educational" and f["resolution"] == "image_shipped_with_quality_flag"
+        for f in findings
+    )
+
+
+async def test_an_incorrect_formula_plus_a_cosmetic_issue_still_withholds(monkeypatch):
+    """Critical always wins on co-occurrence, consistent with how every
+    other critical/non-critical pair is handled: an incorrect formula
+    together with a merely-cosmetic vision finding still withholds the
+    whole image - the cosmetic finding never "rescues" a scientifically
+    wrong picture into shipping."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                genuinely_educational=False, educational_detail="reads as decorative",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(formula_expression="F = m / a", purpose="A wrong, decorative-looking diagram")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_formula_wrong_plus_cosmetic", block=block, template=template,
+        course_title="Physics",
+    )
+
+    assert ok is False
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    assert not any(f["resolution"] == "image_shipped_with_quality_flag" for f in findings)
+    assert any(f["type"] == "formula_mismatch" for f in findings)
 
 
 async def test_formula_verification_never_erases_an_existing_diagram_fallback_finding():
@@ -1483,9 +1652,12 @@ async def test_the_full_fallback_cascade_tries_wikimedia_before_withholding(monk
 async def test_a_persistently_style_noncompliant_image_still_stops_at_two_retries(monkeypatch):
     """The bounded retry loop must still be BOUNDED - a check that never
     passes gets the original attempt plus exactly `_MAX_RELEVANCE_RETRIES`
-    (2) retries, never more, before withholding the image (fallback-cascade
-    root-cause fix: no further "generic fallback" draw call on top of that
-    - see the sibling withheld-image test for the terminal-state details)."""
+    (2) retries, never more (3 total `_draw` calls), regardless of what the
+    final decision does with the result. Conditional-shipping policy fix:
+    persistent style drift ALONE (no scientific/off-topic/contradiction
+    issue) is a non-critical, cosmetic finding - "slightly less textbook-
+    like appearance" is explicitly allowed to ship, flagged, rather than
+    withheld - but the retry budget itself is unchanged either way."""
     svc = ImageService()
     image_calls = {"n": 0}
 
@@ -1510,11 +1682,16 @@ async def test_a_persistently_style_noncompliant_image_still_stops_at_two_retrie
         course_id="course_style_bounded", block=block, template=template, course_title="Fluid Mechanics",
     )
 
-    assert ok is False
-    assert block.content.get("omitted_after_qa_failure") is True
-    # 1 original + 2 retries that all fail the relevance check = 3 total
-    # `_draw` calls, never more - no further "generic fallback" draw on top.
+    assert ok is True
+    assert block.content.get("omitted_after_qa_failure") is False
+    # 1 original + 2 retries that all fail the style check = 3 total `_draw`
+    # calls, never more - the bounded retry budget is unchanged by this fix.
     assert image_calls["n"] == 3
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "textbook_style_not_followed" and f["resolution"] == "image_shipped_with_quality_flag"
+        for f in findings
+    )
 
 
 async def test_overlapping_labels_retry_once_and_succeed_on_a_cleaner_retry(monkeypatch):
@@ -1557,13 +1734,13 @@ async def test_overlapping_labels_retry_once_and_succeed_on_a_cleaner_retry(monk
     assert block.content.get("visual_qa_findings") == []
 
 
-async def test_persistently_overlapping_labels_are_withheld_not_shipped_as_a_generic_fallback(monkeypatch):
-    """Mirrors `test_an_image_that_fails_relevance_after_retry_is_withheld_
-    not_replaced_with_a_generic_picture`, for the `labels_legible`
-    dimension: a confirmed, persistent layout defect must never be silently
-    shipped (and never silently reported as a different defect) - and,
-    per the fallback-cascade root-cause fix, never papered over with an
-    unrelated generic picture either. It is withheld, flagged for review."""
+async def test_persistently_overlapping_labels_on_a_textbook_image_are_withheld(monkeypatch):
+    """Conditional-shipping policy fix: illegible/overlapping labels on a
+    `textbook`-style image are CRITICAL, not cosmetic - `expected_labels`
+    there are real, declared, load-bearing content (apparatus parts,
+    formula variables), so an illegible one means a specific piece of
+    intended information is genuinely unreadable. It is withheld, flagged
+    for review, never papered over with an unrelated generic picture."""
     svc = ImageService()
 
     async def fake_image(*, prompt, size=None, phase="image", provider=None):
@@ -1580,7 +1757,7 @@ async def test_persistently_overlapping_labels_are_withheld_not_shipped_as_a_gen
     svc.ai.image = fake_image  # type: ignore[method-assign]
     monkeypatch.setattr(svc.ai, "structured", fake_structured)
 
-    block = _image_block(purpose="A labelled diagram of rigid-body rotation")
+    block = _image_block(purpose="A labelled diagram of rigid-body rotation", illustration_style="textbook")
     template = load_template("technical")
 
     ok = await svc._generate_illustration(
@@ -1594,6 +1771,50 @@ async def test_persistently_overlapping_labels_are_withheld_not_shipped_as_a_gen
     types = {f["type"] for f in findings}
     assert types == {"overlapping_or_illegible_labels", "image_withheld_after_qa_failure"}
     assert not any(f["resolution"] == "generic_fallback_published" for f in findings)
+    assert not any(f["resolution"] == "image_shipped_with_quality_flag" for f in findings)
+
+
+async def test_persistently_overlapping_labels_on_a_decorative_image_ship_flagged(monkeypatch):
+    """Conditional-shipping policy fix: the SAME `labels_legible=False`
+    finding on a non-`textbook` illustration (default/decorative style,
+    which carries its own STRICT NO-TEXT RULE - any text present was never
+    requested/load-bearing in the first place) is cosmetic, not critical -
+    nothing here is scientifically wrong, off-topic, or contradicts the
+    course's own text, so the best available candidate ships, flagged for
+    human review, instead of being withheld."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                labels_legible=False,
+                labels_legible_detail="every callout overlaps at least one other label",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A decorative scene-setter for rigid-body rotation")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_legibility_cosmetic", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert image_calls["n"] == 3
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "overlapping_or_illegible_labels" and f["resolution"] == "image_shipped_with_quality_flag"
+        for f in findings
+    )
 
 
 async def test_style_noncompliant_textbook_image_retries_once_and_succeeds_on_a_cleaner_retry(monkeypatch):
@@ -1638,10 +1859,13 @@ async def test_style_noncompliant_textbook_image_retries_once_and_succeeds_on_a_
     assert block.content.get("visual_qa_findings") == []
 
 
-async def test_persistently_style_noncompliant_textbook_image_is_withheld_not_shipped_generic(monkeypatch):
-    """Fallback-cascade root-cause fix: a confirmed, persistent style-
-    compliance failure is withheld, not papered over with an unrelated
-    generic picture."""
+async def test_persistently_style_noncompliant_textbook_image_ships_flagged_not_withheld(monkeypatch):
+    """Conditional-shipping policy fix: a confirmed, persistent style-
+    compliance failure ALONE (no scientific/off-topic/contradiction issue)
+    is cosmetic ("slightly less textbook-like appearance", explicitly
+    allowed to ship per the conditional-shipping policy) - the best
+    available candidate now ships, flagged for human review, instead of
+    being withheld."""
     svc = ImageService()
 
     async def fake_image(*, prompt, size=None, phase="image", provider=None):
@@ -1664,11 +1888,14 @@ async def test_persistently_style_noncompliant_textbook_image_is_withheld_not_sh
         course_id="course_style_fails", block=block, template=template, course_title="Physics",
     )
 
-    assert ok is False
-    assert block.content.get("omitted_after_qa_failure") is True
+    assert ok is True
+    assert block.content.get("omitted_after_qa_failure") is False
     findings = block.content.get("visual_qa_findings")
-    types = {f["type"] for f in findings}
-    assert types == {"textbook_style_not_followed", "image_withheld_after_qa_failure"}
+    assert any(
+        f["type"] == "textbook_style_not_followed" and f["resolution"] == "image_shipped_with_quality_flag"
+        for f in findings
+    )
+    assert not any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
 
 
 async def test_style_compliant_is_never_checked_for_a_non_textbook_illustration(monkeypatch):
@@ -2012,11 +2239,23 @@ async def test_the_new_text_defect_preserved_finding_lands_in_review_not_approva
 # monkeypatched `image_service.run_ocr` - never a live Tesseract call.
 
 
-def _ocr_clean(text: str = "Occupy", confidence: float = 95.0) -> ocr_module.OcrResult:
-    return ocr_module.OcrResult(
-        words=[ocr_module.OcrWord(text=text, confidence=confidence, left=0, top=0, width=10, height=10)],
-        average_confidence=confidence,
-    )
+def _ocr_clean(
+    text: str = "Occupy", confidence: float = 95.0,
+    *, companions: tuple[str, ...] = ("Electrons", "fixed", "levels", "nucleus"),
+) -> ocr_module.OcrResult:
+    """`companions` are realistic additional words OCR would plausibly also
+    read off the same image (matching the standard `source_excerpt` these
+    tests use, "Electrons occupy fixed energy levels around the nucleus.")
+    - needed so these fixtures clear the OCR coverage-ratio check
+    (`image_text_ocr._MIN_COVERAGE_RATIO`) and are correctly treated as a
+    genuine, well-covered OCR pass, not the sparse-coverage case that check
+    exists to catch (see `test_image_text_ocr.py`'s own coverage tests for
+    that real scenario)."""
+    words = [ocr_module.OcrWord(text=text, confidence=confidence, left=0, top=0, width=10, height=10)]
+    words += [
+        ocr_module.OcrWord(text=w, confidence=92.0, left=0, top=0, width=10, height=10) for w in companions
+    ]
+    return ocr_module.OcrResult(words=words, average_confidence=confidence)
 
 
 async def test_ocr_confirmed_mismatch_triggers_a_retry_vision_alone_missed(monkeypatch):
@@ -2756,6 +2995,44 @@ def test_a_simple_single_facet_prompt_is_not_artificially_expanded():
     assert prompt.count(simple_prompt) == 1
     tail = prompt.split(simple_prompt, 1)[1]
     assert tail.strip() == "" or tail.lstrip().startswith("Educational context")
+
+
+async def test_generate_for_block_skips_wikimedia_and_clears_the_flag_for_a_replace_image(monkeypatch):
+    """End-to-end through the real dispatch (`generate_for_block`, not
+    `_generate_illustration` directly): `_skip_wikimedia` set by patcher.py's
+    `replace_image` handler must (1) actually stop Wikimedia from being
+    queried for this generation, and (2) be cleared off the block afterward
+    so a later, unrelated regeneration of this same block never silently
+    inherits a stale "skip Wikimedia" instruction that wasn't meant for
+    it."""
+    svc = ImageService()
+    search_calls: list[str] = []
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        search_calls.append(query)
+        return [_wikimedia_candidate()]
+
+    prompts_used: list[str] = []
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        prompts_used.append(prompt)
+        return b"png-bytes"
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+    svc.settings.enable_wikimedia_images = True
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+
+    block = _image_block(
+        purpose="Mitosis stages", prompt="a close-up of anaphase", _skip_wikimedia=True,
+    )
+    ok = await svc.generate_for_block(
+        course_id="course_replace_e2e", block=block, template=load_template("technical"), course_title="Biology",
+    )
+
+    assert ok is True
+    assert search_calls == []
+    assert len(prompts_used) == 1
+    assert block.content.get("_skip_wikimedia") is False
 
 
 async def test_generate_for_block_forces_text_free_when_the_diagram_path_fails(monkeypatch):
@@ -3933,6 +4210,184 @@ async def test_wikimedia_hit_skips_the_ai_model_entirely(monkeypatch):
     assert ai_image_calls == []  # the AI model was never invoked
 
 
+async def test_skip_wikimedia_sends_a_replace_image_prompt_straight_to_the_ai_model(monkeypatch):
+    """Root-cause fix: a user's manual `replace_image` request (patcher.py
+    sets `_skip_wikimedia=True` whenever that operation isn't an in-place
+    edit) must always reach the AI model with their own exact prompt, never
+    get silently swapped for a Wikimedia stock photo - even one that would
+    otherwise have been a perfectly eligible hit. `fake_search` here WOULD
+    return a valid candidate if it were ever called at all; asserting it's
+    never called is the real regression guard, not just that the AI model
+    also got called."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+
+    search_calls: list[str] = []
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        search_calls.append(query)
+        return [_wikimedia_candidate()]
+
+    ai_image_calls: list[str] = []
+
+    async def fake_ai_image(*, prompt, size=None, phase="image", provider=None):
+        ai_image_calls.append(prompt)
+        return b"png-bytes"
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+    svc.ai.image = fake_ai_image  # type: ignore[method-assign]
+
+    block = _image_block(purpose="Mitosis stages", prompt="a close-up of anaphase with labelled spindle fibers")
+    ok = await svc._generate_illustration(
+        course_id="course_replace", block=block, template=load_template("technical"), course_title="Biology",
+        skip_wikimedia=True,
+    )
+    assert ok is True
+    assert search_calls == []  # Wikimedia was never even queried
+    assert len(ai_image_calls) == 1
+    assert ai_image_calls[0].strip() != ""
+    assert block.content["image_source"] == "generated"
+
+
+async def test_manual_replace_folds_actionable_prior_findings_into_the_users_prompt(monkeypatch):
+    """A manual `replace_image` (skip_wikimedia=True) on a block that
+    already carries a confirmed, actionable finding from a prior failed
+    attempt must fold that finding's correction into the final prompt -
+    appended AFTER the user's own prompt, never replacing or reordering
+    it - so the user never has to manually retype what QA already found."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+
+    async def fail_if_wikimedia_called(query, *, limit, settings, transport=None):
+        raise AssertionError("Wikimedia must not be queried for a manual replace")
+
+    prompts_used: list[str] = []
+
+    async def fake_ai_image(*, prompt, size=None, phase="image", provider=None):
+        prompts_used.append(prompt)
+        return b"png-bytes"
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fail_if_wikimedia_called)
+    svc.ai.image = fake_ai_image  # type: ignore[method-assign]
+
+    block = _image_block(
+        purpose="Mitosis stages",
+        prompt="a close-up of anaphase with labelled spindle fibers",
+        visual_qa_findings=[
+            {
+                "type": "text_misspelled_or_garbled",
+                "detail": "OCR detected 'force', expected 'forces'",
+                "resolution": "text_defect_preserved_with_mapping",
+            },
+        ],
+    )
+    ok = await svc._generate_illustration(
+        course_id="course_replace_fold", block=block, template=load_template("technical"), course_title="Biology",
+        skip_wikimedia=True,
+    )
+    assert ok is True
+    assert len(prompts_used) == 1
+    final_prompt = prompts_used[0]
+    assert "a close-up of anaphase with labelled spindle fibers" in final_prompt
+    # The user's own words must appear BEFORE the folded-in correction.
+    assert final_prompt.index("a close-up of anaphase") < final_prompt.index("misspelled or garbled")
+    assert "OCR detected 'force', expected 'forces'" in final_prompt
+
+
+async def test_manual_replace_with_no_prior_findings_leaves_the_prompt_untouched(monkeypatch):
+    """The mirror case: no prior `visual_qa_findings` at all - the already-
+    fixed skip-Wikimedia behaviour from the earlier replace-image fix is
+    unaffected, and nothing extra is appended to the user's prompt."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+    prompts_used: list[str] = []
+
+    async def fake_ai_image(*, prompt, size=None, phase="image", provider=None):
+        prompts_used.append(prompt)
+        return b"png-bytes"
+
+    svc.ai.image = fake_ai_image  # type: ignore[method-assign]
+
+    block = _image_block(purpose="Mitosis stages", prompt="a close-up of anaphase")
+    ok = await svc._generate_illustration(
+        course_id="course_replace_no_findings", block=block, template=load_template("technical"),
+        course_title="Biology", skip_wikimedia=True,
+    )
+    assert ok is True
+    assert "a close-up of anaphase" in prompts_used[0]
+    assert "A previous attempt on this image also" not in prompts_used[0]
+
+
+async def test_manual_replace_ignores_non_actionable_findings(monkeypatch):
+    """A finding type this module doesn't recognise as actionable (here, an
+    infrastructure error with nothing concrete to correct, and a chapter-
+    level concern that would never actually appear in this list anyway)
+    must never be folded in - only a real, fixable defect description
+    is."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+    prompts_used: list[str] = []
+
+    async def fake_ai_image(*, prompt, size=None, phase="image", provider=None):
+        prompts_used.append(prompt)
+        return b"png-bytes"
+
+    svc.ai.image = fake_ai_image  # type: ignore[method-assign]
+
+    block = _image_block(
+        purpose="Mitosis stages",
+        prompt="a close-up of anaphase",
+        visual_qa_findings=[
+            {"type": "image_relevance_check_error", "detail": "vision call failed", "resolution": "x"},
+            {"type": "missing_required_block", "detail": "framework section missing", "resolution": "x"},
+        ],
+    )
+    ok = await svc._generate_illustration(
+        course_id="course_replace_non_actionable", block=block, template=load_template("technical"),
+        course_title="Biology", skip_wikimedia=True,
+    )
+    assert ok is True
+    assert "a close-up of anaphase" in prompts_used[0]
+    assert "A previous attempt on this image also" not in prompts_used[0]
+    assert "vision call failed" not in prompts_used[0]
+    assert "framework section missing" not in prompts_used[0]
+
+
+async def test_automatic_generation_never_folds_in_prior_findings(monkeypatch):
+    """The existing automatic Strategy-A retry loop and ordinary (non-
+    replace) generation must be completely unaffected by the fold-in
+    feature: with `skip_wikimedia` unset (the default, ordinary path), a
+    block's own prior `visual_qa_findings` must never be appended to the
+    prompt, even if present - Wikimedia continues to run normally too."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=_wikimedia_settings())
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        return []
+
+    prompts_used: list[str] = []
+
+    async def fake_ai_image(*, prompt, size=None, phase="image", provider=None):
+        prompts_used.append(prompt)
+        return b"png-bytes"
+
+    monkeypatch.setattr(image_service.wikimedia_provider, "search_commons", fake_search)
+    svc.ai.image = fake_ai_image  # type: ignore[method-assign]
+
+    block = _image_block(
+        purpose="Mitosis stages",
+        prompt="a close-up of anaphase",
+        visual_qa_findings=[
+            {
+                "type": "text_misspelled_or_garbled",
+                "detail": "OCR detected 'force', expected 'forces'",
+                "resolution": "text_defect_preserved_with_mapping",
+            },
+        ],
+    )
+    ok = await svc._generate_illustration(
+        course_id="course_no_replace", block=block, template=load_template("technical"), course_title="Biology",
+    )
+    assert ok is True
+    assert "OCR detected" not in prompts_used[0]
+    assert "a close-up of anaphase" in prompts_used[0]
+
+
 async def test_wikimedia_miss_falls_through_to_the_ai_model(monkeypatch):
     """Scenario 2: no candidates at all - the existing AI path runs exactly
     as it did before this feature existed."""
@@ -4621,6 +5076,98 @@ async def test_pending_edit_success_replaces_the_asset_and_clears_the_flag():
     assert saved == edited_bytes
 
 
+async def test_pending_edit_success_clears_stale_findings_from_the_old_picture():
+    """Root-cause fix (real course audit, doc_132d5e838e34): a successful
+    edit produces a genuinely new picture - the OLD `visual_qa_findings`
+    (relevance/OCR/source-grounding judgments about the PREVIOUS image's
+    pixels, from before this edit) must not linger and keep wrongly
+    blocking approval forever over a picture that no longer exists. No
+    `expected_labels` here, so nothing is re-checked - `text_verified`
+    correctly stays `None` (nothing to honestly claim either way), while
+    the stale findings are still cleared."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=get_settings())
+    block, _ = _editable_illustration_block(
+        svc, "course_edit_clears_stale",
+        visual_qa_findings=[
+            {
+                "type": "text_misspelled_or_garbled",
+                "detail": "OCR detected 'force', expected 'forces'",
+                "resolution": "text_defect_preserved_with_mapping",
+                "deterministic": True,
+            },
+        ],
+    )
+
+    async def fake_image_edit(*, prompt, image, size=None, phase="image", provider=None):
+        return _real_image_bytes("PNG")
+
+    svc.ai.image_edit = fake_image_edit  # type: ignore[method-assign]
+
+    ok = await svc.generate_for_block(
+        course_id="course_edit_clears_stale", block=block, template=load_template("technical"), course_title="Course",
+    )
+    assert ok is True
+    assert block.content["visual_qa_findings"] == []
+    assert block.content["text_verified"] is None
+
+
+async def test_pending_edit_success_with_clean_labels_marks_text_verified_true():
+    """When this edit DOES have declared labels to check and the result is
+    clean (first attempt, no retry needed), `text_verified` is honestly set
+    to `True` - a real, fresh signal this path genuinely checked, not a
+    leftover from before the edit."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=get_settings())
+    block, _ = _editable_illustration_block(
+        svc, "course_edit_labels_clean", expected_labels=["Force", "Voltage"],
+        visual_qa_findings=[{"type": "off_topic_image", "detail": "stale", "resolution": "x"}],
+    )
+
+    async def fake_image_edit(*, prompt, image, size=None, phase="image", provider=None):
+        return _real_image_bytes("PNG")
+
+    svc.ai.image_edit = fake_image_edit  # type: ignore[method-assign]
+
+    async def clean_text_check(image: bytes, expected_labels: list[str]) -> list[str]:
+        return []
+
+    svc._verify_generated_text = clean_text_check  # type: ignore[method-assign]
+
+    ok = await svc.generate_for_block(
+        course_id="course_edit_labels_clean", block=block, template=load_template("technical"), course_title="Course",
+    )
+    assert ok is True
+    assert block.content["text_verified"] is True
+    assert block.content["visual_qa_findings"] == []
+
+
+async def test_pending_edit_success_with_persistently_wrong_labels_marks_text_verified_false():
+    """The retry's OWN final result must be re-checked, not assumed fixed -
+    if the label is STILL wrong after the one bounded retry, `text_
+    verified` must honestly be `False` (re-triggering quality_framework's
+    existing `image_text_unverified` finding, which reads this field
+    directly - never a stale `visual_qa_findings` entry doing that job
+    instead)."""
+    svc = ImageService(ai=_FakeAI(is_mock=True), settings=get_settings())
+    block, _ = _editable_illustration_block(svc, "course_edit_labels_still_wrong", expected_labels=["Force"])
+
+    async def fake_image_edit(*, prompt, image, size=None, phase="image", provider=None):
+        return _real_image_bytes("PNG")
+
+    svc.ai.image_edit = fake_image_edit  # type: ignore[method-assign]
+
+    async def always_missing(image: bytes, expected_labels: list[str]) -> list[str]:
+        return list(expected_labels)
+
+    svc._verify_generated_text = always_missing  # type: ignore[method-assign]
+
+    ok = await svc.generate_for_block(
+        course_id="course_edit_labels_still_wrong", block=block, template=load_template("technical"), course_title="Course",
+    )
+    assert ok is True
+    assert block.content["text_verified"] is False
+    assert block.content["visual_qa_findings"] == []
+
+
 async def test_pending_edit_failure_never_calls_text_to_image_generation():
     """The strict requirement: on an edit failure, the system must NEVER
     silently fall back to a fresh, unrelated text-to-image generation."""
@@ -4689,7 +5236,14 @@ async def test_pending_edit_with_a_missing_source_file_fails_clearly_without_cal
 
 async def test_pending_edit_disabled_by_flag_falls_through_to_fresh_generation():
     """`enable_image_editing=False` reproduces the pre-this-feature
-    behaviour exactly: a fresh text-to-image generation, not a failure."""
+    behaviour exactly: a fresh text-to-image generation, not a failure.
+    Also covers a real gap this feature's own fix had to close: this fresh
+    generation was STILL triggered by a user's explicit `replace_image`
+    request (`_pending_edit` is only ever set by that handler) even though
+    the operator-level flag routed it here instead of `_edit_illustration`
+    - it must still skip Wikimedia rather than risk swapping the user's
+    own prompt for an unrelated stock photo, exactly like the ordinary
+    `_skip_wikimedia` branch does."""
     settings = get_settings()
     svc = ImageService(ai=_FakeAI(is_mock=True), settings=settings)
     block, _ = _editable_illustration_block(svc, "course_edit_disabled")
@@ -4703,8 +5257,17 @@ async def test_pending_edit_disabled_by_flag_falls_through_to_fresh_generation()
         generate_calls.append(prompt)
         return _real_image_bytes("PNG")
 
+    search_calls: list[str] = []
+
+    async def fake_search(query, *, limit, settings, transport=None):
+        search_calls.append(query)
+        return [_wikimedia_candidate()]
+
     svc.ai.image_edit = fail_if_edit_called  # type: ignore[method-assign]
     svc.ai.image = fake_generate  # type: ignore[method-assign]
+    monkeypatch_target = image_service.wikimedia_provider
+    original_search = monkeypatch_target.search_commons
+    monkeypatch_target.search_commons = fake_search
     settings.enable_image_editing = False
     try:
         ok = await svc.generate_for_block(
@@ -4712,9 +5275,12 @@ async def test_pending_edit_disabled_by_flag_falls_through_to_fresh_generation()
         )
     finally:
         settings.enable_image_editing = True
+        monkeypatch_target.search_commons = original_search
     assert ok is True
     assert len(generate_calls) >= 1
+    assert search_calls == []  # Wikimedia was never queried for this replace request
     assert block.content["_pending_edit"] is False
+    assert block.content.get("_skip_wikimedia") is False  # read and cleared, not left stale
 
 
 async def test_only_the_selected_block_is_affected_by_an_edit():
@@ -4734,3 +5300,455 @@ async def test_only_the_selected_block_is_affected_by_an_edit():
     )
     assert ok is True
     assert other_block.content == other_snapshot
+
+
+# --- audience/style propagation (uploaded templates were never read for
+# image/diagram generation - only for the pre-creation audience-compatibility
+# gate and the writer's own TEXT prompt; `template` was already in scope in
+# `build_prompt` but `template.audience`/`template.image_guidance` were never
+# actually read there) --------------------------------------------------------
+
+
+def test_build_prompt_reflects_a_young_learner_templates_own_audience_and_style():
+    young_template = load_template("technical").model_copy(
+        update={
+            "audience": "Children aged 6 to 11 (Class 1 to 5)",
+            "image_guidance": "Simple shapes, bright friendly colors, large readable text.",
+        }
+    )
+    block = _image_block(illustration_style="textbook")
+    prompt = ImageService.build_prompt(block, young_template, "Course Title")
+    assert "Children aged 6 to 11" in prompt
+    assert "Simple shapes, bright friendly colors" in prompt
+    assert "firm requirement" in prompt.lower()
+    assert 'audience = "children aged 6 to 11' in prompt.lower()
+
+
+def test_build_prompt_reflects_a_different_templates_own_distinct_audience_and_style():
+    """Never a hardcoded audience branch - two different templates' own free
+    text must both show up verbatim and differ from each other."""
+    professional_template = load_template("technical").model_copy(
+        update={
+            "audience": "Senior researchers and advanced practitioners",
+            "image_guidance": "Precise technical notation, muted professional palette.",
+        }
+    )
+    block = _image_block(illustration_style="textbook")
+    prompt = ImageService.build_prompt(block, professional_template, "Course Title")
+    assert "Senior researchers and advanced practitioners" in prompt
+    assert "Precise technical notation, muted professional palette" in prompt
+    assert "Children aged 6 to 11" not in prompt
+
+
+def test_build_prompt_with_no_template_audience_or_style_is_unchanged():
+    """Backward compatibility: a template that states neither `audience` nor
+    `image_guidance` (every built-in template has no `audience` - see
+    audience_gate.py's own docstring - but `technical`/`non_technical` DO
+    have their own `image_guidance`, so both must be explicitly blanked here
+    to test the true "nothing to say" case) must produce exactly the prompt
+    this app already produced before this fix - no new, empty "firm
+    requirement" guidance line appended."""
+    template = load_template("technical").model_copy(update={"audience": "", "image_guidance": ""})
+    block = _image_block(illustration_style="textbook")
+    prompt = ImageService.build_prompt(block, template, "Course Title")
+    assert "firm requirement" not in prompt.lower()
+
+
+def test_build_prompt_with_a_built_in_templates_real_image_guidance_but_no_audience():
+    """The realistic, actually-common case: a built-in template states a
+    real `image_guidance` but no `audience` at all - only the style half of
+    the new guidance line should appear, never an empty "audience: " clause."""
+    template = load_template("technical")
+    assert not (template.audience or "").strip()
+    assert (template.image_guidance or "").strip()
+    block = _image_block(illustration_style="textbook")
+    prompt = ImageService.build_prompt(block, template, "Course Title")
+    assert "firm requirement" in prompt.lower()
+    assert 'audience = "' not in prompt.lower()
+    assert "style requirement = " in prompt.lower()
+
+
+def test_build_prompt_audience_guidance_applies_to_every_illustration_style():
+    """The propagation must be universal (textbook, section_intro, and the
+    default/decorative style alike) - not just the main labelled path."""
+    template = load_template("technical").model_copy(update={"audience": "Retirees new to technology"})
+    for style in ("textbook", "section_intro", ""):
+        block = _image_block(illustration_style=style) if style else _image_block()
+        prompt = ImageService.build_prompt(block, template, "Course Title")
+        assert "Retirees new to technology" in prompt
+
+
+def test_build_prompt_template_guidance_is_directive_not_merely_descriptive():
+    """Strengthening follow-up: the first version of this line was mild,
+    passively-worded context - a real side-by-side generation showed only a
+    moderate difference. The instruction must now be a firm, explicit
+    DIRECTIVE to actively derive and apply visual decisions - and the
+    translation guidance must stay generic (describing HOW to adapt in
+    general terms), never a hardcoded audience-category branch, so it works
+    for any uploaded template's own wording."""
+    template = load_template("technical").model_copy(update={"audience": "Retired hobbyists"})
+    block = _image_block(illustration_style="textbook")
+    prompt = ImageService.build_prompt(block, template, "Course Title")
+    assert "firm requirement" in prompt.lower()
+    assert "deliberately and visibly" in prompt.lower()
+    assert "noticeably simpler" in prompt.lower()
+    assert "noticeably more precise" in prompt.lower()
+    # The generic translation sentences describe HOW to adapt, never WHO -
+    # the specific audience string appears only once, in the quoted
+    # template text itself, never repeated inside the generic guidance.
+    assert prompt.lower().count("retired hobbyists") == 1
+
+
+def test_safety_fallback_prompt_includes_template_audience_and_style():
+    prompt = ImageService._safety_fallback_prompt(
+        course_title="Course",
+        chapter_title="Chapter",
+        section_title="Section",
+        key_concept="",
+        block_topic="A rejected illustration",
+        template_audience="Children aged 6 to 11 (Class 1 to 5)",
+        template_image_guidance="Simple shapes, bright friendly colors.",
+    )
+    assert "Children aged 6 to 11" in prompt
+    assert "Simple shapes, bright friendly colors" in prompt
+
+
+def test_safety_fallback_prompt_with_no_template_audience_is_unchanged():
+    """Backward compatibility: omitting the new kwargs entirely (as every
+    pre-existing caller/test in this file does) must produce byte-identical
+    output to before this fix."""
+    prompt = ImageService._safety_fallback_prompt(
+        course_title="Course", chapter_title="Chapter", section_title="Section",
+        key_concept="", block_topic="A rejected illustration",
+    )
+    assert "this course's own template specifies" not in prompt.lower()
+
+
+# --- conditional-shipping policy (image-approval-friction fix) -------------
+# Case numbering below matches the 7 required cases from the task: (1) clean
+# pass, (2) correct-but-decorative ships flagged, (3) minor text defect with
+# clear meaning ships flagged (already covered by the pre-existing Strategy D
+# tests - `test_persistently_misspelled_but_scientifically_sound_textbook_
+# image_ships_flagged_not_withheld` and its siblings - not duplicated here),
+# (4) incorrect formula/scientific relationship still withholds, (5) garbled
+# CRITICAL (textbook) label still withholds, (6) completely off-topic still
+# withholds, (7) multiple failed attempts then a usable candidate (Best
+# Candidate Image Tracking interaction).
+
+async def test_case1_a_scientifically_sound_textbook_image_ships_clean(monkeypatch):
+    """Case 1: a clean pass is completely unaffected by this fix - no
+    finding of either kind, no change in behaviour."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck()
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A correct, clean apparatus diagram", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_case1", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_case2_a_correct_but_decorative_illustration_ships_flagged(monkeypatch):
+    """Case 2: `genuinely_educational=False` ALONE (correct, on-topic, not
+    contradicting anything - just reads as decorative rather than richly
+    pedagogical) ships, flagged, per the user's own explicit worked example."""
+    svc = ImageService()
+    image_calls = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        image_calls["n"] += 1
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                genuinely_educational=False,
+                educational_detail="correct subject, but reads as a generic product shot",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A decorative-but-accurate scene")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_case2", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert image_calls["n"] == 3
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "decorative_not_educational" and f["resolution"] == "image_shipped_with_quality_flag"
+        for f in findings
+    )
+
+
+async def test_case4_a_contradicted_scientific_claim_always_withholds(monkeypatch):
+    """Case 4 (incorrect formula/scientific relationship, as expressed via
+    `contradicts_source_text` - the actual boolean this pipeline's vision
+    check uses to flag a misleading/factually-wrong depiction, e.g. a
+    misleading meter reading): always critical, always withholds, even
+    when a non-critical cosmetic issue is ALSO present on the same
+    candidate (proving the two are never conflated into one pass/fail)."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                contradicts_source_text=True,
+                contradicts_source_text_detail="shows a 12V reading where the text states 120V was measured",
+                genuinely_educational=False,  # a co-occurring NON-critical finding
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A meter reading during a measurement")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_case4", block=block, template=template, course_title="Electrical Measurement",
+    )
+
+    assert ok is False
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    assert not any(f["resolution"] == "image_shipped_with_quality_flag" for f in findings)
+    types = {f["type"] for f in findings}
+    assert {"contradicts_source_text", "decorative_not_educational", "image_withheld_after_qa_failure"} == types
+
+
+async def test_case5_a_garbled_critical_textbook_label_always_withholds(monkeypatch):
+    """Case 5: garbled/illegible CRITICAL labels - declared content on a
+    `textbook` image - always withhold. Duplicate of the dedicated test
+    above, kept here under the case-numbering the task asked for, for a
+    quick cross-reference."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                labels_legible=False, labels_legible_detail="the voltage and current labels overlap",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A labelled circuit diagram", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_case5", block=block, template=template, course_title="Circuits",
+    )
+
+    assert ok is False
+    assert block.content.get("omitted_after_qa_failure") is True
+
+
+async def test_case6_a_completely_off_topic_image_always_withholds(monkeypatch):
+    """Case 6: completely off-topic is always critical, always withholds -
+    unaffected by this fix."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(on_topic=False, on_topic_detail="shows an unrelated kitchen scene")
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A diagram of a specific chemical reaction")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_case6", block=block, template=template, course_title="Chemistry",
+    )
+
+    assert ok is False
+    assert block.content.get("omitted_after_qa_failure") is True
+
+
+async def test_case7_best_candidate_tracking_prefers_a_later_clean_attempt_over_cosmetic_earlier_ones(
+    monkeypatch,
+):
+    """Case 7: multiple failed attempts (all cosmetic) followed by a
+    genuinely clean candidate - Best Candidate Image Tracking must still
+    select the clean one (rank (0,0) beats (0,1)), and since the FINAL
+    decision runs on the selected candidate alone, the clean pick ships
+    with zero findings - proving the new ship-with-flag path and Best
+    Candidate Image Tracking compose correctly rather than fighting."""
+    svc = ImageService()
+    attempts = {"n": 0}
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        attempts["n"] += 1
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            if attempts["n"] < 3:
+                return ImageRelevanceCheck(
+                    genuinely_educational=False, educational_detail="reads as decorative",
+                )
+            return ImageRelevanceCheck()  # the 3rd (final) attempt is fully clean
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="An apparatus diagram")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_case7", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    assert attempts["n"] == 3
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_conditional_shipping_policy_applies_identically_on_the_azure_mai_textbook_path(monkeypatch):
+    """Identical policy semantics for Azure MAI (`is_textbook=True` ->
+    `provider = settings.textbook_image_provider`, "azure_mai") as for the
+    default FLUX path below - one shared decision point (`_scientific_
+    check_failed`'s classification inside `_generate_illustration`), never
+    two parallel implementations. (`provider` is derived internally from
+    `is_textbook`, not an argument of this method - set via the real
+    `illustration_style` trigger, not injected directly, so this exercises
+    the real dispatch, not a stub of it.)"""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        assert provider == svc.settings.textbook_image_provider == "azure_mai"
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                style_compliant=False, style_compliant_detail="minor style drift",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A labelled diagram", illustration_style="textbook")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_parity_azure_mai", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["resolution"] == "image_shipped_with_quality_flag" for f in findings)
+
+
+async def test_conditional_shipping_policy_applies_identically_on_the_default_flux_path(monkeypatch):
+    """Same policy, same shared decision point, on the DEFAULT provider
+    path (`is_textbook=False` -> `provider=None` -> `ImageService._draw`'s
+    own default falls through to `settings.image_provider`, "azure" i.e.
+    FLUX.2-flex) - this is `decorative_not_educational`, the one non-
+    critical finding that can actually occur on a non-"textbook" image
+    (`style_compliant`/`labels_legible`-on-textbook are the other two, each
+    already covered by their own dedicated tests above)."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        assert provider is None  # falls through to settings.image_provider (FLUX) inside _draw
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                genuinely_educational=False, educational_detail="reads as decorative",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A decorative-but-accurate scene")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_parity_flux", block=block, template=template, course_title="Physics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["resolution"] == "image_shipped_with_quality_flag" for f in findings)
+
+
+async def test_image_shipped_with_quality_flag_lands_in_review_not_approval_blocking(monkeypatch):
+    """Observability requirement: the new resolution routes through the
+    EXISTING `quality_framework.py` severity/review mechanism, no parallel
+    system - `severity="blocker"` + `deterministic=False` ->
+    `verification_status="unverified"` lands exactly in `QualityReport.
+    review_findings`, visible to a human, and is explicitly EXCLUDED from
+    `approval_blocking_findings` (which requires `verification_status !=
+    "unverified"`) - so it can never silently auto-block approval."""
+    svc = ImageService()
+
+    async def fake_image(*, prompt, size=None, phase="image", provider=None):
+        return b"png-bytes"
+
+    async def fake_structured(*, schema, **kwargs):
+        if schema is ImageRelevanceCheck:
+            return ImageRelevanceCheck(
+                genuinely_educational=False, educational_detail="reads as decorative",
+            )
+        return schema()
+
+    svc.ai.image = fake_image  # type: ignore[method-assign]
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+
+    block = _image_block(purpose="A decorative-but-accurate scene")
+    template = load_template("technical")
+
+    ok = await svc._generate_illustration(
+        course_id="course_quality_flag_review", block=block, template=template, course_title="Physics",
+    )
+    assert ok is True
+
+    from app.services.quality_framework import QualityReport, _visual_findings_for_block
+
+    findings = _visual_findings_for_block(f"image:{block.id}", block.content)
+    flag_finding = next(f for f in findings if f.reason == "visual_qa_decorative_not_educational")
+    assert flag_finding.severity == "blocker"
+    assert flag_finding.verification_status == "unverified"
+
+    report = QualityReport(course_id="c1", findings=findings)
+    assert report.review_findings == [flag_finding]
+    assert report.approval_blocking_findings == []  # never auto-blocks on this presentation-quality flag

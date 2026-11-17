@@ -419,6 +419,33 @@ export function PropertiesPanel({
                   />
                 </div>
               </div>
+
+              {block.type === "table" ? (
+                <div>
+                  <span className="mb-1 block text-[11px] text-ink-500">Header background</span>
+                  <div className="flex items-center gap-2 rounded-[7px] border border-line px-2 py-1.5">
+                    <label className="relative h-4 w-4 cursor-pointer overflow-hidden rounded-[3px] border border-line">
+                      <span
+                        className="block h-full w-full"
+                        style={{ background: style.accent_color ?? "#F1F5F9" }}
+                      />
+                      <input
+                        type="color"
+                        aria-label="Header background colour"
+                        value={style.accent_color ?? "#F1F5F9"}
+                        onChange={(event) => setStyle({ accent_color: event.target.value })}
+                        className="absolute inset-0 cursor-pointer opacity-0"
+                      />
+                    </label>
+                    <input
+                      aria-label="Header background colour hex"
+                      className="min-w-0 flex-1 bg-transparent text-[12px] uppercase text-ink outline-none"
+                      value={style.accent_color ?? "#F1F5F9"}
+                      onChange={(event) => setStyle({ accent_color: event.target.value })}
+                    />
+                  </div>
+                </div>
+              ) : null}
             </div>
           </Section>
 

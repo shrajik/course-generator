@@ -166,6 +166,74 @@ def _is_renderable_label(label: str) -> bool:
     return True
 
 
+# Actionable `visual_qa_findings` type codes this module itself produces for
+# an illustration-kind block, each with a real, specific correction a fresh
+# generation attempt can act on - see `_manual_replace_correction_note`'s own
+# docstring for how/why these are folded into a user's manual replace
+# request. Deliberately excludes purely-informational/terminal markers
+# (`image_withheld_after_qa_failure` - its own detail is generic boilerplate;
+# the SPECIFIC reason is always one of the entries below, already present in
+# the same list alongside it) and infrastructure failures with nothing to
+# correct (`image_relevance_check_error` - the vision call itself failed,
+# not a judgment about the image). Anything that isn't even about THIS
+# image's own generation (a chapter-level "missing required block" finding,
+# a fabricated-numeric-claim finding in surrounding prose) never appears in
+# a block's own `visual_qa_findings` list in the first place, so nothing
+# extra is needed to keep those out.
+_ACTIONABLE_FINDING_TYPES: dict[str, str] = {
+    "text_misspelled_or_garbled": "had misspelled or garbled text",
+    "off_topic_image": "did not depict the requested topic",
+    "overlapping_or_illegible_labels": "had labels/callouts overlapping or illegible",
+    "decorative_not_educational": "read as decorative rather than genuinely educational",
+    "textbook_style_not_followed": "did not follow the required flat 2D vector textbook style",
+    "contradicts_source_text": "contradicted the course's own text",
+    "source_grounding_unsupported": "included a claim the course's own text doesn't address",
+}
+
+
+def _manual_replace_correction_note(findings: list[dict] | None) -> str:
+    """Folds a block's EXISTING (pre-regeneration) `visual_qa_findings` into
+    a short correction note appended to a user's manual `replace_image`
+    prompt - see `patcher.py`'s `replace_image` handler and `generate_for_
+    block`'s own comment on `_skip_wikimedia` for why this only ever runs
+    for that one user-initiated path, never routine/automatic generation
+    (callers gate this on the same `skip_wikimedia` flag). The user's own
+    prompt stays primary - this is appended AFTER it, never replaces or
+    reorders it - and only genuinely actionable defect types (see
+    `_ACTIONABLE_FINDING_TYPES`) are ever folded in; a finding this module
+    doesn't recognise is silently skipped rather than guessed at, and a
+    block with no prior findings (or only non-actionable ones) yields an
+    empty string - a complete no-op.
+
+    Mirrors the EXISTING retry loop's own note-building wording/approach
+    (`spelling_note`/`contradiction_note`, the inline closures inside
+    `_generate_illustration`'s bounded relevance-retry loop) rather than
+    inventing a new phrasing style - those notes are built from a FRESH
+    `ImageRelevanceCheck` just produced during that same retry loop, a
+    different data shape from this block's PERSISTED finding dicts (`type`/
+    `detail`/`resolution`), so they cannot be called directly from here,
+    but the correction this function hands the model is deliberately the
+    same kind of sentence, not a parallel invention."""
+    if not findings:
+        return ""
+    notes: list[str] = []
+    seen_types: set[str] = set()
+    for finding in findings:
+        issue_type = finding.get("type") if isinstance(finding, dict) else None
+        if not isinstance(issue_type, str) or issue_type in seen_types:
+            continue
+        summary = _ACTIONABLE_FINDING_TYPES.get(issue_type)
+        if summary is None:
+            continue
+        seen_types.add(issue_type)
+        detail = str(finding.get("detail") or "").strip()
+        notes.append(
+            f" A previous attempt on this image also {summary}"
+            f"{f' ({detail})' if detail else ''} - fix this specific issue in the new image."
+        )
+    return "".join(notes)
+
+
 def sanitize_expected_labels(labels: list[str]) -> list[str]:
     """Drop any label too equation-like for raster text to render, then cap
     the remainder to `_MAX_EXPECTED_LABELS` - applied once, at every point
@@ -1020,6 +1088,58 @@ class ImageService:
             if expected_labels
             else ""
         )
+        # Audience/style propagation fix: the uploaded template's own stated
+        # `audience` and `image_guidance` are already extracted (see
+        # blueprint/builder.py) and the `template` object was already passed
+        # into this function - but neither field was ever actually read here,
+        # so a template written for young children and one written for
+        # senior professionals produced visually identical illustrations.
+        # Never a hardcoded "if audience == 'kids'" branch - both fields are
+        # the template AUTHOR's own free text, passed through verbatim as
+        # descriptive context, so this generalises to whatever any uploaded
+        # template actually says, not a fixed set of recognised audiences.
+        # Capped defensively (matching this function's existing
+        # `_CONTEXT_FIELD_CHAR_CAP`-style guards) even though `audience` is
+        # already clipped to 300 chars at extraction - `image_guidance` is an
+        # unbounded join of every "Image style:" line in the uploaded doc.
+        # Follow-up strengthening fix: the first version of this line (a
+        # mild, passively-worded contextual note) produced only a moderate,
+        # not visibly dramatic, real difference between a young-learner and
+        # a senior-professional template in a real side-by-side generation
+        # (both stayed similar overall composition/saturation). The wording
+        # below is deliberately a firm, directive INSTRUCTION to actively
+        # derive and apply concrete visual decisions from the template's own
+        # text, rather than descriptive context the model can treat as
+        # optional flavour - still entirely generic (never a hardcoded
+        # "if audience == 'kids'" branch): the two example sentences at the
+        # end describe HOW to translate an audience into visuals in general
+        # terms, they never name a specific audience category, so this
+        # generalises to whatever any uploaded template's own author
+        # actually wrote.
+        template_audience = (getattr(template, "audience", "") or "").strip()[:_CONTEXT_FIELD_CHAR_CAP]
+        template_image_guidance = (getattr(template, "image_guidance", "") or "").strip()[:400]
+        template_bits = []
+        if template_audience:
+            template_bits.append(f"audience = \"{template_audience}\"")
+        if template_image_guidance:
+            template_bits.append(f"style requirement = \"{template_image_guidance}\"")
+        template_guidance_line = (
+            "FIRM REQUIREMENT, not a minor stylistic suggestion - this course's own template "
+            "specifies " + " and ".join(template_bits) + ". You must deliberately and visibly "
+            "adapt this image's color palette, shape/notation complexity, labeling density and "
+            "overall visual tone to match this exact audience and style - a generic, one-size-"
+            "fits-all rendering that ignores it is a failure of this brief. Translate the "
+            "audience into real visual choices yourself: a younger or less technical audience "
+            "should look noticeably simpler, bolder and friendlier (fewer/rounder shapes, "
+            "brighter saturated colors, plain everyday wording); a more advanced or technical "
+            "audience should look noticeably more precise and information-dense (exact "
+            "notation/symbols, a more muted/professional palette, denser accurate labeling) - "
+            "apply whichever direction this template's own text above actually calls for. This "
+            "still never overrides the style/no-text rules above - never render any of this "
+            "instruction itself as visible text in the image."
+            if template_bits
+            else ""
+        )
         # Priority-based assembly (see this module's own "image-generation
         # prompt budget" section) - never a flat join-then-slice.
         #
@@ -1064,6 +1184,16 @@ class ImageService:
                 "negative_constraints", "Do not include watermarks, signatures or lorem ipsum text.", priority=1,
             ),
             _PromptSegment("expected_labels", labels_line, priority=1),
+            # Promoted from Priority 2 to Priority 1 (follow-up strengthening
+            # fix): its length is bounded the same way `expected_labels` is
+            # (`_CONTEXT_FIELD_CHAR_CAP`/400-char caps above), so this can
+            # never itself risk the hard budget, and Priority 1 segments are
+            # joined first in the final prompt - placing this firm
+            # instruction immediately before the writer's own subject
+            # description, rather than after it at a lower tier, so the
+            # model reads "apply this audience/style" right before it reads
+            # what to actually draw.
+            _PromptSegment("template_guidance", template_guidance_line, priority=1),
             _PromptSegment(
                 "writer_prompt",
                 content.get("prompt") or content.get("purpose") or content.get("caption") or "",
@@ -1604,8 +1734,28 @@ class ImageService:
             # fall through to the ordinary fresh-generation path below,
             # exactly reproducing the pre-this-feature behaviour. The stale
             # flag is cleared first so a later, unrelated regeneration
-            # never mistakes it for a still-pending correction.
-            block.content = merge_content(block.type, block.content, {"_pending_edit": False})
+            # never mistakes it for a still-pending correction. This WAS a
+            # user's explicit `replace_image` request (that's the only way
+            # `_pending_edit` is ever set) even though the operator-level
+            # setting routed it here instead of `_edit_illustration` - it
+            # must still skip Wikimedia for the same reason patcher.py's
+            # own "not an edit" branch does, so it's set here too in case
+            # the patch itself didn't (that branch only fires when `wants_
+            # edit` was True, the opposite of when patcher.py sets it).
+            block.content = merge_content(
+                block.type, block.content, {"_pending_edit": False, "_skip_wikimedia": True},
+            )
+        # Read once, right here at the one shared call site every
+        # illustration generation path funnels through (direct illustration
+        # requests AND a structured diagram/concept_experience's raster
+        # fallback alike) - see `patcher.py`'s `replace_image` handler for
+        # why this exists. Always cleared immediately, win or lose, so a
+        # later unrelated regeneration of this same block never silently
+        # inherits a stale "skip Wikimedia" instruction that wasn't meant
+        # for it.
+        skip_wikimedia = bool(block.content.get("_skip_wikimedia"))
+        if skip_wikimedia:
+            block.content = merge_content(block.type, block.content, {"_skip_wikimedia": False})
         return await self._generate_illustration(
             course_id=course_id,
             block=block,
@@ -1616,6 +1766,7 @@ class ImageService:
             key_concept=key_concept,
             force_text_free=structured_fallback,
             source_excerpt=source_excerpt,
+            skip_wikimedia=skip_wikimedia,
         )
 
     def _reuse_template_asset(self, *, course_id: str, block: Block, template: CourseTemplate) -> bool:
@@ -1792,6 +1943,8 @@ class ImageService:
         key_concept: str,
         block_topic: str = "",
         expected_labels: list[str] | None = None,
+        template_audience: str = "",
+        template_image_guidance: str = "",
     ) -> str:
         """A generic, policy-conscious prompt for the ONE bounded retry after
         a content-safety rejection (see `_is_content_safety_violation`'s own
@@ -1842,6 +1995,18 @@ class ImageService:
             "matter. Nothing graphic, violent, political, or controversial - purely schematic and "
             "safe for an educational audience of any age."
         )
+        # Audience/style propagation fix: these two fields are the
+        # template's own free text (never a hardcoded audience branch), and
+        # describe only tone/complexity/palette - never a specific scene or
+        # subject - so adding them here cannot reintroduce whatever
+        # triggered the original content-safety rejection.
+        audience_bits = []
+        if template_audience.strip():
+            audience_bits.append(f"intended audience: {template_audience.strip()[:_CONTEXT_FIELD_CHAR_CAP]}")
+        if template_image_guidance.strip():
+            audience_bits.append(f"required visual style: {template_image_guidance.strip()[:400]}")
+        if audience_bits:
+            base += " This course's own template specifies " + "; ".join(audience_bits) + "."
         labels = [label.strip() for label in (expected_labels or []) if label.strip()]
         if not labels:
             return f"{base}{_NO_TEXT_SUFFIX}"
@@ -2260,6 +2425,16 @@ class ImageService:
             "MOCK" if self.ai.is_mock else "REAL", block.id,
             "mock" if self.ai.is_mock else (provider or self.settings.image_provider),
         )
+        # Honest final text-verification state for THIS edit's own output -
+        # `None` when there was nothing to check (no declared labels),
+        # otherwise the real result after the one bounded retry below, not
+        # just whatever the FIRST attempt showed. Stale-findings root-cause
+        # fix: this is the only check this path ever runs (see this
+        # function's own "genuine EDIT, not a fresh generation" contract -
+        # it deliberately never runs the full relevance/OCR pipeline a
+        # from-scratch generation does), so it is the only fresh signal
+        # available to persist below.
+        text_verified: bool | None = None
         try:
             data = await self.ai.image_edit(prompt=edit_prompt, image=source_bytes, provider=provider)
             if expected_labels:
@@ -2283,6 +2458,12 @@ class ImageService:
                         f"{', '.join(expected_labels)}."
                     )
                     data = await self.ai.image_edit(prompt=retry_prompt, image=source_bytes, provider=provider)
+                    # Re-checked against the RETRIED bytes, never assumed
+                    # fixed just because a retry was attempted - the same
+                    # "never trust text on faith" discipline this function
+                    # already applies to the first attempt.
+                    missing = await self._verify_generated_text(data, expected_labels)
+                text_verified = not missing
         except Exception as exc:  # noqa: BLE001 - never silently fall back to a fresh, unrelated generation
             log.warning("Image edit failed for %s - the existing image was kept unchanged: %s", block.id, exc)
             block.content = merge_content(
@@ -2304,6 +2485,24 @@ class ImageService:
                 "width": width,
                 "height": height,
                 "_pending_edit": False,
+                "text_verified": text_verified,
+                # Root-cause fix (real course audit, doc_132d5e838e34): an
+                # edit produces a GENUINELY NEW picture, but the block's
+                # OLD `visual_qa_findings` (relevance/OCR/source-grounding
+                # judgments about the PREVIOUS image's pixels) were never
+                # cleared before this fix - confirmed real: approval stayed
+                # blocked on a stale finding even after the user
+                # successfully fixed the exact problem it described,
+                # because this path has no way to know the edit actually
+                # resolved it (it doesn't re-run that check) and no way to
+                # know it didn't (same reason) - either way, a judgment
+                # about a picture that no longer exists must not keep
+                # blocking approval forever. Cleared to the one thing this
+                # path CAN honestly claim - `text_verified` above, from the
+                # one check it genuinely does run - never a false "still
+                # bad" and never a false "fully re-verified clean" for
+                # dimensions this function never actually checked.
+                "visual_qa_findings": [],
             },
         )
         log.info("Edited illustration %s for block %s", relative, block.id)
@@ -2363,6 +2562,7 @@ class ImageService:
         key_concept: str = "",
         force_text_free: bool = False,
         source_excerpt: str = "",
+        skip_wikimedia: bool = False,
     ) -> bool:
         """`force_text_free` is set when this is a FALLBACK from a failed
         diagram/concept_experience attempt (see generate_for_block) - that
@@ -2403,11 +2603,17 @@ class ImageService:
         # Wikimedia Commons is checked FIRST, before any AI model, for every
         # path that reaches this function (a genuine illustration request
         # AND the raster fallback from a failed diagram/concept_experience
-        # attempt - see this module's own docstring and the approved plan).
+        # attempt - see this module's own docstring and the approved plan) -
+        # EXCEPT when `skip_wikimedia` is set: a user's manual `replace_
+        # image` request with their own exact prompt must always reach the
+        # AI model with those exact words, never get silently swapped for a
+        # stock photo found via generic chapter/section signals that were
+        # never this specific prompt - see `generate_for_block`'s comment on
+        # where this flag comes from.
         # `None` here means "nothing suitable, or Wikimedia itself failed" -
         # both cases fall straight through to the unchanged AI path below,
         # never raise, never interrupt course generation.
-        wikimedia_result = await self._try_wikimedia_image(
+        wikimedia_result = None if skip_wikimedia else await self._try_wikimedia_image(
             course_id=course_id,
             block=block,
             course_title=course_title,
@@ -2427,6 +2633,21 @@ class ImageService:
         if not prompt.strip():
             log.warning("Image block %s has no prompt - skipped", block.id)
             return False
+        if skip_wikimedia:
+            # Manual-replace correction fold-in: gated on the exact same
+            # flag that identifies this as a user-initiated `replace_image`
+            # request (see `generate_for_block`'s own comment on where it
+            # comes from) - never fires for routine/automatic generation,
+            # so the existing Strategy-A retry loop below and ordinary
+            # fresh generation elsewhere are completely unaffected. Reads
+            # this block's OWN pre-regeneration `visual_qa_findings` (still
+            # the old list at this point - nothing between patcher.py and
+            # here touches it) and appends any genuinely actionable defect
+            # AFTER the user's own prompt, never before or instead of it.
+            correction_note = _manual_replace_correction_note(block.content.get("visual_qa_findings"))
+            if correction_note:
+                log.info("Folding prior QA findings into the manual replace prompt for %s", block.id)
+                prompt = f"{prompt}\n\n{correction_note.strip()}"
         if force_text_free:
             # Root-cause fix (production course audit, ThermoDynamics/
             # doc_a2f5625a7fd9): `prompt` here is still the ORIGINAL
@@ -2612,6 +2833,8 @@ class ImageService:
                 key_concept=key_concept,
                 block_topic=block_topic,
                 expected_labels=expected_labels,
+                template_audience=getattr(template, "audience", "") or "",
+                template_image_guidance=getattr(template, "image_guidance", "") or "",
             )
             log.warning(
                 "Image generation for %s was rejected by the provider's content-safety filter "
@@ -2677,6 +2900,17 @@ class ImageService:
         # combined verdict, so a scientifically-sound-but-imperfectly-spelled
         # image can ship (flagged) instead of being withheld outright.
         text_findings: list[dict] = []
+        # Conditional-shipping policy fix: non-critical scientific/structural
+        # findings on the best candidate (decorative-but-correct, minor
+        # textbook-style drift, incidental illegible marks on a non-
+        # "textbook" image) - see the classification inside `_scientific_
+        # check_failed`'s own withhold branch below for exactly which issue
+        # types land here vs. in `relevance_findings`. Same pattern as
+        # `text_findings` immediately above: recorded separately, never
+        # merged into the withhold-triggering list, so a presentation-only
+        # imperfection ships (flagged) instead of discarding a scientifically
+        # sound image.
+        quality_flag_findings: list[dict] = []
         source_grounding_findings: list[dict] = []
         safety_fallback_relevance_findings: list[dict] = []
         if is_safety_fallback:
@@ -2969,7 +3203,40 @@ class ImageService:
                     "Image for %s still failed its scientific/structural relevance check after retry - "
                     "will be omitted rather than published, not silently accepted as correct", block.id,
                 )
+                # Conditional-shipping policy fix: every issue below is
+                # still DETECTED exactly as before (nothing here changes
+                # `_scientific_check_failed`, which keeps driving retries and
+                # Best Candidate Image Tracking's ranking with its full,
+                # unchanged strictness) - the only new thing is which of two
+                # lists a CONFIRMED issue on the final best candidate lands
+                # in. `issues` (critical) still withholds, unchanged. `quality_
+                # issues` (non-critical) now ships with a flag instead - the
+                # classification line, drawn deliberately narrow:
+                #   - errored/off_topic/contradicts_source_text are ALWAYS
+                #     critical - "could not verify", "wrong subject", and
+                #     "misrepresents the course's own text" (which is exactly
+                #     how a misleading meter reading or scientific marking
+                #     gets caught - see its own branch below) can never be
+                #     merely cosmetic.
+                #   - illegible/overlapping labels are critical ONLY on a
+                #     `textbook`-style image, where `expected_labels` are
+                #     real, declared, load-bearing content (apparatus parts,
+                #     formula variables, measurement names) - illegible there
+                #     means a specific, intended piece of information is
+                #     unreadable. On every other style, labels were never
+                #     meant to carry substantive content in the first place
+                #     (illustration styles besides `textbook` carry their own
+                #     STRICT NO-TEXT RULE - any text present is incidental,
+                #     not requested), so illegible marks there are cosmetic,
+                #     not misleading.
+                #   - decorative-not-educational and textbook-style-drift are
+                #     always non-critical: both describe a CORRECT image that
+                #     simply doesn't look as rich/on-style as hoped - neither
+                #     one means the image depicts something false or
+                #     unrelated (those are covered by the critical checks
+                #     above already).
                 issues: list[tuple[str, str, bool]] = []
+                quality_issues: list[tuple[str, str, bool]] = []
                 if relevance.errored:
                     issues.append((
                         "image_relevance_check_error",
@@ -2980,16 +3247,21 @@ class ImageService:
                 if not relevance.on_topic:
                     issues.append(("off_topic_image", relevance.on_topic_detail or "Image does not depict the requested topic.", False))
                 if not relevance.labels_legible:
-                    issues.append((
-                        "overlapping_or_illegible_labels",
+                    label_detail = (
                         relevance.labels_legible_detail
-                        or "Text labels/callouts overlap each other or other elements, unreadable.",
-                        False,
+                        or "Text labels/callouts overlap each other or other elements, unreadable."
+                    )
+                    (issues if is_textbook else quality_issues).append((
+                        "overlapping_or_illegible_labels", label_detail, False,
                     ))
                 if not relevance.genuinely_educational:
-                    issues.append(("decorative_not_educational", relevance.educational_detail or "Image reads as decorative, not educational.", False))
+                    quality_issues.append((
+                        "decorative_not_educational",
+                        relevance.educational_detail or "Image reads as decorative, not educational.",
+                        False,
+                    ))
                 if is_textbook and not relevance.style_compliant:
-                    issues.append((
+                    quality_issues.append((
                         "textbook_style_not_followed",
                         relevance.style_compliant_detail
                         or "Image does not follow the required flat 2D vector textbook style.",
@@ -3002,7 +3274,43 @@ class ImageService:
                         or "Image depicts something that contradicts the course's own text.",
                         False,
                     ))
-                relevance_findings = visual_qa_finding_entries(issues, resolution="image_relevance_unverified")
+                if issues:
+                    # At least one CRITICAL issue is present - the image
+                    # withholds either way (unchanged), so any non-critical
+                    # companion finding is folded back into the same single
+                    # list/resolution exactly as before this fix. Giving it
+                    # the new "shipped with a quality flag" resolution here
+                    # would be actively misleading - nothing was shipped.
+                    relevance_findings = visual_qa_finding_entries(
+                        issues + quality_issues, resolution="image_relevance_unverified",
+                    )
+                else:
+                    relevance_findings = []
+                    if quality_issues:
+                        log.info(
+                            "Image for %s has only non-critical presentation findings (%s) after retry - "
+                            "shipping the best available candidate (provider=%s, attempt %s of %s) flagged "
+                            "for human review rather than withheld, since nothing here is scientifically "
+                            "wrong, off-topic, or contradicts the course's own text",
+                            block.id, [t for t, _, _ in quality_issues],
+                            provider or self.settings.image_provider, best_index + 1, len(candidates),
+                        )
+                        quality_flag_findings = visual_qa_finding_entries(
+                            [
+                                (
+                                    kind,
+                                    f"{detail} Shipped with a quality flag rather than withheld: this is a "
+                                    "presentation-quality issue (not a scientific, factual, or on-topic "
+                                    f"problem), so the best available candidate was published instead "
+                                    f"(provider={provider or self.settings.image_provider}, attempt "
+                                    f"{best_index + 1} of {len(candidates)}). Manual review recommended to "
+                                    "judge whether a visually richer regeneration is worth attempting.",
+                                    det,
+                                )
+                                for kind, detail, det in quality_issues
+                            ],
+                            resolution="image_shipped_with_quality_flag",
+                        )
 
             # Strategy D (text-preservation fix): a confirmed text defect on
             # the best available candidate - from the HOLISTIC vision check
@@ -3125,18 +3433,54 @@ class ImageService:
         formula_expression = str(block.content.get("formula_expression") or "").strip()
         formula_verified: bool | None = None
         formula_findings: list[dict] = []
+        # Conditional-shipping policy fix (formula-correctness gap): a
+        # CONFIRMED (`verifiable=True`) formula mismatch is a genuine
+        # scientific error with a picture baked in that actively teaches the
+        # wrong equation - critical, structurally unable to be downgraded to
+        # `image_shipped_with_quality_flag` (see the withhold gate below,
+        # where this variable is OR'd in directly, never routed through the
+        # `issues`/`quality_issues` classification that CAN be downgraded).
+        # Deliberately excludes the two genuinely uncertain outcomes from
+        # `evaluate_formula` (`formula_qa.py`'s own "never claim verification
+        # that didn't happen" contract): `MALFORMED_EXPRESSION`
+        # (`verifiable=False` - an authoring/parsing problem, not a confirmed
+        # scientific error) and "no matching reference" (also `verifiable=
+        # False` - nothing to compare against). Both already get the
+        # existing, unchanged, non-blocking `formula_verification_failed`
+        # finding below - consistent with this pipeline's "don't guess
+        # either direction when genuinely unverifiable" pattern used
+        # everywhere else (OCR low-coverage, unsupported_claims, etc.).
+        formula_confirmed_wrong = False
         if formula_expression:
             formula_result = evaluate_formula(formula_expression)
             formula_verified = formula_result.verifiable and formula_result.passed
             if not formula_result.passed:
                 log.warning(
-                    "Formula verification failed for %s (%s) - flagged, not silently shipped as correct",
-                    block.id, [issue.reason for issue in formula_result.issues],
+                    "Formula verification failed for %s (%s, verifiable=%s) - %s",
+                    block.id, [issue.reason for issue in formula_result.issues], formula_result.verifiable,
+                    "withholding (a confirmed scientific error)" if formula_result.verifiable
+                    else "flagged, not silently shipped as correct",
                 )
                 formula_findings = visual_qa_finding_entries(
                     [(issue.reason, issue.detail, True) for issue in formula_result.issues],
                     resolution="formula_verification_failed",
                 )
+                formula_confirmed_wrong = formula_result.verifiable
+        if formula_confirmed_wrong and quality_flag_findings:
+            # A confirmed formula error forces withholding regardless of the
+            # vision-based classification above (see the withhold gate
+            # below) - any non-critical finding already classified as
+            # "shipped with a quality flag" on this SAME candidate must be
+            # folded back into the critical bucket too, for the identical
+            # reason the vision-only `issues`-vs-`quality_issues` co-
+            # occurrence case already does this: giving it the "shipped"
+            # resolution would be actively misleading on an image that is,
+            # in fact, about to be withheld for this unrelated critical
+            # reason.
+            relevance_findings = relevance_findings + [
+                {**finding, "resolution": "image_relevance_unverified"} for finding in quality_flag_findings
+            ]
+            quality_flag_findings = []
         # merge_content is a shallow merge - `visual_qa_findings` would
         # otherwise be REPLACED wholesale, silently erasing a finding
         # app.services.diagram_service just persisted on this exact block a
@@ -3158,6 +3502,7 @@ class ImageService:
             "formula_verification_failed", "image_relevance_unverified",
             "generic_fallback_published", "image_withheld_after_qa_failure",
             "safety_fallback_relevance_unconfirmed", "text_defect_preserved_with_mapping",
+            "image_shipped_with_quality_flag",
         }
         existing_findings = [
             entry for entry in (block.content.get("visual_qa_findings") or [])
@@ -3216,7 +3561,7 @@ class ImageService:
         # on its own; see `confirmed_unexpected_text` above for the one
         # text-failure case that still does.
         confirmed_text_failure = (text_verified is False) or bool(text_findings)
-        if confirmed_unexpected_text or confirmed_relevance_failure:
+        if confirmed_unexpected_text or confirmed_relevance_failure or formula_confirmed_wrong:
             # Fallback-cascade root-cause fix: every real attempt at the
             # actual brief failed its own bounded QA, and Wikimedia (tried
             # BEFORE any of this, at the very top of this method - see
@@ -3242,9 +3587,9 @@ class ImageService:
             # docstring above).
             log.warning(
                 "Image for %s failed confirmed QA after every bounded attempt (unexpected_text=%s, "
-                "relevance_failed=%s) and no Wikimedia match was available - withholding the image "
-                "rather than publishing an unrelated generic picture in its place",
-                block.id, confirmed_unexpected_text, confirmed_relevance_failure,
+                "relevance_failed=%s, formula_confirmed_wrong=%s) and no Wikimedia match was available - "
+                "withholding the image rather than publishing an unrelated generic picture in its place",
+                block.id, confirmed_unexpected_text, confirmed_relevance_failure, formula_confirmed_wrong,
             )
             withheld_findings = visual_qa_finding_entries(
                 [(
@@ -3313,7 +3658,8 @@ class ImageService:
                     "formula_verified": formula_verified,
                     "visual_qa_findings": (
                         existing_findings + formula_findings + relevance_findings
-                        + safety_fallback_relevance_findings + text_findings + withheld_findings
+                        + safety_fallback_relevance_findings + text_findings + quality_flag_findings
+                        + withheld_findings
                     ),
                     "generation_mode": "mock" if self.ai.is_mock else "real",
                 },
@@ -3335,7 +3681,7 @@ class ImageService:
         if (
             self.settings.enable_image_overlay_suggestions
             and not is_safety_fallback
-            and not (confirmed_text_failure or confirmed_relevance_failure)
+            and not (confirmed_text_failure or confirmed_relevance_failure or quality_flag_findings)
             and illustration_style != "section_intro"
         ):
             overlay_brief = "\n".join(
@@ -3375,6 +3721,7 @@ class ImageService:
                 "visual_qa_findings": (
                     existing_findings + formula_findings + relevance_findings
                     + safety_fallback_relevance_findings + source_grounding_findings + text_findings
+                    + quality_flag_findings
                 ),
                 "generation_mode": "mock" if self.ai.is_mock else "real",
             },

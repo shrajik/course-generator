@@ -841,11 +841,13 @@ def test_a_five_task_gantt_chart_renders_clean():
 # ---------------------------------------------------------------------------
 
 
-async def test_diagram_service_ships_flagged_when_the_rendered_output_keeps_failing_qa(service, monkeypatch):
-    """Visual-generation policy fix: a structured diagram kind must never
-    fall back to an unrelated AI illustration, even when its rendered
-    geometry still has issues after one corrective retry - it ships as a
-    real SVG asset, flagged `rendered_with_unresolved_issues` for review."""
+async def test_diagram_service_withholds_a_persistent_critical_render_defect(service, monkeypatch):
+    """Conditional-shipping policy fix: an edge drawn straight through an
+    unrelated node is `edge_crosses_node` - critical (could mislead a
+    reader about what connects to what), not cosmetic - so a structured
+    diagram kind still never falls back to an unrelated AI illustration,
+    but this specific defect is now withheld rather than shipped flagged,
+    the same treatment `is_usable()`/confirmed garbled text already get."""
     from app.render import diagram_renderer as renderer_module
     from app.schemas.document import Block
     from app.schemas.blocks import BlockType
@@ -881,11 +883,14 @@ async def test_diagram_service_ships_flagged_when_the_rendered_output_keeps_fail
         course_id="course_render_qa_fallback", block=block, template=template, course_title="Test Course"
     )
 
-    assert ok is True  # ships as a real diagram, never an unrelated illustration
-    assert block.content.get("path", "").endswith(".svg")
-    assert block.content.get("omitted_after_qa_failure") is False
+    assert ok is True  # the block was handled (withheld), not a hard failure
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
     findings = block.content.get("visual_qa_findings")
-    assert any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
+    types = {f["type"] for f in findings}
+    assert "edge_crosses_node" in types
+    assert "image_withheld_after_qa_failure" in types
+    assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
 
 
 # ---------------------------------------------------------------------------

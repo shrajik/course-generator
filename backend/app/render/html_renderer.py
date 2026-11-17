@@ -459,7 +459,16 @@ def render_document_html(
                     "code": _code_context(block) if block.type is BlockType.CODE else None,
                     "cell": _cell_context(block) if block.type is BlockType.CODE_CELL else None,
                     "accent": block.style.accent_color or theme.get("accent_color"),
-                    "accent_soft": theme.get("surface_color"),
+                    # Only ever consumed by a `table` block's header-row
+                    # background (course.html.j2's one `b.accent_soft`
+                    # reference) - must read the SAME `block.style.accent_color`
+                    # the live editor's TableBlock.tsx already reads for its
+                    # own header background, or a colour picked there
+                    # (PropertiesPanel.tsx's "Header background" field) would
+                    # render correctly in the editor but silently revert to
+                    # the theme's fixed surface_color in the exported PDF - a
+                    # real, confirmed mismatch this line used to have.
+                    "accent_soft": block.style.accent_color or theme.get("surface_color"),
                     "divider_color": block.style.border_color or theme.get("border_color"),
                 }
             )

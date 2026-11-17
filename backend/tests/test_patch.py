@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from app.agents.prompts import EDITOR_SYSTEM
 from app.course.document.patcher import apply_patch
 from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
@@ -213,7 +214,12 @@ def test_replace_image_on_an_illustration_with_an_existing_picture_preserves_it_
 def test_replace_image_on_a_block_with_no_existing_picture_has_nothing_to_edit(document, template):
     """The mirror case: a block that never had a real picture (no `path`
     yet) has nothing to edit from, so this is an ordinary fresh generation
-    - `_pending_edit` stays False and there's nothing to clear either way."""
+    - `_pending_edit` stays False and there's nothing to clear either way.
+    `_skip_wikimedia` is set: this is a user's own explicit replace prompt,
+    not routine writer-authored generation, and must reach the AI model
+    with those exact words rather than risk getting swapped for an
+    unrelated Wikimedia stock photo found via generic chapter/section
+    signals - see ImageService._generate_illustration's own comment."""
     image = document.pages[0].blocks[2]
     assert image.content.get("path") is None
     patch = DocumentPatch.model_validate(
@@ -223,6 +229,7 @@ def test_replace_image_on_a_block_with_no_existing_picture_has_nothing_to_edit(d
     updated = document.find_block(image.id)[1]
     assert updated.content["path"] is None
     assert updated.content["_pending_edit"] is False
+    assert updated.content["_skip_wikimedia"] is True
 
 
 def test_replace_image_on_a_diagram_or_concept_experience_still_clears_the_asset(document, template):
@@ -231,7 +238,12 @@ def test_replace_image_on_a_diagram_or_concept_experience_still_clears_the_asset
     behaviour (clear `path` so the structured pipeline regenerates it) is
     unchanged. See test_replace_image_preserves_the_existing_spec_... below
     for the real editing mechanism these kinds use instead (their own
-    `spec`, never cleared, read back as correction context)."""
+    `spec`, never cleared, read back as correction context). `_skip_
+    wikimedia` is still set here too: if this block's structured attempt
+    ever falls back to a raster illustration, that fallback shares the
+    exact same ImageService call site, and the user's explicit replace
+    intent must reach it there just as much as on a direct illustration
+    replace."""
     image = document.pages[0].blocks[2]
     image.content["kind"] = "diagram"
     image.content["diagram_kind"] = "concept_map"
@@ -243,6 +255,26 @@ def test_replace_image_on_a_diagram_or_concept_experience_still_clears_the_asset
     updated = document.find_block(image.id)[1]
     assert updated.content["path"] is None
     assert updated.content["_pending_edit"] is False
+    assert updated.content["_skip_wikimedia"] is True
+
+
+def test_replace_image_being_edited_does_not_need_to_skip_wikimedia(document, template):
+    """The edit path (`_pending_edit=True`) never calls Wikimedia at all -
+    `_edit_illustration` reads the existing picture's own bytes and sends
+    them straight to the provider's image-edit endpoint - so `_skip_
+    wikimedia` has nothing to do here and must not be set, keeping the
+    content patch minimal and unambiguous about which mechanism is live."""
+    image = document.pages[0].blocks[2]
+    assert image.content.get("kind", "illustration") == "illustration"
+    image.content["path"] = "assets/image_001.png"
+    image.content["generated"] = True
+    patch = DocumentPatch.model_validate(
+        {"operations": [{"type": "replace_image", "block_id": image.id, "prompt": "fix the overlapping numbers"}]}
+    )
+    apply_patch(document, patch, template)
+    updated = document.find_block(image.id)[1]
+    assert updated.content["_pending_edit"] is True
+    assert not updated.content.get("_skip_wikimedia")
 
 
 def test_replace_image_preserves_the_existing_spec_for_the_regeneration_step_to_reuse(document, template):
@@ -465,3 +497,66 @@ def test_patch_application_reflows_layout(document, template):
     )
     apply_patch(document, patch, template)
     assert len(document.pages) > 1  # re-paginated after the block grew
+
+
+def test_editor_system_instructs_content_derived_text_to_image_conversion():
+    """"Convert this into an image" root-cause fix: EDITOR_SYSTEM used to
+    only ever mention `replace_image`/`insert_block` for a new image,
+    never `replace_block` for turning an EXISTING non-image block into
+    one - the model had no instruction to derive a real prompt from the
+    selected content, or to detect flowchart/process-shaped prose and
+    route it to a structured diagram instead of a raster illustration.
+    This is a prompt-text-only check (the only honest way to verify
+    instruction text, same pattern as every other prompts.py regression
+    test this session) - it does not prove the model complies, only that
+    the instruction now exists."""
+    assert "replace_block" in EDITOR_SYSTEM
+    assert "INTO an image" in EDITOR_SYSTEM
+    # Must tell the model to derive content from the SELECTED block, not
+    # invent a generic placeholder.
+    assert "FROM the selected block's own actual content" in EDITOR_SYSTEM
+    assert "an image representing this section" in EDITOR_SYSTEM
+    # Must reuse the SAME flowchart/process classification already
+    # described for replace_image, not a new, separate heuristic.
+    assert "sequential procedure" in EDITOR_SYSTEM
+    assert "diagram_kind: \"diagram\"" not in EDITOR_SYSTEM  # sanity: no malformed literal
+
+
+def test_replace_block_converting_a_paragraph_into_a_flowchart_image_reuses_the_existing_pipeline(
+    document, template,
+):
+    """Architecture-level proof (no LLM involved): `replace_block` already
+    feeds a path-less image block into the EXACT SAME `images_to_generate`
+    -> `generate_missing` -> `ImageService`/`DiagramService` pipeline every
+    other new image does - no new backend mechanism was needed for text-
+    to-image conversion, only the EDITOR_SYSTEM instruction above telling
+    the model to actually use it this way."""
+    paragraph = document.pages[0].blocks[1]
+    patch = DocumentPatch.model_validate(
+        {
+            "operations": [
+                {
+                    "type": "replace_block",
+                    "block_id": paragraph.id,
+                    "block": {
+                        "type": "image",
+                        "content": {
+                            "kind": "diagram",
+                            "diagram_kind": "flow_chart",
+                            "purpose": "Show the PACE loop as a flowchart",
+                            "prompt": "Flow chart: Prepare -> Apply -> Cross-check -> Escalate",
+                            "caption": "The PACE loop.",
+                        },
+                    },
+                }
+            ]
+        }
+    )
+    result = apply_patch(document, patch, template)
+    updated = document.find_block(paragraph.id)[1]
+    assert updated.type is BlockType.IMAGE
+    assert updated.content["kind"] == "diagram"
+    assert updated.content["diagram_kind"] == "flow_chart"
+    assert updated.content["path"] is None
+    assert result.images_to_generate == [paragraph.id]
+    assert result.applied == [f"replace_block:{paragraph.id}"]

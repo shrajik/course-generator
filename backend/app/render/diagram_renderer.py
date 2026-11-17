@@ -629,6 +629,19 @@ def _node_block(
     if colors is not None:
         fill, stroke = colors
         stroke_width = 2.0
+    elif _HEX_RE.match(node.color.strip()):
+        # Edit Visuals (flowchart editor)'s per-node colour override, for
+        # every kind that doesn't already compute its own semantic `colors`
+        # pair (flow_chart/process/decision_tree's role colouring via
+        # `_node_colors` above still takes priority when a caller passes
+        # `colors=` explicitly) - without this, a manual colour pick on e.g.
+        # a concept_map/hierarchy/tree node persisted correctly to the spec
+        # but was silently discarded on every render, since those layout
+        # functions call this with `colors=None` and never look at
+        # `node.color` themselves.
+        stroke = node.color.strip()
+        fill = _tint(stroke)
+        stroke_width = 2.5 if emphasis else 1.5
     else:
         fill = theme.accent_soft if emphasis else theme.surface_color
         stroke = theme.accent_color if emphasis else theme.border_color
@@ -686,7 +699,79 @@ EDGE_LABEL_MAX_WIDTH = 200.0
 EDGE_LABEL_LINE_GAP = 14.0  # vertical distance between wrapped lines
 
 
-def _edge_label_pill_width(text: str, *, max_width: float = EDGE_LABEL_MAX_WIDTH) -> float:
+def _edge_label_tier(line_count: int) -> str:
+    """Short/medium/long classification built purely from `_wrap`'s own
+    output (line count) - not a new measurement system, just a thin label
+    for callers that want to react to a pill's rough size (e.g. giving a
+    taller pill a little more collision-retry search room). "short" is a
+    single line, "medium" is 2 lines (the pre-existing cap every diagram
+    kind already rendered without truncating), "long" is anything that
+    needed 3+ lines to say without cutting it off."""
+    if line_count <= 1:
+        return "short"
+    if line_count <= 2:
+        return "medium"
+    return "long"
+
+
+def _edge_label_layout(
+    text: str, *, max_width: float, max_lines: int, allow_shrink: bool,
+) -> tuple[list[str], float, float, float]:
+    """Shared sizing core for `_edge_label_pill_width`/`_edge_label` -
+    returns (lines, font_size, pill_width, pill_height), computed exactly
+    once so both functions always agree on what will actually be drawn
+    (the collision checks in `_layout_concept_wheel` depend on this).
+
+    `max_lines`/`allow_shrink` default to this function's ORIGINAL,
+    unconditional behaviour (wrap to 2 lines, truncate with an ellipsis
+    past that - `_wrap`'s own long-standing contract) for every existing
+    caller across every other diagram kind (flow_chart, decision_tree,
+    hierarchy, cycle, ...), which never pass these new parameters and so
+    are byte-for-byte unaffected by anything below. Only concept_map's own
+    call sites opt into the wider, truncation-free behaviour.
+
+    When `allow_shrink` is set and the text still doesn't fit within
+    `max_lines` at the nominal font size (a confirmed ellipsis would
+    result), this progressively shrinks the font instead of accepting
+    that truncation - the same "more lines, then a smaller font, never
+    silent data loss" fallback `_layout_decision_tree`'s own font-shrink
+    loop already uses (mirroring its `_MIN_READABLE_PX` floor so a shrunk
+    edge label never renders illegibly small) - reserved for genuinely
+    long/pathological text a reasonable relationship phrase would never
+    hit at the normal `max_lines` budget."""
+    font_size = _scaled_font_size(EDGE_LABEL_FONT_SIZE)
+    inner_w = max_width - 16.0
+    lines = _wrap(text, font_size=font_size, width=inner_w, max_lines=max_lines)
+    if allow_shrink and lines and lines[-1].endswith("…"):
+        # A genuine safety valve, not the normal path: keep shrinking the
+        # font (same multiplicative step `_layout_decision_tree` uses) and
+        # allowing more lines, until either it fits cleanly or the font
+        # hits the same readability floor every other kind's label text
+        # already respects - at which point the last, smallest-font
+        # attempt is kept rather than looping forever on truly pathological
+        # input (a 300-character label has to land somewhere).
+        safety_max_lines = max_lines + 4
+        shrunk = font_size
+        while shrunk > _MIN_READABLE_PX:
+            shrunk = max(shrunk * 0.9, _MIN_READABLE_PX)
+            candidate = _wrap(text, font_size=shrunk, width=inner_w, max_lines=safety_max_lines)
+            if candidate:
+                lines, font_size = candidate, shrunk
+            if candidate and not candidate[-1].endswith("…"):
+                break
+    if not lines:
+        return [], font_size, 0.0, 0.0
+    longest = max(len(line) for line in lines)
+    width = min(max(longest * font_size * _SANS_RATIO + 14, 40.0), max_width)
+    line_gap = _scaled_font_size(EDGE_LABEL_LINE_GAP) * (font_size / _scaled_font_size(EDGE_LABEL_FONT_SIZE))
+    base_height = _scaled_font_size(18.0) * (font_size / _scaled_font_size(EDGE_LABEL_FONT_SIZE))
+    height = base_height + (len(lines) - 1) * line_gap
+    return lines, font_size, width, height
+
+
+def _edge_label_pill_width(
+    text: str, *, max_width: float = EDGE_LABEL_MAX_WIDTH, max_lines: int = 2, allow_shrink: bool = False,
+) -> float:
     """The real pixel width `_edge_label` will draw this exact text's pill
     at - extracted so a caller can reserve layout space based on what a
     label ACTUALLY needs (a real, confirmed case: `_layout_concept_wheel`
@@ -701,29 +786,22 @@ def _edge_label_pill_width(text: str, *, max_width: float = EDGE_LABEL_MAX_WIDTH
     text = text.strip()
     if not text:
         return 0.0
-    font_size = _scaled_font_size(EDGE_LABEL_FONT_SIZE)
-    inner_w = max_width - 16.0
-    lines = _wrap(text, font_size=font_size, width=inner_w, max_lines=2)
-    if not lines:
-        return 0.0
-    longest = max(len(line) for line in lines)
-    return min(max(longest * font_size * _SANS_RATIO + 14, 40.0), max_width)
+    _, _, width, _ = _edge_label_layout(text, max_width=max_width, max_lines=max_lines, allow_shrink=allow_shrink)
+    return width
 
 
-def _edge_label(x: float, y: float, text: str, theme: TemplateTheme, *, max_width: float = EDGE_LABEL_MAX_WIDTH) -> str:
+def _edge_label(
+    x: float, y: float, text: str, theme: TemplateTheme, *,
+    max_width: float = EDGE_LABEL_MAX_WIDTH, max_lines: int = 2, allow_shrink: bool = False,
+) -> str:
     """A small pill sitting on an edge, naming the relationship it
-    represents. Wraps to at most 2 lines instead of overflowing its pill -
-    same visual style as the single-line version when text is short, just
-    taller when it isn't."""
+    represents. Wraps instead of overflowing its pill - same visual style
+    as the single-line version when text is short, just taller when it
+    isn't. `max_lines`/`allow_shrink` are opt-in (see `_edge_label_layout`)
+    - every existing caller keeps today's 2-line-then-ellipsis behaviour
+    unchanged."""
     text = text.strip()
     if not text:
-        return ""
-    font_size = _scaled_font_size(EDGE_LABEL_FONT_SIZE)
-    line_gap = _scaled_font_size(EDGE_LABEL_LINE_GAP)
-    base_height = _scaled_font_size(18.0)
-    inner_w = max_width - 16.0
-    lines = _wrap(text, font_size=font_size, width=inner_w, max_lines=2)
-    if not lines:
         return ""
     # Same calibration _wrap already uses for every node box (confirmed
     # against real browser rendering - see _wrap's own docstring), not an
@@ -732,8 +810,12 @@ def _edge_label(x: float, y: float, text: str, theme: TemplateTheme, *, max_widt
     # got clipped by whichever node box painted over it afterward (a real,
     # confirmed case: "Charge <-> Queue item" rendered as "harge <-> Queue
     # item" in an exported PDF).
-    width = _edge_label_pill_width(text, max_width=max_width)
-    height = base_height if len(lines) == 1 else base_height + line_gap
+    lines, font_size, width, height = _edge_label_layout(
+        text, max_width=max_width, max_lines=max_lines, allow_shrink=allow_shrink
+    )
+    if not lines:
+        return ""
+    line_gap = _scaled_font_size(EDGE_LABEL_LINE_GAP) * (font_size / _scaled_font_size(EDGE_LABEL_FONT_SIZE))
     rect = (
         f'<rect class="diagram-edge-label" x="{x - width / 2:.1f}" y="{y - height / 2:.1f}" '
         f'width="{width:.1f}" height="{height:.1f}" rx="9" fill="{theme.page_background}" '
@@ -1949,6 +2031,23 @@ def _cycling_palette(theme: TemplateTheme) -> list[tuple[str, str]]:
     return _CYCLING_PALETTES.get(theme.diagram_palette.strip().lower(), _WHEEL_SEGMENT_COLORS)
 
 
+def _cycling_color(node: DiagramNode, theme: TemplateTheme, index: int) -> tuple[str, str]:
+    """(fill, stroke) for a node drawn via the cycling palette above - but
+    Edit Visuals (flowchart editor)'s own per-node `color` override always
+    wins first, same priority `_node_colors`/`_node_block` already give it
+    for box-shaped kinds. Without this, every ring/wheel/cycle-style kind
+    (concept_map, pyramid, funnel, radial_mindmap, chevron_process, nested
+    shapes, etc. - everywhere `_cycling_palette(theme)[index % ...]` is
+    used directly) silently discarded a user's manual colour pick on every
+    render, a real, confirmed bug: the colour persisted correctly to the
+    spec, but this fixed index-based cycle never looked at it."""
+    if _HEX_RE.match(node.color.strip()):
+        stroke = node.color.strip()
+        return (_tint(stroke), stroke)
+    palette = _cycling_palette(theme)
+    return palette[index % len(palette)]
+
+
 def _circle_node_size(
     label: str, *, min_radius: float, font_size: float
 ) -> tuple[list[str], float]:
@@ -2472,7 +2571,10 @@ def _layout_concept_wheel(
     # edge-drawing loop below), never through this radial gap.
     max_spoke_label_width = max(
         (
-            _edge_label_pill_width(edge.label, max_width=CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH)
+            _edge_label_pill_width(
+                edge.label, max_width=CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH,
+                max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True,
+            )
             for edge in edges
             if focal_id in (edge.source, edge.target)
         ),
@@ -2564,28 +2666,29 @@ def _layout_concept_wheel(
             fan_slot[id(e)] = (i, len(group))
     _FAN_ANGLE_STEP = math.radians(34.0)
 
-    def _label_clears_circles(mid: tuple[float, float], label: str, max_width: float) -> bool:
+    def _label_clears_circles(
+        mid: tuple[float, float], label: str, max_width: float,
+        *, max_lines: int = 2, allow_shrink: bool = False,
+    ) -> bool:
         """Does this label's OWN rendered pill - not just the thin curve/
         spoke line it sits on, which `_curve_clears_nodes` already checks -
         clear every node circle in the diagram? A real, confirmed gap: a
         curve sampled at 7 points can clear a node circle by its own
         required 6px margin while the much WIDER label pill drawn at that
         same midpoint (up to 150px wide, vs. the curve's few-px stroke)
-        still overlaps that circle significantly. Uses the same width/
-        line-wrapping `_edge_label` itself computes (`_edge_label_pill_
-        width`/`_wrap`), so this checks against the label's real drawn
-        size, never a guess. Checked against EVERY node (focal and every
-        satellite), not only the two this edge connects - a label can sit
-        clear of its own curve while still landing on an uninvolved third
-        satellite's circle in a crowded wheel."""
+        still overlaps that circle significantly. Uses the same sizing
+        `_edge_label` itself computes (`_edge_label_layout`), so this
+        checks against the label's real drawn size, never a guess. Checked
+        against EVERY node (focal and every satellite), not only the two
+        this edge connects - a label can sit clear of its own curve while
+        still landing on an uninvolved third satellite's circle in a
+        crowded wheel."""
         text = label.strip()
         if not text:
             return True
-        width = _edge_label_pill_width(text, max_width=max_width)
-        font_size = _scaled_font_size(EDGE_LABEL_FONT_SIZE)
-        lines = _wrap(text, font_size=font_size, width=max_width - 16.0, max_lines=2)
-        base_height = _scaled_font_size(18.0)
-        height = base_height if len(lines) <= 1 else base_height + _scaled_font_size(EDGE_LABEL_LINE_GAP)
+        _, _, width, height = _edge_label_layout(
+            text, max_width=max_width, max_lines=max_lines, allow_shrink=allow_shrink
+        )
         half_w, half_h = width / 2.0, height / 2.0
         for nx, ny, nr in positions.values():
             closest_x = min(max(nx, mid[0] - half_w), mid[0] + half_w)
@@ -2602,23 +2705,21 @@ def _layout_concept_wheel(
     # genuinely colliding curve's bulge grows until its label clears every
     # label already placed - a non-colliding diagram (the common case)
     # never grows past its normal, original bulge at all.
-    placed_label_mids: list[tuple[float, float]] = []
-    # Full typical pill width/height (NOT half) - a real, confirmed bug: two
+    # Each placed label's own real (mid_x, mid_y, half_w, half_h) - a real,
+    # confirmed bug this replaced: a SINGLE flat half-height (40.0, sized
+    # for the old 2-line-max pill) can't represent a pill that may now
+    # legitimately wrap to `CONCEPT_MAP_EDGE_LABEL_MAX_LINES` lines - two
     # pill CENTRES only need to be farther apart than the SUM of both
-    # pills' own half-extents to avoid overlapping, but this used a single
-    # pill's half-extent as the whole threshold - roughly half of what two
-    # genuinely wide, two-line-wrapped pills (confirmed: several real
-    # course labels wrap to the full CONCEPT_MAP_LABEL_MAX_WIDTH at 2 lines,
-    # ~32-40px tall) actually need, so the in-process retry below judged a
-    # position "clear" that the real drawn pills still visibly overlapped
-    # at (closed by `label_overlaps_label_issues` in diagram_render_qa.py,
-    # the independent final check this exact case exposed as missing).
-    label_half_w, label_half_h = CONCEPT_MAP_LABEL_MAX_WIDTH + 12.0, 40.0
+    # pills' OWN real half-extents to avoid overlapping, and that sum is
+    # only correct when each pill's real, current-text-driven size is
+    # known, not an average/typical guess from when every pill was capped
+    # at 2 lines.
+    placed_label_boxes: list[tuple[float, float, float, float]] = []
 
-    def _label_collides(mid: tuple[float, float]) -> bool:
+    def _label_collides(mid: tuple[float, float], half_w: float, half_h: float) -> bool:
         return any(
-            abs(mid[0] - other[0]) < label_half_w and abs(mid[1] - other[1]) < label_half_h
-            for other in placed_label_mids
+            abs(mid[0] - ox) < (half_w + ohw) and abs(mid[1] - oy) < (half_h + ohh)
+            for ox, oy, ohw, ohh in placed_label_boxes
         )
 
     def _curve_clears_nodes(
@@ -2664,7 +2765,18 @@ def _layout_concept_wheel(
         if not p1 or not p2:
             continue
         start, end = _shorten_to_circle_edge((p1[0], p1[1]), (p2[0], p2[1]), r1=p1[2], r2=p2[2])
-        if focal_id in (edge.source, edge.target):
+        # This edge's OWN label half-extents, computed once up front so
+        # every collision check below (against nodes AND against other
+        # labels) reasons about the exact same real, text-driven size the
+        # pill will actually be drawn at - never a flat, one-size guess.
+        is_spoke = focal_id in (edge.source, edge.target)
+        label_width_budget = CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH if is_spoke else CONCEPT_MAP_LABEL_MAX_WIDTH
+        _, _, _label_w, _label_h = _edge_label_layout(
+            edge.label, max_width=label_width_budget,
+            max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True,
+        )
+        label_half_w, label_half_h = _label_w / 2.0, _label_h / 2.0
+        if is_spoke:
             # A spoke to/from the focal node: straight - these never cross
             # anything else since every satellite sits on the same ring
             # around the one shared centre.
@@ -2672,7 +2784,52 @@ def _layout_concept_wheel(
                 f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
                 f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
             )
-            mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            # The label sits BESIDE the spoke, not on top of it - offset
+            # perpendicular to the spoke's own direction (the same fixed-
+            # offset convention other diagram kinds already use for their
+            # own edge labels elsewhere in this module), then checked
+            # against the SAME collision machinery satellite-to-satellite
+            # curves already have below - a real, confirmed gap: spokes
+            # previously had no collision retry of any kind, only a curve
+            # ever got one, even though a spoke's label can just as easily
+            # land on an uninvolved node or another already-placed label in
+            # a dense wheel.
+            raw_mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            seg_dx, seg_dy = end[0] - start[0], end[1] - start[1]
+            seg_len = math.hypot(seg_dx, seg_dy) or 1.0
+            perp = (-seg_dy / seg_len, seg_dx / seg_len)
+            mid = raw_mid
+            # Fixed by construction, not left purely to luck/retries (same
+            # philosophy as the satellite-satellite fan-out above): which
+            # SIDE a spoke's label starts on alternates with that spoke's
+            # own satellite index, so two ADJACENT spokes (consecutive
+            # ring positions - the pair most likely to end up with similar
+            # offsets by symmetry) default to opposite sides from the very
+            # first attempt, instead of only diverging if/when retries
+            # happen to find different positions. A real, confirmed case
+            # this fixes: several satellites all sharing the identical
+            # longest-tier label, which - without this bias - could all
+            # try "side=+1" first and land close enough to collide before
+            # any retry ever ran.
+            sat_id_for_edge = edge.target if edge.source == focal_id else edge.source
+            base_side = 1.0 if (sat_ids.index(sat_id_for_edge) % 2 == 0) else -1.0
+            # Widened from an original 6 attempts once several spokes could
+            # all carry the same long label (a real, confirmed case: 6+
+            # satellites all sharing one long relationship phrase, each
+            # spoke's perpendicular offset alone not always enough room to
+            # avoid a neighbouring spoke's own offset label at a tighter
+            # ring-angle spacing) - the growing per-pair offset gives later
+            # attempts real alternatives, not just a further nudge along the
+            # same two sides.
+            for attempt in range(10):
+                side = base_side if attempt % 2 == 0 else -base_side
+                offset = _CONCEPT_MAP_SPOKE_OFFSET_BASE + (attempt // 2) * _CONCEPT_MAP_SPOKE_OFFSET_STEP
+                mid = (raw_mid[0] + perp[0] * offset * side, raw_mid[1] + perp[1] * offset * side)
+                if not _label_collides(mid, label_half_w, label_half_h) and _label_clears_circles(
+                    mid, edge.label, CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH,
+                    max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True,
+                ):
+                    break
         else:
             # A relationship between two satellites, not through the focal
             # node - a straight chord would cut across the focal circle and
@@ -2705,8 +2862,16 @@ def _layout_concept_wheel(
             # angle offsets together with the growing distance so a bad
             # fixed angle has real alternatives to try, not just "further
             # away in the same wrong direction".
-            _ANGLE_JITTERS = (0.0, 10.0, -10.0, 18.0, -18.0)
-            for attempt in range(10):
+            # Widened from the original (10 attempts, 5 jitters) once edge
+            # labels could legitimately wrap to more lines (`CONCEPT_MAP_
+            # EDGE_LABEL_MAX_LINES`) - a taller pill needs more room to find
+            # a clearing bulge than a 2-line one did, a real, confirmed
+            # regression this exact widening fixed (`test_convergent_
+            # satellite_edges_sharing_a_target_render_clean`, previously
+            # passing against short 2-word labels, started overlapping a
+            # node once its own labels legitimately grew to 3 real lines).
+            _ANGLE_JITTERS = (0.0, 10.0, -10.0, 18.0, -18.0, 26.0, -26.0)
+            for attempt in range(16):
                 bulge = base_bulge + attempt * 42.0
                 this_theta = theta + math.radians(_ANGLE_JITTERS[attempt % len(_ANGLE_JITTERS)])
                 ctrl = (cx + bulge * math.cos(this_theta), cy + bulge * math.sin(this_theta))
@@ -2716,8 +2881,11 @@ def _layout_concept_wheel(
                 )
                 if (
                     _curve_clears_nodes(start, ctrl, end, skip_ids=(edge.source, edge.target))
-                    and not _label_collides(mid)
-                    and _label_clears_circles(mid, edge.label, CONCEPT_MAP_LABEL_MAX_WIDTH)
+                    and not _label_collides(mid, label_half_w, label_half_h)
+                    and _label_clears_circles(
+                        mid, edge.label, CONCEPT_MAP_LABEL_MAX_WIDTH,
+                        max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True,
+                    )
                 ):
                     break
             elements.append(
@@ -2725,22 +2893,29 @@ def _layout_concept_wheel(
                 f'{end[0]:.1f},{end[1]:.1f}" fill="none" stroke="{theme.accent_color}" '
                 f'stroke-width="2" marker-end="url(#diagram-arrow)"/>'
             )
-        placed_label_mids.append(mid)
-        label_width_budget = (
-            CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH if focal_id in (edge.source, edge.target) else CONCEPT_MAP_LABEL_MAX_WIDTH
+        placed_label_boxes.append((mid[0], mid[1], label_half_w, label_half_h))
+        edge_labels.append(
+            _edge_label(
+                mid[0], mid[1], edge.label, theme, max_width=label_width_budget,
+                max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True,
+            )
         )
-        edge_labels.append(_edge_label(mid[0], mid[1], edge.label, theme, max_width=label_width_budget))
 
+    if _HEX_RE.match(focal.color.strip()):
+        focal_stroke = focal.color.strip()
+        focal_fill = _tint(focal_stroke)
+    else:
+        focal_fill, focal_stroke = theme.accent_soft, theme.accent_color
     focal_svg, _ = _circle_node(
         focal.label, cx=cx, cy=cy, theme=theme, number="",
-        fill=theme.accent_soft, stroke=theme.accent_color, min_radius=focal_radius, font_size=14.5,
+        fill=focal_fill, stroke=focal_stroke, min_radius=focal_radius, font_size=14.5,
         detail=focal.detail, sizing=focal_sizing,
     )
     elements.append(focal_svg)
 
     for index, sat in enumerate(satellites):
         sx, sy, _ = positions[sat_ids[index]]
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(sat, theme, index)
         svg, _ = _circle_node(
             sat.label, cx=sx, cy=sy, theme=theme, number=str(index + 1),
             fill=fill, stroke=stroke, min_radius=sat_radius, detail=sat.detail,
@@ -3250,7 +3425,11 @@ def _bisecting_angle(a1: float, a2: float) -> float:
     return a1 + diff / 2
 
 
-CONCEPT_MAP_LABEL_MAX_WIDTH = 150.0  # narrower than the default pill - leaves room beside neighbouring spokes
+CONCEPT_MAP_LABEL_MAX_WIDTH = 190.0  # widened from 150 - see CONCEPT_MAP_EDGE_LABEL_MAX_LINES: a satellite-
+# -satellite label has bulge room to spare (unlike a spoke), so letting it lean on WIDTH instead of extra
+# LINES for an ordinary long phrase keeps its pill shorter, which a dense multi-edge convergence (several
+# curves and labels competing for the same small patch of space) needs to still find a clean position for
+# within the existing bounded retry below.
 # A straight focal<->satellite SPOKE (unlike a bowed satellite-satellite
 # curve, which has the whole outward bulge to spread into) sits directly on
 # the radial gap this same label forces `_layout_concept_wheel` to reserve
@@ -3265,13 +3444,32 @@ CONCEPT_MAP_LABEL_MAX_WIDTH = 150.0  # narrower than the default pill - leaves r
 # costing far less width - used ONLY for a spoke's own gap/label sizing,
 # never for a satellite-satellite curve's label (that one keeps the wider
 # budget, since its bulge already has room to spare).
-CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH = 108.0
+CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH = 130.0
 # The reserved gap between focal/satellite box edges must comfortably fit
 # the label pill *and* its own left/right margin - a gap merely equal to
 # the label's own max width still lets it touch (or, for a near-horizontal
 # or near-vertical spoke where the pill's screen-aligned width lines up
 # with the radial direction, overlap) the boxes on either side.
 CONCEPT_MAP_LABEL_GAP = CONCEPT_MAP_LABEL_MAX_WIDTH + 40.0
+# How many lines a concept_map edge label may wrap to before the shrink-
+# then-truncate safety valve inside `_edge_label_layout` kicks in -
+# wide enough that an ordinary multi-word relationship phrase ("via
+# magnetic flux change", "sets polarity across the terminals") wraps
+# cleanly instead of being cut off with an ellipsis, the real, confirmed
+# bug a 2-line cap produced on real production diagrams. Deliberately a
+# LINE increase, not primarily a WIDTH one (see `CONCEPT_MAP_SPOKE_LABEL_
+# MAX_WIDTH`'s own docstring on why spoke width growth has a direct canvas
+# cost) - taller pills cost far less layout budget than wider ones here.
+CONCEPT_MAP_EDGE_LABEL_MAX_LINES = 4
+# Perpendicular distance a SPOKE label's pill sits off the straight spoke
+# line it names, so the line never passes through the label - reusing the
+# same small-fixed-offset convention other diagram kinds already use for
+# their own edge labels elsewhere in this module (e.g. a plain vertical/
+# horizontal nudge off the connector), not inventing a new one. Grows in
+# bounded steps, alternating sides, only when the smallest offset doesn't
+# clear a collision; most spokes never need more than the base offset.
+_CONCEPT_MAP_SPOKE_OFFSET_BASE = 22.0
+_CONCEPT_MAP_SPOKE_OFFSET_STEP = 16.0
 
 
 def _focal_node(nodes: list[DiagramNode], edges: list[DiagramEdge]) -> DiagramNode:
@@ -5010,7 +5208,7 @@ def _layout_pyramid(
     depth = 7.0
     for index, node in enumerate(nodes):
         w_top, w_bottom = edge_widths[index], edge_widths[index + 1]
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         points = (
             f"{cx - w_top / 2:.1f},{y:.1f} {cx + w_top / 2:.1f},{y:.1f} "
             f"{cx + w_bottom / 2:.1f},{y + layer_h:.1f} {cx - w_bottom / 2:.1f},{y + layer_h:.1f}"
@@ -5267,7 +5465,7 @@ def _layout_gears_process(
     key_entries: list[tuple[str, str, str]] = []
     for index, node in enumerate(nodes):
         cx = start_x + index * slot_w
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         tooltip = node.label.strip()
         if node.detail.strip():
             tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
@@ -5349,7 +5547,7 @@ def _layout_matrix(spec: DiagramSpec, *, theme: TemplateTheme, top: float) -> tu
         r, c = divmod(index, cols)
         x = grid_left + c * cell_w
         y = grid_top + r * _MATRIX_CELL_H
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         tooltip = node.label.strip()
         if node.detail.strip():
             tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
@@ -5523,7 +5721,7 @@ def _layout_radial_mindmap(
         angle = (2 * math.pi * index / max(branch_count, 1)) - math.pi / 2
         ux, uy = math.cos(angle), math.sin(angle)
         bx, by = cx + r1 * ux, cy + r1 * uy
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(branch, theme, index)
         branch_svg, branch_r = _circle_node(
             branch.label, cx=bx, cy=by, theme=theme, number="", fill=fill, stroke=stroke,
             min_radius=75.0, font_size=13.5, detail=branch.detail, sizing=branch_sizings[index],
@@ -5697,7 +5895,7 @@ def _layout_chevron_process(nodes: list[DiagramNode], *, theme: TemplateTheme, t
     key_entries: list[tuple[str, str, str]] = []
     for index, node in enumerate(nodes):
         x = start_x + index * (chevron_w + _CHEVRON_GAP)
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         nd = _CHEVRON_NOTCH if index > 0 else 0.0  # the first chevron's left edge stays flat
         points = (
             f"{x:.1f},{y:.1f} {x + chevron_w - _CHEVRON_NOTCH:.1f},{y:.1f} "
@@ -5784,7 +5982,7 @@ def _layout_timeline(nodes: list[DiagramNode], *, theme: TemplateTheme, top: flo
     for index, node in enumerate(nodes):
         cx = start_x + index * slot_w
         above = index % 2 == 0
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         if above:
             card_bottom = axis_y - _TIMELINE_STEM
             card_top = card_bottom - card_h
@@ -5860,7 +6058,7 @@ def _layout_staircase_process(
     max_right = x0
 
     for index, node in enumerate(nodes):
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         cy = y + _STAIRCASE_BAR_H / 2
         badge_cx = MARGIN + _STAIRCASE_BADGE_R
         elements.append(
@@ -6070,7 +6268,7 @@ def _layout_nested_circles(nodes: list[DiagramNode], *, theme: TemplateTheme, to
     key_entries: list[tuple[str, str, str]] = []
     for index, node in enumerate(nodes):
         r = outer_r - index * _NESTED_RADIUS_STEP
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         tooltip = node.label.strip()
         if node.detail.strip():
             tooltip = f"{tooltip} — {node.detail.strip()}" if tooltip else node.detail.strip()
@@ -6249,7 +6447,7 @@ def _layout_network_mesh(
     key_entries: list[tuple[str, str, str]] = []
     for index, node in enumerate(nodes):
         nx, ny = positions[index]
-        fill, stroke = _cycling_palette(theme)[index % len(_cycling_palette(theme))]
+        fill, stroke = _cycling_color(node, theme, index)
         svg, _r = _circle_node(
             node.label, cx=nx, cy=ny, theme=theme, number=str(index + 1), fill=fill, stroke=stroke,
             min_radius=55.0, font_size=font_size, detail=node.detail, sizing=sizings[index],

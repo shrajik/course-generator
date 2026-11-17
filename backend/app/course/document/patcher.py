@@ -197,7 +197,22 @@ def apply_patch(
                 if wants_edit:
                     update["error"] = None
                 else:
-                    update.update({"path": None, "generated": False, "error": None})
+                    # Root-cause fix: a `replace_image` that ISN'T an edit (no
+                    # existing picture to edit, editing is off, or the kind
+                    # changed) used to fall straight into ImageService's
+                    # ordinary fresh-generation path, which checks Wikimedia
+                    # Commons FIRST using generic chapter/section/purpose
+                    # signals that never include this operation's own
+                    # `prompt` - a real, confirmed complaint: the user types
+                    # an exact description of what they want and the block
+                    # comes back as an unrelated stock photo that happened to
+                    # pass a loose relevance check, never having reached the
+                    # AI model with their actual words at all. `_skip_
+                    # wikimedia` is read once, right before ImageService's
+                    # one shared illustration call site, and always cleared
+                    # immediately after - a user's explicit replace request
+                    # must always reach the model with their own prompt.
+                    update.update({"path": None, "generated": False, "error": None, "_skip_wikimedia": True})
                 if operation.caption is not None:
                     update["caption"] = operation.caption
                 if operation.alt is not None:

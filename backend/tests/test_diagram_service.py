@@ -16,8 +16,12 @@ from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
 from app.schemas.diagram import DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS, DIAGRAM_KINDS
 from app.schemas.document import Block
+from app.services import diagram_service as diagram_service_module
 from app.services import mock_ai as mock_ai_module
-from app.services.diagram_service import DIAGRAM_SYSTEM, DiagramService
+from app.services.diagram_content_qa import CONTRADICTS_SOURCE_TEXT
+from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult
+from app.services.diagram_render_qa import RenderQAIssue
+from app.services.diagram_service import DIAGRAM_SYSTEM, DiagramService, _diagram_user_prompt
 from app.services.mock_ai import MockAIClient
 
 
@@ -191,3 +195,307 @@ def test_writer_system_never_mandates_multiple_facets_for_a_simple_topic():
     assert "not every topic" in normalized
     assert "never invented for density" in normalized
     assert "single-facet topic" in normalized
+
+
+def test_writer_system_names_a_rule_of_thumb_and_key_takeaways_as_optional_facets():
+    """Panel-density follow-up (real live verification run: AC Generator
+    shipped with only 3 of the Playground reference's 6 panels, missing an
+    explicit governing-rule-of-thumb panel and a key-takeaways panel).
+    WRITER_SYSTEM must now name both as facet categories a writer can draw
+    from - still governed by the exact same "only when genuinely
+    applicable, never forced" language the other facets already use, never
+    a separate, weaker rule."""
+    normalized = _normalized_whitespace(WRITER_SYSTEM)
+    assert "rule of thumb" in normalized
+    assert "Fleming's right-hand rule" in normalized
+    assert "key-takeaways" in normalized or "key takeaways" in normalized
+    # The anti-padding safeguard explicitly covers the new facet too, not
+    # just the pre-existing ones.
+    assert "must never be added just to pad out a panel count" in normalized
+
+
+# --- audience/style propagation (the uploaded template's own audience/
+# image_guidance never reached diagram generation at all - DIAGRAM_SYSTEM and
+# the diagram-authoring user prompt were completely audience-blind) ----------
+
+
+def test_diagram_user_prompt_reflects_the_templates_own_audience_and_style():
+    prompt = _diagram_user_prompt(
+        purpose="Explain how photosynthesis works",
+        prompt="",
+        caption="",
+        course_title="Biology Basics",
+        template_audience="Children aged 6 to 11 (Class 1 to 5)",
+        template_style="Simple shapes, bright friendly colors.",
+    )
+    assert "Children aged 6 to 11" in prompt
+    assert "Simple shapes, bright friendly colors" in prompt
+    assert "firm requirement" in prompt.lower()
+
+
+def test_diagram_user_prompt_reflects_a_different_templates_distinct_audience():
+    """Never a hardcoded audience branch - verbatim template text only."""
+    prompt = _diagram_user_prompt(
+        purpose="Explain how photosynthesis works",
+        prompt="",
+        caption="",
+        course_title="Biology Basics",
+        template_audience="Senior researchers and advanced practitioners",
+        template_style="Precise technical notation, muted professional palette.",
+    )
+    assert "Senior researchers and advanced practitioners" in prompt
+    assert "Children aged 6 to 11" not in prompt
+
+
+def test_diagram_user_prompt_with_no_template_audience_or_style_is_unchanged():
+    """Backward compatibility: omitting the new kwargs (as every pre-existing
+    caller/test already does) must produce byte-identical output to before
+    this fix - no new, empty 'firm requirement' guidance line."""
+    prompt = _diagram_user_prompt(
+        purpose="Explain how photosynthesis works", prompt="", caption="", course_title="Biology Basics",
+    )
+    assert "firm requirement" not in prompt.lower()
+
+
+def test_diagram_user_prompt_template_guidance_is_directive_not_merely_descriptive():
+    """Strengthening follow-up (same reasoning as image_service.py's
+    equivalent fix): a firm directive, with generic translation guidance
+    that describes HOW to adapt labelling in general terms, never a
+    hardcoded audience-category branch."""
+    prompt = _diagram_user_prompt(
+        purpose="Explain how photosynthesis works", prompt="", caption="", course_title="Biology Basics",
+        template_audience="Retired hobbyists", template_style="",
+    )
+    assert "firm requirement" in prompt.lower()
+    assert "deliberately adapt" in prompt.lower()
+    assert "noticeably simpler" in prompt.lower()
+    assert "noticeably more precise" in prompt.lower()
+    assert prompt.lower().count("retired hobbyists") == 1
+
+
+# --- concept_map kind-selection exclusion (real, confirmed bug: a block
+# asking for "which external resource maps to which topic, with a coverage
+# badge per pairing" was requested as concept_map, had no real relationship
+# to label, and produced zero usable nodes/edges - withheld correctly by
+# today's A/C/D fix, but the upstream content-shape mismatch was never
+# addressed) -------------------------------------------------------------
+
+
+def test_writer_system_excludes_parallel_list_correspondences_from_concept_map():
+    """WRITER_SYSTEM must explicitly steer a flat correspondence between two
+    parallel lists (no real named relationship, just a match/rating per
+    pairing) away from concept_map and toward comparison instead, using the
+    real confirmed failure (external sources/references mapped to the
+    topics they cover) as the worked example."""
+    normalized = _normalized_whitespace(WRITER_SYSTEM)
+    assert "PARALLEL LISTS" in normalized
+    assert "which external source/reference covers which topic" in normalized
+    assert "diagram_kind: comparison` instead" in normalized or (
+        "comparison" in normalized and "zero usable nodes/edges" in normalized
+    )
+    assert "zero usable nodes/edges" in normalized
+
+
+# --- conditional-shipping policy for structured diagrams (parity with the
+# same-day fix for AI illustrations): most render-QA geometry issues are
+# cosmetic and now ship, flagged, rather than withhold; a narrow critical
+# subset (`edge_crosses_node`/`out_of_canvas`/`unparseable_svg` - issues that
+# could mislead about connectivity or hide content) still withholds, the
+# same as `is_usable()`/confirmed garbled text already did. ---------------
+
+
+def _simple_flow_chart_builder(user: str) -> dict:
+    return {
+        "kind": "flow_chart",
+        "title": "Simple",
+        "nodes": [{"id": f"n{i}", "label": f"Step {i}"} for i in range(4)],
+        "edges": [{"source": f"n{i}", "target": f"n{i + 1}", "label": ""} for i in range(3)],
+    }
+
+
+async def test_case1_a_clean_diagram_ships_with_no_findings(monkeypatch):
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(diagram_service_module, "validate_rendered_svg", lambda svg, kind: [])
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case1", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("omitted_after_qa_failure") is False
+    assert block.content.get("visual_qa_findings") == []
+
+
+async def test_case2_a_cosmetic_render_issue_ships_flagged_not_withheld(monkeypatch):
+    """`shared_edge_segment` is cosmetic - it doesn't change which node an
+    edge actually connects to, just how tidy the overlap looks - so it
+    keeps the existing, unchanged "ship anyway, flagged" treatment."""
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(
+        diagram_service_module, "validate_rendered_svg",
+        lambda svg, kind: [RenderQAIssue("shared_edge_segment", "two edges overlap for 10px")],
+    )
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case2", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("path") is not None
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == "shared_edge_segment" and f["resolution"] == "rendered_with_unresolved_issues"
+        for f in findings
+    )
+
+
+async def test_case3_a_genuinely_unusable_spec_still_withholds(monkeypatch):
+    """Unchanged by this fix: no real nodes/edges at all is a content
+    problem, not a geometry imperfection - `is_usable()` catches this
+    before render-QA ever runs."""
+    def empty_spec_builder(user: str) -> dict:
+        return {"kind": "concept_map", "title": "Empty", "nodes": [], "edges": []}
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", empty_spec_builder)
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="Something with no real structure", diagram_kind="concept_map")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case3", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True  # the block was handled (withheld), not a hard failure
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    assert any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
+    assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
+
+
+async def test_case4_a_confirmed_source_text_contradiction_still_ships_flagged(monkeypatch):
+    """Documents CURRENT, deliberately UNCHANGED behaviour - reported as a
+    finding needing the user's own decision, not silently altered here: no
+    `formula_qa.py`-equivalent deterministic "this diagram is factually
+    wrong" check exists for structured diagrams. The closest analog,
+    `evaluate_content`'s `contradicts_source_text`, is an LLM judgment call
+    (`deterministic=False`), not a provable structural fact, and was
+    already, deliberately, routed to "ship anyway, flagged" by an earlier,
+    separate fix (see `generate_for_block`'s own comment on why) - unlike
+    the image pipeline, where `contradicts_source_text` IS critical. This
+    test locks in the current behaviour so a future change to it is a
+    deliberate, visible decision, not an accidental side effect."""
+    async def fake_evaluate_content(spec, *, brief, course_title, ai, settings, source_excerpt):
+        return DiagramQAResult(issues=[
+            DiagramQAIssue(CONTRADICTS_SOURCE_TEXT, "claims something the course text disputes", deterministic=False),
+        ])
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(diagram_service_module, "evaluate_content", fake_evaluate_content)
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case4", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("path") is not None
+    assert block.content.get("omitted_after_qa_failure") is False
+    findings = block.content.get("visual_qa_findings")
+    assert any(
+        f["type"] == CONTRADICTS_SOURCE_TEXT and f["resolution"] == "rendered_with_unresolved_issues"
+        for f in findings
+    )
+
+
+async def test_case5_a_critical_edge_crosses_node_still_withholds(monkeypatch):
+    """The new split: `edge_crosses_node` means an edge visually passes
+    THROUGH an unrelated node - exactly the "edges pointing to the wrong
+    things" case that can make a reader genuinely misread connectivity, a
+    correctness problem, not a layout imperfection. Withheld, never
+    downgraded to `rendered_with_unresolved_issues`."""
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(
+        diagram_service_module, "validate_rendered_svg",
+        lambda svg, kind: [RenderQAIssue("edge_crosses_node", "edge point inside an unrelated node")],
+    )
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case5", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    assert "edge_crosses_node" in types
+    assert "image_withheld_after_qa_failure" in types
+    assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
+
+
+async def test_case6_out_of_canvas_and_unparseable_svg_are_also_critical(monkeypatch):
+    """The other two critical kinds: content literally invisible, or the QA
+    check itself couldn't verify the output at all - both withhold, same
+    reasoning as `edge_crosses_node`."""
+    for bad_kind in ("out_of_canvas", "unparseable_svg"):
+        monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+        monkeypatch.setattr(
+            diagram_service_module, "validate_rendered_svg",
+            lambda svg, kind, _bad=bad_kind: [RenderQAIssue(_bad, "detail")],
+        )
+
+        settings = get_settings()
+        svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+        block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+        template = load_template("technical")
+
+        ok = await svc.generate_for_block(
+            course_id=f"course_diagram_{bad_kind}", block=block, template=template, course_title="Biology",
+        )
+        assert ok is True
+        assert block.content.get("omitted_after_qa_failure") is True, bad_kind
+
+
+async def test_case7_a_critical_and_cosmetic_issue_together_still_withholds(monkeypatch):
+    """Co-occurrence: critical always wins, consistent with how the image
+    pipeline handles the identical kind of co-occurrence."""
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(
+        diagram_service_module, "validate_rendered_svg",
+        lambda svg, kind: [
+            RenderQAIssue("edge_crosses_node", "edge point inside an unrelated node"),
+            RenderQAIssue("shared_edge_segment", "two edges overlap for 10px"),
+        ],
+    )
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case7", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
+    assert any(f["type"] == "edge_crosses_node" for f in findings)

@@ -118,6 +118,65 @@ def test_low_confidence_near_miss_is_never_confirmed():
     assert mismatches == []
 
 
+# --- OCR coverage check (real false-positive fix, live verification run) --
+
+
+def test_sparse_ocr_coverage_on_a_dense_multi_panel_image_never_produces_a_false_positive():
+    """The exact real scenario a live end-to-end verification run surfaced:
+    a dense, multi-panel textbook illustration where Tesseract only
+    detected a small fraction of the actual visible text - several real,
+    correctly-spelled labels ("Terminals", "Rotation", etc.) were never
+    read at all, not misread. Before this fix, the near-miss search
+    compared those missing labels against unrelated OCR words that
+    happened to clear the similarity threshold by a small margin ("rings"
+    vs "terminals", a real measured ratio of 0.571) - a false positive.
+    Reproduces the real word list and real (far larger) expected-label set
+    from that run; confirms the fix suppresses every near-miss rather than
+    confirming one against an incomplete word pool."""
+    # The real OCR output from that run - Tesseract found only a handful of
+    # words on a 14-label, multi-panel image.
+    ocr_words = [
+        ("B", 91.0), ("(magnetic", 96.0), ("field)", 96.0), ("Slip", 96.0), ("rings", 96.0),
+        ("e(t)", 91.0), ("(induced", 96.0), ("emf)", 96.0),
+    ]
+    result = _result(*ocr_words)
+    expected_labels = [
+        "Rotor coil", "Stator yoke", "N pole", "S pole", "Axle", "Slip rings", "Brushes", "Load",
+        "B (magnetic field)", "ω (angular speed)", "e(t) (induced emf)", "I (load current)",
+        "Rotation", "Terminals",
+    ]
+    mismatches = ocr.find_ground_truth_mismatches(result, expected_labels=expected_labels)
+    # No false "rings" vs "terminals"/"rotating" mismatch - OCR's thin
+    # overall coverage means a missing label stays unconfirmed, not FAILed.
+    assert mismatches == []
+
+
+def test_good_ocr_coverage_still_confirms_a_genuine_near_miss_unaffected_by_the_coverage_fix():
+    """The coverage fix must not weaken the case it's explicitly required
+    to leave alone: when OCR's overall coverage is substantial (it read
+    most/all of the expected text, just one word wrong), a genuine near-
+    miss must still be confirmed exactly as before."""
+    result = _result(("Oucupy", 90.0), ("Electron", 92.0), ("Nucleus", 95.0))
+    mismatches = ocr.find_ground_truth_mismatches(
+        result, expected_labels=["Occupy", "Electron", "Nucleus"],
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0].ocr_text == "Oucupy"
+
+
+def test_a_single_label_with_nothing_else_to_check_is_not_treated_as_low_coverage():
+    """Deliberately NOT based on 'how many labels matched' (which would be
+    circular): a single genuinely-misspelled label with no other labels to
+    compare against must not look like '0% coverage' just because the one
+    thing being checked is itself wrong - OCR read something, it was just
+    the wrong something. This is the exact real case `test_misspelled_
+    declared_label_is_confirmed` already covers; this test makes the
+    coverage-ratio reasoning explicit."""
+    result = _result(("Oucupy", 88.0))  # 1 word detected, 1 word expected - full "coverage", wrong content
+    mismatches = ocr.find_ground_truth_mismatches(result, expected_labels=["Occupy"])
+    assert len(mismatches) == 1
+
+
 # --- Case 8 & 9: OCR init/runtime failures never crash, never flag -------
 
 
@@ -239,6 +298,56 @@ def test_run_ocr_averages_confidence_and_skips_blank_entries(monkeypatch):
     assert [w.text for w in result.words] == ["Occupy", "Electron"]
     assert result.average_confidence == pytest.approx(90.0)
     ocr._run_ocr_cached.cache_clear()
+
+
+# --- Real confirmed false positive (live course "Motional Emf Derivation"):
+# free-text/source-text matching flagged a correct word against an
+# unrelated word from elsewhere in the same section's prose, and separately
+# flagged two plain singular/plural variants as mismatches ------------------
+
+
+def test_singular_plural_variant_from_source_text_is_never_flagged():
+    """Real case: the image correctly rendered singular "force"/"voltage";
+    the section's own prose elsewhere used the plural "forces"/"voltages" -
+    these are not a text defect, just two equally-correct word forms."""
+    result = _result(("force", 95.0), ("voltage", 94.0))
+    source_text = (
+        "Electric forces vs. induced voltages. An electric field does direct work on charges."
+    )
+    mismatches = ocr.find_ground_truth_mismatches(result, expected_labels=[], source_text=source_text)
+    assert mismatches == []
+
+
+def test_unrelated_word_from_elsewhere_in_source_text_is_never_flagged_against_a_correct_word():
+    """Real case: the image's own correct, declared label "present" (from
+    "No battery present") was compared against "release" - a real word,
+    but from a completely unrelated sentence elsewhere in the same
+    section's prose (confirmed ratio 0.571 - the same coincidental ratio as
+    the earlier-fixed "rings"/"terminals" coverage case, but NOT a coverage
+    problem: OCR read "present" just fine). The stricter source_text floor
+    must reject this without needing to touch the declared-label floor."""
+    result = _result(
+        ("No", 92.0), ("battery", 93.0), ("present", 94.0), ("induced", 92.0), ("voltage", 91.0),
+    )
+    source_text = (
+        "Electric forces vs. induced voltages. An electric field does direct work on charges; "
+        "if you release a charge, it accelerates along the field. No battery present — induced "
+        "voltage appears at terminals."
+    )
+    mismatches = ocr.find_ground_truth_mismatches(
+        result, expected_labels=["No battery present"], source_text=source_text,
+    )
+    assert mismatches == []
+
+
+def test_a_genuine_source_text_near_miss_still_clears_the_stricter_floor():
+    """The stricter `source_text` floor must not accidentally eliminate a
+    real detection - the exact confirmed "oucupy"/"occupy" case (ratio
+    0.83) must keep firing."""
+    result = _result(("Electrons", 90.0), ("oucupy", 88.0), ("fixed", 90.0), ("levels", 90.0))
+    source_text = "Electrons occupy fixed energy levels around the nucleus."
+    mismatches = ocr.find_ground_truth_mismatches(result, expected_labels=[], source_text=source_text)
+    assert any(m.ocr_text == "oucupy" and m.expected_text == "occupy" for m in mismatches)
 
 
 def test_run_ocr_caches_by_content_so_identical_bytes_only_run_tesseract_once(monkeypatch):

@@ -638,6 +638,22 @@ def _visual_findings_for_block(artifact: str, content: dict) -> list[QualityFind
             # real, good diagram here, just one a human should double-check
             # the wording of before relying on it.
             severity = "blocker"
+        elif resolution == "image_shipped_with_quality_flag":
+            # Conditional-shipping policy (image-approval-friction fix,
+            # ImageService._generate_illustration): a non-critical
+            # scientific/structural finding (decorative-but-correct, minor
+            # textbook-style drift, or incidental illegible marks on a
+            # non-"textbook" illustration where no declared label was ever
+            # load-bearing) on a best candidate that is NOT off-topic, does
+            # NOT contradict the course's own text, and was NOT errored -
+            # shipped rather than withheld, since none of those three would-
+            # be-critical conditions apply. Same "blocker"+`deterministic=
+            # False`->"unverified" combination as `text_defect_preserved_
+            # with_mapping`/`source_grounding_unsupported` above, for the
+            # identical reason: lands exactly in `QualityReport.review_
+            # findings`, visible to a human, never auto-blocking approval on
+            # an LLM judgment call about presentation quality alone.
+            severity = "blocker"
         elif resolution == "safety_fallback_relevance_unconfirmed":
             # Visual-generation policy fix: a deliberately-generic emergency
             # image (the one bounded retry after a content-safety rejection

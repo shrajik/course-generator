@@ -502,6 +502,52 @@ def test_concept_wheel_draws_real_connecting_lines_and_edge_labels():
     assert "belongs to" in text
 
 
+def test_a_manual_node_color_override_is_honoured_on_a_concept_map():
+    """Edit Visuals (flowchart editor): a user-picked per-node `color`
+    persists correctly to the spec but was silently discarded at render
+    time for any kind whose layout never computes its own `_node_colors`
+    pair (concept_map, hierarchy, tree, comparison, etc. - everything that
+    calls the shared `_node_block` with `colors=None`), since that function
+    only ever fell back to theme/emphasis colouring and never looked at
+    `node.color` itself. A real, confirmed regression: a user changes a
+    concept_map satellite's colour in the editor, clicks Save, and the
+    rendered diagram comes back exactly as before."""
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[
+            DiagramNode(id="subj", label="Subject", level=0),
+            DiagramNode(id="a", label="Part A", level=1, color="#ff00aa"),
+        ],
+        edges=[DiagramEdge(source="a", target="subj", label="belongs to")],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert 'stroke="#ff00aa"' in text
+
+
+def test_a_manual_node_color_override_does_not_leak_onto_other_nodes():
+    """The same fixture, confirming an un-coloured sibling node still falls
+    back to the ordinary theme colouring - the override is per-node, not a
+    global switch."""
+    theme = TemplateTheme()
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[
+            DiagramNode(id="subj", label="Subject", level=0),
+            DiagramNode(id="a", label="Part A", level=1, color="#ff00aa"),
+            DiagramNode(id="b", label="Part B", level=1),
+        ],
+        edges=[
+            DiagramEdge(source="a", target="subj", label="belongs to"),
+            DiagramEdge(source="b", target="subj", label="belongs to"),
+        ],
+    )
+    svg_bytes, _w, _h = render_diagram_svg(spec, theme)
+    text = svg_bytes.decode("utf-8")
+    assert 'stroke="#ff00aa"' in text
+    assert f'stroke="{theme.border_color}"' in text
+
+
 def test_render_diagram_svg_hierarchy_layout():
     nodes = [
         DiagramNode(id="root", label="Root", level=0),
@@ -1716,6 +1762,302 @@ def test_edge_label_pill_width_uses_the_same_calibrated_ratio_as_node_boxes():
 
     assert abs(width - calibrated_width) < 0.2
     assert width > old_ad_hoc_width
+
+
+# ---------------------------------------------------------------------------
+# concept_map edge-label redesign: floating pills beside connectors,
+# wrap-not-truncate, collision-avoided spokes. concept_map ONLY - every
+# assertion below that renders flow_chart/decision_tree is there specifically
+# to prove those kinds are untouched by this redesign.
+# ---------------------------------------------------------------------------
+
+
+def test_the_real_reported_screenshot_scenario_renders_with_no_truncation_or_overlap():
+    """The exact real production scenario this redesign was built for: an
+    'Induced emf' concept_map wheel with genuinely long relationship phrases
+    ('via magnetic force on mobile charges', 'sets polarity across the two
+    terminals', 'closed path completes the circuit loop') that the old
+    2-line/108px cap truncated with a literal ellipsis ('via magnetic...',
+    'sets polari...', 'closed path...' - the real screenshot's own text).
+    Every one of these must now render completely, and nothing must
+    overlap anything else."""
+    nodes = [
+        DiagramNode(id="induced_emf", label="Induced emf", level=0, detail="net potential around loop"),
+        DiagramNode(id="motion_b", label="Motion + B", level=1, detail="conductor moving in field"),
+        DiagramNode(id="charge_sep", label="Charge separation", level=1, detail="charges displaced by force"),
+        DiagramNode(id="loop_path", label="Loop path", level=1, detail="closed conductor geometry"),
+        DiagramNode(id="terminal_pol", label="Terminal polarity", level=1, detail="which end is +/-"),
+    ]
+    edges = [
+        DiagramEdge(source="motion_b", target="charge_sep", label="via magnetic force on mobile charges"),
+        DiagramEdge(source="charge_sep", target="induced_emf", label="creates separation that sets up a potential"),
+        DiagramEdge(source="induced_emf", target="terminal_pol", label="sets polarity across the two terminals"),
+        DiagramEdge(source="loop_path", target="induced_emf", label="closed path completes the circuit loop"),
+    ]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+
+    assert "…" not in svg_text, "a normal-length relationship phrase must never be ellipsis-truncated"
+    assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
+
+
+@pytest.mark.parametrize(
+    "label,expected_tier",
+    [
+        ("causes", "short"),
+        ("sets polarity across terminals", "medium"),
+        ("a genuinely long relationship phrase with enough words that it needs three or more lines to read", "long"),
+    ],
+)
+def test_short_medium_long_labels_all_render_without_truncation(label, expected_tier):
+    """The three-tier classification (`_edge_label_tier`) is built from
+    `_wrap`'s own line count - this proves each tier actually produces a
+    pill with that many real lines, not a flat always-2-lines pill."""
+    from app.render.diagram_renderer import (
+        CONCEPT_MAP_EDGE_LABEL_MAX_LINES,
+        _edge_label_layout,
+        _edge_label_tier,
+    )
+
+    lines, _, _, _ = _edge_label_layout(
+        label, max_width=190.0, max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True
+    )
+    assert "".join(lines).count("…") == 0
+    tier = _edge_label_tier(len(lines))
+    assert tier == expected_tier
+
+
+@pytest.mark.parametrize("satellite_count", [2, 3, 4, 5])
+def test_spoke_labels_in_every_wheel_direction_render_without_truncation_or_overlap(satellite_count):
+    """Spokes fan out at different angles depending on satellite count
+    (2 satellites = opposite/horizontal-ish spokes, odd counts put spokes
+    at genuinely diagonal angles) - this sweeps enough counts to exercise
+    horizontal, vertical and diagonal spoke directions with labels long
+    enough to need the new multi-line/offset handling on every one. Each
+    spoke gets its OWN distinct long phrase, as a real concept map's
+    relationships actually read (see the companion
+    test_a_wheel_this_dense_with_every_spoke_at_maximum_length_is_a_known_
+    remaining_limitation just below for the separate, much more extreme
+    all-spokes-identical-maximum-length case)."""
+    phrases = [
+        "a genuinely long relationship phrase describing exactly what this spoke means",
+        "drives the outcome through a completely different mechanism than the others",
+        "constrains the result whenever the surrounding conditions change meaningfully",
+        "feeds directly into the next stage of this particular process chain",
+        "only applies under a specific, clearly documented set of circumstances",
+        "represents the opposite effect compared to its neighbouring relationship",
+        "summarises a secondary consideration worth noting for this component",
+        "closes the loop by connecting this part back to where it started",
+    ]
+    nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+    edges = []
+    for i in range(satellite_count):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=phrases[i % len(phrases)]))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+    assert "…" not in svg_text
+    assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
+
+
+def test_a_wheel_this_dense_with_every_spoke_at_maximum_length_is_a_known_remaining_limitation():
+    """Honest, documented limitation, not silently swept under the rug:
+    6+ satellites ALL carrying the IDENTICAL longest-tier relationship
+    phrase (an artificially perfect-symmetry case no real concept map
+    actually produces - real relationships read differently from each
+    other, as the realistic sweep just above already proves clean) can
+    still leave a residual `label_overlaps_label`/`label_overlaps_node`
+    finding after the bounded retry's attempts are exhausted - the exact
+    same "ship the last, best-effort attempt rather than loop forever"
+    contract this file's own satellite-satellite curve retry already
+    documents and accepts for an equally pathological topology. Growing
+    canvas width further to guarantee a clean result here was tried and
+    reverted - it pushed ordinary, realistic diagrams' canvases wide
+    enough to trip the text-too-small-after-scaling safeguard, a strictly
+    worse trade for real courses than this residual, narrow, synthetic
+    edge case. This test exists so this limitation is tracked, not
+    rediscovered as a surprise."""
+    long_relationship = "a genuinely long relationship phrase describing exactly what this spoke means"
+    nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+    edges = []
+    for i in range(8):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=long_relationship))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+    assert "…" not in svg_text, "even in this extreme case, text must never be ellipsis-truncated"
+    assert canvas_w < CANVAS_WIDTH * 1.6, "must not have grown the canvas to brute-force this case"
+    issues = validate_rendered_svg(svg_bytes, kind="concept_map")
+    assert {i.kind for i in issues} <= {"label_overlaps_label", "label_overlaps_node"}, (
+        f"only the known, documented residual overlap classes are acceptable here, got: {issues}"
+    )
+
+
+def test_spoke_label_line_never_passes_through_its_own_pill():
+    """The spoke line itself is drawn as a single <line> from the node edge
+    to the node edge, unmodified by this redesign - the label is the thing
+    that moved off of it. Confirms the label pill's rect is NOT centred on
+    the line's own midpoint anymore (the old, on-the-line behaviour), i.e.
+    a real perpendicular offset was actually applied, not just computed and
+    discarded."""
+    nodes = [
+        DiagramNode(id="focal", label="Subject", level=0),
+        DiagramNode(id="sat", label="Related part", level=1),
+    ]
+    edges = [DiagramEdge(source="sat", target="focal", label="a real relationship worth naming clearly")]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+
+    line_match = re.search(r'<line x1="([\d.]+)" y1="([\d.]+)" x2="([\d.]+)" y2="([\d.]+)"', svg_text)
+    assert line_match, "expected a straight spoke <line>"
+    x1, y1, x2, y2 = (float(v) for v in line_match.groups())
+    line_mid = ((x1 + x2) / 2, (y1 + y2) / 2)
+
+    label_rect = _rects_by_class(svg_text, "diagram-edge-label")[0]
+    rx, ry, rw, rh = label_rect
+    pill_centre = (rx + rw / 2, ry + rh / 2)
+
+    distance = ((pill_centre[0] - line_mid[0]) ** 2 + (pill_centre[1] - line_mid[1]) ** 2) ** 0.5
+    assert distance > 10.0, "the label pill must sit measurably off the raw spoke midpoint, not on top of it"
+
+
+def test_several_nearby_convergent_labels_never_overlap_each_other_or_nodes():
+    """Several satellite-to-satellite edges converging on the same two hubs
+    with genuinely long labels each - the exact dense-wheel shape that
+    required per-label (not flat-constant) collision half-extents once
+    labels could legitimately wrap to more than 2 lines."""
+    nodes = [
+        DiagramNode(id="zeff", label="Zeff", level=0),
+        DiagramNode(id="shells", label="Shells", level=1),
+        DiagramNode(id="i1", label="I1", level=1),
+        DiagramNode(id="ea", label="EA", level=1),
+        DiagramNode(id="anomalies", label="Anomalies", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="shells", target="i1", label="depends on n, l; penetration & occupancy together"),
+        DiagramEdge(source="shells", target="ea", label="depends on n, l; penetration & occupancy together"),
+        DiagramEdge(source="anomalies", target="i1", label="local deviations from subshell filling order"),
+        DiagramEdge(source="anomalies", target="ea", label="local deviations from subshell filling order"),
+    ]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    issues = validate_rendered_svg(svg_bytes, kind="concept_map")
+    # `duplicate_arrowhead_side` on this exact topology is a real,
+    # pre-existing bug confirmed (via git-stash A/B) to exist identically
+    # BEFORE this redesign too - out of scope for the edge-label work this
+    # test exists to verify. What this test actually asserts: the redesign
+    # itself never lets two genuinely long, converging labels land on top
+    # of each other or a node.
+    assert [i for i in issues if i.kind not in ("duplicate_arrowhead_side",)] == []
+
+
+def test_a_pathological_300_character_label_shrinks_and_wraps_before_ever_truncating():
+    """A genuinely pathological label (not a realistic relationship phrase)
+    must still never silently lose content without first trying every
+    adaptive fallback - more lines, then a smaller font - exactly as it
+    would for a real course's own worst-case input, which this directly
+    exercises end to end rather than calling the internal helper alone."""
+    pathological = ("a b c d e f g h i j k l m n o p q r s t u v w x y z " * 6).strip()
+    assert len(pathological) > 280
+    nodes = [
+        DiagramNode(id="focal", label="Subject", level=0),
+        DiagramNode(id="sat", label="Related part", level=1),
+    ]
+    edges = [DiagramEdge(source="sat", target="focal", label=pathological)]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+
+    font_match = re.search(r'<text[^>]*font-size="([\d.]+)"[^>]*fill="#4b5563"', svg_text)
+    assert font_match, "expected the edge-label <text> element"
+    from app.services.diagram_render_qa import MIN_READABLE_PX
+
+    assert float(font_match.group(1)) <= EDGE_LABEL_FONT_SIZE, "shrank below the nominal size, not just wrapped"
+    assert float(font_match.group(1)) >= MIN_READABLE_PX - 0.5, "never shrank below the readability floor"
+
+
+def test_canvas_width_does_not_blow_up_for_an_ordinary_concept_map_after_the_label_redesign():
+    """The redesign deliberately leans on extra LINES (height), not extra
+    WIDTH, to avoid truncation - this confirms an ordinary concept_map
+    (short node labels, one moderately-long relationship phrase) still
+    gets a canvas close to the plain default, not a canvas blown wide by
+    the wider label budgets this redesign introduced."""
+    nodes = [
+        DiagramNode(id="focal", label="Subject", level=0),
+        DiagramNode(id="s0", label="Part A", level=1),
+        DiagramNode(id="s1", label="Part B", level=1),
+        DiagramNode(id="s2", label="Part C", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="s0", target="focal", label="influences"),
+        DiagramEdge(source="s1", target="focal", label="depends on"),
+        DiagramEdge(source="s2", target="focal", label="a moderately long but ordinary relationship phrase"),
+    ]
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    _, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    assert canvas_w < CANVAS_WIDTH * 1.6, f"canvas grew to {canvas_w:.0f}, well past a reasonable ordinary budget"
+
+
+def test_label_overlaps_label_issues_still_fires_for_a_genuine_synthetic_overlap():
+    """Proves `label_overlaps_label_issues` (the independent final render-QA
+    check, not the in-process retry this redesign tuned) still genuinely
+    detects a real overlap when forced - the redesign must make real
+    overlaps LESS likely, never make the detector itself blind to one."""
+    from app.services.diagram_render_qa import label_overlaps_label_issues
+
+    svg = (
+        '<svg><rect class="diagram-edge-label" x="0" y="0" width="100" height="30"/>'
+        '<rect class="diagram-edge-label" x="20" y="10" width="100" height="30"/></svg>'
+    )
+    root = ET.fromstring(svg)
+    issues = label_overlaps_label_issues(root)
+    assert issues, "two genuinely overlapping label rects must still be caught"
+
+
+def test_flow_chart_edge_labels_are_completely_unaffected_by_the_concept_map_redesign():
+    """Explicit regression guard: flow_chart shares `_edge_label`/
+    `_edge_label_pill_width` with concept_map, but every new parameter
+    (`max_lines`, `allow_shrink`) defaults to the ORIGINAL 2-line-then-
+    ellipsis behaviour, and flow_chart's own call sites never pass the new
+    kwargs - so a flow_chart label long enough to have needed truncation
+    before this redesign must still truncate exactly the same way now."""
+    from app.render.diagram_renderer import _edge_label
+
+    long_text = "a genuinely long relationship phrase with enough words that it needs three or more lines to read"
+    before_behaviour = _edge_label(100.0, 100.0, long_text, TemplateTheme(), max_width=110.0)
+    assert before_behaviour.count("<tspan") == 2, "flow_chart's own edge labels must still cap at 2 lines"
+
+    nodes = [
+        DiagramNode(id="start", label="Start", shape_role="start"),
+        DiagramNode(id="end", label="End", shape_role="end"),
+    ]
+    edges = [DiagramEdge(source="start", target="end", label=long_text)]
+    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
+
+
+def test_decision_tree_rendering_is_completely_unaffected_by_the_concept_map_redesign():
+    """Same explicit regression guard as flow_chart, for decision_tree -
+    neither this diagram kind's layout code nor its own edge-label call
+    sites were touched by this redesign at all."""
+    nodes = [
+        DiagramNode(id="root", label="Is the value positive?", level=0),
+        DiagramNode(id="yes", label="Proceed", level=1),
+        DiagramNode(id="no", label="Reject", level=1),
+    ]
+    edges = [
+        DiagramEdge(source="root", target="yes", label="Yes"),
+        DiagramEdge(source="root", target="no", label="No"),
+    ]
+    spec = DiagramSpec(kind="decision_tree", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes, kind="decision_tree") == []
 
 
 def test_concept_map_focal_node_is_chosen_by_real_connectivity_not_declared_level():

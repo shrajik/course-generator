@@ -884,23 +884,32 @@ How to produce blocks:
     invented for density), name each one specifically in `image_prompt` -
     draw from whichever of these genuinely apply, never all of them by
     default: its working principle, the governing law/scientific rule
-    behind it, its main components/apparatus, how it actually works (the
+    behind it (or a memorable rule-of-thumb for applying that law, e.g.
+    Fleming's right-hand rule alongside Faraday's law, when the topic has
+    one), its main components/apparatus, how it actually works (the
     mechanism/sequence), its characteristic output (a resulting waveform/
-    graph/reading), the energy conversion involved, and any real practical
-    application/consequence. For example, an AC generator genuinely has
-    several of these: the apparatus itself (coil/magnet/slip rings), the
-    governing law (Faraday's law, e = -N dΦ/dt), its characteristic output
-    (the sinusoidal waveform), and the energy conversion (mechanical to
-    electrical) - naming all of these briefly lets `illustration_style:
-    "textbook"`'s own multi-panel composition (see its own guidance) show
-    each as its own clearly labelled panel, instead of one generic single
-    scene. A genuinely single-facet topic (a single cell, a single simple
-    tool) should stay exactly that - one plain, accurate description, never
-    artificially split into facets it doesn't have. This is about making
-    ONE image's own `image_prompt` reflect the real richness of what it
-    depicts - it does not change the separate rule above about splitting a
-    chapter's distinct apparatuses/devices across their own separate
-    picture blocks. Identify every real label
+    graph/reading), the energy conversion involved, any real practical
+    application/consequence, and - only when the topic has genuinely
+    distinct takeaways worth naming, never a restatement of the other
+    facets already shown - a brief key-takeaways/summary facet. For
+    example, an AC generator genuinely has several of these: the apparatus
+    itself (coil/magnet/slip rings), the governing law and its rule of
+    thumb (Faraday's law, e = -N dΦ/dt, alongside Fleming's right-hand
+    rule), its characteristic output (the sinusoidal waveform), and the
+    energy conversion (mechanical to electrical) - naming all of these
+    briefly lets `illustration_style: "textbook"`'s own multi-panel
+    composition (see its own guidance) show each as its own clearly
+    labelled panel, instead of one generic single scene. A genuinely
+    single-facet topic (a single cell, a single simple tool) should stay
+    exactly that - one plain, accurate description, never artificially
+    split into facets it doesn't have, and a key-takeaways facet in
+    particular must never be added just to pad out a panel count - only
+    when the topic has a real, distinct "what to remember" beyond what the
+    other facets already show. This is about making ONE image's own
+    `image_prompt` reflect the real richness of what it depicts - it does
+    not change the separate rule above about splitting a chapter's
+    distinct apparatuses/devices across their own separate picture blocks.
+    Identify every real label
     this specific apparatus genuinely needs to be understood (component
     names, vector/quantity symbols like "B", "n̂", "+"/"-", direction
     arrows) and set them in `image_expected_labels` (see below) - do not
@@ -952,6 +961,16 @@ How to produce blocks:
   * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
     the relationships is enough (an abstract system, an organisation, a
     reaction pathway) and there's no real physical arrangement to draw.
+    NOT for a correspondence between two PARALLEL LISTS where each pairing
+    has no real named relationship beyond "matches"/"covers"/a rating (e.g.
+    "which external source/reference covers which topic", "which resource
+    belongs to which category") - a confirmed real failure: a block asking
+    for "which external resource maps to which topic, with a coverage
+    badge per pairing" was requested as concept_map and produced zero
+    usable nodes/edges, because there is no actual relationship to label,
+    only a flat lookup. That shape is `diagram_kind: comparison` (one card
+    per item, its matched counterpart and rating as plain fields on the
+    card) instead.
   * `diagram_kind: hierarchy` for a strict parent/child breakdown, and
     `diagram_kind: comparison` for two or more things compared side by side.
   * `diagram_kind: pyramid` for LEVELS of importance/priority/foundation
@@ -1851,6 +1870,33 @@ Rules:
   content has this shape, pick only the 1-2 branches that matter most
   rather than enumerating every one, or keep the merge implicit in prose
   instead of drawing every path back to a shared node explicitly.
+- To turn an EXISTING non-image block (a paragraph, a list, a quote - even
+  another diagram) INTO an image ("convert this into an image", "turn this
+  into a diagram"), use `replace_block` with a fresh `image` block as the
+  replacement `content` - the same `NewBlock` payload shape `insert_block`
+  already uses (`kind`/`diagram_kind`/`illustration_style`/`purpose`/
+  `prompt`/`caption` all go inside `content`, exactly as described above).
+  This is not a new mechanism to invent - `replace_block` already feeds a
+  path-less image block into the same generation/QA/retry/Best-Candidate-
+  Tracking pipeline insert_block and replace_image do, automatically. Build
+  `purpose`/`prompt`/`caption` FROM the selected block's own actual content
+  (its real text/steps/labels/numbers) - never a generic placeholder like
+  "an image representing this section" or "a diagram of the topic above";
+  quote or closely paraphrase the real specifics so the result genuinely
+  depicts THIS content, not a vague stand-in for it. Run the EXACT same
+  kind/diagram_kind classification check already described above for
+  replace_image against what the selected content actually describes, not
+  against its container type: prose that lays out a sequential procedure,
+  a decision, or a repeating cycle (e.g. "first do X, then Y, then if Z
+  either A or B") gets `kind: "diagram"` with the matching diagram_kind
+  (flow_chart/process/decision_tree/cycle - same node/branch-count
+  discipline as above) or `kind: "concept_experience"` for the qualifying
+  technical-topic cases, never flattened into a plain illustration just
+  because the source happened to be prose. Leave `path` unset on the new
+  block - the server generates the real image the same way it does for any
+  other new image block, and the existing picture (if the old block
+  already was one) is simply discarded along with it, like any other
+  block replacement.
 - update_style may only set presentation keys: font_size, font_weight, color,
   background, align, italic, padding, border_radius, border_color, line_height.
 - Never invent a block_id. Use only ids that appear in the context below.

@@ -72,12 +72,80 @@ _MIN_CONFIDENT_CONFIDENCE = 40.0
 # A near-miss must be close enough to be plausibly the SAME intended word
 # gone wrong (a garbled rendering), not merely similar-looking vocabulary -
 # below this ratio, two words are just different, not "the same word
-# misspelled", and are never compared at all.
+# misspelled", and are never compared at all. Applies to `expected_label`-
+# sourced ground truth - a block's own declared labels are deliberately
+# curated (a human/writer chose exactly these words for this image), so a
+# 0.55 near-miss there is trustworthy evidence of real garbling, not
+# coincidence (confirmed real case: "Oucupy" vs "Occupy", ratio 0.83).
 _NEAR_MISS_MIN_RATIO = 0.55
+# `source_text`-sourced ground truth is NOT curated the same way - it is
+# every sufficiently-long word anywhere in the image's own chapter/section
+# prose (see `chapter_section_context`'s own docstring on why that's the
+# right scope for the SEPARATE source-grounding/contradiction check this
+# module's ground truth is borrowed from), which can and does contain
+# several genuinely different sentences about different sub-points. A real,
+# confirmed false positive (live production course, "Motional Emf
+# Derivation"): the real label "present" (from "No battery present...", a
+# correct, legitimate expected_labels-shaped string already confirmed
+# correct elsewhere on the image) was compared against "release" - a real
+# word, but from a completely unrelated sentence two paragraphs earlier
+# ("if you release a charge..."). Both pairs happen to share
+# `_NEAR_MISS_MIN_RATIO`'s floor exactly (0.571), the SAME ratio as the
+# earlier-fixed "rings"/"terminals" coincidence - but this one isn't a
+# coverage problem (OCR genuinely read "present" just fine), so the
+# coverage fix above cannot catch it. A stricter floor for this specific,
+# less-trustworthy ground-truth source closes it without affecting the
+# curated `expected_labels` pool at all - every existing confirmed real
+# near-miss sourced from source_text ("oucupy" vs "occupy", ratio 0.83)
+# clears this comfortably; "present" vs "release" (0.571) does not.
+_NEAR_MISS_MIN_RATIO_SOURCE_TEXT = 0.72
 # At or above this ratio the words are considered the same (OCR noise only,
 # e.g. a stray comma Tesseract attached) - never flagged, since there is no
 # real discrepancy to report.
 _EXACT_MATCH_MIN_RATIO = 0.97
+
+# Trivial suffix variants (plain singular/plural - "force"/"forces",
+# "voltage"/"voltages") are NOT a text defect; they are two equally-correct
+# words, and treating one as "wrong" because the OTHER happens to appear
+# verbatim in the source prose is exactly as confirmed, real, and wrong as
+# the cases above (same live course: "force" flagged against source text's
+# "forces", ratio 0.91; "voltage" against "voltages", ratio 0.93 - both
+# comfortably clear every similarity floor above, so only an explicit
+# suffix-aware equality check - not a stricter ratio - can catch this
+# class). Deliberately just a trailing "s"/"es" strip, not real stemming or
+# a new NLP dependency - this module's whole philosophy (see module
+# docstring) is "small, deterministic, dependency-free, conservative";
+# matching the exact two confirmed real cases is enough, not an attempt at
+# a general English pluralization engine.
+def _singular_plural_equivalent(a: str, b: str) -> bool:
+    if a == b or len(a) < 3 or len(b) < 3:
+        return False
+    return a + "s" == b or b + "s" == a or a + "es" == b or b + "es" == a
+
+# Real, confirmed false-positive case (live verification run, a dense
+# 3-panel AC-generator illustration): Tesseract detected only a small
+# fraction of the actual visible text - several real, correctly-spelled
+# labels ("Terminals", "Rotation") were never read at all, not misread.
+# Because those labels were simply absent from OCR's own output, the near-
+# miss search compared them against unrelated OCR words that happened to
+# clear `_NEAR_MISS_MIN_RATIO` by a small margin ("rings" vs "terminals",
+# 0.571) - a stray, unrelated word standing in as "evidence" that a
+# perfectly good label was wrong. The fix: before trusting ANY near-miss
+# verdict, confirm OCR's overall coverage of this image was substantial
+# enough that "if a label's text were really there, OCR would likely have
+# found something near it" is a reasonable inference. Below this ratio -
+# `len(ocr_result.words)` (ALL raw detections, unfiltered - a genuine
+# measure of how much OCR activity happened on this image, independent of
+# whether any of it was useful for matching) against the total word-count
+# across every ground-truth phrase being checked - near-miss matching is
+# skipped entirely for this call; every missing label stays UNCERTAIN
+# (no finding), never guessed at from an incomplete word pool. Deliberately
+# NOT based on how many labels were successfully matched (that would be
+# circular - a single genuinely-misspelled label with nothing else to check
+# against always looks like "0% confirmed" even when OCR read it perfectly
+# fine, just wrong - confirmed via `test_misspelled_declared_label_is_
+# confirmed`'s own real numbers, which must keep working unchanged).
+_MIN_COVERAGE_RATIO = 0.5
 
 # Small, deliberately conservative allowlist of legitimate scientific
 # terminology/units/symbol-names that must never be treated as a mismatch
@@ -266,7 +334,19 @@ def find_ground_truth_mismatches(
     - A token matching `SCIENTIFIC_TERM_ALLOWLIST` is never treated as a
       mismatch, even as a "near miss" of some other word.
     - An OCR word with confidence below `_MIN_CONFIDENT_CONFIDENCE` is
-      never used to confirm a mismatch (stays silent, not flagged)."""
+      never used to confirm a mismatch (stays silent, not flagged).
+    - Sparse overall OCR coverage for this image (see `_MIN_COVERAGE_
+      RATIO`) suppresses near-miss matching entirely - a label OCR never
+      detected at all must never be "confirmed wrong" via a coincidentally
+      similar, unrelated word from elsewhere on the image.
+    - A plain singular/plural variant of the exact ground-truth word is
+      never a mismatch (see `_singular_plural_equivalent`).
+    - `source_text`-sourced ground truth (incidentally extracted from the
+      image's chapter/section prose, not curated per-block the way
+      `expected_labels` is) requires a stricter near-miss floor than
+      `expected_labels` (see `_NEAR_MISS_MIN_RATIO_SOURCE_TEXT`) - a
+      coincidental lexical similarity to an unrelated word elsewhere in
+      that prose is not evidence of garbling."""
     if not expected_labels and not source_text.strip():
         return []
 
@@ -281,6 +361,18 @@ def find_ground_truth_mismatches(
             if normalized and len(normalized) >= 4 and not _is_formula_like(raw_word):
                 ground_truth.append((normalized, "source_text"))
     if not ground_truth:
+        return []
+
+    # OCR coverage check (false-positive fix - see `_MIN_COVERAGE_RATIO`'s
+    # own docstring for the real case this closes): if OCR's total detected-
+    # word count is small relative to how much text this image is expected
+    # to carry, a "missing" label is far more likely "OCR never looked here
+    # closely enough" than "confirmed garbled" - stay silent on every
+    # near-miss for this call rather than let a coincidentally-similar,
+    # unrelated leftover word stand in as evidence.
+    expected_word_count = sum(len(normalized.split()) for normalized, _ in ground_truth)
+    actual_word_count = len(ocr_result.words)
+    if expected_word_count and (actual_word_count / expected_word_count) < _MIN_COVERAGE_RATIO:
         return []
 
     ocr_words = [
@@ -300,13 +392,27 @@ def find_ground_truth_mismatches(
         if normalized_truth in ocr_normalized_set or normalized_truth in ocr_full_text:
             seen_ground_truth.add(normalized_truth)
             continue
+        # A plain singular/plural variant (or vice versa) of this exact
+        # ground-truth word anywhere in OCR's output is NOT a mismatch - two
+        # equally-correct words, never flagged (see `_singular_plural_
+        # equivalent`'s own docstring for the confirmed real case this
+        # closes). Checked before the fuzzy search below so it short-
+        # circuits regardless of which ratio floor would otherwise apply.
+        if any(_singular_plural_equivalent(normalized_truth, _normalize(w.text)) for w in ocr_words):
+            seen_ground_truth.add(normalized_truth)
+            continue
         best_word: OcrWord | None = None
         best_ratio = 0.0
         for ocr_word in ocr_words:
             ratio = difflib.SequenceMatcher(None, normalized_truth, _normalize(ocr_word.text)).ratio()
             if ratio > best_ratio:
                 best_ratio, best_word = ratio, ocr_word
-        if best_word is None or best_ratio < _NEAR_MISS_MIN_RATIO or best_ratio >= _EXACT_MATCH_MIN_RATIO:
+        # `source_text`-derived ground truth is incidentally extracted, not
+        # curated like `expected_labels` - see `_NEAR_MISS_MIN_RATIO_SOURCE_
+        # TEXT`'s own docstring for the confirmed real false positive
+        # ("present" vs "release") a shared, lower floor let through.
+        near_miss_floor = _NEAR_MISS_MIN_RATIO_SOURCE_TEXT if source == "source_text" else _NEAR_MISS_MIN_RATIO
+        if best_word is None or best_ratio < near_miss_floor or best_ratio >= _EXACT_MATCH_MIN_RATIO:
             # Either nothing plausibly close exists (OCR may simply have
             # missed this label entirely - inconclusive, not a mismatch),
             # or it's close enough to be noise, not a real discrepancy.

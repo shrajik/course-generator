@@ -25,8 +25,11 @@ fallback image sharing one generic, chapter-wide prompt across several
 structurally-unrelated blocks). Two outcomes only:
 
 1. The spec is genuinely unusable (no usable structure, a generation/
-   rendering exception, confirmed garbled/misspelled text) -> the image is
-   WITHHELD entirely (see `_withhold_structured_diagram`), the same
+   rendering exception, confirmed garbled/misspelled text) OR the rendered
+   geometry has a CRITICAL defect that could mislead about what connects
+   to what, or renders part of the diagram invisible/unverifiable (see
+   `_CRITICAL_RENDER_ISSUE_KINDS`) -> the image is WITHHELD entirely (see
+   `_withhold_structured_diagram`), the same
    `omitted_after_qa_failure`/blocker-severity state `ImageService`'s own
    illustration path already uses for its equivalent case. Never a
    fabricated replacement picture just to avoid shipping nothing.
@@ -88,6 +91,30 @@ MAX_BRIEF_CHARS = 2000
 # wasn't always enough. Bounded, not unlimited: a persistently-failing spec
 # still falls back after this many tries, same as before.
 _MAX_CONTENT_QA_RETRIES = 2
+
+# Conditional-shipping policy fix (structured-diagram parity with the
+# illustration path's same-day fix): most of `validate_rendered_svg`'s
+# issue kinds are genuine but COSMETIC - a reader can still correctly tell
+# which label belongs to which node/edge, just with imperfect visual
+# polish (`shared_edge_segment`, `label_overlaps_node`/`label_overlaps_
+# label`, `duplicate_arrowhead_side`, `text_overflows_node`, `font_below_
+# minimum`, `text_too_small_after_scaling`, `excessive_whitespace`,
+# `edge_collinear_with_node_border`, `node_overlap`) - these keep the
+# existing, unchanged "ship anyway, flagged `rendered_with_unresolved_
+# issues`" treatment. `edge_crosses_node` is different in kind, not just
+# degree: an edge visually passing THROUGH an unrelated node's box is
+# exactly the "edges pointing to the wrong things" case that can make a
+# reader genuinely misread which nodes a connection is actually between -
+# a correctness problem, not a layout imperfection. `out_of_canvas` means
+# part of the diagram is literally invisible (missing information, not
+# merely untidy). `unparseable_svg` means this check could not even
+# verify the rendered output at all - never silently trusted either way,
+# same "never ship something unverified" principle `ImageService.
+# _scientific_check_failed`'s own `errored` case already applies. These
+# three force withholding after the existing corrective retry, the same
+# way `is_usable()`/confirmed garbled text already do - never downgraded
+# to a quality flag.
+_CRITICAL_RENDER_ISSUE_KINDS = frozenset({"edge_crosses_node", "out_of_canvas", "unparseable_svg"})
 
 DIAGRAM_SYSTEM = """\
 You are two experts working as one: a professor who is a genuine
@@ -684,6 +711,8 @@ def _diagram_user_prompt(
     pin_kind: bool = False,
     qa_feedback: str = "",
     existing_outline: dict | None = None,
+    template_audience: str = "",
+    template_style: str = "",
 ) -> str:
     brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
     section = prompts.memory_section(memory)
@@ -705,12 +734,43 @@ def _diagram_user_prompt(
         if existing_outline
         else ""
     )
+    # Audience/style propagation fix: same uploaded-template free text
+    # already threaded into image_service.py's build_prompt - never a
+    # hardcoded audience branch, passed through verbatim so label
+    # verbosity/terminology level follows whatever THIS template's own
+    # author actually wrote.
+    #
+    # Follow-up strengthening fix (same reasoning as build_prompt's own
+    # template_guidance_line): a mild, passive restatement produced only a
+    # moderate real difference between a young-learner and a senior-
+    # professional template. This is now a firm, directive instruction to
+    # actively derive concrete labelling decisions from the template's own
+    # text - the two example sentences describe HOW to translate an
+    # audience into labels in general terms, never naming a specific
+    # audience category, so it still generalises to any uploaded template.
+    audience_bits = []
+    if template_audience.strip():
+        audience_bits.append(f"audience = \"{template_audience.strip()[:300]}\"")
+    if template_style.strip():
+        audience_bits.append(f"style requirement = \"{template_style.strip()[:400]}\"")
+    audience_block = (
+        "\nFIRM REQUIREMENT, not a minor suggestion - this course's own template specifies "
+        + " and ".join(audience_bits) + ". You must deliberately adapt label wording, "
+        "terminology level and node/connector detail to match this exact audience and style - "
+        "a generic, one-size-fits-all diagram that ignores it is a failure of this brief. "
+        "A younger or less technical audience needs noticeably simpler, plainer labels and "
+        "fewer/coarser-grained nodes; a more advanced or technical audience needs noticeably "
+        "more precise terminology and finer-grained, denser labelling - apply whichever "
+        "direction this template's own text above actually calls for.\n"
+        if audience_bits
+        else ""
+    )
     return f"""\
 COURSE: {course_title}
 
 VISUAL BRIEF:
 {brief or "(not specified)"}
-{requested}{memory_block}{feedback_block}{current_block}
+{requested}{memory_block}{feedback_block}{current_block}{audience_block}
 Produce the diagram specification for this visual.{pin}
 """
 
@@ -1000,6 +1060,8 @@ class DiagramService:
         block_id: str,
         qa_feedback: str = "",
         existing_outline: dict | None = None,
+        template_audience: str = "",
+        template_style: str = "",
     ) -> DiagramSpec:
         return await self.ai.structured(
             schema=DiagramSpec,
@@ -1014,6 +1076,8 @@ class DiagramService:
                 pin_kind=pin_kind,
                 qa_feedback=qa_feedback,
                 existing_outline=existing_outline,
+                template_audience=template_audience,
+                template_style=template_style,
             ),
             model=self.settings.diagram_model,
             purpose=f"diagram:{block_id}",
@@ -1048,6 +1112,8 @@ class DiagramService:
         memory_text: str,
         kind_hint: str,
         block_id: str,
+        template_audience: str = "",
+        template_style: str = "",
     ) -> DiagramSpec:
         """Turn semantic shapes into real coordinates and run the combined
         blueprint/geometry/composition quality gate; on failure, ONE retry
@@ -1069,6 +1135,7 @@ class DiagramService:
                 purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
                 memory=memory_text, kind_hint=kind_hint or "schematic", pin_kind=True,
                 block_id=block_id, qa_feedback=result.feedback(),
+                template_audience=template_audience, template_style=template_style,
             )
             retried = self._normalise(retried)
         except Exception as exc:  # noqa: BLE001 - keep the first attempt, don't fail the block
@@ -1097,6 +1164,12 @@ class DiagramService:
         prompt = str(content.get("prompt") or "")
         caption = str(content.get("caption") or "")
         kind_hint = str(content.get("diagram_kind") or "").strip().lower().replace(" ", "_")
+        # Audience/style propagation fix: the uploaded template's own stated
+        # audience/image_guidance, threaded through every `_request_spec`
+        # call below (initial + every retry) - never a hardcoded audience
+        # branch, just the template author's own free text passed through.
+        template_audience = getattr(template, "audience", "") or ""
+        template_style = getattr(template, "image_guidance", "") or ""
         if not (purpose.strip() or prompt.strip()):
             log.warning(
                 "Diagram block %s has no purpose/prompt - withholding rather than falling back to "
@@ -1231,6 +1304,7 @@ class DiagramService:
                 purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
                 memory=memory_text, kind_hint=kind_hint, pin_kind=False, block_id=block.id,
                 existing_outline=existing_outline,
+                template_audience=template_audience, template_style=template_style,
             )
         except Exception as exc:  # noqa: BLE001 - withhold rather than fall back to illustration
             log.warning("Diagram spec generation failed for %s: %s", block.id, exc)
@@ -1304,6 +1378,7 @@ class DiagramService:
                     purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
                     memory=memory_text, kind_hint=retry_kind_hint, pin_kind=True, block_id=block.id,
                     qa_feedback=" ".join(feedback_parts), existing_outline=existing_outline,
+                    template_audience=template_audience, template_style=template_style,
                 )
                 corrected = self._normalise(corrected)
                 corrected_count = len([n for n in corrected.nodes if n.label.strip()])
@@ -1389,6 +1464,7 @@ class DiagramService:
                         "never a generic placeholder - and cover every concept the brief named."
                     ),
                     existing_outline=existing_outline,
+                    template_audience=template_audience, template_style=template_style,
                 )
                 retried = self._normalise(retried)
                 if retried.normalised_kind() != spec.normalised_kind() or not retried.is_usable():
@@ -1492,6 +1568,7 @@ class DiagramService:
             spec = await self._resolve_and_check_schematic(
                 spec, purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
                 memory_text=memory_text, kind_hint=kind_hint, block_id=block.id,
+                template_audience=template_audience, template_style=template_style,
             )
 
         spec = _with_figure_caption(spec, block)
@@ -1576,6 +1653,7 @@ class DiagramService:
                         "out cleanly."
                     ),
                     existing_outline=existing_outline,
+                    template_audience=template_audience, template_style=template_style,
                 )
                 retried = self._normalise(retried)
                 if retried.normalised_kind() == spec.normalised_kind() and retried.is_usable():
@@ -1587,11 +1665,36 @@ class DiagramService:
             except Exception as exc:  # noqa: BLE001 - keep the first render, don't fail the block
                 log.warning("Diagram render-QA retry failed for %s: %s", block.id, exc)
 
+        # Conditional-shipping policy fix: split the remaining render-QA
+        # issues (if any survived the corrective retry above) into critical
+        # (never shippable - see `_CRITICAL_RENDER_ISSUE_KINDS`'s own
+        # comment) and cosmetic. Critical issues withhold, the same
+        # treatment `is_usable()`/confirmed-garbled-text already get -
+        # structurally unable to be downgraded to a quality flag.
+        critical_render_issues = [issue for issue in issues if issue.kind in _CRITICAL_RENDER_ISSUE_KINDS]
+        issues = [issue for issue in issues if issue.kind not in _CRITICAL_RENDER_ISSUE_KINDS]
+        if critical_render_issues:
+            log.info(
+                "Diagram for %s still has a critical rendered-geometry issue after retry (%s) - "
+                "withholding rather than shipping a diagram that could mislead about what connects "
+                "to what, or publishing unverifiable/invisible content",
+                block.id, [issue.kind for issue in critical_render_issues],
+            )
+            critical_render_findings = visual_qa_finding_entries(
+                [(issue.kind, issue.detail, True) for issue in critical_render_issues],
+                resolution="image_withheld_after_qa_failure",
+            )
+            _withhold_structured_diagram(
+                block,
+                detail="; ".join(f["detail"] for f in critical_render_findings)[:300],
+                extra_findings=critical_render_findings,
+            )
+            return True
         # Visual-generation policy fix: a structured diagram kind must never
         # fall back to an unrelated AI illustration, even when its rendered
-        # geometry still has issues after one corrective retry (an edge
-        # sharing a segment with another, a duplicate arrowhead, an edge
-        # crossing a node). The diagram is still a real, correctly-shaped,
+        # geometry still has COSMETIC issues after one corrective retry (an
+        # edge sharing a segment with another, a duplicate arrowhead, an
+        # overlapping label). The diagram is still a real, correctly-shaped,
         # legible answer to the brief - a layout imperfection, not a reason
         # to discard it for a textless, unrelated picture - so it ships
         # anyway, flagged `major` (`rendered_with_unresolved_issues`, same
@@ -1600,8 +1703,8 @@ class DiagramService:
         # module already gives every other recoverable QA issue.
         if issues:
             log.info(
-                "Diagram for %s still has %s rendered layout issue(s) after retry - shipping anyway, "
-                "flagged for review, rather than falling back to an unrelated AI illustration",
+                "Diagram for %s still has %s cosmetic rendered layout issue(s) after retry - shipping "
+                "anyway, flagged for review, rather than falling back to an unrelated AI illustration",
                 block.id, len(issues),
             )
 
