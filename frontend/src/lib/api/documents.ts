@@ -191,6 +191,22 @@ export function exportedPdfDownloadUrl(documentId: string): string {
   return apiUrl(`/api/documents/${documentId}/export/pdf/download`);
 }
 
+/** Same request/response shape as generateExportedPdf, for the PPTX export
+ * path (backend/app/services/pptx_service.py) - one real PowerPoint deck,
+ * one slide per page. */
+export function generateExportedPptx(documentId: string): Promise<{ size_bytes: number }> {
+  return request(`/api/documents/${documentId}/export/pptx`, {
+    method: "POST",
+    query: { download: false },
+  });
+}
+
+/** Same native-browser-download reasoning as exportedPdfDownloadUrl, for the
+ * already-exported PPTX. */
+export function exportedPptxDownloadUrl(documentId: string): string {
+  return apiUrl(`/api/documents/${documentId}/export/pptx/download`);
+}
+
 /** API-relative path for a document-relative asset such as "assets/image_001.png". */
 export function assetPath(documentId: string, path: string | null | undefined): string | null {
   if (!path) return null;

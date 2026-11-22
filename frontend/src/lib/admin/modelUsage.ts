@@ -26,3 +26,13 @@ export function summarizeModelUsage(calls: AdminModelUsageRecord[]): ModelUsageS
     { totalCalls: 0, totalInputTokens: 0, totalOutputTokens: 0, failedCount: 0, fallbackCount: 0 },
   );
 }
+
+/** ₹1,234.56 - the one place this formatting is defined, so every cost
+ * figure in the admin UI (the summary line, the breakdown list, the
+ * per-call table) looks identical. `null` (an unpriced model - see
+ * AdminModelUsageRecord.cost_inr) renders as an em dash, never "₹0", so an
+ * unknown cost is never visually indistinguishable from a real zero. */
+export function formatInr(amount: number | null): string {
+  if (amount === null) return "—";
+  return `₹${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}

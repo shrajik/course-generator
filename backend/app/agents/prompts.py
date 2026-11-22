@@ -859,18 +859,39 @@ How to produce blocks:
     subject. A labelled-box schematic (a cell and its organelles, a magnet
     and a coil, a titration setup, an orbit, a mechanical assembly, any
     experimental apparatus) now ALWAYS goes through `image_kind:
-    illustration` with `illustration_style: textbook` instead (describe the
-    exact setup/components in `image_prompt`) - this applies to every
+    illustration` with full, accurate, labelled treatment instead (describe
+    the exact setup/components in `image_prompt`) - this applies to every
     subject alike, biology/life-science included; there is no longer a
     subject split here, `schematic` is simply never the right choice for
-    anything. The renderer itself now rejects any `schematic` spec
+    anything. Which `illustration_style` delivers that labelled treatment
+    is an AUDIENCE choice, not a subject choice: `illustration_style:
+    "textbook"` by default, or `illustration_style: "playful_infographic"`
+    instead of it (never in addition to it, and never dropping the labels)
+    when this course's own audience context genuinely reads as young/early
+    learners (see that style's own guidance further below) - a kids-
+    audience apparatus/mechanism still needs every real component and
+    direction correctly named, exactly as firmly as a technical-audience one
+    does, just presented as a warm cartoon-mascot infographic instead of a
+    flat-vector technical illustration. Do not let "this is a real
+    apparatus" alone default you to `textbook` regardless of audience, and
+    do not let "the audience is young" alone tempt you to drop or soften the
+    labelling - both signals apply together here, not one overriding the
+    other. Example: a wheel-and-axle lifting a cart is real apparatus either
+    way. For an advanced/professional audience, draw it `textbook` style
+    with precise labels. For a young/kids audience, draw the SAME
+    wheel-and-axle as `playful_infographic` instead - a friendly
+    illustration with a simple mascot character nearby, bright colors, and
+    the exact same accurate labels (Wheel, Axle, Effort, Load) in labelled
+    callout boxes. The subject (wheel-and-axle) does not change which style
+    to use - only the stated audience does. The renderer itself now rejects any `schematic` spec
     unconditionally regardless of what gets requested, so setting it only
     wastes a generation attempt before falling back to illustration anyway -
-    go straight there. Routing it to `illustration` does NOT make its
+    go straight to whichever of the two labelled illustration styles this
+    audience calls for. Routing it to `illustration` does NOT make its
     labels optional - the rule above (every mechanism needs a labelled
     diagram showing every relevant component and the direction of motion/
-    force/current/flow) still applies in full; `schematic` just isn't the
-    renderer that satisfies it here. A real, confirmed failure mode: an
+    force/current/flow) still applies in full, under EITHER style;
+    `schematic` just isn't the renderer that satisfies it here. A real, confirmed failure mode: an
     illustration for "magnetic flux through a surface" shipped with
     unlabelled arrows and no indication of which one was B, which was the
     surface normal, or which direction was positive - technically a clean
@@ -958,6 +979,24 @@ How to produce blocks:
     known reference formulas for mathematical correctness, something
     `image_expected_labels` alone (spelling only) can never catch. Leave it
     blank when the picture has no governing equation at all.
+  * `illustration_style: "playful_infographic"` instead of `"textbook"` when
+    THIS course's own propagated audience/style context above (see TARGET
+    AUDIENCE and any template-level audience/style requirement already given
+    to you elsewhere in this brief) genuinely reads as young/early learners
+    or a general, non-technical reader - never a hardcoded keyword match,
+    judge it the same way you already judge tone/vocabulary for the rest of
+    the chapter's prose. This produces a warm cartoon-mascot infographic
+    (a friendly character, bold rounded color-coded boxes, curved arrows,
+    a labelled bottom summary strip) instead of the flat-vector technical
+    look - set `image_expected_labels` exactly the same way as for
+    `"textbook"` (short, plain, everyday-word labels only - no dense
+    technical term, multi-clause phrase or formula notation in any entry for
+    this style). Never choose it for a technical/professional/advanced
+    audience, and never choose it just because a picture happens to have few
+    labels - it is an audience-driven style choice, never a fallback for a
+    sparse brief. The concept itself must still be depicted accurately - a
+    playful presentation, never a distorted or simplified-to-the-point-of-wrong
+    one.
   * `diagram_kind: concept_map` when a labelled-boxes-and-arrows diagram of
     the relationships is enough (an abstract system, an organisation, a
     reaction pathway) and there's no real physical arrangement to draw.
@@ -1792,9 +1831,19 @@ Rules:
   `schematic`, permanently retired for every subject including biology/
   life-science: a cell, a plant, an organ, a magnet, an apparatus, a
   molecule, an orbit, a mechanical assembly all always get `kind:
-  "illustration"` with `illustration_style: "textbook"` instead, even for a
+  "illustration"` with full, accurate labelled treatment instead, even for a
   simple static object - this is a firm preference from real generated
-  courses, not a style suggestion,
+  courses, not a style suggestion. Which `illustration_style` delivers that
+  labelled treatment is an audience choice, not a subject choice:
+  `"textbook"` by default, or `"playful_infographic"` instead of it (same
+  labelling rigor, never dropped) when this course's own audience context
+  genuinely reads as young/early learners - a real apparatus for a kids
+  audience still needs every component correctly named, just as a warm
+  cartoon-mascot infographic rather than a flat-vector technical one (e.g. a
+  wheel-and-axle lifting a cart: `textbook` with precise labels for an
+  advanced audience, the SAME wheel-and-axle as `playful_infographic` with a
+  mascot and the same labels - Wheel, Axle, Effort, Load - for a kids
+  audience; the subject never changes which style, only the audience does),
   concept_map for an abstract structure's components and how they relate,
   hierarchy, comparison, smart_art, data_flow_diagram for a system/pipeline
   walkthrough needing distinct external-caller/data-store shapes, er_diagram
@@ -1870,12 +1919,29 @@ Rules:
   content has this shape, pick only the 1-2 branches that matter most
   rather than enumerating every one, or keep the merge implicit in prose
   instead of drawing every path back to a shared node explicitly.
-- To turn an EXISTING non-image block (a paragraph, a list, a quote - even
-  another diagram) INTO an image ("convert this into an image", "turn this
-  into a diagram"), use `replace_block` with a fresh `image` block as the
-  replacement `content` - the same `NewBlock` payload shape `insert_block`
-  already uses (`kind`/`diagram_kind`/`illustration_style`/`purpose`/
-  `prompt`/`caption` all go inside `content`, exactly as described above).
+- To turn an EXISTING non-image block (a paragraph, a list, a quote) INTO an image
+  ("convert this into an image", "turn this into a diagram"), use
+  `replace_block` with a fresh `image` block as the replacement `content` -
+  the same `NewBlock` payload shape `insert_block` already uses
+  (`kind`/`diagram_kind`/`illustration_style`/`purpose`/`prompt`/`caption`
+  all go inside `content`, exactly as described above).
+  If the SELECTED block's `type` is already "image" (an existing
+  illustration, diagram, or concept_experience) and the instruction asks to
+  convert/turn/redo/regenerate it into an image again - even using "convert
+  this into an image" wording rather than "regenerate"/"replace"/"redo" - use
+  `replace_image`, not `replace_block`: this is the exact same request as the
+  `replace_image` regenerate case above, just phrased as a conversion, and it
+  must re-run the full kind/diagram_kind classification check the same way.
+  A real, confirmed bug this closes: re-issuing "convert this into an image"
+  on a block that is already an image (e.g. a comparison diagram the first
+  conversion produced) used to return ZERO operations - neither rule
+  recognised it ("convert into an image" was only described for a non-image
+  source; "regenerate/replace/redo" was only described for that wording) -
+  which surfaced to the user as a dead-end "no applicable operations" error
+  instead of actually doing something. Never leave this instruction with no
+  operation at all: always resolve it to either `replace_image` (most cases)
+  or `replace_block` (only when the instruction also changes the block's
+  fundamental type away from an image, e.g. back to plain text).
   This is not a new mechanism to invent - `replace_block` already feeds a
   path-less image block into the same generation/QA/retry/Best-Candidate-
   Tracking pipeline insert_block and replace_image do, automatically. Build
@@ -1912,6 +1978,7 @@ def editor_user(
     instruction: str,
     *,
     audience: str = "",
+    force_illustration_override: bool = False,
 ) -> str:
     import json
 
@@ -1924,6 +1991,19 @@ def editor_user(
             "style": block.style.model_dump(exclude_none=True),
         }
 
+    override_note = (
+        """
+EXPLICIT OVERRIDE: the wording above explicitly asks for a real/actual/
+photographic/AI-generated picture, not a structured diagram or chart - for
+THIS instruction only, set kind: "illustration" (illustration_style per the
+audience rule) regardless of whether the content could otherwise be
+classified as comparison/flow_chart/hierarchy/concept_map/smart_art-shaped.
+Do not route this one to kind: "diagram" or "concept_experience".
+"""
+        if force_illustration_override
+        else ""
+    )
+
     return f"""\
 COURSE TITLE: {document_title}
 TEMPLATE KIND: {template.kind}
@@ -1932,6 +2012,7 @@ ALLOWED BLOCK TYPES: {", ".join(bt.value for bt in template.allowed_block_types)
 
 USER INSTRUCTION:
 {instruction}
+{override_note}
 
 SELECTED BLOCKS (these are what you may modify):
 {json.dumps([describe(b) for b in selected], ensure_ascii=False)[:40000]}

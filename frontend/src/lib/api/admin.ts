@@ -129,8 +129,12 @@ export function getAdminCourse(courseId: string): Promise<AdminCourse> {
 
 /** One real AI call made while generating a course - mirrors
  * backend/app/schemas/admin.py's ModelUsageRecord exactly (MOM Phase 2.2 -
- * AI Model Transparency). No cost field exists on the backend - tokens are
- * captured, never converted to a dollar figure, so none is shown here. */
+ * AI Model Transparency; cost fields added for real-₹-cost estimation -
+ * see backend/app/core/pricing.py). `cost_inr` is `null` when `model` has
+ * no entry in the backend's rate table (an unrecognised model, or
+ * MockAIClient's "mock") - never a fabricated 0. `cost_estimated` is true
+ * only for MAI-Image-2.6, whose real per-image cost can't be computed
+ * exactly from this app's own data (see pricing.py's own docstring). */
 export interface AdminModelUsageRecord {
   kind: string;
   purpose: string;
@@ -139,21 +143,34 @@ export interface AdminModelUsageRecord {
   seconds: number;
   input_tokens: number;
   output_tokens: number;
+  megapixels: number;
   retries: number;
   failed: boolean;
   used_fallback: boolean;
   timestamp: string;
+  cost_inr: number | null;
+  cost_estimated: boolean;
 }
 
 /** Mirrors AdminModelUsageResponse. `job_id` is null when this course has
  * never had a recorded generation run at all - distinct from a run that
- * made zero real AI calls, where `calls` is `[]` but `job_id` is set. */
+ * made zero real AI calls, where `calls` is `[]` but `job_id` is set.
+ * `by_model_inr`/`total_cost_inr` are a real sum of only the calls the
+ * backend could price - `has_unpriced_models` says plainly when that sum
+ * left something out, rather than presenting it as if it covered every
+ * call. `has_estimated_models` flags that at least one included call (always
+ * MAI-Image-2.6, if present) used a documented approximation, not an exact
+ * rate. */
 export interface AdminModelUsageResponse {
   course_id: string;
   job_id: string | null;
   run_state: string | null;
   run_created_at: string | null;
   calls: AdminModelUsageRecord[];
+  by_model_inr: Record<string, number>;
+  total_cost_inr: number;
+  has_unpriced_models: boolean;
+  has_estimated_models: boolean;
 }
 
 /** Takes the course's own `course_id` (e.g. "crs_abc123"), NOT its database

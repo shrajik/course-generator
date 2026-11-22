@@ -26,6 +26,7 @@ from app.core.concurrency import get_limiter
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 from app.core.metrics import phase as metrics_phase
+from app.course.blocks.normalizer import _reads_as_young_learner_audience
 from app.schemas.blocks import TEXTUAL_BLOCK_TYPES, BlockType, merge_content
 from app.schemas.document import Block, CourseDocument
 from app.schemas.template import CourseTemplate
@@ -185,7 +186,7 @@ _ACTIONABLE_FINDING_TYPES: dict[str, str] = {
     "off_topic_image": "did not depict the requested topic",
     "overlapping_or_illegible_labels": "had labels/callouts overlapping or illegible",
     "decorative_not_educational": "read as decorative rather than genuinely educational",
-    "textbook_style_not_followed": "did not follow the required flat 2D vector textbook style",
+    "textbook_style_not_followed": "did not follow the required illustration style",
     "contradicts_source_text": "contradicted the course's own text",
     "source_grounding_unsupported": "included a claim the course's own text doesn't address",
 }
@@ -531,6 +532,7 @@ def _assemble_prompt_with_priority(
 # itself, not just in `_assemble_prompt_with_priority`.
 _MANDATORY_PROMPT_MARKERS: dict[str, tuple[str, ...]] = {
     "textbook": ("CRITICAL FRAMING RULE",),
+    "playful_infographic": ("ACCURACY, NOT A LICENSE TO SIMPLIFY WRONG",),
     "section_intro": ("STRICT NO-TEXT RULE",),
     "": ("STRICT NO-TEXT RULE", "RELATIONSHIP DIRECTION MUST BE CORRECT"),
 }
@@ -565,6 +567,15 @@ def _validate_prompt_assembly(result: PromptAssemblyResult, *, style: str) -> li
 # keeping that path exactly as it was before this feature existed is the
 # lowest-risk choice).
 _WIKIMEDIA_EXCLUDED_STYLES = ("section_intro",)
+
+# Every illustration style whose whole job includes real, verified labels -
+# see `is_textbook`'s own comment at each of its two definitions below for
+# why this widened a previously textbook-only boolean rather than adding a
+# second, parallel flag: both styles need the same label-verification
+# provider/landscape-canvas/OCR treatment, just with their own distinct
+# visual guidance text (TEXTBOOK_ILLUSTRATION_GUIDANCE vs
+# PLAYFUL_INFOGRAPHIC_GUIDANCE above).
+_LABEL_BEARING_STYLES = ("textbook", "playful_infographic")
 # At most this many downloaded-and-vision-checked candidates per query -
 # the deterministic license/resolution/mime filter already did the cheap
 # elimination; this bounds how many AI vision calls one query can ever cost
@@ -973,6 +984,66 @@ SECTION_INTRO_ILLUSTRATION_GUIDANCE = (
     "icon standing in for it."
 )
 
+# Fixed (not per-template) guidance for a "playful_infographic" illustration -
+# see ImageContent.illustration_style. Picked by the WRITER itself (see
+# WRITER_SYSTEM) when the already-propagated course/template audience context
+# genuinely reads as young/early learners - never a hardcoded "if audience ==
+# 'kids'" branch in code, the model makes the same kind of judgement call
+# from free-text context it already makes for every other style/content
+# choice today. This is the labelled-infographic counterpart to `textbook`
+# (same label-verification/provider/landscape treatment - see `is_textbook`'s
+# own comment on why it also matches this style), never a text-free style
+# like the default/section_intro: a convincing young-learner infographic is
+# built FROM its labels (a mascot's dialogue-style call-outs, named category
+# boxes, a labelled summary strip), not despite them.
+PLAYFUL_INFOGRAPHIC_GUIDANCE = (
+    "STYLE, exactly: a warm, professionally-designed FLAT VECTOR cartoon "
+    "infographic for a young/early learner, the kind printed in a "
+    "children's educational book or a friendly e-learning app - never "
+    "photorealistic, never a 3D render, never muted/corporate in tone. "
+    "Bold, rounded shapes, bright saturated pastel colors, soft drop "
+    "shadows on cards/boxes only (never on the whole canvas).\n"
+    "MASCOT: include one simple, friendly flat-cartoon character (a person "
+    "or a relatable mascot) actively doing something that embodies the "
+    "concept (e.g. holding/choosing/comparing/building) - it is the visual "
+    "anchor the rest of the infographic connects to, not decoration.\n"
+    "TITLE: one large, bold, rounded-sans-serif title naming the concept at "
+    "the top of the image, in a single strong accent color.\n"
+    "LABELLED, COLOR-CODED BOXES: group the concept's real components/"
+    "categories into rounded-rectangle or simple-shape boxes, each a "
+    "distinct flat pastel color, each with a short bold label and (where "
+    "the concept has one) a small flat icon representing it - these boxes "
+    "must represent the concept's ACTUAL real parts/categories, never "
+    "generic filler.\n"
+    "CONNECTORS: thick, rounded, color-coded curved arrows (never thin "
+    "straight technical connector lines) linking the mascot to the boxes "
+    "and to each other, showing the real flow/relationship between them. "
+    "Small cloud or speech-bubble shaped callouts near the mascot, each "
+    "with a tiny icon and a short label, work well for a decision/thought/"
+    "feeling step in the concept.\n"
+    "SUMMARY STRIP: when the concept has a clear sequence or short "
+    "equation-like relationship (step + step + step = outcome), include one "
+    "horizontal strip near the bottom with small icons connected by '+'/'=' "
+    "and a short label under each icon, summarising the whole concept in "
+    "one visual line - omit this entirely when the concept has no such "
+    "natural sequence rather than forcing one.\n"
+    "LABELS: short, plain, everyday words only (2-4 words per label) - "
+    "never a dense technical term, a multi-clause phrase or any equation/"
+    "formula notation anywhere in this style. Every label must be spelled "
+    "correctly and fully legible, large enough for a young reader.\n"
+    "ACCURACY, NOT A LICENSE TO SIMPLIFY WRONG: the concept depicted must "
+    "still be factually correct - a playful, friendly presentation of the "
+    "real idea, never a distorted or misleading one just because the "
+    "audience is young. Never use this style for dense technical content "
+    "aimed at an advanced/professional audience, and never choose it just "
+    "because an image happens to have few declared labels - it is an "
+    "audience-driven style choice, not a fallback for a sparse brief.\n"
+    "FRAMING: every box, callout, arrow and the summary strip must sit with "
+    "clear margin inside the canvas - nothing touching or crossing any "
+    "edge. Landscape composition, generous spacing between boxes so nothing "
+    "crowds the mascot or another box."
+)
+
 
 class ImageService:
     def __init__(
@@ -1027,6 +1098,8 @@ class ImageService:
         style = (content.get("illustration_style") or "").strip().lower()
         if style == "textbook":
             style_guidance = TEXTBOOK_ILLUSTRATION_GUIDANCE
+        elif style == "playful_infographic":
+            style_guidance = PLAYFUL_INFOGRAPHIC_GUIDANCE
         elif style == "section_intro":
             style_guidance = SECTION_INTRO_ILLUSTRATION_GUIDANCE
         else:
@@ -1073,7 +1146,7 @@ class ImageService:
             sanitize_expected_labels(
                 [str(label).strip() for label in (content.get("expected_labels") or []) if str(label).strip()]
             )
-            if style == "textbook"
+            if style in _LABEL_BEARING_STYLES
             else []
         )
         labels_line = (
@@ -1425,7 +1498,7 @@ class ImageService:
 
     async def _verify_image_relevance(
         self, image: bytes, *, brief: str, course_title: str, textbook_style: bool = False,
-        source_excerpt: str = "",
+        source_excerpt: str = "", style: str = "textbook",
     ) -> ImageRelevanceCheck:
         """Does this generated image actually depict its own brief, and does
         it read as genuinely educational rather than purely decorative or
@@ -1442,9 +1515,13 @@ class ImageService:
         `textbook_style=True` adds a fourth judgment, `style_compliant` -
         see `ImageRelevanceCheck.style_compliant`'s own docstring for why
         this is the only check that can catch a MAI-Image-2.6 generation
-        drifting away from the required flat-vector textbook look (no
-        negative-prompt/style parameter exists at the API level to enforce
-        it instead).
+        drifting away from the required look (no negative-prompt/style
+        parameter exists at the API level to enforce it instead). `style`
+        (the real `illustration_style` value, defaulting to "textbook" for
+        every pre-existing caller) selects WHICH required look that
+        question describes - `textbook`'s flat-vector/no-photorealism
+        criteria are the wrong yardstick for a `playful_infographic`
+        image, whose whole brief is a warm cartoon mascot look.
 
         `source_excerpt` (Canonical Visual Spec milestone), when given, adds
         the source-grounding judgment (`contradicts_source_text`/
@@ -1456,15 +1533,26 @@ class ImageService:
         an empty `brief` already skips the whole call."""
         if not brief.strip():
             return ImageRelevanceCheck()
-        style_question = (
-            " (4) `style_compliant` - this image was required to be a flat 2D vector textbook "
-            "illustration (crisp line art, flat/simply-shaded colors, no photorealistic shading, "
-            "no 3D render, no soft studio lighting or glow, nothing cropped at or crowding the "
-            "canvas edge). Does it actually look that way? Answer false if it instead reads as "
-            "photorealistic, 3D-rendered, has a glow/gradient/dark background, or has any panel, "
-            "icon, label or text cut off at an edge."
-            if textbook_style else ""
-        )
+        if not textbook_style:
+            style_question = ""
+        elif style == "playful_infographic":
+            style_question = (
+                " (4) `style_compliant` - this image was required to be a warm flat-vector cartoon "
+                "infographic for a young learner: a friendly mascot character, bold rounded shapes, "
+                "bright pastel colors, labelled color-coded boxes connected by thick curved arrows. "
+                "Does it actually look that way? Answer false if it instead reads as photorealistic, "
+                "3D-rendered, a plain technical diagram with no mascot/character, or has any box, "
+                "label or the summary strip cut off at an edge."
+            )
+        else:
+            style_question = (
+                " (4) `style_compliant` - this image was required to be a flat 2D vector textbook "
+                "illustration (crisp line art, flat/simply-shaded colors, no photorealistic shading, "
+                "no 3D render, no soft studio lighting or glow, nothing cropped at or crowding the "
+                "canvas edge). Does it actually look that way? Answer false if it instead reads as "
+                "photorealistic, 3D-rendered, has a glow/gradient/dark background, or has any panel, "
+                "icon, label or text cut off at an edge."
+            )
         spelling_question = (
             " (5) `text_accurately_spelled` - if this image has ANY text, labels or callouts "
             "baked into it, is every piece of it spelled correctly and legible letter-by-letter - "
@@ -1643,6 +1731,7 @@ class ImageService:
         section_title: str = "",
         key_concept: str = "",
         source_excerpt: str = "",
+        course_audience: str = "",
     ) -> bool:
         """Diagram/concept_experience blocks try their structured path first
         and fall back to the raster illustration path on any failure - a
@@ -1695,6 +1784,25 @@ class ImageService:
             )
             if ok:
                 return True
+            # Kids-audience apparatus override, second site (real, confirmed
+            # gap): `normalize_draft_blocks`'s own override (see that
+            # function's docstring) only sees a block at writer-draft time,
+            # when it's still `kind: "diagram", diagram_kind: "schematic"` -
+            # too early to catch THIS reroute, which sets `illustration_
+            # style: "textbook"` directly, here, well after normalization.
+            # A real course ("How a Lever Works") confirmed this exact gap:
+            # the lever request used the retired `schematic` hint, so the
+            # writer-time override never saw an `illustration_style:
+            # "textbook"` value to act on, and the lever shipped `textbook`
+            # under a kids audience despite the first fix. Same conservative
+            # classifier, applied again right here where this specific path
+            # sets the style - never touches a block the writer already
+            # chose `textbook` for and that got generated some OTHER way.
+            if (
+                block.content.get("illustration_style") == "textbook"
+                and _reads_as_young_learner_audience(course_audience, getattr(template, "audience", "") or "")
+            ):
+                block.content = {**block.content, "illustration_style": "playful_infographic"}
             # Root-cause fix (Phase 2 card-grid audit): a retired-"schematic"
             # hint (see DiagramService.generate_for_block's own comment on
             # this exact rerouting) deliberately sets `illustration_style:
@@ -2415,7 +2523,12 @@ class ImageService:
             "what this instruction explicitly asks to change. Do not redesign the picture "
             "from scratch or replace its subject."
         )
-        is_textbook = (content.get("illustration_style") or "").strip().lower() == "textbook"
+        # Widened from a literal `== "textbook"` check to `_LABEL_BEARING_
+        # STYLES` membership (see that constant's own comment) so a
+        # `playful_infographic` edit gets the identical reliable-provider/
+        # label-verification treatment a `textbook` edit already does -
+        # both styles' whole job includes real, verified labels.
+        is_textbook = (content.get("illustration_style") or "").strip().lower() in _LABEL_BEARING_STYLES
         provider = self.settings.textbook_image_provider if is_textbook else None
         expected_labels = sanitize_expected_labels(
             [str(label).strip() for label in (content.get("expected_labels") or []) if str(label).strip()]
@@ -2679,7 +2792,12 @@ class ImageService:
         # `MockAIClient.image()` ignores prompt content entirely. `is_mock`
         # already exists on AIClient for exactly this purpose (course_service
         # already uses it to record which model actually produced a block).
-        is_textbook = (block.content.get("illustration_style") or "").strip().lower() == "textbook"
+        # Widened to `_LABEL_BEARING_STYLES` membership (see that constant) -
+        # `playful_infographic` is the young-learner counterpart to
+        # `textbook`: a different visual style, but the same "this image's
+        # whole job includes real, verified labels" contract, so it earns
+        # the identical provider/landscape/label-verification treatment.
+        is_textbook = (block.content.get("illustration_style") or "").strip().lower() in _LABEL_BEARING_STYLES
         # A `textbook` illustration's whole job is accurately depicting and
         # LABELLING a real apparatus/structure - text/label correctness
         # matters far more there than for a purely decorative illustration.
@@ -2959,6 +3077,7 @@ class ImageService:
             relevance = await self._verify_image_relevance(
                 data, brief=brief, course_title=course_title, textbook_style=is_textbook,
                 source_excerpt=grounding_excerpt,
+                style=(block.content.get("illustration_style") or "").strip().lower(),
             )
 
             def _scientific_check_failed(check: ImageRelevanceCheck) -> bool:
@@ -3079,11 +3198,26 @@ class ImageService:
                         "- give every label clear, non-overlapping space with its own leader line."
                         if not relevance.labels_legible else ""
                     )
+                    _style_fallback_detail = relevance.style_compliant_detail or (
+                        "drifted photorealistic/3D, lost the mascot, or was cropped"
+                        if (block.content.get("illustration_style") or "").strip().lower()
+                        == "playful_infographic"
+                        else "drifted photorealistic/3D or was cropped"
+                    )
                     style_note = (
-                        f" The previous attempt also did not follow the required flat 2D vector textbook "
-                        f"style ({relevance.style_compliant_detail or 'drifted photorealistic/3D or was cropped'}) "
-                        "- redraw as crisp flat-colour line art with no photorealistic shading, no 3D render, "
-                        "no glow/gradient background, and every element fully inside the frame with margin."
+                        (
+                            f" The previous attempt also did not follow the required warm flat-vector "
+                            f"cartoon infographic style ({_style_fallback_detail}) - redraw with bold "
+                            "rounded shapes, bright pastel colors, the friendly mascot character, and "
+                            "every box/label/the summary strip fully inside the frame with margin."
+                            if (block.content.get("illustration_style") or "").strip().lower()
+                            == "playful_infographic"
+                            else
+                            f" The previous attempt also did not follow the required flat 2D vector textbook "
+                            f"style ({_style_fallback_detail}) - redraw as crisp flat-colour line art with "
+                            "no photorealistic shading, no 3D render, no glow/gradient background, and every "
+                            "element fully inside the frame with margin."
+                        )
                         if is_textbook and not relevance.style_compliant else ""
                     )
                     # Multi-error correction fix: names EVERY confirmed-wrong
@@ -3140,6 +3274,7 @@ class ImageService:
                         retried_relevance = await self._verify_image_relevance(
                             retried_data, brief=brief, course_title=course_title, textbook_style=is_textbook,
                             source_excerpt=grounding_excerpt,
+                            style=(block.content.get("illustration_style") or "").strip().lower(),
                         )
                         candidates.append((retried_data, retry_prompt, retried_relevance))
                         data, relevance, prompt = retried_data, retried_relevance, retry_prompt
@@ -3770,6 +3905,7 @@ class ImageService:
         force: bool = False,
         on_progress: Callable[[Block, bool], Awaitable[None]] | None = None,
         job_id: str = "",
+        course_audience: str = "",
     ) -> int:
         """Generate every image the document is still missing. Returns the count.
 
@@ -3811,6 +3947,7 @@ class ImageService:
                     section_title=section_title,
                     key_concept=key_concept,
                     source_excerpt=source_excerpt,
+                    course_audience=course_audience,
                 )
                 if ok:
                     # Marks this block as validated during THIS job - see

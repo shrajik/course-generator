@@ -33,9 +33,11 @@ import type { CourseActivityEntry, CourseReview, ReviewStatus } from "@/lib/type
 interface EditorToolbarProps {
   onPreview: () => void;
   onExport: () => void;
+  onExportPptx: () => void;
   onReload: () => void;
   onSave: () => void;
   exporting: boolean;
+  exportingPptx: boolean;
   reloading: boolean;
   saving: boolean;
   saveError: string | null;
@@ -75,9 +77,11 @@ interface ChapterEntry {
 export function EditorToolbar({
   onPreview,
   onExport,
+  onExportPptx,
   onReload,
   onSave,
   exporting,
+  exportingPptx,
   reloading,
   saving,
   saveError,
@@ -318,9 +322,20 @@ export function EditorToolbar({
           Preview
         </Button>
 
-        <Button size="sm" className="shrink-0" onClick={onExport} disabled={exporting || saving}>
+        <Button size="sm" className="shrink-0" onClick={onExport} disabled={exporting || exportingPptx || saving}>
           {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
           Export PDF
+        </Button>
+
+        <Button
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={onExportPptx}
+          disabled={exporting || exportingPptx || saving}
+        >
+          {exportingPptx ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+          Export PPTX
         </Button>
 
         {activity ? (

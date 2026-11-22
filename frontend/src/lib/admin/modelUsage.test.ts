@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { summarizeModelUsage } from "./modelUsage.ts";
+import { formatInr, summarizeModelUsage } from "./modelUsage.ts";
 
 import type { AdminModelUsageRecord } from "../api/admin.ts";
 
@@ -14,10 +14,13 @@ function call(overrides: Partial<AdminModelUsageRecord> = {}): AdminModelUsageRe
     seconds: 1.2,
     input_tokens: 100,
     output_tokens: 50,
+    megapixels: 0,
     retries: 0,
     failed: false,
     used_fallback: false,
     timestamp: "2026-01-01T00:00:00Z",
+    cost_inr: 0.01,
+    cost_estimated: false,
     ...overrides,
   };
 }
@@ -53,4 +56,13 @@ test("a single successful call is counted once with no failures or fallbacks", (
   assert.equal(summary.totalCalls, 1);
   assert.equal(summary.failedCount, 0);
   assert.equal(summary.fallbackCount, 0);
+});
+
+test("formatInr renders a real amount with the rupee sign and two decimals", () => {
+  assert.equal(formatInr(1234.5), "₹1,234.50");
+  assert.equal(formatInr(0), "₹0.00");
+});
+
+test("formatInr renders null (an unpriced model) as an em dash, never ₹0", () => {
+  assert.equal(formatInr(null), "—");
 });

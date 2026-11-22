@@ -21,6 +21,7 @@ import abc
 import asyncio
 import base64
 import json
+import math
 import random
 import re
 import time
@@ -407,6 +408,7 @@ class OpenAIClient(AIClient):
         failed: bool = False,
         provider: str = "",
         used_fallback: bool = False,
+        megapixels: float = 0.0,
     ) -> None:
         metrics = current_metrics()
         if metrics is None:
@@ -429,12 +431,33 @@ class OpenAIClient(AIClient):
                 seconds=time.perf_counter() - started,
                 input_tokens=int(input_tokens),
                 output_tokens=int(output_tokens),
+                megapixels=megapixels,
                 retries=retries,
                 failed=failed,
                 provider=provider,
                 used_fallback=used_fallback,
             )
         )
+
+    @staticmethod
+    def _megapixels_for(size: str | None) -> float:
+        """Real output resolution in megapixels, rounded UP to the next whole
+        megapixel - matches Azure's own documented FLUX.2-flex billing rule
+        (1 megapixel == 1024x1024; any resolution rounds up to the next
+        whole megapixel) exactly, so this is the real billed quantity, not
+        an approximation of it. Returns 0.0 for an unparseable/missing size
+        rather than guessing - a cost estimate must never silently invent a
+        resolution it was never actually given."""
+        if not size:
+            return 0.0
+        try:
+            width_text, height_text = size.lower().split("x", 1)
+            width, height = int(width_text), int(height_text)
+        except (ValueError, AttributeError):
+            return 0.0
+        if width <= 0 or height <= 0:
+            return 0.0
+        return float(math.ceil((width * height) / 1_048_576))
 
     # --- structured output -------------------------------------------------
     async def structured(
@@ -853,6 +876,7 @@ class OpenAIClient(AIClient):
                 retries=retries,
                 failed=failed,
                 provider="openai",
+                megapixels=self._megapixels_for(size or self.settings.image_size),
             )
             if metrics:
                 metrics.call_finished()
@@ -889,6 +913,7 @@ class OpenAIClient(AIClient):
                 retries=0,
                 failed=failed,
                 provider="azure",
+                megapixels=self._megapixels_for(size or self.settings.image_size),
             )
             if metrics:
                 metrics.call_finished()
@@ -931,6 +956,7 @@ class OpenAIClient(AIClient):
                 retries=0,
                 failed=failed,
                 provider="azure_mai",
+                megapixels=self._megapixels_for(size or self.settings.image_size),
             )
             if metrics:
                 metrics.call_finished()

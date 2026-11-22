@@ -84,6 +84,9 @@ class StorageService:
     def pdf_path(self, course_id: str) -> Path:
         return self.exports_dir(course_id) / "course.pdf"
 
+    def pptx_path(self, course_id: str) -> Path:
+        return self.exports_dir(course_id) / "course.pptx"
+
     def html_path(self, course_id: str) -> Path:
         return self.exports_dir(course_id) / "course.html"
 

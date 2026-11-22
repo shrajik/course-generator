@@ -108,6 +108,11 @@ def test_a_real_generation_run_persists_model_usage_and_admin_can_read_it(usage_
         # provider/model (see MockAIClient._simulate's provider="mock").
         assert call["provider"] == "mock"
         assert call["model"] == "mock"
+        # "mock" has no entry in app.core.pricing's rate tables - cost must
+        # be None (never a fabricated 0), and the response must say so.
+        assert call["cost_inr"] is None
+    assert body["has_unpriced_models"] is True
+    assert body["total_cost_inr"] == 0.0
 
 
 def test_non_admin_owner_cannot_read_model_usage(usage_client):
@@ -140,6 +145,9 @@ def test_model_usage_for_a_course_with_no_generation_run_yet_is_empty_not_fabric
     assert body["course_id"] == course_id
     assert body["job_id"] is None
     assert body["calls"] == []
+    # Zero usage -> zero cost, not an error and not omitted.
+    assert body["total_cost_inr"] == 0.0
+    assert body["by_model_inr"] == {}
 
 
 def test_model_usage_for_a_nonexistent_course_is_404(usage_client, monkeypatch):

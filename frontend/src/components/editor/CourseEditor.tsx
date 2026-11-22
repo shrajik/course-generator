@@ -21,7 +21,9 @@ import { ApiError } from "@/lib/api/client";
 import {
   aiEdit,
   exportedPdfDownloadUrl,
+  exportedPptxDownloadUrl,
   generateExportedPdf,
+  generateExportedPptx,
   getDocument,
   saveDocument,
   updateConceptVisualSpec,
@@ -51,6 +53,7 @@ export function CourseEditor({ documentId }: { documentId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloading, setReloading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportingPptx, setExportingPptx] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
@@ -285,11 +288,22 @@ export function CourseEditor({ documentId }: { documentId: string }) {
           ...(result?.rejected ?? []),
           ...response.rejected_operations,
         ].length;
+        const imagesFailed = response.images_failed.length;
 
         setAiMessage(
           [
             `${appliedCount} change${appliedCount === 1 ? "" : "s"} applied.`,
             rejected ? `${rejected} rejected.` : "",
+            // A real, confirmed gap this closes: the patch itself can apply
+            // cleanly (so the line above says "applied") while the image
+            // generation it triggers fails every bounded attempt under real
+            // network conditions - without this, the reader was told
+            // "applied" and then found the block still showing "Image not
+            // generated yet" (or its old picture silently restored) with no
+            // indication anything went wrong.
+            imagesFailed
+              ? `${imagesFailed} image${imagesFailed === 1 ? "" : "s"} could not be generated - try again or adjust the prompt.`
+              : "",
             response.patch.reasoning,
             hadLocalEdits
               ? "Your unsaved manual edits were kept, so this page may differ from the backend copy."
@@ -400,6 +414,34 @@ export function CourseEditor({ documentId }: { documentId: string }) {
     }
   }, [documentId, editor.dirty, editor.document, saveManualEdits, courseId, refreshActivity]);
 
+  // Same shape/reasoning as handleExport above, for the PPTX path
+  // (backend/app/services/pptx_service.py) - one real PowerPoint deck.
+  const handleExportPptx = useCallback(async () => {
+    setExportingPptx(true);
+    setSaveError(null);
+    try {
+      if (editor.dirty && editor.document) {
+        await saveManualEdits(editor.document);
+      }
+      await generateExportedPptx(documentId);
+      const link = document.createElement("a");
+      link.href = exportedPptxDownloadUrl(documentId);
+      link.download = `${(editor.document?.course_title ?? "course")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "")}.pptx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      if (courseId) refreshActivity(courseId);
+    } catch (caught) {
+      console.error("PPTX export failed:", caught);
+      setAiError(caught instanceof Error ? caught.message : "PPTX export failed.");
+    } finally {
+      setExportingPptx(false);
+    }
+  }, [documentId, editor.dirty, editor.document, saveManualEdits, courseId, refreshActivity]);
+
   // --- keyboard shortcuts --------------------------------------------------
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -463,9 +505,11 @@ export function CourseEditor({ documentId }: { documentId: string }) {
       <EditorToolbar
         onPreview={() => router.push(`/preview/${documentId}`)}
         onExport={handleExport}
+        onExportPptx={handleExportPptx}
         onReload={handleReload}
         onSave={handleSave}
         exporting={exporting}
+        exportingPptx={exportingPptx}
         reloading={reloading}
         saving={saving}
         saveError={saveError}

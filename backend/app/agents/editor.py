@@ -19,6 +19,37 @@ log = get_logger(__name__)
 
 CONTEXT_RADIUS = 2
 
+# Conservative, zero-extra-LLM-call signal for an explicit "I want a real
+# AI-generated picture, not a structured diagram" request. Real, confirmed
+# gap: EDITOR_SYSTEM's shape classification (comparison/flow_chart/hierarchy/
+# ...) applies even to a generic "convert this into an image" instruction, so
+# prose that merely describes two contrasting things (e.g. a rolling suitcase
+# vs. a sliding box) can get routed to a structured comparison diagram
+# instead of the raster illustration the user actually asked for - no AI
+# image model ever gets called. The bare, generic "convert this into an
+# image"/"turn this into a diagram" phrasing is deliberately left alone here
+# (it's the documented ambiguous case that should keep running the full shape
+# check) - this only fires on wording that goes further and explicitly asks
+# for a real/actual/photographic/AI picture, or explicitly rules out a
+# diagram/chart. False-negative biased on purpose: missing an edge-case
+# phrasing just falls back to today's existing classification, never to a
+# misfire that overrides a genuinely diagram-shaped request.
+_EXPLICIT_ILLUSTRATION_PHRASES = (
+    "real image", "real picture", "real photo", "actual image", "actual picture",
+    "actual photo", "actual illustration", "realistic image", "realistic picture",
+    "realistic illustration", "photorealistic", "photo-realistic", "ai image",
+    "ai-generated image", "ai generated image", "ai generated picture",
+    "not a diagram", "not a chart", "not a flowchart", "no diagram", "no chart",
+    "instead of a diagram", "instead of a chart", "draw a picture", "draw an image",
+    "draw a photo", "paint a picture", "a photo of", "a photograph of",
+)
+
+
+def requests_real_illustration_over_diagram(instruction: str) -> bool:
+    lowered = instruction.lower()
+    return any(phrase in lowered for phrase in _EXPLICIT_ILLUSTRATION_PHRASES)
+
+
 _ALLOWED_STYLE_KEYS = {
     "font_family",
     "font_size",
@@ -62,6 +93,7 @@ class EditorAgent:
                 self._context_blocks(document, selected_block_ids),
                 instruction,
                 audience=document.meta.audience,
+                force_illustration_override=requests_real_illustration_over_diagram(instruction),
             ),
             model=self.settings.editor_model,
             purpose="editor",

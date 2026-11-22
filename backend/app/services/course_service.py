@@ -1703,6 +1703,7 @@ class CourseService:
                         force=request.force,
                         on_progress=_on_image_done,
                         job_id=job_id,
+                        course_audience=record.input.target_audience,
                     )
                 # A failed picture shrinks to a one-line strip, so the pages
                 # need re-flowing then too, not only when something succeeded.

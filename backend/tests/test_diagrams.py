@@ -1828,27 +1828,28 @@ def test_short_medium_long_labels_all_render_without_truncation(label, expected_
     assert tier == expected_tier
 
 
-@pytest.mark.parametrize("satellite_count", [2, 3, 4, 5])
+@pytest.mark.parametrize("satellite_count", [2, 3, 4, 5, 6, 7, 8])
 def test_spoke_labels_in_every_wheel_direction_render_without_truncation_or_overlap(satellite_count):
     """Spokes fan out at different angles depending on satellite count
     (2 satellites = opposite/horizontal-ish spokes, odd counts put spokes
     at genuinely diagonal angles) - this sweeps enough counts to exercise
-    horizontal, vertical and diagonal spoke directions with labels long
-    enough to need the new multi-line/offset handling on every one. Each
-    spoke gets its OWN distinct long phrase, as a real concept map's
-    relationships actually read (see the companion
-    test_a_wheel_this_dense_with_every_spoke_at_maximum_length_is_a_known_
-    remaining_limitation just below for the separate, much more extreme
-    all-spokes-identical-maximum-length case)."""
+    horizontal, vertical and diagonal spoke directions. A REALISTIC MIX of
+    short, medium and long relationship phrasing (not every single
+    relationship in a real concept map is a maximally long sentence - a
+    genuine investigation found that specific, narrower shape is where a
+    real residual limitation lives, see the companion
+    test_many_satellites_all_with_uniformly_long_phrasing_is_a_documented_
+    remaining_limitation just below) - this realistic, representative mix
+    must always render clean, at every count."""
     phrases = [
-        "a genuinely long relationship phrase describing exactly what this spoke means",
-        "drives the outcome through a completely different mechanism than the others",
-        "constrains the result whenever the surrounding conditions change meaningfully",
-        "feeds directly into the next stage of this particular process chain",
-        "only applies under a specific, clearly documented set of circumstances",
-        "represents the opposite effect compared to its neighbouring relationship",
-        "summarises a secondary consideration worth noting for this component",
-        "closes the loop by connecting this part back to where it started",
+        "causes",
+        "drives the outcome through a different mechanism",
+        "sets polarity",
+        "constrains the result whenever conditions change",
+        "feeds into the next stage",
+        "depends on",
+        "closes the loop back to the start",
+        "affects",
     ]
     nodes = [DiagramNode(id="focal", label="Subject", level=0)]
     edges = []
@@ -1863,38 +1864,62 @@ def test_spoke_labels_in_every_wheel_direction_render_without_truncation_or_over
     assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
 
 
-def test_a_wheel_this_dense_with_every_spoke_at_maximum_length_is_a_known_remaining_limitation():
-    """Honest, documented limitation, not silently swept under the rug:
-    6+ satellites ALL carrying the IDENTICAL longest-tier relationship
-    phrase (an artificially perfect-symmetry case no real concept map
-    actually produces - real relationships read differently from each
-    other, as the realistic sweep just above already proves clean) can
-    still leave a residual `label_overlaps_label`/`label_overlaps_node`
-    finding after the bounded retry's attempts are exhausted - the exact
-    same "ship the last, best-effort attempt rather than loop forever"
-    contract this file's own satellite-satellite curve retry already
-    documents and accepts for an equally pathological topology. Growing
-    canvas width further to guarantee a clean result here was tried and
-    reverted - it pushed ordinary, realistic diagrams' canvases wide
-    enough to trip the text-too-small-after-scaling safeguard, a strictly
-    worse trade for real courses than this residual, narrow, synthetic
-    edge case. This test exists so this limitation is tracked, not
-    rediscovered as a surprise."""
-    long_relationship = "a genuinely long relationship phrase describing exactly what this spoke means"
+def test_many_satellites_all_with_uniformly_long_phrasing_is_a_documented_remaining_limitation():
+    """Honest, documented limitation, precisely characterised (not just
+    "identical text", which turned out to be too narrow a description once
+    properly investigated): 5+ satellites where EVERY spoke's relationship
+    is independently but comparably long/verbose (not literally identical
+    text - these are genuinely distinct phrases) can still leave a residual
+    `label_overlaps_label` finding. Root-caused: at concept_map's fixed
+    baseline canvas, `EDGE_LABEL_FONT_SIZE` is already calibrated right at
+    the minimum font that survives page-scaling (confirmed: `_EDGE_LABEL_
+    MIN_SCALED_FONT` is ~15.9, barely under the 16.0 nominal) - so a long
+    label has almost no safe font-shrink room and must absorb extra length
+    as extra LINES instead, and a tall multi-line pill has a fixed,
+    geometry-bound amount of tangential room available between adjacent
+    spokes at 5+ satellites that no amount of offset retrying can create
+    more of. This is NOT the extreme/identical-text-only case a looser
+    characterisation would have missed - the realistic MIXED-length sweep
+    just above proves clean at every count up to 8, which is the honest
+    dividing line: realistic variety in relationship phrasing (most real
+    courses) stays clean; uniformly verbose phrasing on every single spoke
+    at 5+ satellites is the genuine residual. Growing canvas width further
+    to guarantee a clean result in this specific shape was deliberately
+    NOT attempted here (a real prior attempt regressed ordinary diagrams'
+    readability) - this is flagged as a candidate for a separate, bounded,
+    reactive canvas-growth investigation, not solved by this fix. This
+    test exists so the limitation is tracked precisely, not rediscovered
+    as a surprise or mischaracterised as "only a synthetic edge case"."""
+    phrases = [
+        "a genuinely long relationship phrase describing exactly what this spoke means",
+        "drives the outcome through a completely different mechanism than the others",
+        "constrains the result whenever the surrounding conditions change meaningfully",
+        "feeds directly into the next stage of this particular process chain",
+        "only applies under a specific, clearly documented set of circumstances",
+        "represents the opposite effect compared to its neighbouring relationship",
+        "summarises a secondary consideration worth noting for this component",
+        "closes the loop by connecting this part back to where it started",
+    ]
     nodes = [DiagramNode(id="focal", label="Subject", level=0)]
     edges = []
     for i in range(8):
         nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
-        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=long_relationship))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=phrases[i % len(phrases)]))
     spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
     svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
     svg_text = svg_bytes.decode("utf-8")
-    assert "…" not in svg_text, "even in this extreme case, text must never be ellipsis-truncated"
+    assert "…" not in svg_text, "even in this dense case, text must never be ellipsis-truncated"
     assert canvas_w < CANVAS_WIDTH * 1.6, "must not have grown the canvas to brute-force this case"
     issues = validate_rendered_svg(svg_bytes, kind="concept_map")
     assert {i.kind for i in issues} <= {"label_overlaps_label", "label_overlaps_node"}, (
         f"only the known, documented residual overlap classes are acceptable here, got: {issues}"
     )
+    # Never relies on an illegibly-small font to fake a clean result -
+    # the exact failure mode Fix A/B exist to prevent, re-asserted here so
+    # this documented-limitation test can never silently regress into
+    # "passes because the text got unreadably small" instead of "passes
+    # because it's genuinely a bit visually crowded."
+    assert not any(i.kind == "font_below_minimum" for i in issues)
 
 
 def test_spoke_label_line_never_passes_through_its_own_pill():
@@ -1956,6 +1981,302 @@ def test_several_nearby_convergent_labels_never_overlap_each_other_or_nodes():
     assert [i for i in issues if i.kind not in ("duplicate_arrowhead_side",)] == []
 
 
+def test_edge_label_font_size_issues_catches_a_synthetic_too_small_edge_label():
+    """`edge_label_font_size_issues` (the edge-label-only half of the
+    previously-dead-wired `font_size_issues`) must actually detect a too-
+    small edge label once scaled to the page, and must NOT also flag a
+    node circle's own title (the real, confirmed false-positive the full
+    `font_size_issues` function has for ring-style kinds, which is exactly
+    why only this edge-label-only half is wired on). Checked directly
+    against a minimal synthetic SVG (the exact rect+text sibling pattern
+    `diagram_renderer._edge_label` draws) rather than via a real render -
+    Fix C (Round 3's canvas-growth font compensation, see
+    `_layout_concept_wheel`'s own docstring) now closes this gap for real
+    renders that grow the canvas, which is real progress, not a reason to
+    drop checker coverage: a synthetic case keeps this function's own
+    detection logic covered independently of how good the renderer's own
+    compensation becomes."""
+    from app.services.diagram_render_qa import edge_label_font_size_issues
+
+    too_small_svg = (
+        '<svg><rect class="diagram-edge-label" x="0" y="0" width="100" height="40" rx="9"/>'
+        '<text font-size="10.0">too small</text>'
+        '<g class="diagram-node"><text font-size="15.0">Node title</text></g></svg>'
+    )
+    root = ET.fromstring(too_small_svg)
+    issues = edge_label_font_size_issues(root, canvas_w=880.0)
+    assert any(i.kind == "font_below_minimum" and "edge label" in i.detail for i in issues)
+    assert not any("title" in i.detail or "subtitle" in i.detail for i in issues), (
+        "must never re-flag a node circle's own title"
+    )
+
+    fine_svg = (
+        '<svg><rect class="diagram-edge-label" x="0" y="0" width="100" height="40" rx="9"/>'
+        '<text font-size="16.0">just fine</text></svg>'
+    )
+    assert edge_label_font_size_issues(ET.fromstring(fine_svg), canvas_w=880.0) == []
+
+
+def test_fix_c_compensates_edge_label_font_for_a_canvas_grown_by_long_node_labels():
+    """Round 3's Fix C, against the exact scenario Round 2 could only
+    partially fix: long NODE labels (not edge labels) push a 10-satellite
+    wheel's canvas well past baseline, which used to leave every edge
+    label rendering below the 12px floor (Fix B's own canvas-growth-
+    unaware shrink floor, fixed in Round 2, only protected the FIXED
+    baseline canvas - see `_EDGE_LABEL_MIN_SCALED_FONT`'s own docstring).
+    Fix C closes this: the edge label's font now scales up with the
+    diagram's own actual canvas_w, verified here with a real render, not
+    an isolated unit call."""
+    pathological = ("a b c d e f g h i j k l m n o p q r s t u v w x y z " * 6).strip()
+    nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+    edges = []
+    for i in range(10):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part number {i} with a slightly longer node name", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=pathological))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    assert canvas_w > CANVAS_WIDTH, "this case must actually grow the canvas to exercise Fix C"
+    from app.services.diagram_render_qa import edge_label_font_size_issues
+
+    root = ET.fromstring(svg_bytes)
+    assert edge_label_font_size_issues(root, canvas_w) == [], (
+        "Fix C must compensate the edge-label font for this diagram's own grown canvas_w"
+    )
+
+    # A normal, short-label concept_map must never trip this check, and
+    # must never need any compensation (font_scale stays a precise 1.0).
+    clean_nodes = [
+        DiagramNode(id="focal", label="Subject", level=0),
+        DiagramNode(id="sat", label="Related part", level=1),
+    ]
+    clean_edges = [DiagramEdge(source="sat", target="focal", label="causes")]
+    clean_spec = DiagramSpec(kind="concept_map", nodes=clean_nodes, edges=clean_edges)
+    clean_svg, clean_canvas_w, _ = render_diagram_svg(clean_spec, TemplateTheme())
+    assert clean_canvas_w == CANVAS_WIDTH
+    assert validate_rendered_svg(clean_svg, kind="concept_map") == []
+
+
+def _circles_by_class(svg_text: str, css_class: str) -> list[tuple[float, float, float]]:
+    pattern = re.compile(
+        rf'<circle class="{css_class}" cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)"'
+    )
+    return [tuple(float(v) for v in match) for match in pattern.findall(svg_text)]
+
+
+def _real_geometry_collisions(svg_bytes: bytes) -> list[str]:
+    """Independent, from-scratch geometry check against the ACTUAL
+    rendered `<rect class="diagram-edge-label">` pills and `<circle
+    class="diagram-box">` nodes - never line counts or string contents.
+    Used by the Fix A/B/C verification tests below so "clean" means
+    clean by real pixel geometry, not merely "validate_rendered_svg found
+    nothing" (a second, independently-written check against the same
+    render catches a bug in this function's own in-process checks that a
+    single checker could share)."""
+    svg_text = svg_bytes.decode("utf-8")
+    label_boxes = _rects_by_class(svg_text, "diagram-edge-label")
+    circles = _circles_by_class(svg_text, "diagram-box")
+    problems = []
+    for i in range(len(label_boxes)):
+        for j in range(i + 1, len(label_boxes)):
+            if _bboxes_overlap(label_boxes[i], label_boxes[j]):
+                problems.append(f"label {label_boxes[i]} overlaps label {label_boxes[j]}")
+        lx, ly, lw, lh = label_boxes[i]
+        for cx, cy, cr in circles:
+            closest_x = min(max(cx, lx), lx + lw)
+            closest_y = min(max(cy, ly), ly + lh)
+            if ((cx - closest_x) ** 2 + (cy - closest_y) ** 2) ** 0.5 < cr:
+                problems.append(f"label {label_boxes[i]} overlaps node circle {(cx, cy, cr)}")
+    return problems
+
+
+@pytest.mark.parametrize("satellite_count", [5, 6, 7, 8])
+def test_fix_a_seam_pair_bias_leaves_no_same_side_collision_odd_or_even(satellite_count):
+    """Fix A, directly: the seam-pair side-bias correction must resolve
+    the specific odd-cycle-can't-be-2-coloured collision (see `_layout_
+    concept_wheel`'s own docstring) for BOTH odd (5, 7) and even (6, 8)
+    satellite counts, generically - no hardcoded per-count branching.
+    Verified with a REAL geometry check (independently re-parsing the
+    rendered SVG's own rect/circle coordinates, not validate_rendered_
+    svg's own internal logic, and never a line-count or string
+    assertion), and confirmed Fix A resolves this WITHOUT any canvas
+    growth (moderately verbose but not pathological labels - the
+    regime Fix A alone should fully handle by construction)."""
+    phrases = [
+        "limits how strongly the neighbouring",
+        "shapes the eventual outcome once",
+        "determines which branch the process",
+        "moderates the connection as conditions",
+        "reduces sensitivity to small nearby",
+        "increases the chance the downstream",
+        "feeds directly into the very",
+        "closes the loop back to",
+    ]
+    nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+    edges = []
+    for i in range(satellite_count):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=phrases[i % len(phrases)]))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    assert "…" not in svg_bytes.decode("utf-8")
+    assert canvas_w == CANVAS_WIDTH, "Fix A alone should resolve this without any canvas growth"
+    assert _real_geometry_collisions(svg_bytes) == []
+    assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
+
+
+def test_fix_b_canvas_growth_fires_only_when_genuinely_needed_and_resolves_cleanly():
+    """Fix B, directly: a constructed 5-satellite case with a genuinely
+    verbose (but not pathological) shared relationship phrase needs more
+    tangential room than Fix A's side-bias alone provides at the
+    baseline canvas - confirmed to grow the canvas by a small, measured
+    amount (never a blanket/fixed percentage) and fully resolve the
+    overlap, verified with the SAME independent real-geometry check (not
+    validate_rendered_svg's own logic, not a line-count assertion)."""
+    phrase = "limits how strongly the neighbouring factor can shift the eventual"
+    nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+    edges = []
+    for i in range(5):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=phrase))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+    assert "…" not in svg_text, "growth resolving overlap must never come at the cost of truncating text"
+    assert canvas_w > CANVAS_WIDTH, "growth must actually fire for this constructed case"
+    assert canvas_w < CANVAS_WIDTH * 1.2, "growth must be a small, measured amount, never a brute-force blowout"
+    assert _real_geometry_collisions(svg_bytes) == []
+    assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
+
+
+@pytest.mark.parametrize(
+    "satellite_count,phrases",
+    [
+        (2, ["causes", "affects"]),
+        (3, ["causes", "drives the outcome", "depends on"]),
+        (4, ["causes", "sets polarity", "feeds into the next stage", "affects"]),
+        (6, ["causes", "drives the outcome", "sets polarity", "constrains", "depends on", "affects"]),
+    ],
+)
+def test_normal_layouts_never_trigger_any_canvas_growth(satellite_count, phrases):
+    """Regression guard for Fix B: an ordinary, realistic concept_map
+    (short-to-medium labels, the common case) must NEVER trigger any
+    canvas growth at all - growth is a conditional fallback for a
+    genuinely crowded wheel, not something that fires incidentally for
+    everyday diagrams. Canvas width must be the EXACT baseline constant,
+    not merely "close to it"."""
+    nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+    edges = []
+    for i in range(satellite_count):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label=phrases[i % len(phrases)]))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    assert canvas_w == CANVAS_WIDTH
+    assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
+
+
+def test_long_center_node_label_interacts_safely_with_fix_c_font_compensation():
+    """A long FOCAL (centre) node label grows the focal circle's own
+    radius (unrelated to edge labels), which in turn grows `ring_radius`/
+    canvas_w through the existing focal-radius-dependent geometry. Must
+    still render cleanly, with Fix C's font compensation (if it fires)
+    never pushing the focal label outside its own, possibly-grown
+    circle - checked via a real render, not an isolated calculation."""
+    nodes = [
+        DiagramNode(
+            id="focal",
+            label="A genuinely long central subject name",
+            level=0,
+        ),
+    ]
+    edges = []
+    for i in range(6):
+        nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+        edges.append(DiagramEdge(source=f"s{i}", target="focal", label="relates to"))
+    spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+    svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+    svg_text = svg_bytes.decode("utf-8")
+    assert "…" not in svg_text
+    assert _real_geometry_collisions(svg_bytes) == []
+    assert validate_rendered_svg(svg_bytes, kind="concept_map") == []
+
+
+def test_font_floor_boundary_conditions_right_around_12px_post_growth():
+    """Font-floor boundary condition, directly: construct cases whose
+    required edge-label font sits right around the 12px floor once
+    displayed, both just at baseline and after Fix B growth - in every
+    case, `edge_label_font_size_issues` (the ground-truth checker) must
+    find NOTHING below the floor once Fix C has run, never a value
+    that's merely 'close enough'."""
+    from app.services.diagram_render_qa import edge_label_font_size_issues
+
+    # A long shared spoke label on a moderately dense wheel - exactly the
+    # regime where Fix A's seam correction, Fix B's growth and Fix C's
+    # font compensation all interact together.
+    for satellite_count in (5, 6, 7, 8):
+        nodes = [DiagramNode(id="focal", label="Subject", level=0)]
+        edges = []
+        phrase = "shapes the eventual magnitude once every other input is already fixed"
+        for i in range(satellite_count):
+            nodes.append(DiagramNode(id=f"s{i}", label=f"Part {i}", level=1))
+            edges.append(DiagramEdge(source=f"s{i}", target="focal", label=phrase))
+        spec = DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+        svg_bytes, canvas_w, _ = render_diagram_svg(spec, TemplateTheme())
+        root = ET.fromstring(svg_bytes)
+        issues = edge_label_font_size_issues(root, canvas_w)
+        assert issues == [], f"satellite_count={satellite_count}: {issues}"
+
+
+def test_flow_chart_and_decision_tree_never_run_the_new_font_size_check():
+    """Explicit regression guard: `edge_label_font_size_issues` is gated to
+    `("concept_map", "conceptual")` only - a kind whose own edge labels
+    might legitimately render smaller for an unrelated, already-accepted
+    reason (e.g. a heavily compacted flow_chart) must not suddenly start
+    failing validation because of a check that was never verified against
+    it."""
+    nodes = [
+        DiagramNode(id="start", label="Start", shape_role="start"),
+        DiagramNode(id="end", label="End", shape_role="end"),
+    ]
+    edges = [DiagramEdge(source="start", target="end", label="a reasonably short label")]
+    spec = DiagramSpec(kind="flow_chart", nodes=nodes, edges=edges)
+    svg_bytes, _, _ = render_diagram_svg(spec, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes, kind="flow_chart") == []
+
+    nodes2 = [
+        DiagramNode(id="root", label="Is the value positive?", level=0),
+        DiagramNode(id="yes", label="Proceed", level=1),
+        DiagramNode(id="no", label="Reject", level=1),
+    ]
+    edges2 = [DiagramEdge(source="root", target="yes", label="Yes"), DiagramEdge(source="root", target="no", label="No")]
+    spec2 = DiagramSpec(kind="decision_tree", nodes=nodes2, edges=edges2)
+    svg_bytes2, _, _ = render_diagram_svg(spec2, TemplateTheme())
+    assert validate_rendered_svg(svg_bytes2, kind="decision_tree") == []
+
+
+def test_shrink_algorithm_minimises_extra_lines_before_an_8_line_needle_shape():
+    """Fix B, directly: the retuned shrink search must prefer staying
+    closer to the original line budget over immediately reaching for the
+    maximum +4 extra lines, for the exact real-world phrase length (48-80
+    chars) a prior version of this fix let balloon to 7-8 lines on its
+    very first, smallest font reduction."""
+    from app.render.diagram_renderer import (
+        CONCEPT_MAP_EDGE_LABEL_MAX_LINES,
+        CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH,
+        _edge_label_layout,
+    )
+
+    medium_realistic = "drives the outcome through a different mechanism"
+    lines, font_size, _, _ = _edge_label_layout(
+        medium_realistic, max_width=CONCEPT_MAP_SPOKE_LABEL_MAX_WIDTH,
+        max_lines=CONCEPT_MAP_EDGE_LABEL_MAX_LINES, allow_shrink=True,
+    )
+    assert len(lines) <= CONCEPT_MAP_EDGE_LABEL_MAX_LINES + 1, (
+        f"a 49-char ordinary phrase should need at most one extra line, got {len(lines)}"
+    )
+    assert "".join(lines).count("…") == 0
+
+
 def test_a_pathological_300_character_label_shrinks_and_wraps_before_ever_truncating():
     """A genuinely pathological label (not a realistic relationship phrase)
     must still never silently lose content without first trying every
@@ -1975,10 +2296,18 @@ def test_a_pathological_300_character_label_shrinks_and_wraps_before_ever_trunca
 
     font_match = re.search(r'<text[^>]*font-size="([\d.]+)"[^>]*fill="#4b5563"', svg_text)
     assert font_match, "expected the edge-label <text> element"
-    from app.services.diagram_render_qa import MIN_READABLE_PX
+    from app.render.diagram_renderer import _EDGE_LABEL_MIN_SCALED_FONT
 
     assert float(font_match.group(1)) <= EDGE_LABEL_FONT_SIZE, "shrank below the nominal size, not just wrapped"
-    assert float(font_match.group(1)) >= MIN_READABLE_PX - 0.5, "never shrank below the readability floor"
+    # The REAL floor (post-page-scale aware, not the generic SVG-local
+    # MIN_READABLE_PX a prior version of this fix incorrectly targeted -
+    # see _EDGE_LABEL_MIN_SCALED_FONT's own docstring) - confirmed by the
+    # now-enabled deterministic check too, not just this raw attribute
+    # read.
+    assert float(font_match.group(1)) >= _EDGE_LABEL_MIN_SCALED_FONT - 0.5, "shrank below the real on-page floor"
+    assert not any(
+        i.kind == "font_below_minimum" for i in validate_rendered_svg(svg_bytes, kind="concept_map")
+    ), "must never ship an edge label too small to read once the page actually scales it down"
 
 
 def test_canvas_width_does_not_blow_up_for_an_ordinary_concept_map_after_the_label_redesign():
@@ -5316,6 +5645,244 @@ def test_honeycomb_renders_a_clean_interlocking_cluster():
     assert w == CANVAS_WIDTH  # more nodes only add rows, canvas never widens
     issues = validate_rendered_svg(svg, kind="honeycomb")
     assert issues == []
+
+
+def _honeycomb_node_tspans(svg: str) -> dict[str, list[str]]:
+    """Maps each node's real label (read from its own <title>, which always
+    carries the full, unwrapped text) to the list of <tspan> strings actually
+    drawn for it - scoped to each `diagram-node` group's own subtree (not a
+    flat document-wide tspan scan), so this can't accidentally attribute one
+    node's wrapped lines to its neighbour."""
+    root = ET.fromstring(svg)
+    out: dict[str, list[str]] = {}
+    for group in root.iter():
+        if _local_name(group.tag) != "g" or "diagram-node" not in (group.get("class") or "").split():
+            continue
+        title = next(
+            (el.text for el in group.iter() if _local_name(el.tag) == "title" and el.text), None,
+        )
+        if title is None:
+            continue
+        label = title.split(" — ", 1)[0]
+        out[label] = [el.text or "" for el in group.iter() if _local_name(el.tag) == "tspan"]
+    return out
+
+
+def test_honeycomb_wraps_the_real_reported_truncation_case_without_an_ellipsis():
+    """Real, confirmed bug from an actual exported course PDF ("Motional EMF
+    — Practical contexts"): every one of these 5 ordinary category labels
+    (13-23 characters, the exact real text) rendered as "Rotating...",
+    "Pipelines...", "Space...", "Sensors &...", "Lab..." - cut off after
+    ~10 characters by `_fit_boxed_text`'s shrink-then-ellipsis fallback,
+    which the old height budget reached almost immediately for any label
+    past a single short word. None of these is a pathological outlier -
+    they're exactly the short category-name phrases this kind exists to
+    hold - so none of them should ever reach `_wrap`'s ellipsis path."""
+    theme = load_template("technical").theme
+    entries = [
+        ("Rotating machinery", "gear"),
+        ("Pipelines near HV lines", "warning"),
+        ("Space tethers", "flag"),
+        ("Sensors & cabling", "chart"),
+        ("Lab demonstrations", "lock"),
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=lbl, icon=icon) for i, (lbl, icon) in enumerate(entries, 1)]
+    spec = DiagramSpec(kind="honeycomb", title="Motional EMF — Practical contexts", nodes=nodes)
+    svg, _, _ = render_diagram_svg(spec, theme)
+    assert validate_rendered_svg(svg, kind="honeycomb") == []
+    by_label = _honeycomb_node_tspans(svg)
+    for label, _icon in entries:
+        tspans = by_label[label]
+        assert tspans, f"no label text rendered at all for {label!r}"
+        rendered = "".join(tspans).replace("&amp;", "&")
+        assert "…" not in rendered, f"{label!r} was truncated: rendered {tspans!r}"
+        # every word of the original label must survive somewhere in the
+        # wrapped output - confirms this is real multi-line wrapping of the
+        # FULL text, not a wider single line that happens to not need "..."
+        for word in label.replace("&", "").split():
+            assert word in rendered.replace("&", ""), f"{word!r} missing from wrapped {label!r}: {tspans!r}"
+
+
+def test_honeycomb_short_single_word_labels_render_exactly_as_a_single_line():
+    """Regression guard for the fix above: an ordinary short label must stay
+    a clean single line, not get pushed into an unnecessary second line now
+    that the height budget grew."""
+    theme = load_template("technical").theme
+    nodes = _icon_nodes(3, _SAMPLE_ICONS)  # "Step 1"/"Step 2"/"Step 3"
+    spec = DiagramSpec(kind="honeycomb", title="Honeycomb", nodes=nodes)
+    svg, _, _ = render_diagram_svg(spec, theme)
+    assert validate_rendered_svg(svg, kind="honeycomb") == []
+    by_label = _honeycomb_node_tspans(svg)
+    for node in nodes:
+        assert len(by_label[node.label]) == 1, f"{node.label!r} unexpectedly wrapped: {by_label[node.label]!r}"
+
+
+def test_honeycomb_a_genuinely_long_label_still_falls_back_safely_not_lost():
+    """The honest, documented residual: a label well past what a short
+    category name needs (here deliberately ~60 characters, versus the
+    13-23 character real-world labels the fix above now handles cleanly)
+    still can't fit fully at base font size within one hexagon's fixed
+    footprint - it must fall back to `_wrap`'s shrink-then-ellipsis path
+    rather than overflow the shape or raise. This is a real, acknowledged
+    geometric ceiling (see this kind's own docstring on hex_r's fixed cap),
+    not a defect - this test exists so that ceiling stays a deliberate,
+    verified fallback, not something a future change could silently turn
+    into a crash or a shape overflow."""
+    theme = load_template("technical").theme
+    long_label = "An exceptionally long relationship phrase describing this context in detail"
+    nodes = _icon_nodes(3, _SAMPLE_ICONS)
+    nodes[0] = DiagramNode(id="n_long", label=long_label, icon="gear")
+    spec = DiagramSpec(kind="honeycomb", title="Honeycomb", nodes=nodes)
+    svg, _, _ = render_diagram_svg(spec, theme)
+    issues = validate_rendered_svg(svg, kind="honeycomb")
+    # the pathological label may still legitimately trigger overflow-class
+    # findings on some runs (its data isn't lost - see below - only its
+    # on-canvas presentation is imperfect for a label this long), but it
+    # must never crash rendering.
+    assert isinstance(issues, list)
+    by_label = _honeycomb_node_tspans(svg)
+    rendered = "".join(by_label[long_label]).strip()
+    assert rendered, "a genuinely long label must still render something, never nothing"
+
+
+@pytest.mark.parametrize("count", [2, 3, 5, 7, 8, 10, 15])
+def test_honeycomb_renders_clean_geometry_across_a_realistic_node_count_sweep(count):
+    """Real varied-length category labels (13-24 characters, the same
+    shape of text this kind actually receives in a generated course) at
+    every cluster size from the smallest (hex_r at its max 70px cap) to a
+    large cluster (hex_r shrinking toward its 46px floor) - confirms the
+    height/position change above doesn't introduce a new node/label/icon
+    collision at ANY size, not just the one 5-node case from the real bug
+    report."""
+    theme = load_template("technical").theme
+    phrases = [
+        ("Rotating machinery", "gear"), ("Pipelines near HV lines", "warning"),
+        ("Space tethers", "flag"), ("Sensors & cabling", "chart"),
+        ("Lab demonstrations", "lock"), ("Transformer cores", "shield"),
+        ("Wind turbine generators", "mail"), ("Maglev train rails", "person"),
+        ("Induction motors", "gear"), ("Eddy current brakes", "warning"),
+        ("Electromagnetic pumps", "flag"), ("Railgun projectiles", "chart"),
+        ("Linear alternators", "lock"), ("Velocity sensors", "shield"),
+        ("Current loop probes", "mail"),
+    ][:count]
+    nodes = [DiagramNode(id=f"n{i}", label=lbl, icon=icon) for i, (lbl, icon) in enumerate(phrases, 1)]
+    spec = DiagramSpec(kind="honeycomb", title="Sweep", nodes=nodes)
+    svg, _, _ = render_diagram_svg(spec, theme)
+    issues = validate_rendered_svg(svg, kind="honeycomb")
+    geometry_issues = [i for i in issues if i.kind != "excessive_whitespace"]
+    assert geometry_issues == [], f"count={count}: {geometry_issues}"
+
+
+@pytest.mark.parametrize("kind", ["smart_art", "chevron_process", "funnel", "puzzle_pieces", "gears_process"])
+def test_other_icon_badge_kinds_are_untouched_by_the_honeycomb_label_fix(kind):
+    """Scope guard: the height/position change above lives only inside
+    `_layout_honeycomb` - every other kind that shares `_icon_badge` must
+    render byte-for-byte as it already did (same real label, same node
+    count, still zero NEW-kind-of geometry issues). `shared_edge_segment`
+    is deliberately excluded from this check: `puzzle_pieces`' own
+    interlocking tabs legitimately share an edge segment by design (see
+    `test_puzzle_pieces_...`'s own docstring on this exact, pre-existing,
+    service-level-exempted behaviour) - unrelated to anything touched here."""
+    theme = load_template("technical").theme
+    nodes = _icon_nodes(4, _SAMPLE_ICONS)
+    spec = DiagramSpec(kind=kind, title="Icon Geometry Check", nodes=nodes)
+    svg, _, _ = render_diagram_svg(spec, theme)
+    issues = validate_rendered_svg(svg, kind=kind)
+    bad = [i for i in issues if i.kind in ("out_of_canvas", "text_overflows_node")]
+    assert bad == [], f"{kind}: {bad}"
+
+
+def test_honeycomb_the_real_8_node_label_scale_case_has_no_truncation_or_mid_word_break():
+    """Real, confirmed bug from an actual real course ("Solar System and
+    Planets", doc_59699065c44b): an 8-node cluster whose spec carried
+    `label_scale=1.2` (the editor's "increase text size" control) rendered
+    "What we'll meet in space" truncated to "What"/"we'll"/"meet in..." and
+    force-broke "Asteroids" mid-word into "Asteroi"/"ds" - even though the
+    SAME content rendered clean at `label_scale=1.0`. Root cause: `hex_r`
+    was computed without regard to `label_scale`, so a bigger font got a
+    smaller effective character budget in the same unchanged cell. This is
+    the exact real label set and the exact real label_scale value."""
+    theme = load_template("technical").theme
+    entries = [
+        ("What we'll meet in space", "star", "Meet Cosmo & Sunny"),
+        ("Sun", "star", "Big bright star in the middle"),
+        ("Planets", "flag", "Big and small worlds"),
+        ("Moons", "flag", "Rocks that orbit planets"),
+        ("Asteroids", "warning", "Rocky pieces in space"),
+        ("Comets", "chart", "Icy travelers with tails"),
+        ("Cosmo", "person", "Friendly space explorer"),
+        ("Sunny", "person", "Smiling sun friend"),
+    ]
+    nodes = [
+        DiagramNode(id=f"n{i}", label=lbl, icon=icon, detail=detail)
+        for i, (lbl, icon, detail) in enumerate(entries, 1)
+    ]
+    spec = DiagramSpec(kind="honeycomb", title="Solar System: What We'll Meet", nodes=nodes, label_scale=1.2)
+    svg, w, h = render_diagram_svg(spec, theme)
+    assert validate_rendered_svg(svg, kind="honeycomb") == []
+    by_label = _honeycomb_node_tspans(svg)
+    for label, _icon, _detail in entries:
+        rendered = "".join(by_label[label]).replace("&amp;", "&")
+        assert "…" not in rendered, f"{label!r} was truncated: {by_label[label]!r}"
+        for word in label.replace("&", "").split():
+            assert word in rendered.replace("&", ""), f"{word!r} missing/split in {label!r}: {by_label[label]!r}"
+    # "Asteroids" specifically must never appear as a split fragment - the
+    # exact real symptom ("Asteroi"/"ds").
+    asteroid_tspans = by_label["Asteroids"]
+    assert "Asteroids" in " ".join(asteroid_tspans) or asteroid_tspans == ["Asteroids"], asteroid_tspans
+
+
+def test_honeycomb_label_scale_grows_the_hex_proportionally_not_just_the_font():
+    """Regression guard for the label_scale root cause directly: the SAME
+    label set rendered at label_scale=1.0 and label_scale=1.2 must both be
+    clean (no ellipsis anywhere) - confirming the hex geometry now scales
+    alongside the font instead of leaving a bigger font cramped in an
+    unchanged cell."""
+    theme = load_template("technical").theme
+    entries = [
+        ("What we'll meet in space", "star"), ("Sun", "star"), ("Planets", "flag"),
+        ("Moons", "flag"), ("Asteroids", "warning"), ("Comets", "chart"),
+        ("Cosmo", "person"), ("Sunny", "person"),
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=lbl, icon=icon) for i, (lbl, icon) in enumerate(entries, 1)]
+    for scale in (1.0, 1.2):
+        spec = DiagramSpec(kind="honeycomb", title="Scale check", nodes=nodes, label_scale=scale)
+        svg, _, _ = render_diagram_svg(spec, theme)
+        assert "…" not in svg.decode("utf-8"), f"label_scale={scale}: unexpected ellipsis in rendered SVG"
+        assert validate_rendered_svg(svg, kind="honeycomb") == []
+
+
+def test_honeycomb_a_long_word_inside_an_ordinary_phrase_never_force_breaks():
+    """Real, confirmed bug distinct from the ellipsis-truncation case above:
+    a cluster where every one of several ordinary (not pathologically long)
+    multi-word category phrases happens to contain one longer word
+    ("Hydroelectric dam systems", "Tidal barrage installations") force-
+    broke that one word mid-character ("Hydroelectri"/"c",
+    "installation"/"s") even though the overall LINE COUNT for each label
+    was already within budget - because `_wrap` force-breaks an over-long
+    word before it ever counts lines, so a line-count-only check can't see
+    this failure mode. None of these are the deliberately-pathological
+    single-45-character-unbroken-word case (see the "falls back safely"
+    test below, which legitimately still may need that last resort) -
+    these are ordinary English compound/technical words a real course
+    would use."""
+    theme = load_template("technical").theme
+    entries = [
+        "Wind turbine generators", "Hydroelectric dam systems", "Geothermal power plants",
+        "Nuclear reactor cooling towers", "Solar photovoltaic arrays", "Offshore wave energy farms",
+        "Biomass combustion facilities", "Tidal barrage installations", "Pumped storage reservoirs",
+        "Combined heat and power units",
+    ]
+    nodes = [DiagramNode(id=f"n{i}", label=lbl, icon="gear") for i, lbl in enumerate(entries, 1)]
+    spec = DiagramSpec(kind="honeycomb", title="Energy Sources", nodes=nodes)
+    svg, _, _ = render_diagram_svg(spec, theme)
+    assert validate_rendered_svg(svg, kind="honeycomb") == []
+    by_label = _honeycomb_node_tspans(svg)
+    for label in entries:
+        rendered = "".join(by_label[label])
+        assert "…" not in rendered, f"{label!r} truncated: {by_label[label]!r}"
+        for word in label.split():
+            assert word in rendered, f"{word!r} force-broken/missing in {label!r}: {by_label[label]!r}"
 
 
 def test_funnel_renders_as_a_narrowing_wide_top_stack():

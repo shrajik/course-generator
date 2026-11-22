@@ -39,6 +39,14 @@ class CallRecord:
     seconds: float
     input_tokens: int = 0
     output_tokens: int = 0
+    # Real output resolution for an image call, in megapixels (width*height /
+    # 1_048_576) - 0.0 for every non-image call, and for an image call whose
+    # size couldn't be parsed. Azure's own FLUX.2-flex billing is literally
+    # per-megapixel-rounded-up (see app.core.pricing), so this is captured at
+    # the one place the real `size` string is already in scope, rather than
+    # re-deriving it later from a stored string that might not parse the
+    # same way twice.
+    megapixels: float = 0.0
     retries: int = 0
     failed: bool = False
     # "azure" | "azure_mai" | "openai" - which backend actually served this

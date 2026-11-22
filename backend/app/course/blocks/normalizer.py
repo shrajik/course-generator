@@ -281,12 +281,99 @@ def tag_section_intro_illustrations(blocks: list[Block]) -> None:
             block.content = {**content, "illustration_style": "section_intro"}
 
 
+# Kids-audience apparatus-style override: a real, confirmed gap found across
+# several real course generations today - WRITER_SYSTEM's own instruction
+# ("real apparatus -> `textbook` by default, `playful_infographic` instead
+# of it for a young/kids audience") is a prompt-level judgment call the
+# model follows inconsistently (roughly 1 in 6 real apparatus blocks across
+# repeated real testing, even after two rounds of strengthening the wording
+# with a concrete worked example). This is the deterministic backstop:
+# conservative text-pattern audience detection (false-negative biased - a
+# missed kids phrasing just means the prompt-level instruction is the only
+# signal, exactly like today; a false positive on a genuinely non-kids
+# audience is the failure mode worth avoiding) combined with the one
+# existing, already-reliable proxy for "this is apparatus/mechanism content"
+# in this pipeline: `illustration_style == "textbook"` ITSELF. Investigated,
+# not guessed - there is no separate stored "is_apparatus" flag anywhere in
+# this codebase; `textbook` is ALREADY only ever set for exactly this case
+# (the schematic-retired apparatus rule, and the `schematic`-hint reroute in
+# diagram_service.py, which exists for the identical reason) - nothing else
+# in WRITER_SYSTEM or EDITOR_SYSTEM ever asks for `illustration_style:
+# "textbook"` for any other kind of content. So the writer's own `textbook`
+# choice already IS the apparatus signal; this override does not need a
+# second, independent apparatus classifier.
+_YOUNG_LEARNER_KEYWORDS = (
+    "kid", "kids", "child", "children", "young learner", "young learners",
+    "young reader", "young readers", "young student", "young students",
+    "elementary school", "elementary-school", "primary school", "primary-school",
+    "kindergarten", "preschool", "pre-school", "grade school", "grade-school",
+    "early learner", "early learners", "early-years", "early years",
+    "junior school", "nursery",
+)
+_YOUNG_GRADE_RE = re.compile(r"\bgrades?\s*[1-5]\b", re.IGNORECASE)
+_YOUNG_AGE_RANGE_RE = re.compile(r"\bage[sd]?\s*(\d{1,2})\s*(?:to|-|–|—|through)\s*(\d{1,2})\b", re.IGNORECASE)
+_YOUNG_AGE_SINGLE_RE = re.compile(r"\bage[sd]?\s+(\d{1,2})\b", re.IGNORECASE)
+
+
+def _reads_as_young_learner_audience(*texts: str) -> bool:
+    """Conservative, deterministic, zero-LLM-call text classifier - checks
+    whatever real audience text is available (course-level `target_audience`
+    and/or a template's own stated `audience`, both free text an author
+    wrote) for young-learner indicators. Biased toward false negatives: an
+    ambiguous or unrecognised phrasing returns False (same as today's
+    prompt-only behaviour), never guessed into True. An explicit age range
+    only counts as a young-learner signal when BOTH bounds read as a child's
+    age (<=13) - "ages 25 to 60" must never match just because it contains
+    the word "age" and two numbers."""
+    combined = " ".join(t for t in texts if t).lower()
+    if not combined.strip():
+        return False
+    if any(keyword in combined for keyword in _YOUNG_LEARNER_KEYWORDS):
+        return True
+    if _YOUNG_GRADE_RE.search(combined):
+        return True
+    range_match = _YOUNG_AGE_RANGE_RE.search(combined)
+    if range_match and int(range_match.group(1)) <= 13 and int(range_match.group(2)) <= 13:
+        return True
+    single_match = _YOUNG_AGE_SINGLE_RE.search(combined)
+    if single_match and int(single_match.group(1)) <= 13:
+        return True
+    return False
+
+
+def apply_young_audience_apparatus_override(blocks: list[Block], *audience_texts: str) -> None:
+    """Mutates `blocks` in place - overrides a writer-chosen `illustration_
+    style: "textbook"` to `"playful_infographic"` when the course's own
+    audience context deterministically reads as young/early learners (see
+    `_reads_as_young_learner_audience`). A no-op whenever that check is
+    False (every pre-existing course/template with no stated audience, or a
+    non-kids one, is completely unaffected - confirmed by the early return).
+    Never touches a block the writer already set to `playful_infographic`
+    itself (nothing to override), any other style, or any non-apparatus
+    illustration - see this function's own module-level comment for why
+    `illustration_style == "textbook"` is already a reliable apparatus
+    signal in this pipeline, not a guess. This overrides the STYLE CHOICE
+    only - `expected_labels`/`prompt`/every other field the writer set stays
+    exactly as authored, so `playful_infographic`'s own existing guidance
+    (which already requires the same full, accurate labelling) is what
+    actually governs the generated image's content."""
+    if not _reads_as_young_learner_audience(*audience_texts):
+        return
+    for block in blocks:
+        if block.type != BlockType.IMAGE:
+            continue
+        content = block.content
+        if content.get("kind") == "illustration" and content.get("illustration_style") == "textbook":
+            block.content = {**content, "illustration_style": "playful_infographic"}
+
+
 def normalize_draft_blocks(
     drafts: list[DraftBlock],
     *,
     template: CourseTemplate,
     chapter_id: str,
     chapter_number: int,
+    course_audience: str = "",
 ) -> list[Block]:
     blocks: list[Block] = []
     for draft in drafts:
@@ -305,6 +392,7 @@ def normalize_draft_blocks(
         )
         if block is not None:
             blocks.append(block)
+    apply_young_audience_apparatus_override(blocks, course_audience, getattr(template, "audience", "") or "")
     return finish_chapter_blocks(blocks, template)
 
 

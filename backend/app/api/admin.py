@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.api.dependencies import get_current_admin
 from app.core.errors import ForbiddenError, NotFoundError
+from app.core.pricing import estimate_call_cost_usd, summarize_cost
 from app.db.models import Course, User
 from app.db.repositories.courses import CourseRepository
 from app.db.repositories.users import UserRepository
@@ -195,12 +196,36 @@ async def admin_course_model_usage(
     usage = await service.get_latest_model_usage(course_id)
     if usage is None:
         return AdminModelUsageResponse(course_id=course_id)
+    raw_calls = usage["model_usage"]
+    breakdown = summarize_cost(raw_calls)
+    calls: list[ModelUsageRecord] = []
+    for call in raw_calls:
+        cost = estimate_call_cost_usd(
+            model=call.get("model", ""),
+            kind=call.get("kind", ""),
+            input_tokens=call.get("input_tokens", 0) or 0,
+            output_tokens=call.get("output_tokens", 0) or 0,
+            megapixels=call.get("megapixels", 0.0) or 0.0,
+        )
+        calls.append(
+            ModelUsageRecord.model_validate(
+                {
+                    **call,
+                    "cost_inr": round(cost.inr, 4) if cost is not None else None,
+                    "cost_estimated": cost.estimated if cost is not None else False,
+                }
+            )
+        )
     return AdminModelUsageResponse(
         course_id=course_id,
         job_id=usage["job_id"],
         run_state=usage["state"],
         run_created_at=usage["created_at"],
-        calls=[ModelUsageRecord.model_validate(call) for call in usage["model_usage"]],
+        calls=calls,
+        by_model_inr=breakdown.by_model,
+        total_cost_inr=breakdown.total_inr,
+        has_unpriced_models=breakdown.has_unpriced_models,
+        has_estimated_models=breakdown.has_estimated_models,
     )
 
 

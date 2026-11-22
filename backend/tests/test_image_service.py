@@ -26,6 +26,7 @@ from app.services.image_service import (
     DEFAULT_ILLUSTRATION_GUIDANCE,
     MAI_IMAGE_MAX_PROMPT_TOKENS,
     MAX_PROMPT_CHARS,
+    PLAYFUL_INFOGRAPHIC_GUIDANCE,
     PROMPT_CHAR_BUDGET,
     SECTION_INTRO_ILLUSTRATION_GUIDANCE,
     TEXTBOOK_ILLUSTRATION_GUIDANCE,
@@ -193,6 +194,138 @@ def test_textbook_illustration_with_no_expected_labels_has_no_labels_line():
     block = _image_block(illustration_style="textbook")
     prompt = ImageService.build_prompt(block, template, "Course Title")
     assert "must include these exact labels" not in prompt
+
+
+def test_playful_infographic_illustration_style_uses_its_own_guidance():
+    """New style for a young/early-learner audience, picked by the writer
+    itself (see WRITER_SYSTEM) from the already-propagated audience context -
+    never a hardcoded "if audience == 'kids'" branch in this file."""
+    template = load_template("technical")
+    block = _image_block(illustration_style="playful_infographic")
+    prompt = ImageService.build_prompt(block, template, "Course Title")
+    assert PLAYFUL_INFOGRAPHIC_GUIDANCE in prompt
+    assert TEXTBOOK_ILLUSTRATION_GUIDANCE not in prompt
+    assert DEFAULT_ILLUSTRATION_GUIDANCE not in prompt
+
+
+def test_playful_infographic_guidance_names_its_key_visual_characteristics():
+    """The guidance constant itself must actually describe the reference
+    look the user asked for, and must not be a license to distort the real
+    concept just because the audience is young."""
+    for phrase in (
+        "mascot",
+        "LABELLED, COLOR-CODED BOXES",
+        "curved arrows",
+        "pastel",
+        "SUMMARY STRIP",
+        "ACCURACY, NOT A LICENSE TO SIMPLIFY WRONG",
+    ):
+        assert phrase in PLAYFUL_INFOGRAPHIC_GUIDANCE
+
+
+def test_playful_infographic_tells_the_model_to_render_expected_labels():
+    """Same labelled-style contract as `textbook` - a convincing young-
+    learner infographic is built FROM its labels, not despite them."""
+    template = load_template("technical")
+    block = _image_block(
+        illustration_style="playful_infographic",
+        expected_labels=["Snacks", "Drinks", "Budget"],
+    )
+    prompt = ImageService.build_prompt(block, template, "Course Title")
+    assert "Snacks" in prompt
+    assert "must include these exact labels" in prompt
+
+
+def test_existing_styles_are_unaffected_by_the_new_playful_infographic_style():
+    """Regression guard: adding a new style must not leak into any existing
+    style's own prompt."""
+    template = load_template("technical")
+    for style in ("textbook", "section_intro", ""):
+        block = _image_block(illustration_style=style, expected_labels=["B", "n"])
+        prompt = ImageService.build_prompt(block, template, "Course Title")
+        assert PLAYFUL_INFOGRAPHIC_GUIDANCE not in prompt
+
+
+async def test_playful_infographic_gets_its_own_style_compliant_question(monkeypatch):
+    """`_verify_image_relevance`'s style_compliant question must describe
+    THIS style's own required look, not textbook's flat-vector/no-
+    photorealism criteria - a real, confirmed risk: reusing the textbook
+    wording verbatim would false-flag a correct playful infographic for
+    having a mascot/bold shapes the textbook criteria never expected."""
+    svc = ImageService()
+    captured = {}
+
+    async def fake_structured(*, system, **kwargs):
+        captured["system"] = system
+        return ImageRelevanceCheck()
+
+    monkeypatch.setattr(svc.ai, "structured", fake_structured)
+    await svc._verify_image_relevance(
+        b"png-bytes", brief="x", course_title="y", textbook_style=True, style="playful_infographic",
+    )
+    assert "mascot" in captured["system"]
+    assert "flat 2D vector textbook illustration" not in captured["system"]
+
+    await svc._verify_image_relevance(
+        b"png-bytes", brief="x", course_title="y", textbook_style=True, style="textbook",
+    )
+    assert "flat 2D vector textbook illustration" in captured["system"]
+    assert "mascot" not in captured["system"]
+
+
+async def test_schematic_reroute_textbook_style_is_overridden_for_a_kids_audience(monkeypatch):
+    """Second override site, real-confirmed gap: `normalize_draft_blocks`'s
+    writer-time override (app.course.blocks.normalizer) only sees a block
+    before `DiagramService.generate_for_block`'s own retired-`schematic`
+    reroute sets `illustration_style: "textbook"` directly - a real course
+    ("How a Lever Works") shipped `textbook` under a kids audience because
+    of exactly this gap. `generate_for_block` must apply the same
+    conservative classifier again right after the diagram attempt returns,
+    using `course_audience` and/or the template's own stated audience."""
+    svc = ImageService()
+    block = _image_block(kind="diagram", diagram_kind="schematic")
+
+    async def fake_diagram_generate(**kwargs):
+        # Simulate the real reroute: sets illustration_style directly on the
+        # block and reports failure, exactly like DiagramService does.
+        kwargs["block"].content = {**kwargs["block"].content, "kind": "illustration", "illustration_style": "textbook"}
+        return False
+
+    async def fake_generate_illustration(**kwargs):
+        return True
+
+    monkeypatch.setattr(svc.diagrams, "generate_for_block", fake_diagram_generate)
+    monkeypatch.setattr(svc, "_generate_illustration", fake_generate_illustration)
+
+    template = load_template("technical")
+    ok = await svc.generate_for_block(
+        course_id="c1", block=block, template=template, course_title="t",
+        course_audience="Children aged 6 to 9 (early primary school)",
+    )
+    assert ok is True
+    assert block.content["illustration_style"] == "playful_infographic"
+
+
+async def test_schematic_reroute_textbook_style_unaffected_for_non_kids_audience(monkeypatch):
+    svc = ImageService()
+    block = _image_block(kind="diagram", diagram_kind="schematic")
+
+    async def fake_diagram_generate(**kwargs):
+        kwargs["block"].content = {**kwargs["block"].content, "kind": "illustration", "illustration_style": "textbook"}
+        return False
+
+    async def fake_generate_illustration(**kwargs):
+        return True
+
+    monkeypatch.setattr(svc.diagrams, "generate_for_block", fake_diagram_generate)
+    monkeypatch.setattr(svc, "_generate_illustration", fake_generate_illustration)
+
+    template = load_template("technical")
+    await svc.generate_for_block(
+        course_id="c1", block=block, template=template, course_title="t",
+        course_audience="Senior engineers and researchers",
+    )
+    assert block.content["illustration_style"] == "textbook"
 
 
 # ---------------------------------------------------------------------------

@@ -104,10 +104,21 @@ class ModelUsageRecord(BaseModel):
     seconds: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Real output resolution in megapixels, for an image call only - see
+    # app.core.metrics.CallRecord.megapixels and app.core.pricing (the only
+    # reader of this field, for FLUX.2-flex's real per-megapixel billing).
+    megapixels: float = 0.0
     retries: int = 0
     failed: bool = False
     used_fallback: bool = False
     timestamp: str = ""
+    # Estimated real-money cost of this one call, in INR - None when `model`
+    # isn't a recognised, priced model (see app.core.pricing.estimate_call_
+    # cost_usd; never a fabricated 0). `cost_estimated` is True only for the
+    # MAI-Image-2.6 approximation (see app.core.pricing's module docstring,
+    # point 2) - the UI must show this differently from an exact figure.
+    cost_inr: float | None = None
+    cost_estimated: bool = False
 
 
 class AdminModelUsageResponse(BaseModel):
@@ -116,3 +127,17 @@ class AdminModelUsageResponse(BaseModel):
     run_state: str | None = None
     run_created_at: datetime | None = None
     calls: list[ModelUsageRecord] = Field(default_factory=list)
+    # Real-money cost breakdown for this run's calls (see app.core.pricing) -
+    # by_model_inr sums to total_inr by construction; both are 0 for a run
+    # with no calls, never fabricated for one that has calls this app can't
+    # price (see has_unpriced_models).
+    by_model_inr: dict[str, float] = Field(default_factory=dict)
+    total_cost_inr: float = 0.0
+    # True when at least one call's `model` has no entry in app.core.pricing's
+    # rate tables (an unrecognised/new model, or MockAIClient's "mock") - the
+    # total above is a real sum of only the priced calls, not an admission
+    # that nothing is missing.
+    has_unpriced_models: bool = False
+    # True when at least one call's cost used the documented MAI-Image-2.6
+    # estimate rather than an exact rate (see app.core.pricing, point 2).
+    has_estimated_models: bool = False

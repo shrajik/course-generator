@@ -34,7 +34,7 @@ import {
   type AdminCourseListResponse,
   type AdminModelUsageResponse,
 } from "@/lib/api/admin";
-import { summarizeModelUsage } from "@/lib/admin/modelUsage";
+import { formatInr, summarizeModelUsage } from "@/lib/admin/modelUsage";
 import { createRequestGuard } from "@/lib/admin/requestGuard";
 
 const PAGE_SIZE = 25;
@@ -107,6 +107,7 @@ function yesNo(value: boolean): string {
  * readable; still fetched/owned by the page above it. */
 function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
   const summary = summarizeModelUsage(usage.calls);
+  const modelEntries = Object.entries(usage.by_model_inr);
   return (
     <>
       <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-ink">
@@ -122,8 +123,39 @@ function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
           {summary.fallbackCount} fallback{summary.fallbackCount === 1 ? "" : "s"}
         </span>
       </div>
+      {/* Real-money cost breakdown (see backend/app/core/pricing.py) - a
+          separate block from the token summary above so "this is an
+          estimate built from list pricing" reads as its own claim, not
+          folded silently into the token counts. */}
+      <div className="mb-3 rounded-[8px] border border-line bg-surface-muted px-3 py-2">
+        <div className="mb-1 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="text-[11px] uppercase tracking-[0.08em] text-ink-400">Estimated cost</span>
+          <span className="text-[14px] font-semibold text-ink">{formatInr(usage.total_cost_inr)}</span>
+        </div>
+        {modelEntries.length > 0 ? (
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-[12px] text-ink">
+            {modelEntries.map(([model, amount]) => (
+              <span key={model}>
+                {model}: {formatInr(amount)}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {usage.has_unpriced_models ? (
+          <p className="mt-1 text-[11px] text-ink-400">
+            One or more models used here have no configured rate yet - the total above excludes
+            them rather than guessing.
+          </p>
+        ) : null}
+        {usage.has_estimated_models ? (
+          <p className="mt-1 text-[11px] text-ink-400">
+            MAI-Image-2.6&apos;s cost is a documented estimate (Microsoft Foundry doesn&apos;t
+            return a token count for this model) - see backend/app/core/pricing.py.
+          </p>
+        ) : null}
+      </div>
       <div className="overflow-x-auto rounded-[8px] border border-line">
-        <table className="w-full min-w-[640px] text-left text-[12px]">
+        <table className="w-full min-w-[720px] text-left text-[12px]">
           <thead className="bg-surface-muted text-[10px] uppercase tracking-[0.08em] text-ink-400">
             <tr>
               <th className="px-3 py-2 font-medium">Purpose</th>
@@ -134,6 +166,7 @@ function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
               <th className="px-3 py-2 font-medium text-right">Out</th>
               <th className="px-3 py-2 font-medium text-right">Sec</th>
               <th className="px-3 py-2 font-medium text-right">Retries</th>
+              <th className="px-3 py-2 font-medium text-right">Cost</th>
               <th className="px-3 py-2 font-medium">Flags</th>
               <th className="px-3 py-2 font-medium">Timestamp</th>
             </tr>
@@ -151,6 +184,10 @@ function ModelUsageDetail({ usage }: { usage: AdminModelUsageResponse }) {
                 <td className="px-3 py-2 text-right">{call.output_tokens.toLocaleString()}</td>
                 <td className="px-3 py-2 text-right">{call.seconds.toFixed(1)}</td>
                 <td className="px-3 py-2 text-right">{call.retries}</td>
+                <td className="px-3 py-2 text-right" title={call.cost_estimated ? "Estimated" : undefined}>
+                  {formatInr(call.cost_inr)}
+                  {call.cost_estimated ? "*" : ""}
+                </td>
                 <td className="px-3 py-2">
                   <div className="flex flex-wrap gap-1">
                     {call.failed ? <AdminStatusBadge tone="danger">Failed</AdminStatusBadge> : null}

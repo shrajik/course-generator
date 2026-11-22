@@ -513,6 +513,59 @@ def font_size_issues(root: ET.Element, canvas_w: float, *, display_width: float 
     return issues
 
 
+def edge_label_font_size_issues(
+    root: ET.Element, canvas_w: float, *, display_width: float = CONTENT_WIDTH
+) -> list[RenderQAIssue]:
+    """The edge-label-only half of `font_size_issues` above, standing alone
+    - that function's node-title/subtitle checking (the `diagram-node`
+    group loop) assumes the old box-structure convention
+    (LABEL_SIZE/DETAIL_SIZE) and produces real false positives for
+    ring-style kinds (concept_map/cycle/etc.), whose circles are correctly
+    SMALLER by design (`RING_LABEL_SIZE`, already checked correctly by
+    `readability_issues` elsewhere) - confirmed directly: enabling the
+    whole of `font_size_issues` for concept_map flagged its own node
+    circle titles as "below 14px" even though they were rendering exactly
+    at their intended, correct size. This function exists so the edge-
+    label check (genuinely useful - see below) can be used without that
+    unrelated false-positive baggage.
+
+    Root cause this closes: edge labels can now legitimately shrink their
+    own font (see `diagram_renderer._edge_label_layout`'s shrink fallback)
+    independently of the diagram's main node-label size, which the
+    existing whole-diagram `readability_issues` check was never designed
+    to catch (it only ever examines ONE representative, node-circle font
+    size, assumed to always be the smallest text present - no longer true
+    now that an edge label can shrink below it). Confirmed by direct
+    render: a real long spoke label does shrink to an on-page size this
+    function correctly flags, which `readability_issues` alone misses.
+
+    Kind-agnostic by construction (checks the rect+text sibling pattern
+    wherever it occurs in the tree, not only as a direct child of the
+    SVG root) - usable for any kind that draws edge labels via
+    `diagram_renderer._edge_label`, not just concept_map."""
+    if canvas_w <= 0:
+        return []
+    scale = min(display_width / canvas_w, 1.0)
+    issues: list[RenderQAIssue] = []
+    for parent in root.iter():
+        children = list(parent)
+        for i, el in enumerate(children):
+            if _local(el.tag) != "rect" or "diagram-edge-label" not in (el.get("class") or "").split():
+                continue
+            if i + 1 >= len(children) or _local(children[i + 1].tag) != "text":
+                continue
+            text_el = children[i + 1]
+            font_size = _f(text_el, "font-size", 0.0)
+            effective = font_size * scale
+            if effective < _FONT_FLOOR_EDGE_LABEL - 0.05:
+                preview = "".join(t.text or "" for t in text_el).strip()[:40]
+                issues.append(RenderQAIssue(
+                    "font_below_minimum",
+                    f"edge label '{preview}' renders at {effective:.1f}px, below the {_FONT_FLOOR_EDGE_LABEL:.0f}px minimum",
+                ))
+    return issues
+
+
 _SHARED_SEGMENT_MIN_OVERLAP = 28.0
 _COLLINEAR_TOLERANCE = 1.0
 
@@ -915,6 +968,18 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
         # exemptions below already use.
         *(label_overlaps_node_issues(root) if kind in ("concept_map", "conceptual") else []),
         *(label_overlaps_label_issues(root) if kind in ("concept_map", "conceptual") else []),
+        # Edge labels can now legitimately shrink their own font below the
+        # diagram's main node-label size (see `diagram_renderer._edge_
+        # label_layout`'s shrink fallback) - `readability_issues` above
+        # only ever checks ONE representative, node-circle font size, so
+        # it can no longer be relied on to catch an edge label that
+        # shrank below readability on its own. Gated to concept_map/
+        # conceptual, the only kind whose edge labels are currently known
+        # to shrink this way - not the full `font_size_issues` (which
+        # also re-checks node-circle titles against a box-structure floor
+        # that's wrong for ring-style circles, a real, confirmed false
+        # positive), only its edge-label-only half.
+        *(edge_label_font_size_issues(root, canvas_w) if kind in ("concept_map", "conceptual") else []),
         # Same reasoning as the edge_crosses_node exemption just below:
         # gantt_chart's tick gridlines are DESIGNED to run collinear with
         # (behind) every task bar in their column - that's the standard

@@ -323,6 +323,128 @@ def test_replace_image_regenerated_to_nothing_detects_a_total_failure():
     assert _replace_image_regenerated_to_nothing(no_image, no_image) is False
 
 
+def test_replace_image_still_has_no_working_image_detects_a_never_generated_failure():
+    from app.services.document_service import _replace_image_still_has_no_working_image
+
+    no_image = {"path": None, "generated": False}
+    has_image = {"path": "assets/image_001.svg", "generated": True}
+
+    assert _replace_image_still_has_no_working_image(no_image) is True
+    assert _replace_image_still_has_no_working_image(has_image) is False
+
+
+def test_ai_edit_reports_images_failed_for_a_block_that_never_generated_in_the_first_place(
+    client, documents, monkeypatch,
+):
+    """Real, confirmed bug (doc_9766b5447186, "How a Pulley Works"): a
+    block whose own automatic generation was never successfully attempted
+    (`path: None`, `generated: False`, but carrying real `visual_qa_
+    findings` from that original failure) gets "Replace Image" clicked
+    with a user prompt. `_replace_image_regenerated_to_nothing` only
+    detects a REGRESSION (had a working image, now doesn't), so it is
+    structurally always False here - the chat reply used to say "applied"
+    with nothing in `images_failed` even though generation failed again,
+    leaving the reader looking at an unchanged "Image not generated yet"
+    placeholder with no indication anything went wrong. Also confirms the
+    real generation call is actually reached (not a silent no-op) and
+    receives the prior findings to fold in - `_manual_replace_correction_
+    note`'s own fold-in logic is unit-tested directly in
+    test_manual_replace_folds_actionable_prior_findings_into_the_users_
+    prompt (test_image_service.py); this test's job is only the ai_edit-
+    level `images_failed` signal."""
+    from app.schemas.patch import DocumentPatch
+
+    course_id = _create(client)["course_id"]
+    client.post(f"/api/courses/{course_id}/generate", json={"mode": "sync"})
+    document = client.get(f"/api/courses/{course_id}/document").json()
+    document_id = document["document_id"]
+    image_block = next(
+        b for page in document["pages"] for b in page["blocks"] if b["type"] == "image"
+    )
+
+    prior_findings = [
+        {
+            "type": "off_topic_image",
+            "detail": "did not depict the requested topic",
+            "resolution": "image_withheld_after_qa_failure",
+        }
+    ]
+
+    async def fake_edit_seed(*, document, selected_block_ids, instruction):
+        # Seeds the block as "never successfully generated, with a real
+        # prior QA finding" exactly as reported - update_block merges, so
+        # the other fields the fixture already set stay intact.
+        return DocumentPatch.model_validate({
+            "operations": [
+                {
+                    "type": "update_block",
+                    "block_id": image_block["id"],
+                    "content": {
+                        "path": None,
+                        "generated": False,
+                        "visual_qa_findings": prior_findings,
+                    },
+                }
+            ],
+            "reasoning": "test setup",
+        })
+
+    async def fake_edit_replace(*, document, selected_block_ids, instruction):
+        return DocumentPatch.model_validate({
+            "operations": [
+                {
+                    "type": "replace_image",
+                    "block_id": image_block["id"],
+                    "prompt": "genrate textbook style image",
+                }
+            ],
+            "reasoning": "test",
+        })
+
+    generate_missing_calls: list[list[str] | None] = []
+
+    async def fake_generate_missing(*, document, template, only_block_ids=None, force=False, on_progress=None, job_id=""):
+        generate_missing_calls.append(only_block_ids)
+        # Simulate every bounded attempt failing again - still no working image.
+        return 0
+
+    monkeypatch.setattr(documents.editor, "edit", fake_edit_seed)
+    seed = client.post(
+        f"/api/documents/{document_id}/ai-edit",
+        json={"selected_block_ids": [image_block["id"]], "instruction": "seed"},
+    )
+    assert seed.status_code == 200, seed.text
+    seeded = client.get(f"/api/documents/{document_id}").json()
+    seeded_block = next(
+        b for page in seeded["pages"] for b in page["blocks"] if b["id"] == image_block["id"]
+    )
+    assert seeded_block["content"]["generated"] is False
+    assert seeded_block["content"]["visual_qa_findings"] == prior_findings
+
+    monkeypatch.setattr(documents.editor, "edit", fake_edit_replace)
+    monkeypatch.setattr(documents.images, "generate_missing", fake_generate_missing)
+
+    response = client.post(
+        f"/api/documents/{document_id}/ai-edit",
+        json={
+            "selected_block_ids": [image_block["id"]],
+            "instruction": "Replace this image with: genrate textbook style image",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    # The real generation call must actually be reached - never a silent no-op.
+    assert generate_missing_calls == [[image_block["id"]]]
+    assert body["images_failed"] == [image_block["id"]]
+
+    updated = client.get(f"/api/documents/{document_id}").json()
+    still_missing = next(
+        b for page in updated["pages"] for b in page["blocks"] if b["id"] == image_block["id"]
+    )
+    assert still_missing["content"].get("generated") is not True
+
+
 def test_non_technical_course_uses_its_own_template(client):
     course = _create(
         client,

@@ -201,6 +201,7 @@ export interface AiEditResponse {
   patch: DocumentPatch;
   applied_operations: string[];
   rejected_operations: Array<{ type: string; block_id: string | null; reason: string }>;
+  images_failed: string[];
   pages: number;
 }
 

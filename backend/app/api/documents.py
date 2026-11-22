@@ -7,7 +7,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse, HTMLResponse
 
-from app.api.course_authorization import check_document_owner, check_document_owner_for_pdf_export
+from app.api.course_authorization import (
+    check_document_owner,
+    check_document_owner_for_pdf_export,
+    check_document_owner_for_pptx_export,
+)
 from app.api.dependencies import get_current_user_if_db_enabled
 from app.core.ids import slugify
 from app.course.companions import companion_deliverables
@@ -353,6 +357,64 @@ async def download_exported_pdf(
         path=str(path),
         media_type="application/pdf",
         filename=f"{slugify(document.course_title)}.pdf",
+    )
+
+
+@router.post("/{document_id}/export/pptx")
+async def export_pptx(
+    document_id: str,
+    download: bool = Query(default=True, description="Stream the PPTX instead of JSON"),
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> Any:
+    """Render the current Course Document JSON to a real, editable .pptx -
+    one slide per page, real PowerPoint shapes (text boxes, tables, pictures),
+    positioned from each block's own real layout - see pptx_service.py."""
+    await check_document_owner_for_pptx_export(document_id, current_user, course_service, service)
+    path, document = await service.export_pptx(document_id)
+    if current_user is not None:
+        await course_service.record_activity(
+            document.course_id, str(current_user.id), current_user.email, "exported"
+        )
+    if not download:
+        return {
+            "document_id": document.document_id,
+            "course_id": document.course_id,
+            "version": document.version,
+            "pages": len(document.pages),
+            "pptx_path": path.as_posix(),
+            "size_bytes": path.stat().st_size,
+        }
+    return FileResponse(
+        path=str(path),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=f"{slugify(document.course_title)}.pptx",
+    )
+
+
+@router.get("/{document_id}/export/pptx/download")
+async def download_exported_pptx(
+    document_id: str,
+    service: DocumentService = Depends(_service),
+    course_service: CourseService = Depends(_course_service),
+    current_user: User | None = Depends(get_current_user_if_db_enabled),
+) -> FileResponse:
+    """Serve the already-exported PPTX (written by `export_pptx` above) as a
+    plain GET, mirroring `download_exported_pdf`'s own native-browser-download
+    resilience reasoning exactly - never regenerates it, so GETting it before
+    an export has ever run is a 404, not silent nonsense."""
+    course_id = await check_document_owner_for_pptx_export(document_id, current_user, course_service, service)
+    path = service.storage.pptx_path(course_id)
+    if not path.exists():
+        from app.core.errors import NotFoundError
+
+        raise NotFoundError("No exported PPTX yet for this document - call export/pptx first")
+    document = await service.load(document_id)
+    return FileResponse(
+        path=str(path),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=f"{slugify(document.course_title)}.pptx",
     )
 
 

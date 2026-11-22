@@ -109,3 +109,22 @@ async def check_document_owner_for_pdf_export(
             "PDF export is only available once this course has passed final SME approval."
         )
     return course_id
+
+
+async def check_document_owner_for_pptx_export(
+    document_id: str,
+    current_user: User | None,
+    course_service: CourseService,
+    document_service: DocumentService,
+) -> str:
+    """Same ownership + approval gate as `check_document_owner_for_pdf_export`
+    (reuses `user_can_export_pdf` directly - the approval rule is about
+    "shipping a finished export from the editor", not specific to PDF as a
+    format), for the PPTX export routes."""
+    course_id = document_service.resolve_course_id(document_id)
+    record = await get_owned_course(course_id, current_user, course_service)
+    if current_user is not None and not user_can_export_pdf(current_user, record):
+        raise ForbiddenError(
+            "PPTX export is only available once this course has passed final SME approval."
+        )
+    return course_id

@@ -32,6 +32,7 @@ from app.schemas.patch import AiEditRequest, AiEditResponse
 from app.services.image_service import ImageService
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.pdf_service import PdfService
+from app.services.pptx_service import PptxService
 from app.services.storage_service import StorageService, get_storage
 
 log = get_logger(__name__)
@@ -51,6 +52,26 @@ def _replace_image_regenerated_to_nothing(old_content: dict, new_content: dict) 
     return had_image and not has_image_now
 
 
+def _replace_image_still_has_no_working_image(new_content: dict) -> bool:
+    """True when a `replace_image` regeneration attempt ended with no
+    working image at all, regardless of whether the block had one before -
+    a real, confirmed gap `_replace_image_regenerated_to_nothing` above
+    leaves open: that check is a REGRESSION detector (had a working image,
+    now doesn't), so it is always False for a block that never had one to
+    begin with (e.g. its own earlier automatic generation was withheld
+    after a QA failure, or simply never attempted). A real reported case:
+    the user clicks "Replace Image" on exactly such a block, generation
+    fails every bounded attempt under real network conditions, and the API
+    response still said "applied" (the patch itself always applies cleanly)
+    with nothing in `images_failed` - the reader was left looking at an
+    unchanged "Image not generated yet" placeholder with no indication
+    anything had gone wrong. There is nothing to restore here (the old
+    content was already blank), so this never triggers the snapshot
+    restore above - it only adds the block to `images_failed` so the chat
+    reply reports the failure instead of silently repeating "applied"."""
+    return not (bool(new_content.get("path")) and bool(new_content.get("generated")))
+
+
 class DocumentService:
     def __init__(
         self,
@@ -68,6 +89,7 @@ class DocumentService:
         self.editor = EditorAgent(self.ai, self.settings)
         self.images = ImageService(self.ai, self.storage, self.settings)
         self.pdf = PdfService(self.storage, self.settings)
+        self.pptx = PptxService(self.storage)
 
     # --- persistence: same short-lived-session pattern as CourseService.
     # Each call opens its own session rather than holding one on the instance,
@@ -222,6 +244,14 @@ class DocumentService:
                     block_id,
                 )
                 block.content = old_content
+                images_failed.append(block_id)
+            elif _replace_image_still_has_no_working_image(block.content):
+                log.warning(
+                    "replace_image regeneration for %s failed every bounded attempt - "
+                    "it had no prior working image to restore, reporting the failure "
+                    "instead of silently claiming success",
+                    block_id,
+                )
                 images_failed.append(block_id)
         if images_failed:
             reflow_document(document, template)
@@ -488,6 +518,11 @@ class DocumentService:
         record = await self._load_course(document.course_id)
         record.pdf_path = path.relative_to(self.storage.course_dir(document.course_id)).as_posix()
         await self._save_course(record)
+        return path, document
+
+    async def export_pptx(self, document_id: str) -> tuple[Path, CourseDocument]:
+        document = await self.load(document_id)
+        path = await self.pptx.export_pptx_to_disk(document)
         return path, document
 
 

@@ -97,6 +97,7 @@ class WriterAgent:
             template=template,
             chapter_id=chapter.id,
             chapter_number=chapter.order,
+            course_audience=course_input.target_audience,
         )
         if not blocks:
             raise ValueError(f"Writer produced no usable blocks for {chapter.id}")

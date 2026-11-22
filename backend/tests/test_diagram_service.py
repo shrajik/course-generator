@@ -10,7 +10,7 @@ call count actually dropped, not just that the end result still looks right.
 
 from __future__ import annotations
 
-from app.agents.prompts import WRITER_SYSTEM
+from app.agents.prompts import EDITOR_SYSTEM, WRITER_SYSTEM
 from app.core.config import get_settings
 from app.course.templates.registry import load_template
 from app.schemas.blocks import BlockType
@@ -195,6 +195,69 @@ def test_writer_system_never_mandates_multiple_facets_for_a_simple_topic():
     assert "not every topic" in normalized
     assert "never invented for density" in normalized
     assert "single-facet topic" in normalized
+
+
+def test_writer_system_instructs_choosing_playful_infographic_for_young_audiences():
+    """New kids/playful-infographic style fix: the writer must be told this
+    style exists and when to choose it FROM the already-propagated audience
+    context (never a hardcoded keyword match in code), and that it is an
+    audience-driven choice, never a fallback for a sparse brief, never a
+    license to distort the real concept."""
+    normalized = _normalized_whitespace(WRITER_SYSTEM)
+    assert "playful_infographic" in normalized
+    assert "young/early learners" in normalized
+    assert "never a hardcoded keyword match" in normalized
+    assert "never a fallback for a sparse brief" in normalized
+    assert "never a distorted or simplified-to-the-point-of-wrong" in normalized
+
+
+def test_writer_system_offers_playful_infographic_as_an_alternative_for_apparatus_too():
+    """Real-course follow-up fix: a real generated course showed the writer
+    picking `illustration_style: "textbook"` for a real apparatus/mechanism
+    (a wheel-and-axle crank handle) even under a kids audience, because the
+    "schematic retired -> ALWAYS textbook" rule sat earlier in the prompt,
+    stated unconditionally, with the playful_infographic alternative only
+    appearing much later as an easy-to-miss addendum. The apparatus rule
+    itself must now state the audience-driven choice at the point it first
+    tells the model what to do, not leave it to a separate, later bullet -
+    and it must do so without weakening the original "every mechanism needs
+    real, accurate labels" requirement that rule exists to protect for
+    EITHER style."""
+    normalized = _normalized_whitespace(WRITER_SYSTEM)
+    # The apparatus-specific rule (schematic retired) itself must now mention
+    # both styles and frame the choice as audience-driven, not subject-driven.
+    assert (
+        "Which `illustration_style` delivers that labelled treatment is an AUDIENCE choice, "
+        "not a subject choice" in normalized
+    )
+    assert "Do not let \"this is a real apparatus\" alone default you to `textbook`" in normalized
+    # The labelling requirement must still apply under either style - never
+    # relaxed just because the style is the playful one.
+    assert "still applies in full, under EITHER style" in normalized
+
+
+def test_editor_system_also_offers_playful_infographic_for_apparatus():
+    """The identical schematic-retired/apparatus rule is duplicated in
+    EDITOR_SYSTEM (manual replace_image/insert_block edits) - fixed there too
+    for consistency, so a manually-edited apparatus image gets the same
+    audience-driven treatment a freshly-authored one does."""
+    normalized = _normalized_whitespace(EDITOR_SYSTEM)
+    assert "playful_infographic" in normalized
+    assert "is an audience choice, not a subject choice" in normalized
+
+
+def test_writer_and_editor_system_give_a_concrete_wheel_and_axle_worked_example():
+    """Strengthening follow-up: two real samples after the first wording fix
+    still showed the writer defaulting real apparatus to `textbook` under a
+    kids audience. Both WRITER_SYSTEM and EDITOR_SYSTEM must now include a
+    concrete, vivid worked example (the same wheel-and-axle subject drawn
+    under both styles, same labels) for the model to pattern-match against,
+    not just abstract instruction language."""
+    for system_prompt in (WRITER_SYSTEM, EDITOR_SYSTEM):
+        normalized = _normalized_whitespace(system_prompt)
+        assert "wheel-and-axle lifting a cart" in normalized
+        assert "Wheel, Axle, Effort, Load" in normalized
+        assert "the subject" in normalized.lower()
 
 
 def test_writer_system_names_a_rule_of_thumb_and_key_takeaways_as_optional_facets():
