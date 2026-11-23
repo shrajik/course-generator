@@ -91,10 +91,12 @@ up, refuses to run if they are not in the expected shape, validates before reloa
 backups itself if anything fails. It never touches the other app, its data, the firewall or SSH.
 ```
 scp deploy/attach-to-caddy.sh root@45.140.201.44:/root/
-ssh root@45.140.201.44 "bash /root/attach-to-caddy.sh courses.rentprompts.com courses-api.rentprompts.com"
+ssh root@45.140.201.44 "bash /root/attach-to-caddy.sh courses.45-140-201-44.sslip.io courses-api.45-140-201-44.sslip.io"
 ```
-Then add two DNS A records (`courses`, `courses-api`) -> `45.140.201.44` (Cloudflare: DNS only). Caddy gets the
-certificates by itself within a minute. Host rules we follow: no public ports, containers pinned to CPU cores
+These `sslip.io` names resolve to the server IP by themselves, so no DNS records are needed. With your own
+domain, add two A records (DNS only if on Cloudflare) to the server IP and use those names instead.
+Caddy gets the certificates by itself within a minute. (sslip.io certificates share a public rate limit;
+if issuance fails, wait or try again later. Use your own domain for real users.) Host rules we follow: no public ports, containers pinned to CPU cores
 4-7 (the other app uses 0-3), backend limited to 6 GB, and never `docker compose down` in `/opt/ppt2scorm`.
 
 ## 6. First-run checks
