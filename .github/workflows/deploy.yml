@@ -1,0 +1,51 @@
+name: Deploy to Contabo
+
+# Runs on every push to Feedback-work, or by hand from the Actions tab. It only calls deploy/deploy.py,
+# the same script you can run from your own PC, so there is a single deploy path.
+#
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   DEPLOY_HOST         server IP or hostname
+#   DEPLOY_USER         the SSH user on the server (a user in the `docker` group)
+#   DEPLOY_SSH_KEY      the PRIVATE key whose public half is in that user's authorized_keys
+#   DEPLOY_KNOWN_HOSTS  the server's host key line(s): run `ssh-keyscan -t ed25519 <ip>` once on your
+#                       own machine and paste the output (pins the server so the runner cannot be
+#                       tricked into deploying to an impostor)
+#   PROD_ENV            the full contents of the production env file (see .env.production.example)
+on:
+  push:
+    branches: [Feedback-work]
+  workflow_dispatch:
+
+# Never run two deploys at once, and never cancel one halfway through a rebuild.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH and the env file
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          PROD_ENV: ${{ secrets.PROD_ENV }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          (umask 077; printf '%s\n' "$PROD_ENV" > "$RUNNER_TEMP/prod.env")
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ~/.ssh/deploy_key
+        run: python3 deploy/deploy.py deploy --env-file "$RUNNER_TEMP/prod.env"
