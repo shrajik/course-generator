@@ -171,6 +171,28 @@ class Settings(BaseSettings):
     azure_mai_image_api_key: str = ""
     azure_mai_image_deployment: str = ""
 
+    # --- Azure Cost Management reconciliation (admin-only) ------------------
+    #  A separate Azure AD SERVICE PRINCIPAL (an app registration), NOT an
+    #  Azure OpenAI/Foundry resource key - used for exactly one thing:
+    #  periodically asking Azure's own Cost Management API what it actually
+    #  billed for MAI-Image-2.6 (see app.services.azure_cost_reconciliation),
+    #  because that model's generation response never returns a usage/
+    #  token-count field (see app.core.pricing's module docstring, point 2 -
+    #  this is the feature that replaced the old third-party-benchmark
+    #  estimate with a real measured figure). The principal needs only the
+    #  "Cost Management Reader" RBAC role on the subscription - it is never
+    #  used to call any Azure OpenAI/Foundry generation endpoint, and never
+    #  logged/returned to a caller, same handling as every other secret
+    #  above. All four are required together - validated at call time (in
+    #  azure_cost_reconciliation.fetch_mai_image_actual_cost_inr), not here,
+    #  so constructing Settings never fails just because this isn't
+    #  configured; the reconciliation feature simply reports itself
+    #  unavailable (see CostQueryOutcome).
+    azure_tenant_id: str = ""
+    azure_client_id: str = ""
+    azure_client_secret: str = ""
+    azure_subscription_id: str = ""
+
     # --- Wikimedia Commons (first-priority image source) --------------------
     #  Checked BEFORE any AI image model for every `kind == "illustration"`
     #  request (and the raster fallback a failed diagram/concept_experience

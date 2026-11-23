@@ -869,6 +869,16 @@ class CourseService:
         async with get_database_service() as db:
             return await db.list_generation_runs(course_id, limit, offset)
 
+    async def count_model_calls_in_window(self, *, model: str, start: datetime, end: datetime) -> int:
+        """Admin-only cross-course real call count (see app.api.admin's
+        MAI-Image-2.6 cost reconciliation endpoint) - 0 for a
+        filesystem-only deployment (use_db False), same "nothing to
+        aggregate" contract as list_activities/list_generation_runs above."""
+        if not self.use_db:
+            return 0
+        async with get_database_service() as db:
+            return await db.count_model_calls_in_window(model=model, start=start, end=end)
+
     async def get_latest_model_usage(self, course_id: str) -> dict | None:
         """Admin-only (see app.api.admin's model-usage endpoint) - the full
         per-call AI model usage list from the most recent generation run.

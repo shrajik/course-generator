@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -141,3 +141,35 @@ class AdminModelUsageResponse(BaseModel):
     # True when at least one call's cost used the documented MAI-Image-2.6
     # estimate rather than an exact rate (see app.core.pricing, point 2).
     has_estimated_models: bool = False
+
+
+class MaiImageCostReconciliation(BaseModel):
+    """Real-vs-estimate comparison for MAI-Image-2.6's per-image cost (see
+    app.services.azure_cost_reconciliation and app.core.pricing's module
+    docstring, point 2) - cost-optimization follow-up. `available=False`
+    whenever Azure Cost Management couldn't be reached (not configured, auth
+    failure, rate-limited, unexpected response, ...); every "real" field is
+    then None/0, never a fabricated number - `unavailable_reason` says why,
+    and the static estimate is still returned either way so the UI always
+    has at least one number to show."""
+
+    available: bool
+    unavailable_reason: str | None = None
+    window_start: date | None = None
+    window_end: date | None = None
+    # Real count of MAI-Image-2.6 calls this app itself recorded in the
+    # window - the denominator behind measured_inr_per_image.
+    real_image_count: int = 0
+    # Real total Azure actually billed for MAI-Image-2.6 in the window (INR,
+    # Azure's own native billing currency for this account) - None whenever
+    # `available` is False.
+    actual_total_cost_inr: float | None = None
+    # actual_total_cost_inr / real_image_count - None when either the query
+    # failed or there were zero real images in the window (never a
+    # division-by-zero fabrication).
+    measured_inr_per_image: float | None = None
+    # app.core.pricing.MAI_IMAGE_ESTIMATED_USD_PER_IMAGE, in both units, for
+    # direct side-by-side comparison against the measured figures above -
+    # always present regardless of `available`, since it needs no live call.
+    static_estimate_inr_per_image: float
+    static_estimate_usd_per_image: float

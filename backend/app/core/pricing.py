@@ -74,18 +74,27 @@ EMBEDDING_RATES_USD_PER_1M: dict[str, float] = {
 FLUX_RATE_USD_PER_MEGAPIXEL = 0.05
 
 # MAI-Image-2.6 (Microsoft Foundry) - see point 2 above: this app cannot see
-# the real billed token count, so this is a documented ESTIMATE, not a
-# verified flat rate. Derivation: Microsoft's own published per-token rates
-# put the standard (non-Flash) model's image-OUTPUT token rate at exactly 2x
-# the Flash variant's ($38 vs $19 per 1M tokens); a third-party benchmark
-# (Artificial Analysis) measured the Flash variant at ~$19.50 per 1,000
-# generated images on Microsoft Foundry. Assuming a comparable token count
-# per image across both variants (the only assumption this estimate makes),
-# the standard model's real-world per-image cost should be in the same
-# neighbourhood as 2x that Flash figure: ~$0.039/image. This number should be
-# replaced with a real measurement (or Microsoft's own flat per-image price,
-# if one is ever published) rather than trusted indefinitely.
-MAI_IMAGE_ESTIMATED_USD_PER_IMAGE = 0.039
+# the real billed token count, so this is still a documented ESTIMATE, not a
+# verified flat rate (hence `estimated=True` below) - but as of this value,
+# it is a REAL MEASUREMENT rather than a third-party-benchmark derivation.
+# app.services.azure_cost_reconciliation queries Azure's own Cost Management
+# API (grouped by Product, which isolates MAI-Image-2.6's 3 real billing
+# meters even though this app's single Azure resource also hosts gpt-5/
+# gpt-5-mini/gpt-5.5/embeddings/FLUX.2-flex/Bing grounding - see that
+# module's docstring) for what Azure actually billed, and divides by this
+# app's own real recorded MAI-Image-2.6 call count over the same window.
+# Measured over the 30-day window ending 2026-11-21: Azure billed
+# ₹2,834.5519945784613 total for MAI-Image-2.6's 3 meters, against 161 real,
+# successful calls this app recorded in that same window - ₹17.60591300980411
+# /image, converted to USD at this module's own USD_TO_INR_RATE (95.0) for
+# internal consistency with every other rate in this file. The PREVIOUS
+# estimate (~$0.039/image, derived from a 2x-the-Flash-variant third-party
+# benchmark) undercounted the real cost by roughly 4.75x - this value should
+# be periodically re-measured (the admin-only reconciliation endpoint makes
+# this a live comparison, not a one-off) rather than trusted indefinitely
+# either, since it is still a snapshot from one measurement window, not a
+# live per-call fact.
+MAI_IMAGE_ESTIMATED_USD_PER_IMAGE = 0.18532540010320114
 
 
 @dataclass

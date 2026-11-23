@@ -428,6 +428,13 @@ class DatabaseService:
         rows = await self.generation_runs.list_for_course(course.id, limit, offset)
         return [self._to_generation_run_entry(row) for row in rows]
 
+    async def count_model_calls_in_window(self, *, model: str, start: datetime, end: datetime) -> int:
+        """Admin-only cross-course real call count (see app.api.admin's
+        MAI-Image-2.6 cost reconciliation endpoint and
+        app.services.azure_cost_reconciliation) - delegates straight to the
+        repository's raw-SQL JSONB query."""
+        return await self.generation_runs.count_model_calls_in_window(model=model, start=start, end=end)
+
     async def get_latest_generation_run_model_usage(self, course_id: str) -> dict | None:
         """Admin-only reader for `GenerationRun.payload_json["model_usage"]`
         (see CourseService._finalise) - the one place that raw field is ever

@@ -9,8 +9,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 
 from app.api.dependencies import get_current_admin
+from app.core.config import get_settings
 from app.core.errors import ForbiddenError, NotFoundError
-from app.core.pricing import estimate_call_cost_usd, summarize_cost
+from app.core.pricing import MAI_IMAGE_ESTIMATED_USD_PER_IMAGE, USD_TO_INR_RATE, estimate_call_cost_usd, summarize_cost
 from app.db.models import Course, User
 from app.db.repositories.courses import CourseRepository
 from app.db.repositories.users import UserRepository
@@ -22,12 +23,14 @@ from app.schemas.admin import (
     AdminModelUsageResponse,
     AdminUserListResponse,
     AdminUserResponse,
+    MaiImageCostReconciliation,
     ModelUsageRecord,
     UpdateUserStatusRequest,
     UpdateUserRoleRequest,
     UserRole,
 )
 from app.schemas.course import CourseStatus
+from app.services import azure_cost_reconciliation
 from app.services.course_service import CourseService, get_course_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -226,6 +229,54 @@ async def admin_course_model_usage(
         total_cost_inr=breakdown.total_inr,
         has_unpriced_models=breakdown.has_unpriced_models,
         has_estimated_models=breakdown.has_estimated_models,
+    )
+
+
+@router.get("/cost/mai-image-reconciliation", response_model=MaiImageCostReconciliation)
+async def admin_mai_image_cost_reconciliation(
+    current_admin: User = Depends(get_current_admin),
+    service: CourseService = Depends(get_course_service),
+) -> MaiImageCostReconciliation:
+    """Real-vs-estimate comparison for MAI-Image-2.6's per-image cost - see
+    app.services.azure_cost_reconciliation's own docstring for the full
+    methodology (why grouping by Product avoids the shared-resource
+    contamination problem, why the window excludes the most recent couple of
+    days). Never raises on Azure Cost Management being unreachable/
+    unconfigured - reports `available=False` with a reason instead, same
+    philosophy as every other cost-estimation path in this app. Calls Azure
+    Cost Management at most once per request - see that module's own
+    docstring on why this must stay infrequent (a real, tight rate limit,
+    confirmed live) rather than something a UI polls."""
+    settings = get_settings()
+    static_inr = round(MAI_IMAGE_ESTIMATED_USD_PER_IMAGE * USD_TO_INR_RATE, 4)
+    window_start, window_end = azure_cost_reconciliation.reconciliation_window()
+
+    outcome = await azure_cost_reconciliation.fetch_mai_image_actual_cost_inr(
+        settings=settings, window_start=window_start, window_end=window_end
+    )
+    if outcome.error is not None or outcome.total_inr is None:
+        return MaiImageCostReconciliation(
+            available=False,
+            unavailable_reason=outcome.error,
+            static_estimate_inr_per_image=static_inr,
+            static_estimate_usd_per_image=MAI_IMAGE_ESTIMATED_USD_PER_IMAGE,
+        )
+
+    image_count = await service.count_model_calls_in_window(
+        model="MAI-Image-2.6",
+        start=datetime(window_start.year, window_start.month, window_start.day, tzinfo=timezone.utc),
+        end=datetime(window_end.year, window_end.month, window_end.day, tzinfo=timezone.utc),
+    )
+    measured = azure_cost_reconciliation.measured_inr_per_image(outcome.total_inr, image_count)
+    return MaiImageCostReconciliation(
+        available=True,
+        window_start=window_start,
+        window_end=window_end,
+        real_image_count=image_count,
+        actual_total_cost_inr=round(outcome.total_inr, 4),
+        measured_inr_per_image=round(measured, 4) if measured is not None else None,
+        static_estimate_inr_per_image=static_inr,
+        static_estimate_usd_per_image=MAI_IMAGE_ESTIMATED_USD_PER_IMAGE,
     )
 
 

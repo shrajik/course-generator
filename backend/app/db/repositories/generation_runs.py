@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Course, GenerationRun
@@ -120,3 +121,30 @@ class GenerationRunRepository:
 
     async def count_all(self) -> int:
         return await self.session.scalar(select(func.count()).select_from(GenerationRun)) or 0
+
+    async def count_model_calls_in_window(self, *, model: str, start: datetime, end: datetime) -> int:
+        """Real count of `model_usage` entries for `model` across ALL
+        courses' generation_runs, whose OWN `timestamp` field (not the
+        owning run's created_at/updated_at - a long-lived run can
+        accumulate calls well after its row was first touched) falls in
+        [start, end) - the real denominator for the Azure Cost Management
+        reconciliation feature's measured per-image rate (see
+        app.services.azure_cost_reconciliation). Raw SQL
+        (jsonb_array_elements) rather than loading every payload_json via
+        the ORM and filtering in Python - this pushes the real counting
+        into Postgres, confirmed against this exact query shape during the
+        feature's live investigation."""
+        result = await self.session.execute(
+            text(
+                """
+                SELECT count(*)
+                FROM generation_runs gr,
+                     jsonb_array_elements(gr.payload_json -> 'model_usage') AS call
+                WHERE call ->> 'model' = :model
+                  AND (call ->> 'timestamp')::timestamptz >= :start
+                  AND (call ->> 'timestamp')::timestamptz < :end
+                """
+            ),
+            {"model": model, "start": start, "end": end},
+        )
+        return result.scalar() or 0
