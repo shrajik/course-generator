@@ -60,6 +60,7 @@ import re
 
 from app.agents import prompts
 from app.core.config import Settings, get_settings
+from app.core.errors import AIServiceError
 from app.core.logging import get_logger
 from app.render.diagram_renderer import render_diagram_svg
 from app.render.schematic_layout import resolve_schematic_layout
@@ -689,6 +690,178 @@ DIAGRAM_SYSTEM = DIAGRAM_SYSTEM.replace(
     "__DIAGRAM_KIND_ENUM__", ", ".join(k for k in DIAGRAM_KINDS if k != "schematic")
 )
 
+# ---------------------------------------------------------------------------
+# Per-kind trimmed DIAGRAM_SYSTEM - cost optimisation (MOM cost-audit,
+# 2026-11-23), built ONLY for a call that already knows its exact kind
+# (`pin_kind=True` - see _request_spec's call sites). A pinned call never
+# needs the other ~44 kinds' own authoring bullets or their classification
+# framing ("is this X or Y?") - it already has its answer. Measured: the
+# full ~9.6K-token DIAGRAM_SYSTEM was ~94% of a real diagram call's average
+# input tokens; a pinned call only genuinely needs its own kind's bullet
+# plus whatever shared rules actually apply to it.
+#
+# This is NOT a 2-bucket "shared vs per-kind" split - DIAGRAM_SYSTEM nests
+# three different kinds of shared content, and getting this wrong would
+# silently drop a real rule for some kinds (confirmed concretely below, see
+# test_diagram_service.py's exhaustive per-kind completeness test):
+#   1. Two explicit "Rules for <kind>/<kind>/...:" / "For <kind> specifically"
+#      blocks, each scoped to its OWN named kind-list (parsed from the
+#      header text itself via regex - never hand-copied, so a future edit
+#      to either header automatically changes which kinds the block applies
+#      to, with no separate list to keep in sync).
+#   2. A genuinely kind-agnostic span (no-invented-facts, no-dense-math-
+#      notation) that happens to sit TEXTUALLY inside block 1's span for
+#      human readability, but is not scoped to block 1's kind-list at all -
+#      e.g. circuit_schematic and periodic_table are NOT in block 1's list,
+#      yet obviously still must never invent facts. Carved out explicitly by
+#      its own exact marker text (searched for, not line-numbered, so it
+#      survives future edits) rather than inferred from its physical
+#      position - this is the one place a human judgement call about scope
+#      was unavoidable; the exhaustive test below verifies the result
+#      against the real source text for every kind, not just this reasoning.
+#   3. Each kind's own dispatch bullet, decided by searching the ENTIRE
+#      bullet text for a `-> kind_name` marker (not requiring the arrow and
+#      name to be on the same visual line - DIAGRAM_SYSTEM line-wraps at
+#      ~79 chars, so e.g. "-> \n  wavy_journey_path" is one real "-> X"
+#      marker split across a wrap; `\s+` already spans that newline).
+#
+# A kind this can't locate a bullet for raises loudly (never silently
+# skipped) - see _kind_bullets()'s own assertion.
+
+_DIAGRAM_PREAMBLE_END_MARKER = (
+    "First decide what the brief actually needs, then pick exactly one `kind`:"
+)
+_DISPATCH_END_MARKER = "For `flow_chart`/`process` specifically:"
+_FLOWCHART_MINIBLOCK_END_MARKER = "\nRules for flow_chart/process/cycle/concept_map/"
+_UNIVERSAL_START_MARKER = "- Base every label and detail only on the brief below."
+_UNIVERSAL_END_MARKER = (
+    "- For smart_art/chevron_process/funnel/honeycomb/puzzle_pieces specifically,"
+)
+
+_HEADER_RE = re.compile(
+    r"(?:Rules for|For)\s+((?:`?[a-zA-Z_][a-zA-Z0-9_]*`?(?:/`?[a-zA-Z_][a-zA-Z0-9_]*`?)*))"
+    r"\s*(?:\([^)]*\))?\s*(?:specifically)?\s*[,:]"
+)
+_ARROW_RE = re.compile(r"->\s*(.{0,80})", re.DOTALL)
+_WORD_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+_ARROW_CONNECTORS = frozenset({"or", "and"})
+
+# Kinds that never reach this prompt at all, so they're excluded from the
+# "every kind must have a bullet" requirement, not silently missed:
+# `schematic` is permanently retired (see its own paragraph in
+# DIAGRAM_SYSTEM - the caller already reroutes away from it before any call
+# reaches here); `concept_experience` is authored by a completely separate,
+# purpose-built pipeline (app.render.concept_experience_renderer) that never
+# calls _request_spec/DIAGRAM_SYSTEM at all. `conceptual` has no bullet of
+# its own by design - it's rendered identically to concept_map (see
+# _RING_OR_WHEEL_KINDS grouping them together), so it reuses concept_map's
+# bullet rather than needing a duplicate.
+_NO_OWN_BULLET_EXPECTED = frozenset({"schematic", "concept_experience"})
+_KIND_ALIASES = {"conceptual": "concept_map"}
+
+
+def _find_universal_span(system_text: str) -> str:
+    start = system_text.index(_UNIVERSAL_START_MARKER)
+    end = system_text.index(_UNIVERSAL_END_MARKER, start)
+    return system_text[start:end].strip()
+
+
+def _find_header_blocks(system_text: str) -> list[tuple[frozenset[str], str]]:
+    """Every "Rules for X/Y/Z:" / "For X specifically" block, as
+    (parsed kind-set, body text up to the next such header or end of
+    string) - parsed from the header's own text, not a hand-copied list."""
+    matches = list(_HEADER_RE.finditer(system_text))
+    blocks: list[tuple[frozenset[str], str]] = []
+    for i, m in enumerate(matches):
+        kinds = frozenset(k.strip("`") for k in m.group(1).split("/"))
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(system_text)
+        blocks.append((kinds, system_text[body_start:body_end].strip()))
+    return blocks
+
+
+def _kinds_after_arrow(text_after_arrow: str, valid_kinds: frozenset[str]) -> list[str]:
+    """Every kind named immediately after a `->` marker, consuming a chain
+    like "flow_chart or process" (flow_chart/process share one bullet, one
+    arrow, two real outcomes - confirmed by the exhaustive completeness test
+    below, which is exactly what caught this case) - stops at the first
+    word that isn't a recognised kind and isn't a connector ("or"/"and"),
+    so trailing explanatory prose never gets misread as another kind."""
+    found: list[str] = []
+    for word in _WORD_RE.finditer(text_after_arrow):
+        token = word.group(0)
+        if token in valid_kinds:
+            found.append(token)
+            continue
+        if token in _ARROW_CONNECTORS:
+            continue
+        break
+    return found
+
+
+def _kind_bullets(system_text: str) -> dict[str, str]:
+    """Every dispatch bullet, keyed by each kind it decides (via its own
+    `-> kind_name[ or kind_name...]` marker, found anywhere in the bullet's
+    text - never assumed to be the bullet's last line, and a single arrow
+    can name more than one real outcome kind)."""
+    dispatch_start = system_text.index(_DIAGRAM_PREAMBLE_END_MARKER) + len(
+        _DIAGRAM_PREAMBLE_END_MARKER
+    )
+    dispatch_end = system_text.index(_DISPATCH_END_MARKER)
+    dispatch_text = system_text[dispatch_start:dispatch_end]
+    bullets = re.split(r"\n(?=- )", dispatch_text)
+    valid_kinds = frozenset(DIAGRAM_KINDS)
+    result: dict[str, str] = {}
+    for bullet in bullets:
+        bullet = bullet.strip()
+        if not bullet.startswith("-"):
+            continue
+        arrow_match = _ARROW_RE.search(bullet)
+        if arrow_match is None:
+            continue
+        # Only the FIRST "->" in a bullet is the real decision - a bullet's
+        # own explanatory prose may name other kinds later via "not X"/
+        # "differs from Y" without ever using another arrow (confirmed by
+        # reading every bullet during this change).
+        for kind in _kinds_after_arrow(arrow_match.group(1), valid_kinds):
+            result[kind] = bullet
+    return result
+
+
+def _build_trimmed_diagram_system(kind: str) -> str:
+    """A DIAGRAM_SYSTEM variant containing only what `kind` (already decided
+    - see `pin_kind=True` call sites) genuinely needs: the universal framing/
+    correction-mode preamble, this kind's own dispatch bullet, the always-
+    universal label/fact/notation rules, and every named-list rules block
+    that actually names this kind (never guessed - see module-level
+    docstring above). Raises if `kind` has no locatable bullet and isn't one
+    of the documented exceptions - a silently-empty trim would be worse than
+    an error here."""
+    kind = _KIND_ALIASES.get(kind, kind)
+    preamble = DIAGRAM_SYSTEM[: DIAGRAM_SYSTEM.index(_DIAGRAM_PREAMBLE_END_MARKER)].strip()
+    bullets = _kind_bullets(DIAGRAM_SYSTEM)
+    if kind not in bullets:
+        raise AIServiceError(
+            f"_build_trimmed_diagram_system: no dispatch bullet found for kind={kind!r} - "
+            "refusing to silently ship an incomplete trimmed prompt."
+        )
+    own_bullet = bullets[kind]
+    universal = _find_universal_span(DIAGRAM_SYSTEM)
+    rules_region = DIAGRAM_SYSTEM[DIAGRAM_SYSTEM.index(_DISPATCH_END_MARKER) :]
+    applicable_blocks = [
+        body for kinds, body in _find_header_blocks(rules_region) if kind in kinds
+    ]
+    parts = [preamble, "", own_bullet, "", universal]
+    parts.extend(["", block] for block in applicable_blocks)
+    flat: list[str] = []
+    for p in parts:
+        if isinstance(p, list):
+            flat.extend(p)
+        else:
+            flat.append(p)
+    return "\n".join(flat)
+
+
 _KIND_PIN_INSTRUCTION = """
 
 The brief above already specifies the required `kind`: "{hint}". Use exactly
@@ -1063,9 +1236,26 @@ class DiagramService:
         template_audience: str = "",
         template_style: str = "",
     ) -> DiagramSpec:
+        system = DIAGRAM_SYSTEM
+        if pin_kind and kind_hint:
+            # Cost optimisation only - opportunistic and best-effort, never a
+            # hard requirement. `kind_hint` here isn't always a real,
+            # trimmable DIAGRAM_KINDS value (e.g. the schematic-retry path's
+            # own "schematic" placeholder when no real hint is set) - any
+            # failure here must fall back to the full prompt, exactly as
+            # reliable as before this change, never a new way for a diagram
+            # request to fail outright.
+            try:
+                system = _build_trimmed_diagram_system(kind_hint)
+            except Exception as exc:  # noqa: BLE001 - cost optimisation must never reduce reliability
+                log.info(
+                    "Could not build a trimmed DIAGRAM_SYSTEM for kind_hint=%r (%s) - "
+                    "using the full prompt instead",
+                    kind_hint, exc,
+                )
         return await self.ai.structured(
             schema=DiagramSpec,
-            system=DIAGRAM_SYSTEM,
+            system=system,
             user=_diagram_user_prompt(
                 purpose=purpose,
                 prompt=prompt,

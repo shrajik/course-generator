@@ -59,6 +59,16 @@ class CallRecord:
     # never silently indistinguishable from "this model was requested and
     # used as normal".
     used_fallback: bool = False
+    # How many of `input_tokens` the provider served from its own prompt
+    # cache (a real, automatic discount OpenAI/Azure OpenAI apply server-side
+    # for a repeated, identical prefix >=1024 tokens - no request changes
+    # needed to benefit from it, but this app had no visibility into whether
+    # it was ever actually happening). 0 whenever the field is absent from
+    # the real `usage` object (a provider/model that doesn't support it, or
+    # this specific call's prefix wasn't eligible/cached this time) - never
+    # guessed, see OpenAIClient._record's own extraction of this field
+    # straight from `usage.prompt_tokens_details.cached_tokens`.
+    cached_input_tokens: int = 0
 
 
 @dataclass

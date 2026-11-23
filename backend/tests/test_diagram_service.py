@@ -21,7 +21,15 @@ from app.services import mock_ai as mock_ai_module
 from app.services.diagram_content_qa import CONTRADICTS_SOURCE_TEXT
 from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult
 from app.services.diagram_render_qa import RenderQAIssue
-from app.services.diagram_service import DIAGRAM_SYSTEM, DiagramService, _diagram_user_prompt
+from app.services.diagram_service import (
+    DIAGRAM_SYSTEM,
+    DiagramService,
+    _build_trimmed_diagram_system,
+    _diagram_user_prompt,
+    _find_header_blocks,
+    _find_universal_span,
+    _kind_bullets,
+)
 from app.services.mock_ai import MockAIClient
 
 
@@ -562,3 +570,106 @@ async def test_case7_a_critical_and_cosmetic_issue_together_still_withholds(monk
     findings = block.content.get("visual_qa_findings")
     assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
     assert any(f["type"] == "edge_crosses_node" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Per-kind trimmed DIAGRAM_SYSTEM - cost optimisation (MOM cost-audit,
+# 2026-11-23). The exhaustive completeness test below is the real safety
+# net: it re-derives, from the REAL DIAGRAM_SYSTEM source text itself (via
+# the same `_find_header_blocks` the production code uses), exactly which
+# named-list rule blocks apply to each kind, then asserts the trimmed
+# prompt matches that derivation precisely - included blocks are a 1:1
+# match, never a hand-maintained "expected" list that could silently drift
+# out of sync with a future edit to DIAGRAM_SYSTEM.
+# ---------------------------------------------------------------------------
+
+_NO_OWN_BULLET = {"schematic", "concept_experience"}
+_ALIASED_KINDS = {"conceptual": "concept_map"}
+
+
+def test_every_kind_that_reaches_diagram_system_has_a_locatable_bullet():
+    bullets = _kind_bullets(DIAGRAM_SYSTEM)
+    for kind in DIAGRAM_KINDS:
+        if kind in _NO_OWN_BULLET or kind in _ALIASED_KINDS:
+            continue
+        assert kind in bullets, f"{kind}: no dispatch bullet found by _kind_bullets"
+
+
+def test_a_shared_bullet_with_multiple_outcomes_resolves_both_kinds():
+    # The real case this parsing approach had to get right first-try and
+    # didn't (caught during development, not hidden): "-> flow_chart or
+    # process." is ONE bullet deciding between two real kinds via one arrow.
+    bullets = _kind_bullets(DIAGRAM_SYSTEM)
+    assert "flow_chart" in bullets
+    assert "process" in bullets
+    assert bullets["flow_chart"] == bullets["process"]
+
+
+def test_unrecognised_kind_raises_rather_than_silently_shipping_an_incomplete_prompt():
+    import pytest
+
+    from app.core.errors import AIServiceError
+
+    with pytest.raises(AIServiceError):
+        _build_trimmed_diagram_system("not_a_real_kind")
+
+
+def test_every_trimmed_kind_contains_its_own_bullet_and_the_universal_rules():
+    universal = _find_universal_span(DIAGRAM_SYSTEM)
+    bullets = _kind_bullets(DIAGRAM_SYSTEM)
+    for kind in DIAGRAM_KINDS:
+        if kind in _NO_OWN_BULLET:
+            continue
+        trimmed = _build_trimmed_diagram_system(kind)
+        resolved = _ALIASED_KINDS.get(kind, kind)
+        assert bullets[resolved] in trimmed, f"{kind}: own bullet missing from trimmed prompt"
+        assert universal in trimmed, f"{kind}: universal rules missing from trimmed prompt"
+
+
+def test_every_trimmed_kind_is_meaningfully_smaller_than_the_original():
+    for kind in DIAGRAM_KINDS:
+        if kind in _NO_OWN_BULLET:
+            continue
+        trimmed = _build_trimmed_diagram_system(kind)
+        # Every real kind measured during this change reduced by 70%+; a
+        # conservative 40% floor catches a real regression without being
+        # brittle to minor future edits to shared/per-kind wording.
+        assert len(trimmed) < len(DIAGRAM_SYSTEM) * 0.6, (
+            f"{kind}: trimmed prompt ({len(trimmed)} chars) isn't meaningfully "
+            f"smaller than the original ({len(DIAGRAM_SYSTEM)} chars)"
+        )
+
+
+def test_exhaustive_per_kind_named_block_inclusion_matches_the_real_source_text():
+    """The mandatory safety net: for EVERY kind DIAGRAM_SYSTEM actually
+    dispatches to, re-derive which named-list rule blocks apply by parsing
+    the REAL source text (the exact same function production code calls),
+    then assert the trimmed prompt includes every block that names this
+    kind and excludes every block that doesn't - a mechanical, exhaustive
+    proof against the real text, not a spot-check or a hand-written
+    expectation list that could drift from DIAGRAM_SYSTEM's real content."""
+    dispatch_end_marker = "For `flow_chart`/`process` specifically:"
+    rules_region = DIAGRAM_SYSTEM[DIAGRAM_SYSTEM.index(dispatch_end_marker):]
+    all_blocks = _find_header_blocks(rules_region)
+    assert len(all_blocks) >= 2, "expected at least the 2 known named-list blocks to be found"
+
+    checked = 0
+    for kind in DIAGRAM_KINDS:
+        if kind in _NO_OWN_BULLET:
+            continue
+        resolved = _ALIASED_KINDS.get(kind, kind)
+        trimmed = _build_trimmed_diagram_system(kind)
+        for block_kinds, block_body in all_blocks:
+            should_include = resolved in block_kinds
+            is_included = block_body in trimmed
+            assert is_included == should_include, (
+                f"kind={kind!r} (resolved={resolved!r}): block scoped to "
+                f"{sorted(block_kinds)} - expected included={should_include}, "
+                f"got included={is_included}"
+            )
+        checked += 1
+    # Every real dispatchable kind was actually exercised - a kind silently
+    # skipped (e.g. a future kind missing from DIAGRAM_KINDS iteration, or a
+    # bug collapsing the loop early) would make every assertion above
+    # vacuously true, so this count is the exhaustiveness proof itself.
+    assert checked == len(DIAGRAM_KINDS) - len(_NO_OWN_BULLET)

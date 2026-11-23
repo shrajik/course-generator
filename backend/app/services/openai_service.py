@@ -413,7 +413,7 @@ class OpenAIClient(AIClient):
         metrics = current_metrics()
         if metrics is None:
             return
-        input_tokens = output_tokens = 0
+        input_tokens = output_tokens = cached_input_tokens = 0
         if usage is not None:
             input_tokens = (
                 getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", 0) or 0
@@ -423,6 +423,18 @@ class OpenAIClient(AIClient):
                 or getattr(usage, "output_tokens", 0)
                 or 0
             )
+            # Pure observability (see CallRecord.cached_input_tokens) - which
+            # of `input_tokens` the provider served from its own prompt
+            # cache. Chat Completions names this `prompt_tokens_details.
+            # cached_tokens`; the Responses API (used by .research()) names
+            # the equivalent `input_tokens_details.cached_tokens` - checked
+            # in that order since `prompt_tokens_details` can be present-but-
+            # None on a Responses-API usage object. Never guessed: 0 when
+            # neither field exists on this particular usage object.
+            details = getattr(usage, "prompt_tokens_details", None) or getattr(
+                usage, "input_tokens_details", None
+            )
+            cached_input_tokens = getattr(details, "cached_tokens", 0) or 0
         metrics.record_call(
             CallRecord(
                 kind=kind,
@@ -436,6 +448,7 @@ class OpenAIClient(AIClient):
                 failed=failed,
                 provider=provider,
                 used_fallback=used_fallback,
+                cached_input_tokens=int(cached_input_tokens),
             )
         )
 
