@@ -1,0 +1,15 @@
+# Caddy obtains and renews HTTPS certificates for both names automatically.
+# Ports 80 and 443 must be reachable from the internet and both names must point at this server.
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy frontend:3000
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+	# Course generation streams progress; flush immediately instead of buffering.
+	reverse_proxy backend:8000 {
+		flush_interval -1
+	}
+}

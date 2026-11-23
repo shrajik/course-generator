@@ -1,20 +1,50 @@
-# Production stack for Dokploy (or plain `docker compose -f docker-compose.prod.yml up -d`).
+# Production stack for a single Docker host (Contabo VPS), deployed by deploy/deploy.py
+# (also what .github/workflows/deploy.yml runs).
 #
 # Differences from docker-compose.yml (the development file):
 #   * no --reload, no source bind-mount: the backend runs the code baked into its image;
-#   * no published ports at all: Dokploy's Traefik proxy reaches the frontend and backend by
-#     domain over the `dokploy-network`, and Postgres is never reachable from outside;
+#   * NO service publishes a host port by default. The frontend and backend join the external
+#     `web` network, where a reverse proxy that is already running on the host (for example a
+#     shared Caddy) reaches them as coursegen-frontend:3000 and coursegen-backend:8000.
+#     The host's rule: every service stays on CPU cores 4-7 (the other app on this host uses 0-3).
+#     Postgres is reachable only inside Docker. If the host has no proxy yet, enable the bundled
+#     one with the `own-caddy` profile (`deploy.py --with-caddy`); it needs ports 80/443 free;
 #   * database migrations run before the API starts (the app does not run them itself);
 #   * secrets have no defaults: the stack refuses to start if one is missing;
 #   * the throw-away test database is gone.
 #
-# Required environment (set in Dokploy's Environment tab, see .env.production.example):
-#   POSTGRES_PASSWORD, JWT_SECRET, JWT_REFRESH_SECRET, FRONTEND_ORIGIN, NEXT_PUBLIC_API_URL
-#   plus the AI provider keys.
+# Required environment (the server's .env, see .env.production.example):
+#   APP_DOMAIN, API_DOMAIN, POSTGRES_PASSWORD, JWT_SECRET, JWT_REFRESH_SECRET, plus AI provider keys.
+
+name: coursegen
 
 services:
+  caddy:
+    image: caddy:2
+    # Only started with `--profile own-caddy`: the host's ports 80/443 are usually taken by an
+    # existing proxy, and starting a second one would fail (or worse, fight the first).
+    profiles: ["own-caddy"]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN must be set}
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN must be set}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and account keys: losing this volume means re-issuing them.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:0.8.0-pg16
+    cpuset: "4-7"
+    mem_limit: 2g
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-course_generator}
       POSTGRES_USER: ${POSTGRES_USER:-course_app}
@@ -35,6 +65,7 @@ services:
       context: ./code-executor
       dockerfile: Dockerfile
     init: true
+    cpuset: "4-7"
     networks:
       - sandbox
     read_only: true
@@ -68,6 +99,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    cpuset: "4-7"
+    mem_limit: 6g
     env_file:
       - .env
     environment:
@@ -76,7 +109,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-course_app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-course_generator}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET must be set}
-      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:?FRONTEND_ORIGIN must be set}
+      # Derived from the two domains so they cannot drift apart. The browser address must match
+      # FRONTEND_ORIGIN exactly (CORS allows exactly this one origin).
+      FRONTEND_ORIGIN: https://${APP_DOMAIN:?APP_DOMAIN must be set}
     volumes:
       # Generated courses, uploads, images and PDFs. Back this volume up.
       - backend_data:/app/data
@@ -91,9 +126,10 @@ services:
       sh -c "alembic upgrade head &&
              exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
     networks:
-      - default
-      - sandbox
-      - dokploy-network
+      default:
+      sandbox:
+      web:
+        aliases: [coursegen-backend]
     restart: unless-stopped
 
   frontend:
@@ -101,23 +137,30 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Inlined into the browser bundle at BUILD time: changing it means a rebuild.
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL must be set}
+        # Inlined into the browser bundle at BUILD time: changing API_DOMAIN means a rebuild
+        # (the deploy workflow always rebuilds).
+        NEXT_PUBLIC_API_URL: https://${API_DOMAIN:?API_DOMAIN must be set}
+    cpuset: "4-7"
+    mem_limit: 1g
     depends_on:
       - backend
     networks:
-      - default
-      - dokploy-network
+      default:
+      web:
+        aliases: [coursegen-frontend]
     restart: unless-stopped
 
 networks:
   # Containers on it have no route out of the host; only the backend shares it with the executor.
   sandbox:
     internal: true
-  # Created by the Dokploy installer; Traefik uses it to reach the frontend and backend.
-  dokploy-network:
+  # Shared with the host's reverse proxy. deploy.py creates it if missing
+  # (`docker network create web`).
+  web:
     external: true
 
 volumes:
   postgres_data:
   backend_data:
+  caddy_data:
+  caddy_config:

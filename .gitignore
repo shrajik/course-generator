@@ -12,6 +12,7 @@ backend/data/index/
 *.egg-info/
 .DS_Store
 .env.local
+.env.production
 *.log
 dist/
 build/
