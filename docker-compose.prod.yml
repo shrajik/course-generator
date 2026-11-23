@@ -1,0 +1,123 @@
+# Production stack for Dokploy (or plain `docker compose -f docker-compose.prod.yml up -d`).
+#
+# Differences from docker-compose.yml (the development file):
+#   * no --reload, no source bind-mount: the backend runs the code baked into its image;
+#   * no published ports at all: Dokploy's Traefik proxy reaches the frontend and backend by
+#     domain over the `dokploy-network`, and Postgres is never reachable from outside;
+#   * database migrations run before the API starts (the app does not run them itself);
+#   * secrets have no defaults: the stack refuses to start if one is missing;
+#   * the throw-away test database is gone.
+#
+# Required environment (set in Dokploy's Environment tab, see .env.production.example):
+#   POSTGRES_PASSWORD, JWT_SECRET, JWT_REFRESH_SECRET, FRONTEND_ORIGIN, NEXT_PUBLIC_API_URL
+#   plus the AI provider keys.
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-course_generator}
+      POSTGRES_USER: ${POSTGRES_USER:-course_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Runs untrusted, AI-generated and user-edited code - same hardening as the dev file
+  # (no secrets, internal-only network, dropped capabilities, read-only root, size limits).
+  code-executor:
+    build:
+      context: ./code-executor
+      dockerfile: Dockerfile
+    init: true
+    networks:
+      - sandbox
+    read_only: true
+    tmpfs:
+      - /work:size=256m,mode=0755,exec,nosuid,nodev
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=4).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DATA_DIR: /app/data
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-course_app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-course_generator}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET must be set}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:?FRONTEND_ORIGIN must be set}
+    volumes:
+      # Generated courses, uploads, images and PDFs. Back this volume up.
+      - backend_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      code-executor:
+        condition: service_healthy
+    # Migrations first, then exactly ONE worker: generation jobs and their live progress are
+    # held in this process's memory, so a second worker would not see the first one's jobs.
+    command: >
+      sh -c "alembic upgrade head &&
+             exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
+    networks:
+      - default
+      - sandbox
+      - dokploy-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Inlined into the browser bundle at BUILD time: changing it means a rebuild.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL must be set}
+    depends_on:
+      - backend
+    networks:
+      - default
+      - dokploy-network
+    restart: unless-stopped
+
+networks:
+  # Containers on it have no route out of the host; only the backend shares it with the executor.
+  sandbox:
+    internal: true
+  # Created by the Dokploy installer; Traefik uses it to reach the frontend and backend.
+  dokploy-network:
+    external: true
+
+volumes:
+  postgres_data:
+  backend_data:
