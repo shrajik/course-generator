@@ -142,6 +142,10 @@ services:
         NEXT_PUBLIC_API_URL: https://${API_DOMAIN:?API_DOMAIN must be set}
     cpuset: "4-7"
     mem_limit: 1g
+    environment:
+      # Docker sets HOSTNAME to the container id and Next.js binds to that single address, i.e. only
+      # the internal network. Listen on every interface so the proxy can reach it over `web`.
+      HOSTNAME: 0.0.0.0
     depends_on:
       - backend
     networks:
