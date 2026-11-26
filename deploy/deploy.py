@@ -6,6 +6,7 @@
     python deploy/deploy.py status
     python deploy/deploy.py logs backend
     python deploy/deploy.py rollback
+    python deploy/deploy.py env      [--dry-run]        # push only the env file, restart what changed
 
 What `deploy` does:
   1. checks the local env file (required secrets present, URL-safe database password, ...);
@@ -286,6 +287,68 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     log("  Then register INITIAL_ADMIN_EMAIL straight away: that account becomes the admin.")
 
 
+# Changing these after the first deploy would break the running stack or need a rebuild.
+ENV_NEEDS_FULL_DEPLOY = ("APP_DOMAIN", "API_DOMAIN")   # baked into the frontend bundle at build time
+ENV_DB_LOCKED = ("POSTGRES_PASSWORD", "POSTGRES_USER", "POSTGRES_DB")  # the database keeps its own copy
+
+
+def cmd_env(args: argparse.Namespace) -> None:
+    """Upload only the env file and recreate the services whose environment changed (no rebuild)."""
+    env_path = Path(args.env_file)
+    if not env_path.is_absolute():
+        env_path = REPO / env_path
+    if not env_path.is_file():
+        raise DeployError(f"env file not found: {env_path}")
+    new = parse_env(env_path)
+    for w in check_env(new):
+        log(f"  warning: {w}")
+
+    remote = make_remote(args)
+    base = remote.base
+    current = remote.text(f"readlink -f {shlex.quote(base)}/current")
+    if not current:
+        raise DeployError("nothing is deployed yet: run `deploy` first")
+    old_text = remote.text(f"cat {shlex.quote(base)}/shared/.env")
+    tmp = REPO / ".env.remote.tmp"
+    try:
+        tmp.write_text(old_text + "\n", encoding="utf-8")
+        old = parse_env(tmp)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    added = sorted(k for k in new if k not in old)
+    removed = sorted(k for k in old if k not in new)
+    changed = sorted(k for k in new if k in old and new[k] != old[k])
+    step("Differences between your env file and the server's (names only, never values)")
+    for label, keys in (("added", added), ("changed", changed), ("removed", removed)):
+        log(f"  {label:8}: {', '.join(keys) if keys else '-'}")
+    if not (added or removed or changed):
+        log("\nThe server already has this env file. Nothing to do.")
+        return
+
+    touched = set(added) | set(changed) | set(removed)
+    if touched & set(ENV_NEEDS_FULL_DEPLOY):
+        raise DeployError("APP_DOMAIN / API_DOMAIN changed: the frontend must be rebuilt. Run `deploy` instead.")
+    locked = sorted(touched & set(ENV_DB_LOCKED))
+    if locked and not args.force:
+        raise DeployError(f"{', '.join(locked)} changed, but the existing database keeps its original value, so the "
+                          "backend would fail to connect. Change the database password inside Postgres first, or "
+                          "pass --force if you know what you are doing.")
+    if {"JWT_SECRET", "JWT_REFRESH_SECRET"} & touched:
+        log("\n  note: changing the JWT secrets signs every user out")
+    if args.dry_run:
+        log("\n--dry-run: nothing was uploaded.")
+        return
+
+    step("Uploading the env file")
+    remote.run(f"umask 077 && cat > {shlex.quote(base)}/shared/.env",
+               input=env_path.read_bytes().rstrip(b"\r\n") + b"\n")
+    step("Recreating the services whose environment changed (no rebuild)")
+    remote.run(f"cd {shlex.quote(current)} && {compose_cmd(args.with_caddy)}up -d --no-build --remove-orphans")
+    wait_healthy(remote, current, args.with_caddy)
+    log("\n  env updated. Services whose settings did not change were left running.")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     remote = make_remote(args)
     step(f"Releases on {remote.target}")
@@ -331,7 +394,7 @@ def make_remote(args: argparse.Namespace) -> Remote:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Deploy the course generator over SSH.")
     p.add_argument("command", nargs="?", default="deploy",
-                   choices=["deploy", "status", "logs", "rollback"])
+                   choices=["deploy", "status", "logs", "rollback", "env"])
     p.add_argument("service", nargs="?", default="backend", help="service for `logs` (default: backend)")
     p.add_argument("--host", default=os.environ.get("DEPLOY_HOST"))
     p.add_argument("--user", default=os.environ.get("DEPLOY_USER", "deploy"))
@@ -342,6 +405,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also start the bundled Caddy on ports 80/443 (only if the server has no proxy)")
     p.add_argument("--dry-run", action="store_true", help="check the env file and file list; connect to nothing")
     p.add_argument("--lines", type=int, default=100, help="log lines for `logs`")
+    p.add_argument("--force", action="store_true", help="env: allow changing POSTGRES_* (see the error text first)")
     return p
 
 
@@ -352,7 +416,8 @@ def main() -> int:
         except Exception:
             pass
     args = build_parser().parse_args()
-    handlers = {"deploy": cmd_deploy, "status": cmd_status, "logs": cmd_logs, "rollback": cmd_rollback}
+    handlers = {"deploy": cmd_deploy, "status": cmd_status, "logs": cmd_logs, "rollback": cmd_rollback,
+                "env": cmd_env}
     try:
         handlers[args.command](args)
     except DeployError as exc:

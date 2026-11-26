@@ -79,6 +79,16 @@ python deploy/deploy.py deploy --host 45.140.201.44 --key <path to deploy_key>
 `logs [service]`, `rollback` (back to the previous release; the database is not rolled back). The same
 settings can come from `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` and `DEPLOY_ENV_FILE`.
 
+**Changing only the env file** (a new API key, SMTP settings, a log level...): edit `.env.production`, then
+```
+python deploy/deploy.py env --dry-run --host 45.140.201.44 --key <path to deploy_key>   # shows names that changed
+python deploy/deploy.py env         --host 45.140.201.44 --key <path to deploy_key>
+```
+It uploads only the env file and recreates just the services whose settings changed, with no rebuild. It
+prints variable names, never values. It refuses `APP_DOMAIN` / `API_DOMAIN` changes (the frontend must be
+rebuilt: use `deploy`) and `POSTGRES_*` changes (the database keeps its original password). Changing the
+JWT secrets signs everyone out.
+
 Or push to `Feedback-work` (or run the workflow by hand from the Actions tab) once the five GitHub secrets
 exist. The first build takes several minutes (Chromium and the Next.js build).
 
