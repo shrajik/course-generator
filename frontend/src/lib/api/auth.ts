@@ -1,5 +1,11 @@
 import { request } from "./client";
-import type { AuthResponse, LoginRequest, RegisterRequest } from "@/lib/types/auth";
+import type {
+  AuthResponse,
+  ForgotPasswordRequest,
+  LoginRequest,
+  RegisterRequest,
+  ResetPasswordRequest,
+} from "@/lib/types/auth";
 
 export function register(payload: RegisterRequest): Promise<AuthResponse> {
   return request<AuthResponse>("/auth/register", {
@@ -29,4 +35,18 @@ export function refresh(): Promise<AuthResponse> {
 
 export function getCurrentUser(): Promise<AuthResponse> {
   return request<AuthResponse>("/auth/me");
+}
+
+export function requestPasswordReset(payload: ForgotPasswordRequest): Promise<{ status: string }> {
+  return request<{ status: string }>("/auth/forgot-password", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function confirmPasswordReset(payload: ResetPasswordRequest): Promise<{ status: string }> {
+  return request<{ status: string }>("/auth/reset-password", {
+    method: "POST",
+    body: payload,
+  });
 }

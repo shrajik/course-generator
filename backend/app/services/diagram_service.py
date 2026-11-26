@@ -55,21 +55,33 @@ this module can hit, not just content-QA.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+from collections.abc import Sequence
 
 from app.agents import prompts
 from app.core.config import Settings, get_settings
+from app.course.blocks.normalizer import _reads_as_young_learner_audience
 from app.core.errors import AIServiceError
 from app.core.logging import get_logger
 from app.render.diagram_renderer import render_diagram_svg
 from app.render.schematic_layout import resolve_schematic_layout
 from app.render.visual_blueprints import apply_blueprint_defaults
 from app.schemas.blocks import merge_content
-from app.schemas.diagram import DIAGRAM_KINDS, RELATIONSHIP_KINDS, SEQUENTIAL_KINDS, DiagramSpec, max_nodes_for
+from app.schemas.diagram import (
+    DIAGRAM_KINDS,
+    RELATIONSHIP_KINDS,
+    SEQUENTIAL_KINDS,
+    DiagramSpec,
+    max_edges_for,
+    max_nodes_for,
+)
 from app.schemas.document import Block
 from app.schemas.template import CourseTemplate
+from app.services.correction_intent import CORRECTION_INTENT_POLICY, classify_correction_intent
 from app.services.diagram_content_qa import (
+    CITATION_LEAKED_INTO_LABEL,
     MISSPELLED_OR_GARBLED_TEXT,
     SOURCE_GROUNDING_UNSUPPORTED,
     STRUCTURALLY_GARBLED_TEXT,
@@ -81,6 +93,7 @@ from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.quality_framework import visual_qa_finding_entries
 from app.services.storage_service import StorageService, get_storage
+from app.services.visual_consistency import apply_diagram_consistency
 
 log = get_logger(__name__)
 
@@ -134,11 +147,26 @@ afterwards - so the only things that matter are (1) choosing the structure a
 textbook illustrator would choose for this exact concept, and (2) writing
 precise, short, unambiguous labels a professor would stand behind.
 
+PLAN BEFORE YOU FILL IN ANY NODE OR EDGE: set `complexity_estimate` first,
+honestly, to one of "simple" (a handful of nodes, one clear idea - most
+briefs are this), "moderate", or "complex" (genuinely many interconnected
+parts the brief itself describes) - then let that honest estimate actually
+constrain what you produce. If you find yourself about to write a "simple"
+diagram with a dozen nodes, that is a sign to consolidate or re-plan, not a
+sign to relabel the estimate as "complex" after the fact to match what you
+already wrote.
+
 When the brief includes a "CURRENT DIAGRAM" section, this is a CORRECTION of
 an existing diagram, not a fresh one - the reader already approved its
 overall subject and structure and is asking you to fix specific, named
 problems with it (garbled symbols, overlapping/cut-off text, a wrong
-connection, cramped spacing, missing content), not to redesign it. Reuse
+connection, cramped spacing, missing content), not to redesign it. The text
+under "YOUR CORRECTION REQUEST" (when present) is the user's own current,
+explicit instruction for THIS regeneration - treat it as the authoritative
+statement of what to change, and apply it precisely and visibly; a
+"CORRECTION REQUEST" that clearly asks for something specific is never
+something to water down or only partially apply just because the default
+below is to preserve everything else. Reuse
 the exact same `kind`, the exact same set of nodes/edges with the exact
 same ids/labels/detail, and the exact same structure, UNLESS the brief
 explicitly asks to add, remove, rename or reconnect something - copy every
@@ -291,7 +319,13 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   one entity (or to a relationship, e.g. a join table's own column) is a
   node with `shape_role: "attribute"` and `parent_id` set to that entity's
   or relationship's `id` - do not connect an attribute via `edges`, only
-  `parent_id`. Keep attribute labels to just the field name.
+  `parent_id`. Keep attribute labels to just the field name. The
+  relationship node's own `label` stays a 1-4 word relationship name ONLY
+  ("enrolled in", "placed by", "assigned to") - never append provenance,
+  confidence or other metadata to it (see the relationship-label rule
+  above); if that metadata matters for this entity pair, give it its own
+  `shape_role: "attribute"` child node instead, the same way any other
+  column would be modelled.
 - The brief is specifically about a process that crosses roles/actors/
   systems, and which one does WHICH step actually matters (a support
   ticket moving between a customer, a support agent and a billing system;
@@ -558,6 +592,29 @@ First decide what the brief actually needs, then pick exactly one `kind`:
   roles in an org). Each node's `label` is the role/title, `detail` the
   person's name or a one-line scope note. Set every node's `level` (0 =
   top of the org) and add one edge per reporting line.
+- The brief is about a SYSTEM/CLOUD/NETWORK architecture whose components
+  are grouped INSIDE bigger boxes - services inside a VPC inside an
+  account, tiers inside an application, modules inside a package - and
+  that grouping/nesting is itself part of what's being taught, not just a
+  flat list of parts -> architecture_diagram, not hierarchy/org_chart
+  (neither one draws a box's own children visually INSIDE a bordered
+  parent box - they only connect boxes with lines) and not network_mesh
+  (no containment at all, every node sits directly on the ring). Give
+  each grouping box `shape_role: "container"` and a short `label` (e.g.
+  "AWS Account", "VPC", "Web tier"); every node - container or leaf
+  component - that belongs inside one sets `parent_id` to that container's
+  own `id` (a container can itself have `parent_id` set to an OUTER
+  container, nesting as deep as the brief actually needs - rarely more
+  than 2-3 levels before it stops being readable). A leaf component
+  (`shape_role` left blank) is one real part - `label` its name, `icon` an
+  optional pictogram (see the icon keyword list elsewhere in this prompt),
+  `detail` a short one-line note if useful. `edges` connect two LEAF
+  component ids only (never a container id - a container is a grouping,
+  not a thing a connection wires to), each with an optional `label`
+  naming the connection ("HTTPS", "writes to", "publishes event").
+  Produce at most ~20 nodes total across every level (containers and
+  leaves combined) - a diagram with more than that stops being legible no
+  matter how it's nested.
 
 For `flow_chart`/`process` specifically: if the sequence has a genuine
 bounded start and end (a bounded procedure, not an ongoing pipeline), add
@@ -615,6 +672,30 @@ chain_links/flower_petal/hourglass_diagram/org_chart:
   details this concise on purpose - the renderer gives every node a fixed,
   often narrow box, and a textbook-clean diagram never has text
   overflowing, wrapping badly or crowding its neighbours.
+- Every EDGE `label` (and, for `er_diagram`, every relationship node's own
+  `label`/`detail` - see that kind's own section below) must read as a
+  natural short phrase answering "what does this connection mean", never a
+  mechanically concatenated cluster of field names, abbreviations or
+  metadata. Prefer a short verb/phrase: "created by", "belongs to",
+  "contains", "references", "resolves", "depends on", "generates",
+  "validates", "triggers", "retrieves", "updates" - 1-3 words is the target,
+  4 words the hard maximum. A real, confirmed failure mode: a concept_map
+  edge labelled "raised by · prov · conf" - three ideas (who raised it, that
+  it carries provenance, that it carries a confidence score) dot-joined into
+  one label instead of written as one phrase. If a relationship genuinely
+  carries provenance, confidence, timestamps or other metadata, that detail
+  belongs on its own `shape_role: "attribute"` child node (exactly like a
+  database column) or in the surrounding course text - it must NEVER be
+  repeated inside the relationship label itself, and never joined onto it
+  with a delimiter (·, |, /, ::) or a "field: value" tag. If a relationship
+  truly cannot be said in 4 words without losing its meaning, that is a sign
+  to redesign it - split it into two simpler relationships, rename it, or
+  reconsider whether this is the right diagram shape for it - never truncate
+  a meaningful label blindly to hit the word count.
+- Not every relationship in the brief deserves its own visible edge. Prefer
+  fewer, clearer relationships over drawing every connection you can infer -
+  keep only the ones most essential to what this diagram is teaching; group,
+  merge or simply omit the rest.
 - Base every label and detail only on the brief below. Do not invent facts,
   numbers or names that were not given to you. No markdown, no quotes.
   This still applies when you personally know the standard formula, number
@@ -640,6 +721,17 @@ chain_links/flower_petal/hourglass_diagram/org_chart:
   "angular momentum selection rule: Δℓ = ±1"), and if a real rendered
   formula is genuinely essential, that belongs in the surrounding prose as
   a proper formula block, never baked into a diagram node's label/detail.
+- Never make a node or edge label ABOUT a source: a document's filename,
+  title, heading, author, or a bracketed citation reference tag like
+  "[S1.3]" or "[G2.5]". The brief may hand you research built from the
+  course's own uploaded documents or the knowledge library, each passage
+  marked with exactly this kind of reference so the WRITER can cite it in
+  prose - that marking is for prose citation, never diagram content. A
+  diagram's nodes and edges represent the subject matter itself (a
+  mechanism, a process, a relationship between real concepts), never "which
+  document says this" or "what resources exist on this topic" - a reading
+  list belongs in the course's own Sources section, never as a concept_map
+  or any other diagram kind.
 - For smart_art/chevron_process/funnel/honeycomb/puzzle_pieces specifically,
   optionally set a node's `icon` to ONE of these exact keywords when it
   genuinely fits that node's own concept - a small pictogram badge draws
@@ -873,6 +965,45 @@ instead of switching kind.
 """
 
 
+_DENSITY_GUIDANCE_SHORT_WORDS = 25
+_DENSITY_GUIDANCE_LONG_WORDS = 90
+
+
+def _density_guidance_line(brief_text: str) -> str:
+    """A deterministic, PRE-generation density nudge (diagram quality audit
+    follow-up, Phase 2/4) - computed from the brief's own word count before
+    the first generation call ever runs, not just a post-hoc cap applied
+    only after the model has already overshot (see `needs_consolidation`/
+    `max_nodes_for` below, which stays the real, hard backstop regardless -
+    this is advisory steering on top of it, never a replacement for it). A
+    short brief describes one or two ideas - nudging toward a small diagram
+    UP FRONT means fewer corrective retries are needed later; a long,
+    detailed brief may genuinely need more nodes, so this never suggests
+    shrinking content a longer brief actually calls for - it only steers a
+    SHORT brief away from needlessly padding itself out to look more
+    thorough, and reminds a LONG brief to still keep individual labels
+    short regardless of how much it covers. Returns "" for an ordinary
+    brief in between - no signal strong enough to add prompt noise over."""
+    word_count = len(brief_text.split())
+    if word_count == 0:
+        return ""
+    if word_count <= _DENSITY_GUIDANCE_SHORT_WORDS:
+        return (
+            "\nThis brief is short and focused - a compact diagram (roughly 3-6 labelled "
+            "nodes) that scans in a few seconds is almost always the right size here; don't "
+            "pad it out with extra nodes or invented sub-detail the brief didn't ask for just "
+            "to look more thorough.\n"
+        )
+    if word_count >= _DENSITY_GUIDANCE_LONG_WORDS:
+        return (
+            "\nThis brief covers real breadth - a larger diagram may genuinely be warranted, "
+            "but keep every individual node/label SHORT regardless (a few words, never a "
+            "sentence) and favour grouping related ideas over listing every last one "
+            "individually; scannability matters more than exhaustiveness.\n"
+        )
+    return ""
+
+
 def _diagram_user_prompt(
     *,
     purpose: str,
@@ -887,7 +1018,45 @@ def _diagram_user_prompt(
     template_audience: str = "",
     template_style: str = "",
 ) -> str:
-    brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
+    # Prompt-fidelity fix (replace_image correction reliability): `purpose`/
+    # `caption` are leftovers from the ORIGINAL generation (DiagramService.
+    # generate_for_block never touches them on a correction - only `prompt`
+    # gets overwritten with the user's live instruction, see patcher.py's
+    # own `replace_image` handling), while `prompt` is what the user is
+    # asking THIS call to change. Joining all three with a bare newline into
+    # one undifferentiated "VISUAL BRIEF" - the old behaviour, still used
+    # below for a fresh, non-correction generation - left the model to GUESS
+    # which sentence was the live instruction, and the flat `[:MAX_BRIEF_
+    # CHARS]` slice could silently truncate `prompt` away entirely if a long
+    # leftover `purpose` ate the budget first. On a correction (an
+    # `existing_outline` is only ever set then), reserve the user's own
+    # `prompt` text FIRST and label it distinctly from the old context - the
+    # same "earlier text gets first claim on the budget" principle app.
+    # services.image_service.py's own `_assemble_prompt_with_priority`
+    # already applies for the raster-illustration path, just without
+    # needing that whole priority-tier machinery here.
+    if existing_outline and prompt.strip():
+        reserved_prompt = prompt.strip()[:MAX_BRIEF_CHARS]
+        remaining_budget = max(MAX_BRIEF_CHARS - len(reserved_prompt) - 1, 0)
+        context_text = "\n".join(part for part in (purpose, caption) if part)[:remaining_budget]
+        # Correction-intent classification (Phase 7) - a sharpened, intent-
+        # specific policy line alongside the general correction-mode rule
+        # already in DIAGRAM_SYSTEM, so e.g. "fix the overlapping arrow
+        # text" (geometry) and "make this suitable for children" (audience)
+        # - both genuine corrections - get the DIFFERENT handling each one
+        # actually needs, instead of one blanket "preserve everything"
+        # default that's right for the first case and wrong for the second.
+        intent = classify_correction_intent(prompt)
+        intent_block = f"\nCORRECTION TYPE: {CORRECTION_INTENT_POLICY[intent]}\n" if intent else ""
+        brief_block = (
+            "YOUR CORRECTION REQUEST (the user's own instruction for THIS "
+            f"regeneration - apply it precisely and visibly):\n{reserved_prompt}\n"
+            f"{intent_block}"
+            + (f"\nORIGINAL BRIEF (context from the first generation):\n{context_text}\n" if context_text else "")
+        )
+    else:
+        brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
+        brief_block = f"VISUAL BRIEF:\n{brief or '(not specified)'}\n"
     section = prompts.memory_section(memory)
     memory_block = f"\n{section}\n" if section else ""
     requested = f"\nREQUESTED DIAGRAM TYPE: {kind_hint}\n" if kind_hint else ""
@@ -938,12 +1107,11 @@ def _diagram_user_prompt(
         if audience_bits
         else ""
     )
+    density_block = _density_guidance_line(" ".join(part for part in (purpose, prompt, caption) if part))
     return f"""\
 COURSE: {course_title}
 
-VISUAL BRIEF:
-{brief or "(not specified)"}
-{requested}{memory_block}{feedback_block}{current_block}{audience_block}
+{brief_block}{requested}{memory_block}{feedback_block}{current_block}{audience_block}{density_block}
 Produce the diagram specification for this visual.{pin}
 """
 
@@ -1136,6 +1304,47 @@ def _correction_drift_issue(existing_outline: dict | None, spec: DiagramSpec) ->
     )
 
 
+_UNDER_CORRECTION_MIN_PROMPT_CHARS = 15  # long enough to be a real instruction, not a stray word
+
+
+def _under_correction_issue(raw_existing_spec: dict | None, prompt: str, spec: DiagramSpec) -> str | None:
+    """The OTHER direction of `_correction_drift_issue` just above: a
+    correction asking for a SUBSTANTIAL, specific change but coming back
+    byte-identical to the spec it was meant to correct is a measurable
+    signal the instruction was effectively ignored, not applied - the "I
+    typed a prompt and nothing changed" failure replace_image's own prompt-
+    fidelity fix (see `_diagram_user_prompt`'s "YOUR CORRECTION REQUEST"
+    block) exists to close. Same house rule as `_correction_drift_issue` -
+    a visible, inspectable finding only, never a retry, never a reason to
+    reject the result; a human reviewer decides what to do with it.
+
+    Compares the FULL spec (via `raw_existing_spec`, the original content
+    dict this block's prior `content["spec"]` held - not
+    `_correction_drift_issue`'s own compact `existing_outline`, which only
+    has labels) because "nothing at all changed" is a much stronger, simpler
+    signal than a label-overlap ratio, and correction mode's whole point is
+    preserving everything NOT asked to change - true full-spec equality
+    after a genuine correction request is specifically what should be rare.
+    `None` when there's nothing to compare (a fresh generation, or an
+    unparseable stored spec) or the prompt is too short to reliably judge as
+    "a real ask that should have changed something" (a bare word, a stray
+    click-through)."""
+    if not raw_existing_spec or len(prompt.strip()) < _UNDER_CORRECTION_MIN_PROMPT_CHARS:
+        return None
+    try:
+        old_dump = DiagramSpec.model_validate(raw_existing_spec).model_dump(mode="json")
+    except Exception:  # noqa: BLE001 - an unparseable old spec just can't be compared
+        return None
+    if old_dump != spec.model_dump(mode="json"):
+        return None
+    shown_prompt = prompt.strip()[:80] + ("..." if len(prompt.strip()) > 80 else "")
+    return (
+        f"This regenerated a diagram in response to a specific correction request "
+        f"('{shown_prompt}'), but the result is identical to the one before it - the "
+        f"request may not have actually been applied."
+    )
+
+
 def _flow_chart_connectivity_issues(spec: DiagramSpec) -> list[str]:
     """A bounded procedure ("flow_chart" specifically - "process"/"cycle"
     legitimately have no bookends for an ongoing pipeline, so this doesn't
@@ -1178,6 +1387,399 @@ def _flow_chart_connectivity_issues(spec: DiagramSpec) -> list[str]:
     elif len(sinks) == 0:
         issues.append("every node has an outgoing edge - there is no valid End (a bounded procedure needs one)")
     return issues
+
+
+# Delimiter characters a relationship label gets flagged for joining two or
+# more segments with - the exact shape of a real, confirmed failure mode: a
+# concept_map edge labelled "raised by · prov · conf" (relationship name +
+# provenance marker + confidence marker, mechanically concatenated) instead
+# of a single natural phrase. None of these ever belongs INSIDE a legitimate
+# short relationship phrase ("depends on", "flows into") - a label that
+# contains one is reliably a metadata-tag cluster, not a sentence a human
+# would write.
+_LABEL_DELIMITER_RE = re.compile(r"[·•|]|::|\s/\s")
+# A bare "word: value" or "word=value" tag - the OTHER shape the same
+# failure mode takes (a field name and its value, rather than a relationship
+# phrase). Requires a letter on both sides of the separator so it doesn't
+# false-positive on a genuine ratio/time/cardinality label ("1:N", "3:00").
+_LABEL_FIELD_TAG_RE = re.compile(r"[a-zA-Z][a-zA-Z_ ]*\s*[:=]\s*[a-zA-Z]")
+_MAX_RELATIONSHIP_LABEL_WORDS = 4
+# Diagram-rendering follow-up: `_wrap` (app.render.diagram_renderer) force-
+# breaks any single word longer than one whole line, and `_edge_label`'s own
+# `allow_shrink` search is bounded (it tries smaller fonts and a few extra
+# lines, never unlimited - see that function's own docstring) - a single
+# word long enough to still need MORE lines than that bounded search allows,
+# even at the smallest readable font, still truncates with an ellipsis no
+# matter how much room the search is given. Confirmed this session via
+# direct rendering: no amount of shrinking or extra-line budget rescues an
+# unbroken term past a certain length, because the word itself - not the
+# label as a whole - is the thing that doesn't fit. The right fix is
+# upstream (never let a label reach rendering with a word this long in the
+# first place), not a deeper rendering patch - the same "fix the root cause,
+# don't add a generic patcher" discipline `edge_label_verbosity_issues`
+# itself already follows for the metadata-cluster/word-count cases above. 22
+# characters is generous enough for a real single technical term
+# ("multivariable", "nanopublication", "authentication" are all well under
+# it) while still catching a genuinely unbroken compound/identifier/URL.
+_MAX_LABEL_WORD_CHARS = 22
+
+
+def _relationship_label_issue(label: str, *, owner: str, max_words: int = _MAX_RELATIONSHIP_LABEL_WORDS) -> str | None:
+    """None when `label` reads as a short, natural relationship phrase;
+    otherwise one human-readable issue for the retry-feedback channel. See
+    `edge_label_verbosity_issues`'s own docstring for why this check exists
+    and what it does/doesn't catch. `max_words` lets a younger/beginner
+    audience get a tighter ceiling (see `audience_multiplier`) - never
+    looser than the default, since conciseness is the right default for
+    every audience, not something an advanced one should be exempt from."""
+    text = label.strip()
+    if not text:
+        return None
+    if _LABEL_DELIMITER_RE.search(text):
+        return f'{owner} "{text}" joins multiple segments together with a delimiter - write ONE natural phrase instead'
+    if _LABEL_FIELD_TAG_RE.search(text):
+        return f'{owner} "{text}" reads as a field-name/value tag, not a relationship phrase'
+    longest_word = max(text.split(), key=len, default="")
+    if len(longest_word) > _MAX_LABEL_WORD_CHARS:
+        return (
+            f'{owner} "{text}" contains "{longest_word}" ({len(longest_word)} characters, no spaces) - too '
+            "long to wrap cleanly at any readable size; shorten it, hyphenate it, or use a standard "
+            "abbreviation"
+        )
+    word_count = len(text.split())
+    if word_count > max_words:
+        return f'{owner} "{text}" is {word_count} words - relationship labels must be at most {max_words}'
+    return None
+
+
+def edge_label_verbosity_issues(spec: DiagramSpec, *, max_words: int = _MAX_RELATIONSHIP_LABEL_WORDS) -> list[str]:
+    """Catches the exact, real, confirmed failure mode behind this check's
+    own existence: a relationship label built by mechanically concatenating
+    a relationship name with provenance/confidence/metadata markers (e.g.
+    "raised by · prov · conf" on a concept_map edge) instead of writing one
+    short natural phrase - DIAGRAM_SYSTEM's prompt asks for this (see the
+    rule immediately following the node label/detail rule above), but
+    nothing previously checked it, unlike node `label`/`detail`, which this
+    same prompt DOES get a hard word-count rule for. Operates on the SPEC,
+    before rendering - cheap (no SVG parse), and lets the finding fold into
+    the SAME combined structural retry every other spec-level check already
+    uses (see `generate_for_block`'s `needs_label_rewrite`), rather than a
+    separate render-then-recheck round trip.
+
+    Checks every `DiagramEdge.label` (every kind) and every relationship-
+    node's own `label`/`detail` (`shape_role == "relationship"`, the
+    er_diagram convention - see this file's own er_diagram prompt section)
+    - a model forced to keep an EDGE label short could just as easily move
+    the same metadata cluster onto the relationship node's own text
+    instead, so both fields need the same check, not just one of them.
+    Empty means every relationship-bearing label already reads cleanly."""
+    issues: list[str] = []
+    for edge in spec.edges:
+        issue = _relationship_label_issue(edge.label, owner="Edge label", max_words=max_words)
+        if issue:
+            issues.append(issue)
+    for node in spec.nodes:
+        if (node.shape_role or "").strip().lower() != "relationship":
+            continue
+        for field_name, value in (("label", node.label), ("detail", node.detail)):
+            issue = _relationship_label_issue(value, owner=f"Relationship node {field_name}", max_words=max_words)
+            if issue:
+                issues.append(issue)
+    return issues
+
+
+# Conservative, deterministic, zero-LLM-call keyword classifier for the
+# "denser/more technical" direction - the counterpart to
+# app.course.blocks.normalizer's own `_reads_as_young_learner_audience`
+# (reused directly below for the "simpler" direction, never duplicated).
+# Biased toward false negatives, same convention: an ambiguous or
+# unrecognised phrasing returns False, never guessed into True.
+_ADVANCED_AUDIENCE_KEYWORDS = (
+    "advanced", "expert", "experts", "professional", "professionals", "graduate",
+    "postgraduate", "phd", "doctoral", "researcher", "researchers", "specialist",
+    "specialists", "practitioner", "practitioners",
+)
+
+
+def _reads_as_advanced_audience(text: str) -> bool:
+    combined = text.lower()
+    return any(keyword in combined for keyword in _ADVANCED_AUDIENCE_KEYWORDS)
+
+
+def audience_multiplier(template_audience: str) -> float:
+    """How much to scale `max_nodes_for`/`max_edges_for`'s own ceiling for
+    this course's stated audience - a real, confirmed gap this closes:
+    DIAGRAM_SYSTEM's own audience-adaptation instruction (see
+    `_design_brief`'s own `audience_block` above) is prompt-only, with no
+    code backstop, unlike raster illustrations' deterministic young-learner
+    override (`apply_young_audience_apparatus_override`). This never
+    relaxes factual/technical correctness - only how many nodes/edges a
+    diagram is ALLOWED to reach and (via the caller) how tight the
+    relationship-label word cap is; a "children" course still gets a
+    factually correct diagram, just a structurally simpler one. 1.0
+    (unchanged behaviour) whenever the audience text doesn't clearly read
+    as young/beginner or advanced - the same "never guess, only act on an
+    unambiguous signal" convention `_reads_as_young_learner_audience`
+    already established."""
+    if not template_audience.strip():
+        return 1.0
+    if _reads_as_young_learner_audience(template_audience):
+        return 0.6
+    if _reads_as_advanced_audience(template_audience):
+        return 1.15
+    return 1.0
+
+
+# A deliberately rough, uncalibrated per-node character budget for the
+# aggregate text-volume signal below - every other check in this module
+# (node-count, edge-count, per-label length) is a precise, individually-
+# justified number; this one is not, by design: there's no real-world
+# calibration data yet on what "too much total text" means per kind. Still
+# recorded as a finding for review at THIS looser budget regardless of
+# whether the retry-gating check below fires - see total_text_volume_
+# issue's own docstring.
+_SOFT_TEXT_BUDGET_PER_NODE = 70
+# Diagram-quality audit follow-up (Phase 4/6 - density should trigger a
+# real action, not just an advisory log line): `_needs_density_retry` below
+# promotes this signal into an actual corrective-retry trigger, but only at
+# a materially higher bar than the advisory budget above - this multiplier
+# exists specifically so only a genuinely excessive case (not merely "a
+# little over" an admittedly uncalibrated guide) ever spends a real retry
+# call on it; the advisory finding keeps using the original, looser budget
+# for logging/review either way.
+_TEXT_VOLUME_RETRY_MULTIPLIER = 1.6
+
+
+def _text_volume_totals(spec: DiagramSpec) -> tuple[int, int]:
+    total_chars = sum(len(n.label) + len(n.detail) for n in spec.nodes) + sum(len(e.label) for e in spec.edges)
+    node_count = max(len([n for n in spec.nodes if n.label.strip()]), 1)
+    return total_chars, node_count
+
+
+def total_text_volume_issue(spec: DiagramSpec) -> str | None:
+    """A rough, ADVISORY aggregate: are there hints that this diagram
+    simply has too much total text for one picture, even though every
+    individual label/detail/edge-label already passes its own check? Always
+    recorded as a finding for later review at this (generous, uncalibrated)
+    budget regardless of whether `_needs_density_retry` below also fires -
+    the two are deliberately independent, since this budget was never
+    tuned to double as a retry-worthy threshold. None when the spec stays
+    under budget."""
+    total_chars, node_count = _text_volume_totals(spec)
+    budget = node_count * _SOFT_TEXT_BUDGET_PER_NODE
+    if total_chars <= budget:
+        return None
+    return (
+        f"Total diagram text ({total_chars} characters across all labels/details) is well above a "
+        f"rough {budget}-character guide for {node_count} nodes - consider shortening text or "
+        "simplifying the diagram (advisory only, not a blocking issue)."
+    )
+
+
+def _needs_density_retry(spec: DiagramSpec) -> bool:
+    """The actual GATING check (see `_TEXT_VOLUME_RETRY_MULTIPLIER`'s own
+    comment for why this is a materially higher bar than `total_text_volume_
+    issue`'s own advisory budget) - only a diagram whose total text is
+    SUBSTANTIALLY over the rough per-node guide triggers a real corrective
+    retry over it."""
+    total_chars, node_count = _text_volume_totals(spec)
+    budget = node_count * _SOFT_TEXT_BUDGET_PER_NODE * _TEXT_VOLUME_RETRY_MULTIPLIER
+    return total_chars > budget
+
+
+# Pre-generation planning follow-up (Phase 2/6): only "simple" has a strict
+# enough implied ceiling to be worth checking the model's own stated
+# estimate against - "moderate"/"complex" are deliberately left unchecked
+# (no numeric promise attached to them this codebase could verify without
+# guessing), see `DiagramSpec.complexity_estimate`'s own docstring.
+_SIMPLE_COMPLEXITY_MAX_NODES = 6
+
+
+def _complexity_mismatch_issue(spec: DiagramSpec) -> str | None:
+    """A real, checkable signal the retry feedback can point at directly:
+    the model estimated its OWN output as "simple" (see `DiagramSpec.
+    complexity_estimate`) but then produced more nodes than a genuinely
+    simple diagram needs - either the estimate was never honestly applied,
+    or this content needed a bigger shape than "simple" and the model
+    should have said so. `None` when `complexity_estimate` isn't "simple"
+    (nothing to check it against) or the node count is within bounds."""
+    if spec.complexity_estimate.strip().lower() != "simple":
+        return None
+    labelled_count = len([n for n in spec.nodes if n.label.strip()])
+    if labelled_count <= _SIMPLE_COMPLEXITY_MAX_NODES:
+        return None
+    return (
+        f"This diagram was estimated as 'simple' but has {labelled_count} nodes - more than a "
+        f"genuinely simple diagram needs (roughly {_SIMPLE_COMPLEXITY_MAX_NODES} or fewer). Either "
+        "consolidate down to match a genuinely simple shape, or this content actually needs a "
+        "'moderate'/'complex' structure - don't just relabel the estimate without changing the content."
+    )
+
+
+# Multi-diagram splitting (diagram quality audit, Phase 2/6 of the "big 5"
+# deferred items): when a diagram genuinely needs more nodes than its own
+# kind can show in one picture, the ONLY existing outcomes were "consolidate
+# (losing real content)" or "withhold entirely and fall back to an unrelated
+# AI illustration" - never "split it into several linked diagrams", even
+# though that is strictly better than discarding real, topic-grounded
+# structure. Deliberately scoped to the two kinds where a split is PROVABLY
+# safe (zero information loss, no judgment call, no new LLM call) rather
+# than a generic splitter for every RELATIONSHIP_KINDS/SEQUENTIAL_KINDS
+# member - see `_linear_chain_split`'s own docstring for exactly what
+# "provably safe" means here and why a relationship-shaped or branching
+# diagram is deliberately NOT covered (the same "do not introduce a generic
+# patcher without understanding the existing layout algorithms" discipline
+# the er_diagram label-shrink fix already followed this session).
+_LINEAR_SPLITTABLE_KINDS = frozenset({"flow_chart", "process"})
+# A sane ceiling on how many parts one split will ever produce - beyond
+# this, a chain this long is more likely mis-structured content (everything
+# crammed into one diagram's `nodes` list that should have been several
+# separate blocks from the start) than a genuinely single procedure, and
+# shipping 5+ linked diagram blocks for one brief starts to work against
+# the "clear, scannable" goal splitting exists to serve in the first place.
+_MAX_SPLIT_PARTS = 4
+
+
+def _linear_chain_split(spec: DiagramSpec) -> list[DiagramSpec] | None:
+    """`None` whenever a split isn't applicable, isn't needed, or - most
+    importantly - can't be done LOSSLESSLY: this only ever splits a diagram
+    whose `edges` form EXACTLY the chain node[0]->node[1]->...->node[n-1]
+    (one edge between every consecutive pair, nothing else) - a flow_chart/
+    process CAN legitimately branch or merge (an edge skipping ahead, two
+    edges into one node), and this function refuses to touch any of those,
+    since cutting a branching graph into parts by node POSITION alone would
+    silently drop whichever edge crosses a cut. Otherwise returns 2 or more
+    parts, each overlapping the next at exactly one shared boundary node (the
+    last node of part N is repeated as the first node of part N+1) so the
+    split reads as one continuous procedure across several pictures, not
+    disconnected fragments - every node and edge from the original appears
+    in one part or two adjacent ones, never dropped, never invented.
+
+    Only called when `spec.is_usable()` has already failed for having MORE
+    labelled nodes than `max_nodes_for(kind)` allows - `n <= cap` returns
+    None (nothing to split). The number of parts needed to keep every part
+    at or under the cap is computed directly (never guessed or hardcoded to
+    2), then capped at `_MAX_SPLIT_PARTS` - beyond that, None: better to
+    fall through to today's existing withhold than ship a chain of parts
+    this is no longer confident is still "one diagram that just needed
+    splitting" rather than mis-structured content."""
+    kind = spec.normalised_kind()
+    if kind not in _LINEAR_SPLITTABLE_KINDS:
+        return None
+    nodes = [node for node in spec.nodes if node.label.strip()]
+    n = len(nodes)
+    cap = max_nodes_for(kind)
+    if n <= cap:
+        return None
+    node_ids = [node.id for node in nodes]
+    if len(set(node_ids)) != n or not all(node_ids):
+        return None  # blank/duplicate ids can't be safely keyed by position
+    required_pairs = [(node_ids[i], node_ids[i + 1]) for i in range(n - 1)]
+    edge_pairs = [(edge.source, edge.target) for edge in spec.edges]
+    if len(edge_pairs) != len(required_pairs) or set(edge_pairs) != set(required_pairs):
+        return None  # a branch, merge, or missing/extra edge - not a pure chain
+    edge_by_pair = {pair: edge for pair, edge in zip(edge_pairs, spec.edges)}
+
+    # Each part shares one boundary node with its neighbour(s), so `k` parts
+    # together cover k * (cap - 1) + 1 nodes at most - the smallest `k` that
+    # can fit all `n` nodes under that bound.
+    total_edges = n - 1
+    part_count = -(-total_edges // (cap - 1))  # ceil(total_edges / (cap - 1))
+    if part_count < 2 or part_count > _MAX_SPLIT_PARTS:
+        return None
+
+    base_edges, remainder = divmod(total_edges, part_count)
+    title = spec.title.strip()
+    parts: list[DiagramSpec] = []
+    cursor = 0
+    for index in range(part_count):
+        edges_in_part = base_edges + (1 if index < remainder else 0)
+        start, end = cursor, cursor + edges_in_part  # node index range [start, end] inclusive
+        part_nodes = [node.model_copy(deep=True) for node in nodes[start : end + 1]]
+        part_edges = [edge_by_pair[pair].model_copy(deep=True) for pair in required_pairs[start:end]]
+        parts.append(spec.model_copy(deep=True, update={
+            "nodes": part_nodes, "edges": part_edges,
+            "title": (
+                f"{title} (Part {index + 1} of {part_count})" if title else f"Part {index + 1} of {part_count}"
+            ),
+        }))
+        cursor = end
+
+    # Verify directly rather than trust the arithmetic above blindly (every
+    # part must independently satisfy the exact bound this whole function
+    # exists to guarantee) - a violation here means bail out to the ordinary
+    # withhold path, never ship a part that itself still needs splitting.
+    if any(not (2 <= len(part.nodes) <= cap) for part in parts):
+        return None
+    return parts
+
+
+# Retry-before-withhold for `is_usable()`'s own per-kind requirements beyond
+# node count (diagram quality audit follow-up): node count already gets a
+# real retry chance via `needs_consolidation`/`_complexity_mismatch_issue`
+# above BEFORE `is_usable()` is ever checked - but every OTHER per-kind
+# requirement `DiagramSpec.is_usable()` enforces (concept_map/er_diagram/
+# data_flow_diagram/circuit_schematic needing real edges, swimlane needing
+# 2+ distinct lanes, venn needing exactly 2-3 nodes, iceberg needing both an
+# above- and below-the-waterline node) got NONE - a model that produced,
+# say, a concept_map with zero edges was withheld immediately with a
+# generic "not enough usable structure" message, no specific diagnosis, no
+# chance to fix that one named thing. This closes that gap the same way,
+# folded into the SAME combined retry as every other structural check here
+# - zero new AI call, just a specific feedback sentence added to whichever
+# retry call was already going to happen (or triggering one on its own when
+# nothing else would have).
+def _usability_gap_feedback(spec: DiagramSpec) -> str | None:
+    """`None` whenever `spec.is_usable()` already passes, the gap is the
+    node-count cap (that already has its own dedicated feedback above, see
+    `needs_consolidation`), or this kind has no extra diagnosable
+    requirement beyond node count (most kinds - this only names the
+    specific per-kind cases `is_usable()` itself checks, see that method's
+    own per-kind branches, never guesses at a generic one)."""
+    if spec.is_usable():
+        return None
+    kind = spec.normalised_kind()
+    labelled = [n for n in spec.nodes if n.label.strip()]
+    if not (2 <= len(labelled) <= max_nodes_for(kind)):
+        return None  # the node-count cap already has its own dedicated retry feedback
+    if kind == "concept_map":
+        has_labelled_edge = any(e.label.strip() for e in spec.edges)
+        if not (spec.edges and (has_labelled_edge or len(labelled) >= 3)):
+            return (
+                "This concept_map has no real relationships wired between its nodes - add at least "
+                "one `edges` entry connecting two nodes, with a specific, labelled relationship type "
+                "(not just a bare list of unconnected boxes)."
+            )
+    elif kind in ("er_diagram", "data_flow_diagram", "circuit_schematic"):
+        if not spec.edges:
+            return (
+                f"This {kind} has nodes but no `edges` connecting them - a {kind} is exactly its "
+                "connections; add the relationships/flows between the nodes you already have."
+            )
+    elif kind == "swimlane":
+        lanes = {n.lane.strip() for n in spec.nodes if n.lane.strip()}
+        if not spec.edges:
+            return "This swimlane diagram has no `edges` showing work moving between steps - add them."
+        if len(lanes) < 2:
+            return (
+                f"This swimlane diagram only has {len(lanes)} distinct `lane` value(s) set - "
+                "swimlane's whole point is showing work crossing roles/actors, so set at least 2 "
+                "distinct lane values across the nodes."
+            )
+    elif kind == "venn":
+        if not (2 <= len(labelled) <= 3):
+            return (
+                f"A venn diagram only reads cleanly with 2 or 3 overlapping circles - this has "
+                f"{len(labelled)} labelled nodes; consolidate or expand to exactly 2 or 3."
+            )
+    elif kind == "iceberg":
+        if not (any(n.level == 0 for n in spec.nodes) and any(n.level >= 1 for n in spec.nodes)):
+            return (
+                "This iceberg diagram needs at least one node at level 0 (above the waterline, "
+                "visible) AND at least one node at level >= 1 (below it, hidden) - set `level` on "
+                "each node to show that split."
+            )
+    return None
 
 
 class DiagramService:
@@ -1348,6 +1950,7 @@ class DiagramService:
         template: CourseTemplate,
         course_title: str,
         source_excerpt: str = "",
+        cited_source_titles: Sequence[str] = (),
     ) -> bool:
         content = block.content
         purpose = str(content.get("purpose") or "")
@@ -1503,16 +2106,46 @@ class DiagramService:
 
         spec = self._normalise(spec)
 
-        # Three independent structural checks against the SAME initial spec -
-        # too many nodes, the wrong shape, and (for a flow chart) broken
+        # Five independent structural checks against the SAME initial spec -
+        # too many nodes, too many edges, verbose/metadata-cluttered
+        # relationship labels, the wrong shape, and (for a flow chart) broken
         # Start/End connectivity. These used to each fire their own
         # sequential corrective retry (up to 3 extra AI calls before content
         # QA even ran); now every issue found is collected up front and
         # folded into a SINGLE retry call, cutting the worst case from 3
-        # extra calls to 1 without dropping any of the three checks.
+        # extra calls to 1 without dropping any of the checks (the two
+        # newest - edge count and label verbosity - follow the exact same
+        # "collect, don't retry individually" discipline the first three
+        # already established).
+        # Scales the node/edge ceilings and the relationship-label word cap
+        # to this course's own stated audience - see audience_multiplier's
+        # own docstring for the gap this closes (audience adaptation used
+        # to be prompt-only, no code backstop). 1.0 (every ceiling below
+        # exactly as before) whenever the audience text isn't clearly
+        # young/beginner or advanced.
+        audience_scale = audience_multiplier(template_audience)
         labelled_count = len([n for n in spec.nodes if n.label.strip()])
-        cap = max_nodes_for(spec.normalised_kind())
+        cap = max(2, round(max_nodes_for(spec.normalised_kind()) * audience_scale))
         needs_consolidation = labelled_count > cap
+        # "Not every relationship deserves a visible arrow" - scoped to the
+        # kinds whose own prompt section invites a rich web of labelled
+        # relationships (concept_map/er_diagram/network_mesh); every other
+        # kind's own shape already bounds its edge count, so max_edges_for
+        # returns an effectively-unbounded ceiling there and this never
+        # fires. See max_edges_for's own docstring (schemas/diagram.py).
+        edge_count = len(spec.edges)
+        edge_cap = max(2, round(max_edges_for(spec.normalised_kind(), labelled_count) * audience_scale))
+        needs_edge_consolidation = edge_count > edge_cap
+        # The real, confirmed failure mode this whole fix exists for: a
+        # relationship label built by concatenating a relationship name with
+        # provenance/confidence/metadata markers (e.g. "raised by · prov ·
+        # conf") instead of one short natural phrase. See
+        # edge_label_verbosity_issues's own docstring. A young/beginner
+        # audience gets a tighter word cap (3, not 4) - never looser for an
+        # advanced one, since conciseness is the right default everywhere.
+        label_max_words = 3 if audience_scale < 0.8 else _MAX_RELATIONSHIP_LABEL_WORDS
+        label_issues = edge_label_verbosity_issues(spec, max_words=label_max_words)
+        needs_label_rewrite = bool(label_issues)
         # The writer asked for a specific shape (e.g. a relationship diagram)
         # but the model reached for a sequential one anyway.
         needs_kind_correction = _kind_conflicts(kind_hint, spec.normalised_kind())
@@ -1521,6 +2154,18 @@ class DiagramService:
         # (Close, Escalate, Keep Task) none of which pointed at a single
         # shared End left one path with nothing to connect to.
         connectivity_issues = _flow_chart_connectivity_issues(spec)
+        # Density-management follow-up (Phase 4/6): a sixth, independent
+        # structural check - total text volume SUBSTANTIALLY over the rough
+        # per-node guide (see `_needs_density_retry`'s own comment on why
+        # this needs a materially higher bar than the advisory-only finding
+        # below uses). Folds into the exact same combined retry as the
+        # other five, never a separate AI call of its own.
+        needs_density_retry = _needs_density_retry(spec)
+        # Pre-generation planning follow-up (Phase 2/6): a seventh,
+        # independent structural check - the model's OWN stated
+        # `complexity_estimate` disagreeing with what it actually produced.
+        # Same combined retry, never a separate AI call.
+        complexity_mismatch = _complexity_mismatch_issue(spec)
         # Carries over into the final, successful save below (see its own
         # merge_content call) ONLY if the retry fails to resolve them -
         # starts at whatever the first attempt found; replaced with [] the
@@ -1529,8 +2174,22 @@ class DiagramService:
         # svg's own connectivity repairs still guarantee no REAL edge is
         # ever silently dropped even if a persistent issue ships anyway.
         unresolved_connectivity_issues = connectivity_issues
+        # Same "persist only if still unresolved after the retry" contract
+        # as connectivity above - label verbosity/edge count are "cosmetic"
+        # (never withheld, see _CRITICAL_RENDER_ISSUE_KINDS below), so a
+        # diagram that still fails after the one retry ships anyway, flagged.
+        unresolved_label_issues = label_issues
+        unresolved_edge_count_issue = needs_edge_consolidation
+        # Retry-before-withhold follow-up: an eighth, independent structural
+        # check - see `_usability_gap_feedback`'s own docstring. Same
+        # combined retry, never a separate AI call.
+        usability_gap_feedback = _usability_gap_feedback(spec)
 
-        if needs_consolidation or needs_kind_correction or connectivity_issues:
+        if (
+            needs_consolidation or needs_edge_consolidation or needs_label_rewrite
+            or needs_kind_correction or connectivity_issues or needs_density_retry
+            or complexity_mismatch or usability_gap_feedback
+        ):
             feedback_parts: list[str] = []
             retry_kind_hint = spec.normalised_kind()
             if needs_consolidation:
@@ -1541,6 +2200,22 @@ class DiagramService:
                     f"{cap} nodes, while keeping the sequence faithful to the brief - "
                     "merge an action with its immediate follow-up rather than dropping "
                     "any genuinely distinct stage."
+                )
+            if needs_edge_consolidation:
+                feedback_parts.append(
+                    f"Your previous attempt had {edge_count} relationships/edges, more than this "
+                    f"diagram can clearly show (maximum {edge_cap}). Not every relationship deserves "
+                    "a visible arrow - keep only the ones most essential to the brief, and group, "
+                    "merge or omit the rest rather than drawing every possible connection."
+                )
+            if needs_label_rewrite:
+                feedback_parts.append(
+                    "Some relationship labels were too long or read as a metadata-tag cluster rather "
+                    "than a natural phrase: " + "; ".join(label_issues) + ". Rewrite each as a short "
+                    "(1-4 word) natural phrase answering 'what does this connection mean' (e.g. "
+                    "'depends on', 'generates', 'references') - never repeat provenance, confidence, "
+                    "timestamps or IDs on the label itself; move that detail to an attribute node or "
+                    "leave it out entirely."
                 )
             if needs_kind_correction:
                 feedback_parts.append(
@@ -1558,10 +2233,26 @@ class DiagramService:
                 )
                 if not needs_kind_correction:
                     retry_kind_hint = "flow_chart"
+            if needs_density_retry:
+                feedback_parts.append(
+                    "This diagram's total text (across every label/detail/edge-label combined) is "
+                    "substantially more than one picture can show clearly, even though no single "
+                    "label is individually too long. Shorten wording throughout, drop any detail "
+                    "that repeats what another node already says, and consider consolidating "
+                    "closely related nodes - the diagram as a whole needs to read as noticeably "
+                    "lighter, not just one or two labels trimmed."
+                )
+            if complexity_mismatch:
+                feedback_parts.append(complexity_mismatch)
+            if usability_gap_feedback:
+                feedback_parts.append(usability_gap_feedback)
             log.info(
-                "Diagram for %s needs correction (consolidation=%s, kind=%s, connectivity=%s) - "
-                "retrying once with combined feedback",
-                block.id, needs_consolidation, needs_kind_correction, bool(connectivity_issues),
+                "Diagram for %s needs correction (consolidation=%s, edges=%s, labels=%s, kind=%s, "
+                "connectivity=%s, density=%s, complexity_mismatch=%s, usability_gap=%s) - retrying "
+                "once with combined feedback",
+                block.id, needs_consolidation, needs_edge_consolidation, needs_label_rewrite,
+                needs_kind_correction, bool(connectivity_issues), needs_density_retry,
+                bool(complexity_mismatch), bool(usability_gap_feedback),
             )
             try:
                 corrected = await self._request_spec(
@@ -1579,26 +2270,85 @@ class DiagramService:
                     unresolved_connectivity_issues = (
                         _flow_chart_connectivity_issues(corrected) if connectivity_issues else []
                     )
+                    # Label/edge-count issues are never part of the
+                    # accept/reject gate above (kind_ok/count_ok) - they're
+                    # cosmetic, same as connectivity, so the corrected spec
+                    # is always accepted once the GATING checks pass, and
+                    # these are simply re-measured against whatever actually
+                    # shipped, exactly like unresolved_connectivity_issues.
+                    unresolved_label_issues = (
+                        edge_label_verbosity_issues(corrected, max_words=label_max_words)
+                        if needs_label_rewrite else []
+                    )
+                    unresolved_edge_count_issue = (
+                        len(corrected.edges)
+                        > max(2, round(max_edges_for(corrected.normalised_kind(), corrected_count) * audience_scale))
+                        if needs_edge_consolidation else False
+                    )
                 # Otherwise keep the first spec rather than looping further -
                 # is_usable() and render_diagram_svg's own repairs still get
                 # the final say, same safety net as before.
             except Exception as exc:  # noqa: BLE001 - keep the first spec, don't fail the block
                 log.warning("Diagram corrective retry failed for %s: %s", block.id, exc)
 
+        pending_split_payloads: list[dict] = []
         if not spec.is_usable():
-            log.info(
-                "Diagram spec for %s (kind=%s) is not usable (%s nodes, %s edges) - withholding "
-                "rather than falling back to an unrelated AI illustration",
-                block.id, spec.normalised_kind(), len(spec.nodes), len(spec.edges),
-            )
-            _withhold_structured_diagram(
-                block,
-                detail=(
-                    f"The generated {spec.normalised_kind()} diagram did not have enough usable "
-                    "structure (labelled nodes/edges) to render."
-                ),
-            )
-            return True
+            parts = _linear_chain_split(spec)
+            rendered_later_parts: list[tuple[DiagramSpec, bytes, int, int]] = []
+            if parts is not None:
+                try:
+                    for later_part in parts[1:]:
+                        later_svg, later_width, later_height = render_diagram_svg(later_part, template.theme)
+                        # Every part after the first never goes through this
+                        # function's own downstream render-QA retry (each is
+                        # inserted as its own block by a later document-
+                        # level pass, see `app.course.document.diagram_
+                        # splitting`) - so a critical defect must be caught
+                        # HERE, before committing to the split, or it would
+                        # ship unchecked. The first part keeps exactly its
+                        # normal QA treatment below (it's simply `spec` from
+                        # here on).
+                        if any(
+                            issue.kind in _CRITICAL_RENDER_ISSUE_KINDS
+                            for issue in validate_rendered_svg(later_svg, kind=later_part.normalised_kind())
+                        ):
+                            parts = None
+                            break
+                        rendered_later_parts.append((later_part, later_svg, later_width, later_height))
+                except Exception as exc:  # noqa: BLE001 - fall through to the ordinary withhold path below
+                    log.warning("Diagram split render failed for %s: %s", block.id, exc)
+                    parts = None
+            if parts is not None:
+                log.info(
+                    "Diagram for %s had %s labelled nodes, over the %s-node cap for %s - splitting "
+                    "into %s linked diagrams instead of withholding",
+                    block.id, len([n for n in spec.nodes if n.label.strip()]),
+                    max_nodes_for(spec.normalised_kind()), spec.normalised_kind(), len(parts),
+                )
+                spec = parts[0]
+                pending_split_payloads = [
+                    {
+                        "spec": later_part.model_dump(mode="json"),
+                        "svg_base64": base64.b64encode(later_svg).decode("ascii"),
+                        "width": later_width,
+                        "height": later_height,
+                    }
+                    for later_part, later_svg, later_width, later_height in rendered_later_parts
+                ]
+            else:
+                log.info(
+                    "Diagram spec for %s (kind=%s) is not usable (%s nodes, %s edges) - withholding "
+                    "rather than falling back to an unrelated AI illustration",
+                    block.id, spec.normalised_kind(), len(spec.nodes), len(spec.edges),
+                )
+                _withhold_structured_diagram(
+                    block,
+                    detail=(
+                        f"The generated {spec.normalised_kind()} diagram did not have enough usable "
+                        "structure (labelled nodes/edges) to render."
+                    ),
+                )
+                return True
 
         # Structural usability (right number of labelled nodes/edges) says
         # nothing about whether the content is actually ABOUT the brief -
@@ -1626,7 +2376,8 @@ class DiagramService:
         brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
         content_result = await evaluate_content(
             spec, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings,
-            source_excerpt=source_excerpt,
+            source_excerpt=source_excerpt, cited_source_titles=cited_source_titles,
+            template_audience=template_audience,
         )
         # `spec`/`content_result` always track the BEST attempt seen so far
         # (never regress to a worse one at the end), but the retry loop
@@ -1661,7 +2412,8 @@ class DiagramService:
                     break
                 retried_result = await evaluate_content(
                     retried, brief=brief, course_title=course_title, ai=self.ai, settings=self.settings,
-                    source_excerpt=source_excerpt,
+                    source_excerpt=source_excerpt, cited_source_titles=cited_source_titles,
+                    template_audience=template_audience,
                 )
                 latest_result = retried_result
                 if retried_result.passed or len(retried_result.issues) < len(content_result.issues):
@@ -1701,11 +2453,18 @@ class DiagramService:
             # the same treatment the raster-illustration path already gives
             # "garbled text", and the honest alternative to either shipping
             # unreadable labels or swapping in an unrelated picture.
-            garbled_types = {STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT}
+            # `CITATION_LEAKED_INTO_LABEL` (real production case: a citation
+            # tag like "[G2.7]" baked into a node label) joins this same
+            # hard-blocking set rather than the "ship anyway, flagged"
+            # bucket below - it is a confirmed, deterministic content defect
+            # (a diagram describing which document a fact came from, not
+            # the subject matter itself), not a judgment call about how WELL
+            # the diagram covers its brief.
+            garbled_types = {STRUCTURALLY_GARBLED_TEXT, MISSPELLED_OR_GARBLED_TEXT, CITATION_LEAKED_INTO_LABEL}
             if any(issue.reason in garbled_types for issue in content_result.issues):
                 log.info(
-                    "Diagram for %s still has garbled/misspelled text after %s retries - withholding "
-                    "rather than falling back to an unrelated AI illustration",
+                    "Diagram for %s still has garbled/misspelled/citation-leaked text after %s retries - "
+                    "withholding rather than falling back to an unrelated AI illustration",
                     block.id, _MAX_CONTENT_QA_RETRIES,
                 )
                 garbled_findings = visual_qa_finding_entries(
@@ -1864,6 +2623,63 @@ class DiagramService:
         critical_render_issues = [issue for issue in issues if issue.kind in _CRITICAL_RENDER_ISSUE_KINDS]
         issues = [issue for issue in issues if issue.kind not in _CRITICAL_RENDER_ISSUE_KINDS]
         if critical_render_issues:
+            # Universal kind-fallback safety net: this kind's own layout
+            # geometry failed CRITICALLY twice in a row now (the initial
+            # render, then the targeted same-kind retry just above) - a
+            # real, confirmed case this closes (a decision_tree whose
+            # level-skipping branch shape deterministically crossed a
+            # sibling node, however the labels/structure were reworded)
+            # showed this is sometimes a genuine bug in ONE kind's own
+            # layout code, not a content problem retrying the SAME kind
+            # again could ever fix - the model has no way to predict which
+            # structure will trigger a specific kind's geometry bug ahead
+            # of time. Rather than audit every one of this module's ~49
+            # layout algorithms for this class of bug (a far bigger,
+            # separate undertaking), this gives the model ONE more attempt
+            # with a DIFFERENT kind for the exact same content before
+            # withholding - the same content expressed through a different
+            # structural shape, which sidesteps whichever kind's layout
+            # code was the actual problem, universally, regardless of
+            # which kind that turns out to be. Only adopted if it's a
+            # genuinely different kind (never trusted if the model ignored
+            # the instruction) AND renders with no critical issue of its
+            # own; otherwise this is a no-op and withholding proceeds
+            # exactly as before.
+            try:
+                fallback_spec = await self._request_spec(
+                    purpose=purpose, prompt=prompt, caption=caption, course_title=course_title,
+                    memory=memory_text, kind_hint="", pin_kind=False, block_id=block.id,
+                    qa_feedback=(
+                        f"The '{spec.normalised_kind()}' diagram kind produced a layout defect "
+                        "rendering this content that a targeted retry could not fix ("
+                        + ", ".join(sorted({issue.kind for issue in critical_render_issues}))
+                        + f"). Pick a DIFFERENT diagram kind for this same content - never "
+                        f"'{spec.normalised_kind()}' again."
+                    ),
+                    existing_outline=existing_outline,
+                    template_audience=template_audience, template_style=template_style,
+                )
+                fallback_spec = self._normalise(fallback_spec)
+                if fallback_spec.normalised_kind() != spec.normalised_kind() and fallback_spec.is_usable():
+                    fallback_spec = _with_figure_caption(fallback_spec, block)
+                    fallback_svg, fallback_w, fallback_h = render_diagram_svg(fallback_spec, template.theme)
+                    fallback_issues = (
+                        [] if fallback_spec.normalised_kind() in _exempt_kinds
+                        else validate_rendered_svg(fallback_svg, kind=fallback_spec.normalised_kind())
+                    )
+                    fallback_critical = [i for i in fallback_issues if i.kind in _CRITICAL_RENDER_ISSUE_KINDS]
+                    if not fallback_critical:
+                        log.info(
+                            "Diagram for %s recovered via a different kind (%s -> %s) after a critical "
+                            "rendered-geometry issue", block.id, spec.normalised_kind(), fallback_spec.normalised_kind(),
+                        )
+                        spec, svg_bytes, width, height = fallback_spec, fallback_svg, fallback_w, fallback_h
+                        issues = [i for i in fallback_issues if i.kind not in _CRITICAL_RENDER_ISSUE_KINDS]
+                        critical_render_issues = []
+            except Exception as exc:  # noqa: BLE001 - keep the original failure, don't fail the block
+                log.warning("Diagram kind-fallback retry failed for %s: %s", block.id, exc)
+
+        if critical_render_issues:
             log.info(
                 "Diagram for %s still has a critical rendered-geometry issue after retry (%s) - "
                 "withholding rather than shipping a diagram that could mislead about what connects "
@@ -1898,13 +2714,49 @@ class DiagramService:
                 block.id, len(issues),
             )
 
+        # Course-wide recurring-concept consistency (diagram quality audit
+        # follow-up, Phase 8): applied here, once, on whichever spec just
+        # won (initial render, same-kind retry, or the kind-fallback) -
+        # never on an intermediate candidate that might still be discarded.
+        # Only actually re-renders (a cheap, deterministic, zero-AI-call
+        # pass) when an icon genuinely needed overriding, so this is a true
+        # no-op for the common case where nothing needed to change.
+        if apply_diagram_consistency(course_id, spec):
+            try:
+                svg_bytes, width, height = render_diagram_svg(spec, template.theme)
+            except Exception as exc:  # noqa: BLE001 - keep the pre-override render rather than fail the block
+                log.warning("Diagram consistency re-render failed for %s: %s", block.id, exc)
+
         relative = self.storage.save_asset(course_id, svg_bytes, extension="svg")
         # See _correction_drift_issue's own docstring - a no-op ([], None)
         # whenever this generation wasn't a replace_image correction at all
         # (existing_outline unset), so a fresh first-time generation never
         # gets a finding here.
         drift_issue = _correction_drift_issue(existing_outline, spec)
+        under_correction_issue = _under_correction_issue(raw_existing_spec, prompt, spec)
         findings = [("flow_chart_connectivity", detail, True) for detail in unresolved_connectivity_issues]
+        # Same deterministic-finding contract as flow_chart_connectivity
+        # above - edge_label_verbosity_issues/max_edges_for are pure string/
+        # count checks, never an LLM judgment call.
+        findings.extend(("edge_label_verbosity", detail, True) for detail in unresolved_label_issues)
+        if unresolved_edge_count_issue:
+            findings.append((
+                "edge_count_exceeded",
+                f"{len(spec.edges)} relationships/edges exceeds this diagram's own clarity ceiling.",
+                True,
+            ))
+        # Advisory-only (see total_text_volume_issue's own docstring) -
+        # measured against whatever spec actually shipped (post-retry, if
+        # one ran), never gates the retry itself.
+        text_volume_issue = total_text_volume_issue(spec)
+        if text_volume_issue:
+            log.info("Diagram for %s: %s", block.id, text_volume_issue)
+            findings.append(("diagram_text_volume_advisory", text_volume_issue, True))
+        # Same "measured fresh against whatever actually shipped" contract
+        # as text_volume_issue just above.
+        final_complexity_mismatch = _complexity_mismatch_issue(spec)
+        if final_complexity_mismatch:
+            findings.append(("diagram_complexity_mismatch", final_complexity_mismatch, True))
         # True (literal, quality-governance follow-up Phase 3.7): RenderQAIssue
         # (app.services.diagram_render_qa) is pure SVG/geometry parsing - no
         # AIClient import anywhere in that module, so every issue here is
@@ -1912,6 +2764,8 @@ class DiagramService:
         findings.extend((issue.kind, issue.detail, True) for issue in issues)
         if drift_issue:
             findings.append(("replace_image_correction_drift", drift_issue, True))
+        if under_correction_issue:
+            findings.append(("replace_image_correction_not_applied", under_correction_issue, True))
         block.content = merge_content(
             block.type,
             block.content,
@@ -1970,6 +2824,18 @@ class DiagramService:
                     visual_qa_finding_entries(findings, resolution="rendered_with_unresolved_issues")
                     if findings else []
                 ) + content_qa_unresolved,
+                # Multi-diagram splitting (see `_linear_chain_split`): every
+                # later part's already-rendered SVG, in order, picked up and
+                # inserted as its own sibling block by
+                # `app.course.document.diagram_splitting`'s own
+                # document-level pass - this service has no access to the
+                # document/page to insert a block itself. Explicitly reset
+                # to `[]` on every save (not just when absent), same
+                # "never leave a stale earlier-attempt marker" rule
+                # `omitted_after_qa_failure` above already follows - a
+                # block that no longer needs splitting must not keep a
+                # previous attempt's stale later parts around.
+                "pending_diagram_splits": pending_split_payloads,
             },
         )
         log.info(

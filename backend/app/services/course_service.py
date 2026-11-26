@@ -55,6 +55,7 @@ from app.core.logging import get_logger
 from app.core.metrics import current_metrics, phase as metrics_phase, run_metrics
 from app.course.document.builder import build_document, finalize_toc_page, reflow_document
 from app.course.document.diagram_compaction import compact_diagrams_for_spacing
+from app.course.document.diagram_splitting import insert_split_diagrams
 from app.course.document.layout import image_generation_failed
 from app.course.document.visual_repair import audit_and_repair_visuals
 from app.services.diagram_diversity import balance_diagram_kinds
@@ -1706,6 +1707,24 @@ class CourseService:
                         record.run.updated_at = utc_now_iso()
                         await self._save_course(record)
 
+                # Sources-leaked-into-diagrams follow-up: the real cited
+                # source titles/filenames this chapter actually drew on,
+                # keyed by chapter_id - built from `sources_offered`, which
+                # `_record_sources` already persists on this SAME `record`
+                # for the progress screen (see that method's own docstring).
+                # Reusing it here (rather than a new tracking mechanism)
+                # threads a real, already-computed signal into diagram
+                # content-QA so a node/edge label that's literally one of
+                # these titles can be caught deterministically - see
+                # `ImageService.generate_missing`'s own docstring on this
+                # parameter.
+                cited_source_titles_by_chapter = {
+                    progress.chapter_id: [
+                        use.filename for use in progress.sources_offered if use.filename
+                    ]
+                    for progress in record.chapters
+                    if progress.sources_offered
+                }
                 with metrics_phase("images"):
                     images = await self.images.generate_missing(
                         document=document,
@@ -1714,11 +1733,27 @@ class CourseService:
                         on_progress=_on_image_done,
                         job_id=job_id,
                         course_audience=record.input.target_audience,
+                        cited_source_titles_by_chapter=cited_source_titles_by_chapter,
                     )
                 # A failed picture shrinks to a one-line strip, so the pages
                 # need re-flowing then too, not only when something succeeded.
                 if images or any(image_generation_failed(block) for _, block in document.iter_blocks()):
                     reflow_document(document, template)
+
+                # Multi-diagram splitting: a diagram DiagramService already
+                # split (see app.services.diagram_service._linear_chain_
+                # split) has its second half waiting as a transient payload
+                # on the first half's own block - insert it as its own
+                # sibling block now, before the repair/compaction passes
+                # below see the document, so they account for the real,
+                # final block count rather than a stale pre-split one.
+                with metrics_phase("diagram_splitting"):
+                    split_report = insert_split_diagrams(document, template, storage=self.storage)
+                if split_report.inserted:
+                    log.info(
+                        "Diagram splitting for %s: %s diagram(s) split into a second linked block",
+                        record.course_id, len(split_report.inserted),
+                    )
 
                 async def _on_repair_progress(done: int, total: int) -> None:
                     # Lightweight: only the progress counters, not a full

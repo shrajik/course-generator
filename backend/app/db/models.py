@@ -56,6 +56,27 @@ class AuthSession(Base):
     user: Mapped[User] = relationship(back_populates="auth_sessions")
 
 
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # SHA-256 of the raw token, NOT `hash_password` - see
+    # `app.core.security.hash_reset_token`'s own docstring for why this is
+    # deliberately a different, faster hash than `AuthSession.refresh_
+    # token_hash` uses: this token carries no embedded user id, so its
+    # owner is found by looking the hash up directly (a single indexed
+    # query), which a per-call-salted hash like argon2 cannot support.
+    token_hash: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Course(Base):
     __tablename__ = "courses"
 

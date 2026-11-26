@@ -52,6 +52,9 @@ already generic (reason/detail strings), not kind-specific."""
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import Settings, get_settings
@@ -80,6 +83,27 @@ MISSPELLED_OR_GARBLED_TEXT = "misspelled_or_garbled_text"
 # unambiguous by construction - the check itself (`_looks_garbled`) is still
 # the exact same reused function, only the persisted label differs.
 STRUCTURALLY_GARBLED_TEXT = "structurally_garbled_text"
+# A diagram's node/edge text containing the exact citation-tag syntax this
+# app's own research pipeline uses to mark a passage for the WRITER to cite
+# in prose (`render_source_excerpts`/`render_knowledge_excerpts`/
+# `render_artifact_excerpts` in app.schemas.research: "[S1.3]", "[G2.5]",
+# "[A7.2]"), or a filename-with-extension the same way a passage's own
+# `(filename, page N - heading)` citation header is written - a real,
+# confirmed production case (a live course's diagram literally carried
+# "...[G2.7]" inside a node label). No legitimate diagram label is ever
+# shaped like a citation tag or a "<name>.pdf"-style filename, so this is a
+# deterministic, zero-ambiguity structural signal - same tier as
+# STRUCTURALLY_GARBLED_TEXT above, never an LLM judgment call. This is a
+# narrower, self-contained net than "matches this chapter's actual cited
+# source list" (that would need the chapter's real source/knowledge
+# excerpts threaded all the way into this call, which nothing upstream of
+# `evaluate_content` persists past the writing run - see `app.services.
+# course_service._attach_source_excerpts`'s own docstring: "attached for
+# this run only... never stored") - the companion fix for a free-text
+# document TITLE used as a label (which this syntax-only check cannot see)
+# is the new DIAGRAM_SYSTEM rule telling the model never to do this in the
+# first place, not a detector here.
+CITATION_LEAKED_INTO_LABEL = "citation_leaked_into_label"
 # Canonical Visual Spec milestone: a diagram that actively CONTRADICTS the
 # course's own written text is treated exactly like garbled text above - a
 # confirmed defect that falls back to the raster illustration path rather
@@ -98,6 +122,19 @@ STRUCTURALLY_GARBLED_TEXT = "structurally_garbled_text"
 # diagram-specific duplicate.
 CONTRADICTS_SOURCE_TEXT = "contradicts_source_text"
 SOURCE_GROUNDING_UNSUPPORTED = "source_grounding_unsupported"
+# Learning-effectiveness follow-up (diagram quality audit, Phase 2/6 of the
+# "big 5" deferred items): two new judgments piggybacked onto this SAME
+# existing content-critique call (no new LLM call, no new dependency, same
+# reasoning this module's own docstring already gives for `text_legible`).
+# Distinct reason strings from concept_qa's own matching checks below -
+# REQUIRED, not stylistic: `quality_framework._visual_qa_source` dispatches
+# by an explicit reason-string set (`_CONTENT_QA_FINDING_TYPES`), and both
+# pipelines share the same `resolution="rendered_with_unresolved_issues"`
+# string, so a shared reason string here would be genuinely ambiguous to
+# that dispatch, not merely a style mismatch - same precedent as this
+# module's own `STRUCTURALLY_GARBLED_TEXT` vs `concept_qa.GARBLED_TEXT`.
+AUDIENCE_MISMATCH = "diagram_audience_mismatch"
+UNNECESSARILY_COMPLEX = "diagram_unnecessarily_complex"
 
 # Kinds this module ever grades - every other normalised_kind() (schematic,
 # concept_experience) already has its own dedicated semantic check and is a
@@ -148,6 +185,17 @@ class ContentCritique(BaseModel):
     contradicts_source_text: bool = False
     contradicts_source_text_detail: str = ""
     unsupported_claims: list[str] = Field(default_factory=list)
+    # Learning-effectiveness follow-up (see AUDIENCE_MISMATCH/
+    # UNNECESSARILY_COMPLEX above) - `True` means "fine", same polarity as
+    # `on_topic`/`specific_enough` above, never inverted. `audience_match`
+    # only means anything when a target audience was actually given (see
+    # `_AUDIENCE_QUESTION`'s own conditional) - stays at its safe default
+    # otherwise, exactly like `contradicts_source_text` already does when no
+    # `source_excerpt` is given.
+    audience_match: bool = True
+    audience_match_detail: str = ""
+    appropriately_scoped: bool = True
+    appropriately_scoped_detail: str = ""
 
 
 CONTENT_CRITIQUE_SYSTEM = """\
@@ -176,6 +224,13 @@ Judge these things:
   correctly spelled, readable English (or the brief's working language) -
   never about whether the content is on-topic or well-chosen, which the
   other two judgments above already cover.
+- `appropriately_scoped`: does every node/edge actually serve the brief, or
+  does the diagram include extra nodes, edges or sub-structure that doesn't
+  teach anything the brief asked for - clutter that makes the diagram harder
+  to read without making it teach more? A diagram with exactly the structure
+  the brief needs, even a rich one, is appropriately scoped; one padded with
+  tangential detail is not. Set this false only for genuine, specific
+  clutter, never because the diagram is merely detailed.
 
 Be concrete and specific in every detail field: name exactly what's wrong,
 in one sentence, never a bare "could be better". If the diagram is
@@ -203,8 +258,23 @@ this is judging CONSISTENCY with the course's own text, never independent
 scientific truth - if the source text itself were wrong, that is a
 different problem this judgment does not cover."""
 
+# Learning-effectiveness follow-up: appended to CONTENT_CRITIQUE_SYSTEM only
+# when the course actually states a target audience (see `_critique_user_
+# prompt`'s own conditional) - same "blank is a safe no-op" contract
+# `_GROUNDING_QUESTION` above already keeps for a missing `source_excerpt`.
+_AUDIENCE_QUESTION = """
 
-def _critique_user_prompt(spec: DiagramSpec, *, brief: str, course_title: str, source_excerpt: str = "") -> str:
+Also judge audience fit: this course's stated target audience is given
+below as TARGET AUDIENCE. Does this diagram's complexity, vocabulary and
+level of detail genuinely suit that audience - not too advanced (unexplained
+jargon, structure a beginner couldn't follow) and not condescending for an
+advanced audience? Set `audience_match` false only when the mismatch is
+real and specific, and name it exactly in `audience_match_detail`."""
+
+
+def _critique_user_prompt(
+    spec: DiagramSpec, *, brief: str, course_title: str, source_excerpt: str = "", template_audience: str = "",
+) -> str:
     nodes = "\n".join(
         f"- {node.label}" + (f": {node.detail}" if node.detail.strip() else "")
         for node in spec.nodes
@@ -219,6 +289,7 @@ def _critique_user_prompt(spec: DiagramSpec, *, brief: str, course_title: str, s
         f"not an external authority, just what this course itself already says):\n{source_excerpt}"
         if source_excerpt.strip() else ""
     )
+    audience_block = f"\nTARGET AUDIENCE: {template_audience}" if template_audience.strip() else ""
     return f"""\
 COURSE: {course_title}
 
@@ -227,6 +298,7 @@ VISUAL BRIEF (what this diagram is supposed to teach):
 
 DIAGRAM KIND: {spec.normalised_kind()}
 TITLE: {spec.title or "(none)"}
+{audience_block}
 
 NODE LABELS:
 {nodes}
@@ -264,6 +336,126 @@ def _garbled_label_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
         "These contain corrupted, garbled text rather than real words: "
         f"{', '.join(repr(t) for t in sorted(texts)[:3])}. Rewrite them as plain, "
         "correctly spelled English text.",
+    )]
+
+
+_CITATION_REF_TAG_RE = re.compile(r"\[(?:S|G|A)\d+(?:\.\d+)?\]")
+_CITATION_FILENAME_RE = re.compile(r"\.(?:pdf|docx?|pptx?|xlsx?|txt|html?)\b", re.IGNORECASE)
+
+
+def _citation_leak_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
+    """Layer 0: a node/edge label or detail carrying this app's own reserved
+    citation-tag syntax ("[S1.3]", "[G2.5]", "[A7.2]" - see this module's
+    `CITATION_LEAKED_INTO_LABEL` docstring above) or a bare filename with a
+    document extension, either of which proves a source/knowledge-library
+    citation header leaked into diagram content instead of staying in the
+    prose it was meant for. Deterministic and narrow by construction - never
+    flags ordinary text, since neither pattern occurs in a genuine concept
+    label."""
+    texts: list[str] = [spec.title] if spec.title else []
+    for node in spec.nodes:
+        texts.extend((node.label, node.detail))
+    for edge in spec.edges:
+        texts.append(edge.label)
+    hits = {
+        text for text in texts
+        if text and (_CITATION_REF_TAG_RE.search(text) or _CITATION_FILENAME_RE.search(text))
+    }
+    if not hits:
+        return []
+    return [DiagramQAIssue(
+        CITATION_LEAKED_INTO_LABEL,
+        "These contain a source/knowledge-library citation reference (a "
+        f"bracketed tag like \"[G2.5]\" or a document filename) instead of "
+        f"genuine subject-matter content: {', '.join(repr(t) for t in sorted(hits)[:3])}. "
+        "A diagram's labels must describe the subject itself, never which "
+        "document a fact came from - move any citation into the surrounding "
+        "prose and rewrite these labels as plain concept text.",
+    )]
+
+
+_TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]")
+_WHITESPACE_RE = re.compile(r"\s+")
+# A normalized match shorter than this could plausibly be a coincidental
+# short phrase shared between an unrelated concept and a source's title
+# (see this check's own docstring) - a real document title/filename is
+# almost always longer than this in practice, so the floor stays
+# conservative without needing per-course tuning.
+_MIN_TITLE_MATCH_CHARS = 15
+
+
+def _normalize_source_title(text: str) -> str:
+    """Case/punctuation/extension/trailing-parenthetical-insensitive form of
+    a title or filename, so "Nanopublications: The anatomy of a
+    nanopublication (Groth et al.)" and a node label that merely COPIED that
+    same title verbatim compare equal regardless of an author/org tag added
+    on either side."""
+    text = _TRAILING_PARENTHETICAL_RE.sub("", text.strip())
+    text = _CITATION_FILENAME_RE.sub("", text)
+    text = _NON_ALNUM_RE.sub(" ", text.lower())
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _cited_source_title_leak_issues(spec: DiagramSpec, cited_source_titles: Sequence[str]) -> list[DiagramQAIssue]:
+    """Layer 0 (follow-up to `_citation_leak_issues` above): a node/edge
+    label that IS, verbatim or near-verbatim, one of this chapter's own real
+    cited source titles/filenames (`cited_source_titles` - sourced from
+    `CourseRecord.chapters[].sources_offered`, see `CourseService.
+    _record_sources`'s own docstring: the same real `SourceUse.filename`
+    values that service already persists per chapter, not a new tracking
+    mechanism). Confirmed real production shape (live course screenshot): a
+    concept_map's satellite nodes were literally the chapter's cited
+    document titles ("SPARQL 1.1 Graph Store HTTP Protocol", a raw uploaded
+    filename, etc.), not genuine subject-matter concepts - `_citation_leak_
+    issues` above only catches the bracketed-ref-tag/bare-extension SHAPE of
+    this defect; this catches the free-text-title shape the prompt rule
+    alone was otherwise the only defense against.
+
+    Deliberately conservative (this session's standing "never guess, never
+    flag without real ground truth" standard): matches by CONTIGUOUS
+    substring containment after normalizing case/punctuation/a trailing
+    parenthetical/a file extension, never by shared-word overlap - a
+    legitimate concept that happens to share a word or two with a source's
+    title (e.g. a node about "nanopublication formats" when a cited paper is
+    titled "Nanopublications: The anatomy of a nanopublication") does NOT
+    match, because neither string contains the other whole. Also floors
+    both sides at `_MIN_TITLE_MATCH_CHARS` so a short, generic source name
+    can never match on a coincidental short substring. A no-op whenever the
+    caller has no real cited-source list for this chapter (the common case
+    for any call site that hasn't threaded `CourseRecord` data through -
+    see `evaluate_content`'s own docstring on this parameter's default)."""
+    normalized_titles = {
+        title: norm for title in cited_source_titles
+        if title and title.strip() and len(norm := _normalize_source_title(title)) >= _MIN_TITLE_MATCH_CHARS
+    }
+    if not normalized_titles:
+        return []
+    texts: list[str] = [spec.title] if spec.title else []
+    for node in spec.nodes:
+        texts.extend((node.label, node.detail))
+    for edge in spec.edges:
+        texts.append(edge.label)
+    hits: dict[str, str] = {}
+    for text in texts:
+        if not text:
+            continue
+        normalized_label = _normalize_source_title(text)
+        if len(normalized_label) < _MIN_TITLE_MATCH_CHARS:
+            continue
+        for original_title, normalized_title in normalized_titles.items():
+            if normalized_label == normalized_title or normalized_title in normalized_label or normalized_label in normalized_title:
+                hits[text] = original_title
+                break
+    if not hits:
+        return []
+    examples = "; ".join(f"{label!r} matches cited source {title!r}" for label, title in list(hits.items())[:3])
+    return [DiagramQAIssue(
+        CITATION_LEAKED_INTO_LABEL,
+        "These labels are this chapter's own cited source titles/filenames, not subject-matter "
+        f"content: {examples}. A diagram's labels must describe the subject itself, never which "
+        "document a fact came from - move any citation into the surrounding prose and rewrite "
+        "these labels as plain concept text.",
     )]
 
 
@@ -324,6 +516,8 @@ async def evaluate_content(
     ai: AIClient | None = None,
     settings: Settings | None = None,
     source_excerpt: str = "",
+    cited_source_titles: Sequence[str] = (),
+    template_audience: str = "",
 ) -> DiagramQAResult:
     """A no-op for schematic/concept_experience (each already has its own
     dedicated semantic check elsewhere) and for a blank brief (nothing to
@@ -343,13 +537,33 @@ async def evaluate_content(
     calls for the common case, exactly the reasoning `ImageService.
     _verify_image_relevance` documents for its own matching fields. Blank
     (the default) skips asking the grounding question at all, same as an
-    empty `brief` already skips the whole call."""
+    empty `brief` already skips the whole call.
+
+    `cited_source_titles` (follow-up to the citation-leak fix above): the
+    chapter's own real cited source titles/filenames, when the caller has
+    them (see `_cited_source_title_leak_issues`'s own docstring for where
+    this comes from and why it's conservative). Empty (the default) is
+    always a safe no-op - exactly the same degrade-gracefully contract
+    `source_excerpt` itself already keeps for a call site that doesn't have
+    it.
+
+    `template_audience` (learning-effectiveness follow-up): the course's own
+    stated audience (see `app.services.diagram_service.audience_multiplier`'s
+    matching field), when the caller has it. Folds the `audience_match`
+    judgment into this SAME call, same zero-new-API-call reasoning as every
+    other optional judgment here. Blank (the default) skips asking the
+    audience question at all, same degrade-gracefully contract as
+    `source_excerpt`."""
     if spec.normalised_kind() not in _GRADED_KINDS or not brief.strip():
         return DiagramQAResult()
 
     garbled = _garbled_label_issues(spec)
     if garbled:
         return DiagramQAResult(issues=garbled)
+
+    citation_leak = _citation_leak_issues(spec) or _cited_source_title_leak_issues(spec, cited_source_titles)
+    if citation_leak:
+        return DiagramQAResult(issues=citation_leak)
 
     # Layer 0 continued: a deterministic, high-confidence numeric or
     # identifier-value mismatch against the course's own text is at least as
@@ -366,8 +580,15 @@ async def evaluate_content(
 
     critique = await (ai or get_ai_client()).structured(
         schema=ContentCritique,
-        system=CONTENT_CRITIQUE_SYSTEM + (_GROUNDING_QUESTION if source_excerpt.strip() else ""),
-        user=_critique_user_prompt(spec, brief=brief, course_title=course_title, source_excerpt=source_excerpt),
+        system=(
+            CONTENT_CRITIQUE_SYSTEM
+            + (_GROUNDING_QUESTION if source_excerpt.strip() else "")
+            + (_AUDIENCE_QUESTION if template_audience.strip() else "")
+        ),
+        user=_critique_user_prompt(
+            spec, brief=brief, course_title=course_title, source_excerpt=source_excerpt,
+            template_audience=template_audience,
+        ),
         model=(settings or get_settings()).diagram_model,
         purpose=f"diagram_content_qa:{spec.normalised_kind()}",
         phase="image",
@@ -416,6 +637,20 @@ async def evaluate_content(
             MISSPELLED_OR_GARBLED_TEXT,
             critique.text_legible_detail
             or "This diagram's labels contain misspelled or garbled text.",
+            deterministic=False,
+        ))
+    if not critique.audience_match:
+        issues.append(DiagramQAIssue(
+            AUDIENCE_MISMATCH,
+            critique.audience_match_detail
+            or "This diagram's complexity/vocabulary doesn't suit the course's stated audience.",
+            deterministic=False,
+        ))
+    if not critique.appropriately_scoped:
+        issues.append(DiagramQAIssue(
+            UNNECESSARILY_COMPLEX,
+            critique.appropriately_scoped_detail
+            or "This diagram includes structure that doesn't serve the brief.",
             deterministic=False,
         ))
     # Merged in, never short-circuited - see `_numeric_contradiction_

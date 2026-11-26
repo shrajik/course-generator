@@ -580,6 +580,9 @@ class Settings(BaseSettings):
     # Server-side bootstrap only: if set, registering this email creates the
     # initial admin account. Public clients cannot choose their own role.
     initial_admin_email: str = ""
+    # How long a forgot-password email's link stays valid - see
+    # app.core.security.generate_reset_token/hash_reset_token.
+    password_reset_token_expire_minutes: int = Field(default=30, ge=1)
 
     # --- derived ------------------------------------------------------------
     @property

@@ -28,6 +28,7 @@ from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 from app.services.quality_framework import visual_qa_finding_entries
 from app.services.storage_service import StorageService, get_storage
+from app.services.visual_consistency import apply_concept_consistency
 from app.services.visual_planner import VisualPlanner
 
 log = get_logger(__name__)
@@ -70,6 +71,67 @@ def _correction_drift_issue(existing_spec: dict | None, spec: DiagramSpec) -> st
         f"it may be a different visual rather than the same one with the requested fix."
     )
 
+
+_UNDER_CORRECTION_MIN_PROMPT_CHARS = 15  # long enough to be a real instruction, not a stray word
+
+
+def _under_correction_issue(existing_spec: dict | None, prompt: str, spec: DiagramSpec) -> str | None:
+    """Mirrors `DiagramService._under_correction_issue` exactly (see its own
+    docstring for the full reasoning) for the concept_experience pipeline -
+    the OTHER direction of `_correction_drift_issue` just above: a
+    correction asking for a SUBSTANTIAL, specific change but coming back
+    byte-identical to the spec it was meant to correct is a measurable
+    signal the instruction was effectively ignored, not applied. A visible,
+    inspectable finding only, never a retry, never a reason to reject the
+    result. `existing_spec` is already the FULL original spec dict here
+    (unlike the diagram pipeline's compact `existing_outline`), so this can
+    compare it directly - no separate "raw" spec needed."""
+    if not existing_spec or len(prompt.strip()) < _UNDER_CORRECTION_MIN_PROMPT_CHARS:
+        return None
+    try:
+        old_dump = DiagramSpec.model_validate(existing_spec).model_dump(mode="json")
+    except Exception:  # noqa: BLE001 - an unparseable old spec just can't be compared
+        return None
+    if old_dump != spec.model_dump(mode="json"):
+        return None
+    shown_prompt = prompt.strip()[:80] + ("..." if len(prompt.strip()) > 80 else "")
+    return (
+        f"This regenerated a visual in response to a specific correction request "
+        f"('{shown_prompt}'), but the result is identical to the one before it - the "
+        f"request may not have actually been applied."
+    )
+
+
+# Pre-generation planning follow-up (diagram quality audit, Phase 2) for the
+# concept_experience pipeline - mirrors DiagramService's own
+# `_SIMPLE_COMPLEXITY_MAX_NODES`/`_complexity_mismatch_issue` exactly (see
+# their docstrings for the full reasoning), measuring "how much structure
+# did this actually produce" as entities+steps+concept_states combined,
+# since a concept_experience spec can use any one of those three lists
+# depending on `representation`.
+_SIMPLE_COMPLEXITY_MAX_ITEMS = 6
+
+
+def _complexity_mismatch_issue(spec: DiagramSpec) -> str | None:
+    """Mirrors `DiagramService._complexity_mismatch_issue` exactly, for the
+    concept_experience pipeline. Unlike the diagram pipeline (which folds
+    this into a combined structural retry), this pipeline has no such
+    retry loop - its only retry is the existing concept_qa pass above - so
+    this is wired as a QA finding only, same as `_correction_drift_issue`/
+    `_under_correction_issue` just above: visible and inspectable, never a
+    reason to re-plan or withhold the result."""
+    if spec.complexity_estimate.strip().lower() != "simple":
+        return None
+    item_count = len(spec.entities) + len(spec.steps) + len(spec.concept_states)
+    if item_count <= _SIMPLE_COMPLEXITY_MAX_ITEMS:
+        return None
+    return (
+        f"This visual was estimated as 'simple' but has {item_count} entities/steps/states "
+        f"combined - more than a genuinely simple visual needs (roughly "
+        f"{_SIMPLE_COMPLEXITY_MAX_ITEMS} or fewer). Either consolidate down to match a "
+        "genuinely simple shape, or this content actually needs a 'moderate'/'complex' "
+        "structure - don't just relabel the estimate without changing the content."
+    )
 
 
 class ConceptVisualService:
@@ -170,12 +232,26 @@ class ConceptVisualService:
             log.warning("Concept visual rendering failed for %s: %s", block.id, exc)
             return False
 
+        # Course-wide recurring-concept consistency (diagram quality audit
+        # follow-up, Phase 8) - see app.services.visual_consistency's own
+        # module docstring. Only re-renders (cheap, deterministic, zero
+        # extra AI call) when an icon genuinely needed overriding.
+        if apply_concept_consistency(course_id, spec):
+            try:
+                html_bytes = render_concept_experience_html(spec, template.theme)
+            except Exception as exc:  # noqa: BLE001 - keep the pre-override render rather than fail the block
+                log.warning("Concept visual consistency re-render failed for %s: %s", block.id, exc)
+
         relative = self.storage.save_asset(course_id, html_bytes, extension="html")
         # See _correction_drift_issue's own docstring - a no-op (None)
         # whenever this generation wasn't a replace_image correction at
         # all (existing_spec unset), so a fresh first-time generation
         # never gets a finding here.
         drift_issue = _correction_drift_issue(existing_spec, spec)
+        under_correction_issue = _under_correction_issue(existing_spec, prompt, spec)
+        # Same "measured fresh against whatever actually shipped" contract
+        # as the other two checks just above.
+        complexity_mismatch_issue = _complexity_mismatch_issue(spec)
         # A real, spec-specific estimate - not a fixed placeholder - so the
         # page layout engine reserves the actual space this content needs.
         # Getting this wrong doesn't just make the block look odd; the next
@@ -218,7 +294,9 @@ class ConceptVisualService:
                     # this correct even if that contract ever changes.
                     [
                         (issue.reason, issue.detail, issue.deterministic) for issue in result.issues
-                    ] + ([("replace_image_correction_drift", drift_issue, True)] if drift_issue else []),
+                    ] + ([("replace_image_correction_drift", drift_issue, True)] if drift_issue else [])
+                    + ([("replace_image_correction_not_applied", under_correction_issue, True)] if under_correction_issue else [])
+                    + ([("concept_complexity_mismatch", complexity_mismatch_issue, True)] if complexity_mismatch_issue else []),
                     resolution="rendered_with_unresolved_issues",
                 ),
             },

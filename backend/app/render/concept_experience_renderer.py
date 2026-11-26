@@ -1414,6 +1414,30 @@ def _render_object(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
         # complaint about exactly this shape ("too colourful").
         is_hub = _concept_map_hub(instance_entities, spec.relationships) is not None
         root_class = "cev-root" if is_hub else "cev-root cev-style-flow"
+    elif (
+        not template_entities
+        and len(instance_entities) >= 2
+        and any(e.properties for e in instance_entities)
+    ):
+        # A flat, UNCONNECTED set of 2+ property-bearing entities - no
+        # template, no relationships between them (we only reach this
+        # branch once the elif above has already claimed every case that
+        # DOES have relationships). This is the real, confirmed "Entity
+        # (Schema)"/"LangGraph pilot schema" complaint: several unrelated
+        # field-group boxes, each its own wall of property:value bullets,
+        # reading as a cluttered grid with too much text per box. A table -
+        # one row per property key, one column per entity - reads far more
+        # clearly for exactly this shape, the same reasoning
+        # `_render_comparison`'s own docstring already gives for picking a
+        # table over a card row; reusing it here (never the flat card grid
+        # for this shape again) is a deliberate, permanent fix, not a
+        # one-off tweak. Entities with NO properties at all (a plain named
+        # list) are deliberately excluded - a table with headers and zero
+        # data rows would be a worse, more degenerate shape than the simple
+        # card row they already get.
+        instances_html = _comparison_table_html(instance_entities)
+        instances_class = "cev-cmp-wrap"
+        root_class = "cev-root"
     else:
         instances_html = _entities_row_html(instance_entities, spec.relationships, extra_class="cev-instance")
         instances_class = "cev-instances"
@@ -1829,8 +1853,11 @@ def _render_process(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def _render_comparison(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
-    entities = spec.entities
+def _comparison_table_html(entities: list[VisualEntity]) -> str:
+    """The table itself (rows = union of every entity's property keys,
+    columns = entities) - factored out of `_render_comparison` so
+    `_render_object`'s own flat-unconnected-entities branch can reuse the
+    exact same table instead of a second, drifting copy."""
     keys: list[str] = []
     seen: set[str] = set()
     for entity in entities:
@@ -1857,10 +1884,14 @@ def _render_comparison(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
         + "</tr>"
         for key in keys
     )
-    table_html = (
+    return (
         f'<table class="cev-cmp-table"><thead><tr><th class="cev-cmp-corner"></th>{header_cells}</tr></thead>'
         f"<tbody>{body_rows}</tbody></table>"
     )
+
+
+def _render_comparison(spec: DiagramSpec, theme: TemplateTheme) -> bytes:
+    table_html = _comparison_table_html(spec.entities)
 
     body = f"""\
 <div class="cev-root">
@@ -2374,6 +2405,22 @@ def _raw_pixel_size(spec: DiagramSpec) -> tuple[int, float]:
             rows = math.ceil(instance_count / 2)
             height += rows * per_row_height
             height += max(rows - 1, 0) * 54.0  # curved connector between rows
+        elif (
+            not template_count
+            and not spec.relationships
+            and instance_count >= 2
+            and any(e.properties for e in instances)
+        ):
+            # Renders via `_comparison_table_html` (see the matching
+            # `_render_object` branch and `_render_comparison`'s own
+            # accounting just above for why) - never the flat per-character
+            # row-wrap math in the final `else` below, which is for the
+            # template+instances and property-less-list cases now.
+            keys: set[str] = set()
+            for entity in instances:
+                keys.update(k for k in entity.properties if k.strip())
+            height += 95.0  # column headers: icon badge + label + padding
+            height += len(keys) * 40.0
         else:
             busiest = max((_entity_chars(e) for e in instances), default=0)
             if spec.relationships:

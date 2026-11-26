@@ -28,6 +28,7 @@ import json
 from app.agents import prompts
 from app.core.config import Settings, get_settings
 from app.schemas.diagram import DiagramSpec
+from app.services.correction_intent import CORRECTION_INTENT_POLICY, classify_correction_intent
 from app.services.memory_service import MemoryService, get_memory_service
 from app.services.openai_service import AIClient, get_ai_client
 
@@ -56,10 +57,16 @@ ONE CONCEPT PER VISUAL. Never combine several ideas (e.g. both Class/Object
 and Inheritance, or both a loop and recursion) into one spec - identify the
 single, specific concept the brief is actually about and teach only that.
 
-PLAN BEFORE YOU FILL IN ANY FIELD. Think through these four questions in
-order - every field below exists to answer one of them, and a spec that
-skips this thinking tends to end up correct-looking but forgettable or
-confusing as a single still picture:
+PLAN BEFORE YOU FILL IN ANY FIELD. Set `complexity_estimate` first, honestly,
+to one of "simple" (a handful of entities/steps/states, one clear idea - most
+briefs are this), "moderate", or "complex" (genuinely many interconnected
+parts the brief itself describes) - then let that honest estimate actually
+constrain what you produce; if you find yourself about to write a "simple"
+visual with a dozen entities, that's a sign to consolidate or re-plan, not a
+sign to relabel the estimate after the fact to match what you already wrote.
+Then think through these four questions in order - every field below exists
+to answer one of them, and a spec that skips this thinking tends to end up
+correct-looking but forgettable or confusing as a single still picture:
 1. What is the ONE thing a complete beginner must walk away visually
    understanding? Not a list of facts - a single mental model. Everything
    else in the spec supports that one thing; cut anything that doesn't.
@@ -89,7 +96,13 @@ an existing visual, not a fresh one - the reader already approved its
 concept, metaphor and structure and is asking you to fix specific, named
 problems with it (a wrong/garbled label, overlapping or cut-off text, a
 cluttered/decorative look, an incorrect property value or relationship),
-not to redesign it. Keep the same `representation`, the same entities/
+not to redesign it. The text under "YOUR CORRECTION REQUEST" (when present)
+is the user's own current, explicit instruction for THIS regeneration -
+treat it as the authoritative statement of what to change, and apply it
+precisely and visibly; a "CORRECTION REQUEST" that clearly asks for
+something specific is never something to water down or only partially
+apply just because the default below is to preserve everything else. Keep
+the same `representation`, the same entities/
 steps/states with the same ids/labels/properties, the same `visual_metaphor`
 and `core_message`, UNLESS the brief explicitly asks to add, remove, rename
 or restructure something - copy every field you are not asked to change
@@ -318,7 +331,17 @@ Fill these fields:
   ("admin", "warning", "note", "top1") reads as an internal field name,
   not a label a reader would recognise; use the plain English a textbook
   caption would use instead (e.g. "Tolerance" not "admin", "Caution" not
-  "warning", "Example set" not "top1"). Each entity also has `actions` (short
+  "warning", "Example set" not "top1"). Give each entity AT MOST 4
+  properties - a card introduces the most important few facts about one
+  thing, never a full field catalog. A real, confirmed failure mode: a
+  schema broken into field-group entities ("Canonical Identity", "Assertion",
+  "Provenance") each carrying 4-6 properties (value/confidence/method/
+  source/ingest_time...) rendered as a wall of bulleted text per box. If a
+  thing genuinely has more facts worth showing than that, pick the 4 most
+  essential ones for the card and drop the rest, split it into two or more
+  smaller entities (e.g. "Assertion" and "Assertion provenance" as separate
+  cards), or move the remainder into `core_message`/the surrounding course
+  text instead of cramming every field onto one card. Each entity also has `actions` (short
   behaviour/capability labels, e.g. "start()" for a Java method, "commit()"
   for a Git repo - only for entities where that's meaningful), `icon`, and
   `color_role`. The renderer aims for a clean, textbook/technical-diagram
@@ -367,7 +390,13 @@ Fill these fields:
   unless you set 2+ entities - a SQL JOIN needs a relationship between its
   two table entities (e.g. `type="connected_to"` labelled by the join type),
   a decision tree needs its branches labelled with the actual condition, not
-  just disconnected boxes.
+  just disconnected boxes. `type` must be a short natural phrase - 1-3 words
+  preferred, 4 words the hard maximum - never a mechanically concatenated
+  cluster of field names/abbreviations/metadata (a real, confirmed failure
+  mode: a relationship labelled "raised by · prov · conf" instead of one
+  clear phrase). If this relationship genuinely carries provenance,
+  confidence, a timestamp or another metadata fact, that belongs as its own
+  entity property, never repeated inside `type` itself.
 - `validation_criteria`: 3-7 short, checkable assertions specific to THIS
   concept (not generic boilerplate) that a reviewer could grade pass/fail
   against the spec. Derive these from what actually matters for
@@ -390,6 +419,37 @@ Rules:
 """
 
 
+_DENSITY_GUIDANCE_SHORT_WORDS = 25
+_DENSITY_GUIDANCE_LONG_WORDS = 90
+
+
+def _density_guidance_line(brief_text: str) -> str:
+    """Mirrors `app.services.diagram_service._density_guidance_line`
+    exactly (see its own docstring for the full reasoning) for the
+    concept_experience pipeline - a deterministic, PRE-generation density
+    nudge computed from the brief's own word count, never a replacement
+    for the existing post-hoc property-count/label-length caps in
+    concept_qa.py."""
+    word_count = len(brief_text.split())
+    if word_count == 0:
+        return ""
+    if word_count <= _DENSITY_GUIDANCE_SHORT_WORDS:
+        return (
+            "\nThis brief is short and focused - a compact visual (a handful of entities/"
+            "steps/states) that scans in a few seconds is almost always the right size here; "
+            "don't pad it out with extra items or invented sub-detail the brief didn't ask "
+            "for just to look more thorough.\n"
+        )
+    if word_count >= _DENSITY_GUIDANCE_LONG_WORDS:
+        return (
+            "\nThis brief covers real breadth - a richer visual may genuinely be warranted, "
+            "but keep every individual label/property SHORT regardless (a few words, never a "
+            "sentence) and favour grouping related ideas over listing every last one "
+            "individually; scannability matters more than exhaustiveness.\n"
+        )
+    return ""
+
+
 def _concept_user_prompt(
     *,
     purpose: str,
@@ -400,7 +460,36 @@ def _concept_user_prompt(
     qa_feedback: str = "",
     existing_spec: dict | None = None,
 ) -> str:
-    brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
+    # Prompt-fidelity fix (replace_image correction reliability) - mirrors
+    # app.services.diagram_service._diagram_user_prompt's identical fix,
+    # same reasoning: `purpose`/`caption` are leftovers from the ORIGINAL
+    # generation (ConceptVisualService.generate_for_block never touches
+    # them on a correction - only `prompt` gets overwritten with the user's
+    # live instruction, see patcher.py's own `replace_image` handling),
+    # while `prompt` is what the user is asking THIS call to change. On a
+    # correction (`existing_spec` is only ever set then), reserve the
+    # user's own `prompt` text FIRST and label it distinctly from the old
+    # context, rather than joining all three into one undifferentiated
+    # "VISUAL BRIEF" the model has to guess at - and so a long leftover
+    # `purpose` can never silently truncate the live instruction away.
+    if existing_spec and prompt.strip():
+        reserved_prompt = prompt.strip()[:MAX_BRIEF_CHARS]
+        remaining_budget = max(MAX_BRIEF_CHARS - len(reserved_prompt) - 1, 0)
+        context_text = "\n".join(part for part in (purpose, caption) if part)[:remaining_budget]
+        # Correction-intent classification (Phase 7) - see app.services.
+        # correction_intent's own module docstring for the full reasoning;
+        # shared verbatim with the diagram pipeline's identical wiring.
+        intent = classify_correction_intent(prompt)
+        intent_block = f"\nCORRECTION TYPE: {CORRECTION_INTENT_POLICY[intent]}\n" if intent else ""
+        brief_block = (
+            "YOUR CORRECTION REQUEST (the user's own instruction for THIS "
+            f"regeneration - apply it precisely and visibly):\n{reserved_prompt}\n"
+            f"{intent_block}"
+            + (f"\nORIGINAL BRIEF (context from the first generation):\n{context_text}\n" if context_text else "")
+        )
+    else:
+        brief = "\n".join(part for part in (purpose, prompt, caption) if part)[:MAX_BRIEF_CHARS]
+        brief_block = f"VISUAL BRIEF:\n{brief or '(not specified)'}\n"
     section = prompts.memory_section(memory)
     memory_block = f"\n{section}\n" if section else ""
     feedback_block = f"\n{qa_feedback}\n" if qa_feedback else ""
@@ -417,12 +506,11 @@ def _concept_user_prompt(
         if existing_spec
         else ""
     )
+    density_block = _density_guidance_line(" ".join(part for part in (purpose, prompt, caption) if part))
     return f"""\
 COURSE: {course_title}
 
-VISUAL BRIEF:
-{brief or "(not specified)"}
-{memory_block}{feedback_block}{current_block}
+{brief_block}{memory_block}{feedback_block}{current_block}{density_block}
 Produce the concept_experience diagram specification for this visual.
 """
 

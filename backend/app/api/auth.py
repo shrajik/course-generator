@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Cookie, Depends, Response
 
-from app.schemas.auth import AuthResponse, LoginRequest, RegisterRequest
+from app.schemas.auth import AuthResponse, ForgotPasswordRequest, LoginRequest, RegisterRequest, ResetPasswordRequest
 from app.services.auth_service import AuthService, get_auth_service, to_user_response
 from app.core.security import clear_auth_cookies, set_auth_cookies
 from app.db.models import User
@@ -60,3 +60,24 @@ async def logout(
 @router.get("/me", response_model=AuthResponse)
 async def me(current_user: User = Depends(get_current_user)) -> AuthResponse:
     return AuthResponse(user=to_user_response(current_user))
+
+
+@router.post("/forgot-password", status_code=202)
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    service: AuthService = Depends(get_auth_service),
+) -> dict[str, str]:
+    # Always 202 with the same body - see `AuthService.request_password_
+    # reset`'s own docstring on why this never reveals whether the email
+    # belongs to a real account.
+    await service.request_password_reset(request)
+    return {"status": "ok"}
+
+
+@router.post("/reset-password")
+async def reset_password(
+    request: ResetPasswordRequest,
+    service: AuthService = Depends(get_auth_service),
+) -> dict[str, str]:
+    await service.reset_password(request)
+    return {"status": "ok"}

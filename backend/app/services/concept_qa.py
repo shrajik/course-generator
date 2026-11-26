@@ -31,6 +31,8 @@ schematic-specific.
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import Settings, get_settings
@@ -48,6 +50,7 @@ TOO_DENSE = "too_dense"
 GENERIC_VISUAL = "generic_visual"
 DANGLING_TRANSITION = "dangling_transition"
 DISCONNECTED_CONCEPTS = "disconnected_concepts"
+RELATIONSHIP_LABEL_TOO_VERBOSE = "relationship_label_too_verbose"
 
 # --- semantic (layer 2) failure reasons -------------------------------------
 CONCEPT_NOT_CLEAR = "concept_not_clear"
@@ -65,6 +68,15 @@ WRONG_RELATIONSHIP = "wrong_relationship"
 # class that diagram/flow_chart content is now protected against could still
 # reach a concept_experience card completely unchecked.
 TEXT_NOT_LEGIBLE = "text_not_legible"
+# Learning-effectiveness follow-up (diagram quality audit, Phase 2/6 of the
+# "big 5" deferred items): two new judgments piggybacked onto this SAME
+# existing semantic-critique call (no new LLM call). Distinct reason strings
+# from diagram_content_qa's own matching checks - REQUIRED, not stylistic,
+# see that module's own comment on `AUDIENCE_MISMATCH`/`UNNECESSARILY_
+# COMPLEX` for why a shared string would be genuinely ambiguous to
+# `quality_framework._visual_qa_source`'s dispatch.
+AUDIENCE_MISMATCH = "concept_audience_mismatch"
+UNNECESSARY_COMPLEXITY = "concept_unnecessary_complexity"
 
 _LABEL_LENGTH_CAP = 40  # characters - "short, a few words", not a sentence
 # Looser than _LABEL_LENGTH_CAP since a real short fact ("flattens at high
@@ -78,6 +90,16 @@ _LABEL_LENGTH_CAP = 40  # characters - "short, a few words", not a sentence
 # literal "key : value" text dumped into a plain card.
 _PROPERTY_KEY_LENGTH_CAP = 30
 _PROPERTY_VALUE_LENGTH_CAP = 60
+# A cap on HOW MANY properties one entity card may carry, not just how long
+# each one reads - a real, confirmed complaint distinct from the per-field
+# length checks above: an entity can pass every individual key/value length
+# check and still render as a dense wall of 6+ property:value bullets inside
+# one rectangular card (the "Entity (Schema)"/"LangGraph pilot schema" case -
+# field-group boxes like "Assertion" carrying value/confidence/method/source
+# all at once). A card exists to introduce the most important few facts
+# about one thing, not to be a full field catalog - a reader who needs the
+# complete list belongs in the surrounding course text instead.
+_MAX_PROPERTIES_PER_ENTITY = 4
 # `VisualStep.description`/`VisualState.description` are deliberately allowed
 # to run a full sentence longer than a label (the renderer's own
 # `estimate_pixel_size` auto-scales a visual down to fit exactly this case -
@@ -206,6 +228,19 @@ def _structural_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
             "short fact (\"color: Red\"), never a full description. If this content doesn't "
             "reduce to short facts, it likely isn't a fit for this representation at all - "
             "reconsider the entity/property breakdown or the representation choice.",
+        ))
+
+    overloaded_entities = [
+        e.label.strip() or e.id for e in spec.entities if len(e.properties) > _MAX_PROPERTIES_PER_ENTITY
+    ]
+    if overloaded_entities:
+        issues.append(DiagramQAIssue(
+            TOO_DENSE,
+            f"Some entities carry more than {_MAX_PROPERTIES_PER_ENTITY} properties (e.g. "
+            f"'{overloaded_entities[0]}') - a card should introduce only the most important few "
+            "facts about one thing, not a full field catalog. Trim each entity to its "
+            f"{_MAX_PROPERTIES_PER_ENTITY} most essential properties, split it into several "
+            "smaller entities, or move the rest into the surrounding course text.",
         ))
 
     long_descriptions = [
@@ -380,6 +415,34 @@ def _entities_share_no_common_property(entities: list[VisualEntity]) -> bool:
 # false-flagged - only "most connectors say the same uninformative thing".
 _GENERIC_RELATIONSHIP_LABEL_MIN_COUNT = 3
 
+# The same metadata-concatenation pattern `app.services.diagram_service`'s
+# own `edge_label_verbosity_issues` checks for the SVG diagram family - a
+# relationship label built by mechanically joining a relationship name with
+# provenance/confidence/metadata markers (e.g. "raised by · prov · conf")
+# instead of writing one short natural phrase. Defined locally rather than
+# imported from `diagram_service` - this module stays a lightweight, pure
+# QA module (no AIClient/StorageService dependency, see its own docstring),
+# and importing the heavier orchestration module here would be the wrong
+# dependency direction; the actual check is a few lines of regex, cheap
+# enough to keep in sync by hand if either ever needs to change.
+_VERBOSITY_DELIMITER_RE = re.compile(r"[·•|]|::|\s/\s")
+_VERBOSITY_FIELD_TAG_RE = re.compile(r"[a-zA-Z][a-zA-Z_ ]*\s*[:=]\s*[a-zA-Z]")
+_MAX_RELATIONSHIP_TYPE_WORDS = 4
+
+
+def _relationship_label_verbosity_issue(rel_type: str) -> str | None:
+    text = rel_type.strip()
+    if not text:
+        return None
+    if _VERBOSITY_DELIMITER_RE.search(text):
+        return f'relationship type "{text}" joins multiple segments with a delimiter - write ONE natural phrase instead'
+    if _VERBOSITY_FIELD_TAG_RE.search(text):
+        return f'relationship type "{text}" reads as a field-name/value tag, not a relationship phrase'
+    word_count = len(text.split())
+    if word_count > _MAX_RELATIONSHIP_TYPE_WORDS:
+        return f'relationship type "{text}" is {word_count} words - must be at most {_MAX_RELATIONSHIP_TYPE_WORDS}'
+    return None
+
 
 def _relationship_structure_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
     """Deliberately does NOT reuse `_entities_share_no_common_property` here
@@ -394,6 +457,22 @@ def _relationship_structure_issues(spec: DiagramSpec) -> list[DiagramQAIssue]:
     this representation is specifically the generic/repeated label below."""
     issues: list[DiagramQAIssue] = []
     if spec.relationships:
+        # Real, confirmed gap this closes: entity/step labels already get a
+        # hard length cap (_LABEL_LENGTH_CAP above); a relationship's own
+        # `type` - the text actually drawn on the connector - never did,
+        # unlike its own sibling checks here. See
+        # _relationship_label_verbosity_issue's own comment for the exact
+        # failure mode (metadata-tag concatenation) this catches.
+        for rel in spec.relationships:
+            verbosity_issue = _relationship_label_verbosity_issue(rel.type)
+            if verbosity_issue:
+                issues.append(DiagramQAIssue(
+                    RELATIONSHIP_LABEL_TOO_VERBOSE,
+                    f"Connector {verbosity_issue}. Rewrite it as a short natural phrase (e.g. "
+                    "'depends on', 'generates', 'references') - never repeat provenance, confidence, "
+                    "timestamps or IDs on the label itself; give that detail its own property/entity "
+                    "instead, or leave it out.",
+                ))
         type_counts: dict[str, int] = {}
         for rel in spec.relationships:
             rel_type = rel.type.strip().lower()
@@ -462,6 +541,14 @@ class ConceptCritique(BaseModel):
     # LLM judgment rather than relying on the deterministic Layer-1 check.
     text_legible: bool = True
     text_legible_detail: str = ""
+    # Learning-effectiveness follow-up (see AUDIENCE_MISMATCH/
+    # UNNECESSARY_COMPLEXITY above) - `True` means "fine", same polarity as
+    # `core_message_delivered`/`structure_correct`/`text_legible` above,
+    # never inverted.
+    audience_match: bool = True
+    audience_match_detail: str = ""
+    complexity_appropriate: bool = True
+    complexity_appropriate_detail: str = ""
 
 
 CRITIQUE_SYSTEM = """\
@@ -492,6 +579,18 @@ Also judge:
   judgment above - grade it even when everything else about the spec is
   excellent, and set `text_legible_detail` to the exact bad text found when
   `text_legible` is false.
+- `audience_match`: given the stated LEARNER LEVEL, is this visual's
+  vocabulary and structure genuinely appropriate - not too advanced
+  (unexplained jargon, a structure a learner at that level couldn't follow)
+  and not condescending for a more advanced level? Set this false only for a
+  real, specific mismatch.
+- `complexity_appropriate`: does every entity/step/state/property actually
+  serve `core_message`/the learning objectives, or does the spec carry extra
+  structure that doesn't teach anything beyond what's needed - clutter that
+  makes the visual harder to read without making it teach more? A rich but
+  genuinely necessary structure is appropriate; one padded with tangential
+  detail is not. Set this false only for genuine, specific excess, never
+  because the visual is merely detailed.
 
 Be specific and concrete in every `detail` - name exactly what's missing or
 wrong, in one sentence, never a generic "could be better."
@@ -508,6 +607,7 @@ def _critique_user_prompt(spec: DiagramSpec) -> str:
     return f"""\
 CONCEPT: {spec.concept}
 REPRESENTATION: {spec.representation}
+LEARNER LEVEL: {spec.learner_level or "(not specified)"}
 CORE MESSAGE: {spec.core_message}
 VISUAL METAPHOR: {spec.visual_metaphor or "(none)"}
 
@@ -575,6 +675,20 @@ async def _semantic_issues(spec: DiagramSpec, *, ai: AIClient, settings: Setting
             TEXT_NOT_LEGIBLE,
             critique.text_legible_detail
             or "This visual's labels contain misspelled or scrambled text.",
+            deterministic=False,
+        ))
+    if not critique.audience_match:
+        issues.append(DiagramQAIssue(
+            AUDIENCE_MISMATCH,
+            critique.audience_match_detail
+            or "This visual's complexity/vocabulary doesn't suit the stated learner level.",
+            deterministic=False,
+        ))
+    if not critique.complexity_appropriate:
+        issues.append(DiagramQAIssue(
+            UNNECESSARY_COMPLEXITY,
+            critique.complexity_appropriate_detail
+            or "This visual includes structure that doesn't serve its core message or objectives.",
             deterministic=False,
         ))
     return issues

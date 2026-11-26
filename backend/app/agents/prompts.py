@@ -819,13 +819,18 @@ How to produce blocks:
   the right SHAPE - ask whether a reader needs to see how the pieces
   connect, not just read a list of facts about each one, and if so this
   is not `comparison`.
-  Two further exceptions stay on `diagram` even for a technical topic,
+  Three further exceptions stay on `diagram` even for a technical topic,
   because concept_experience has no matching shape for them: a genuine
   multi-table DATABASE SCHEMA (2+ entities with their own fields, related by
   foreign keys - not just "explain what a JOIN is") gets `diagram_kind:
   er_diagram`; a system/pipeline walkthrough that specifically needs to show
   external callers and data stores as distinct shapes (not just processing
-  steps) gets `diagram_kind: data_flow_diagram`.
+  steps) gets `diagram_kind: data_flow_diagram`; a system/cloud/network
+  ARCHITECTURE whose components are grouped inside bigger boxes (services
+  inside a VPC inside an account, tiers inside an application) - where that
+  grouping/nesting is itself part of what's being taught - gets
+  `diagram_kind: architecture_diagram` (concept_experience's own entity-card
+  renderer has no way to draw one box visually INSIDE another).
 - Every chapter that describes a SEQUENCE - steps that happen in order, a
   procedure, a decision path - and didn't already get `concept_experience`
   above (a one-shot technical procedure did; a REPEATING technical one

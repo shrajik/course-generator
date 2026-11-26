@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import unicodedata
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -1732,6 +1733,7 @@ class ImageService:
         key_concept: str = "",
         source_excerpt: str = "",
         course_audience: str = "",
+        cited_source_titles: Sequence[str] = (),
     ) -> bool:
         """Diagram/concept_experience blocks try their structured path first
         and fall back to the raster illustration path on any failure - a
@@ -1780,7 +1782,7 @@ class ImageService:
         if kind == "diagram" and self.settings.enable_diagram_generation:
             ok = await self.diagrams.generate_for_block(
                 course_id=course_id, block=block, template=template, course_title=course_title,
-                source_excerpt=source_excerpt,
+                source_excerpt=source_excerpt, cited_source_titles=cited_source_titles,
             )
             if ok:
                 return True
@@ -3906,6 +3908,7 @@ class ImageService:
         on_progress: Callable[[Block, bool], Awaitable[None]] | None = None,
         job_id: str = "",
         course_audience: str = "",
+        cited_source_titles_by_chapter: dict[str, list[str]] | None = None,
     ) -> int:
         """Generate every image the document is still missing. Returns the count.
 
@@ -3921,6 +3924,19 @@ class ImageService:
         re-spending a vision call re-checking an image that was just
         checked moments ago. Defaults to a fresh id when the caller doesn't
         have one (e.g. an ad-hoc "regenerate missing images" call).
+
+        `cited_source_titles_by_chapter` (sources-leaked-into-diagrams
+        follow-up): the chapter's own real cited source titles/filenames,
+        keyed by `chapter_id` - `CourseService._finalise` builds this from
+        the SAME `CourseRecord.chapters[].sources_offered` it already
+        persists for its own progress screen (see `CourseService.
+        _record_sources`), not a new tracking mechanism. Resolved per block
+        via `block.meta.chapter_id` and threaded into the structured-diagram
+        content-QA check so it can catch a label that's literally one of
+        this chapter's own sources rather than a genuine concept - see
+        `diagram_content_qa._cited_source_title_leak_issues`'s own
+        docstring. `None` (the default) is always a safe no-op, same as
+        every other optional context this method already threads through.
         """
         targets = self.missing_image_blocks(document, only_block_ids=only_block_ids, force=force)
         if not targets:
@@ -3930,6 +3946,7 @@ class ImageService:
         # own docstring) rather than per-block, so a big course doesn't repeat
         # the same linear walk once per image block.
         context_map = chapter_section_context(document)
+        titles_by_chapter = cited_source_titles_by_chapter or {}
         limiter = get_limiter("image", self.settings.concurrency_for("image"))
         job_id = job_id or str(uuid.uuid4())
 
@@ -3937,6 +3954,7 @@ class ImageService:
             chapter_title, section_title, key_concept, source_excerpt = context_map.get(
                 block.id, ("", "", "", "")
             )
+            cited_source_titles = titles_by_chapter.get(block.meta.chapter_id or "", [])
             async with limiter.slot():
                 ok = await self.generate_for_block(
                     course_id=document.course_id,
@@ -3948,6 +3966,7 @@ class ImageService:
                     key_concept=key_concept,
                     source_excerpt=source_excerpt,
                     course_audience=course_audience,
+                    cited_source_titles=cited_source_titles,
                 )
                 if ok:
                     # Marks this block as validated during THIS job - see

@@ -46,6 +46,7 @@ from app.schemas.document import Block, CourseDocument, Page
 from app.schemas.template import TemplateTheme
 from app.services import mock_ai as mock_ai_module
 from app.services.concept_qa import (
+    AUDIENCE_MISMATCH,
     CONCEPT_NOT_CLEAR,
     DANGLING_TRANSITION,
     DISCONNECTED_CONCEPTS,
@@ -55,8 +56,10 @@ from app.services.concept_qa import (
     MISSING_LEARNING_OBJECTIVES,
     MULTILINE_TECHNICAL_SIGNATURE,
     NO_INSTANCE_VARIATION,
+    RELATIONSHIP_LABEL_TOO_VERBOSE,
     TEXT_NOT_LEGIBLE,
     TOO_DENSE,
+    UNNECESSARY_COMPLEXITY,
     evaluate_concept_experience,
 )
 from app.services.concept_visual_service import ConceptVisualService
@@ -599,6 +602,38 @@ class TestConceptMapRenderer:
         body = html.split("</style>", 1)[1]
         assert 'class="cev-instances"' in body
         assert 'class="cev-cmap-wrap"' not in body
+
+    def test_flat_unconnected_property_bearing_entities_render_as_a_table_not_a_card_grid(self):
+        """The real, confirmed "Entity (Schema)"/"LangGraph pilot schema"
+        complaint: 2+ unrelated entities (no template, no relationships),
+        each a dense wall of property:value bullets, used to render as a
+        flat flex-wrap card grid - cluttered, too much text per box. This
+        shape now renders as a comparison table instead (one row per
+        property key, one column per entity) - a deliberate, permanent
+        removal of this specific card-grid shape, not a one-off tweak."""
+        entities = [
+            VisualEntity(id="e1", label="Canonical Identity", properties={"id": "uuid", "owner": "user_id"}),
+            VisualEntity(id="e2", label="Assertion", properties={"value": "any", "confidence": "float"}),
+            VisualEntity(id="e3", label="Provenance", properties={"agent": "string", "source": "string"}),
+        ]
+        spec = DiagramSpec(kind="concept_experience", representation="object", entities=entities)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-cmp-table"' in body
+        assert 'class="cev-instances"' not in body
+        assert body.count('class="cev-card') == 0
+
+    def test_flat_entities_with_no_properties_at_all_still_render_as_a_card_row(self):
+        """Guard against the table shape above firing on a plain named list
+        with no properties to tabulate - a table with headers and zero data
+        rows would be a worse, more degenerate shape than the simple card
+        row these already get, so this case must stay untouched."""
+        entities = [VisualEntity(id="e1", label="Red"), VisualEntity(id="e2", label="Blue")]
+        spec = DiagramSpec(kind="concept_experience", representation="object", entities=entities)
+        html = render_concept_experience_html(spec, TemplateTheme()).decode("utf-8")
+        body = html.split("</style>", 1)[1]
+        assert 'class="cev-instances"' in body
+        assert 'class="cev-cmp-table"' not in body
 
     def test_data_structure_with_relationships_is_completely_unaffected(self):
         """_render_data_structure keeps its own established connector-row
@@ -1347,6 +1382,32 @@ class TestPixelSizeEstimation:
         width, _ = estimate_pixel_size(spec)
         assert width == 666
 
+    def test_flat_unconnected_property_bearing_entities_estimate_matches_the_table_it_renders(self):
+        """Regression guard alongside the renderer change: once 2+
+        unconnected property-bearing "object" entities render as a
+        comparison table (not the flat card grid), this estimate must grow
+        with the number of distinct PROPERTY KEYS (table rows), not with
+        entity count/character-width (the old card-row math) - otherwise
+        the page layout reserves the wrong amount of room for what actually
+        renders."""
+        few_keys = DiagramSpec(
+            kind="concept_experience", representation="object",
+            entities=[
+                VisualEntity(id="e1", label="A", properties={"k1": "v"}),
+                VisualEntity(id="e2", label="B", properties={"k1": "v"}),
+            ],
+        )
+        many_keys = DiagramSpec(
+            kind="concept_experience", representation="object",
+            entities=[
+                VisualEntity(id="e1", label="A", properties={f"k{i}": "v" for i in range(8)}),
+                VisualEntity(id="e2", label="B", properties={f"k{i}": "v" for i in range(8)}),
+            ],
+        )
+        _, few_height = estimate_pixel_size(few_keys)
+        _, many_height = estimate_pixel_size(many_keys)
+        assert many_height > few_height
+
     def test_height_is_capped_at_roughly_one_page_even_for_many_entities(self):
         huge = DiagramSpec(
             kind="concept_experience", representation="data_structure",
@@ -1710,6 +1771,31 @@ class TestConceptQAStructural:
         result = await evaluate_concept_experience(spec)
         assert TOO_DENSE not in {i.reason for i in result.issues}
 
+    async def test_an_entity_with_too_many_properties_is_flagged_as_too_dense(self):
+        """The real, confirmed "Entity (Schema)" complaint: an entity can
+        pass every per-field length check above and still render as a wall
+        of property:value bullets because it simply carries too MANY of
+        them at once (e.g. a schema field-group with value/confidence/
+        method/source/ingest_time all on one card)."""
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="a", role="instance", properties={
+                "value": "x", "confidence": "0.9", "method": "llm", "source": "doc", "ingest_time": "t0",
+            }),
+            VisualEntity(id="b", role="instance", properties={"x": "2"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert TOO_DENSE in {i.reason for i in result.issues}
+
+    async def test_an_entity_at_the_property_count_cap_is_not_flagged(self):
+        spec = _good_metaphor_spec(entities=[
+            VisualEntity(id="t", role="template"),
+            VisualEntity(id="a", role="instance", properties={"p1": "1", "p2": "2", "p3": "3", "p4": "4"}),
+            VisualEntity(id="b", role="instance", properties={"p1": "1", "p2": "2", "p3": "3", "p4": "4"}),
+        ])
+        result = await evaluate_concept_experience(spec)
+        assert TOO_DENSE not in {i.reason for i in result.issues}
+
     async def test_a_realistic_sentence_length_step_description_is_not_flagged(self):
         """Regression guard: the renderer's own auto-scaling already handles
         a description exactly this long gracefully (see
@@ -1866,6 +1952,52 @@ class TestConceptQAStructural:
         assert DISCONNECTED_CONCEPTS not in reasons
         assert GENERIC_VISUAL not in reasons
 
+    async def test_relationship_label_concatenating_metadata_is_flagged(self):
+        """Diagram-quality redesign follow-up: the exact, real, confirmed
+        failure mode this check exists for - a relationship `type` built by
+        mechanically joining a relationship name with provenance/
+        confidence markers (e.g. "raised by · prov · conf") rather than one
+        short natural phrase. Unlike GENERIC_VISUAL (repeated label across
+        MANY edges), this must fire on a SINGLE offending edge."""
+        spec = _good_metaphor_spec(
+            representation="relationship",
+            entities=[
+                VisualEntity(id="a", role="instance", properties={"kind": "ticket"}),
+                VisualEntity(id="b", role="instance", properties={"kind": "customer"}),
+            ],
+            relationships=[
+                SchematicRelationship(source="a", target="b", type="raised by · prov · conf"),
+            ],
+        )
+        result = await evaluate_concept_experience(spec)
+        assert RELATIONSHIP_LABEL_TOO_VERBOSE in {i.reason for i in result.issues}
+
+    async def test_relationship_label_that_is_an_overlong_phrase_is_flagged(self):
+        spec = _good_metaphor_spec(
+            representation="relationship",
+            entities=[
+                VisualEntity(id="a", role="instance", properties={"kind": "ticket"}),
+                VisualEntity(id="b", role="instance", properties={"kind": "customer"}),
+            ],
+            relationships=[
+                SchematicRelationship(source="a", target="b", type="was originally raised by the customer"),
+            ],
+        )
+        result = await evaluate_concept_experience(spec)
+        assert RELATIONSHIP_LABEL_TOO_VERBOSE in {i.reason for i in result.issues}
+
+    async def test_a_short_natural_relationship_label_is_not_flagged_as_verbose(self):
+        spec = _good_metaphor_spec(
+            representation="relationship",
+            entities=[
+                VisualEntity(id="a", role="instance", properties={"kind": "ticket"}),
+                VisualEntity(id="b", role="instance", properties={"kind": "customer"}),
+            ],
+            relationships=[SchematicRelationship(source="a", target="b", type="raised by")],
+        )
+        result = await evaluate_concept_experience(spec)
+        assert RELATIONSHIP_LABEL_TOO_VERBOSE not in {i.reason for i in result.issues}
+
     async def test_spatial_representation_gets_the_same_generic_label_coverage(self):
         spec = _good_metaphor_spec(
             representation="spatial",
@@ -2001,6 +2133,50 @@ class TestConceptQASemantic:
         assert TEXT_NOT_LEGIBLE in {i.reason for i in result.issues}
         assert "coniJt" in result.feedback()
         assert all(issue.deterministic is False for issue in result.issues)
+
+
+    async def test_semantic_layer_catches_an_audience_mismatch(self, monkeypatch):
+        """Learning-effectiveness follow-up (diagram quality audit, Phase
+        2/6 of the "big 5" deferred items): piggybacks onto this same
+        semantic-critique call, no new LLM call."""
+        def failing_critique(user: str) -> dict:
+            assert "LEARNER LEVEL" in user
+            return {
+                "objective_verdicts": [], "core_message_delivered": True, "core_message_detail": "",
+                "criteria_verdicts": [], "structure_correct": True, "structure_detail": "",
+                "audience_match": False,
+                "audience_match_detail": "Uses unexplained OOP jargon for a complete beginner.",
+            }
+
+        monkeypatch.setitem(mock_ai_module._BUILDERS, "ConceptCritique", failing_critique)
+        result = await evaluate_concept_experience(
+            _good_metaphor_spec(learner_level="complete beginner"), ai=MockAIClient(get_settings()), settings=get_settings(),
+        )
+        assert not result.passed
+        assert AUDIENCE_MISMATCH in {i.reason for i in result.issues}
+        assert "unexplained OOP jargon" in result.feedback()
+        assert all(issue.deterministic is False for issue in result.issues)
+
+    async def test_semantic_layer_catches_unnecessary_complexity(self, monkeypatch):
+        def failing_critique(user: str) -> dict:
+            return {
+                "objective_verdicts": [], "core_message_delivered": True, "core_message_detail": "",
+                "criteria_verdicts": [], "structure_correct": True, "structure_detail": "",
+                "complexity_appropriate": False,
+                "complexity_appropriate_detail": "Three entities add detail the core message never needs.",
+            }
+
+        monkeypatch.setitem(mock_ai_module._BUILDERS, "ConceptCritique", failing_critique)
+        result = await evaluate_concept_experience(_good_metaphor_spec(), ai=MockAIClient(get_settings()), settings=get_settings())
+        assert not result.passed
+        assert UNNECESSARY_COMPLEXITY in {i.reason for i in result.issues}
+        assert "never needs" in result.feedback()
+
+    async def test_critique_system_prompt_names_the_new_learning_effectiveness_judgments(self):
+        from app.services.concept_qa import CRITIQUE_SYSTEM
+
+        assert "audience_match" in CRITIQUE_SYSTEM
+        assert "complexity_appropriate" in CRITIQUE_SYSTEM
 
 
 class TestConceptQAProvenance:
@@ -2189,6 +2365,278 @@ async def test_a_concept_correction_that_discards_most_original_labels_is_flagge
     assert ok is True
     findings = block.content.get("visual_qa_findings")
     assert findings and any(f["type"] == "replace_image_correction_drift" for f in findings)
+
+
+def test_concept_correction_prompt_is_labelled_and_protected_from_truncation():
+    """Prompt-fidelity fix, concept_experience sibling of DiagramService's
+    identical fix/test: on a correction (`existing_spec` set), the user's
+    own live `prompt` text must be labelled distinctly from leftover
+    `purpose`/`caption` context, and must survive in FULL even when a long
+    leftover `purpose` would otherwise have pushed it past the flat
+    `[:MAX_BRIEF_CHARS]` slice the old undifferentiated-brief behaviour used."""
+    from app.services.visual_planner import MAX_BRIEF_CHARS, _concept_user_prompt
+
+    long_purpose = "Background context. " * 200
+    correction_prompt = "Change the 'myCar' instance's color property to 'Blue' exactly."
+    user_message = _concept_user_prompt(
+        purpose=long_purpose, prompt=correction_prompt, caption="", course_title="Test Course",
+        existing_spec={"kind": "concept_experience", "concept": "java_class_and_object"},
+    )
+    assert "YOUR CORRECTION REQUEST" in user_message
+    assert correction_prompt in user_message
+    assert "ORIGINAL BRIEF" in user_message
+
+
+def test_concept_correction_prompt_gets_a_classified_intent_policy_line():
+    """Correction-intent classification (diagram quality audit follow-up,
+    Phase 7), concept_experience sibling of the identical diagram-pipeline
+    test."""
+    from app.services.visual_planner import _concept_user_prompt
+
+    user_message = _concept_user_prompt(
+        purpose="", prompt="Make this suitable for children", caption="", course_title="Test Course",
+        existing_spec={"kind": "concept_experience", "concept": "java_class_and_object"},
+    )
+    assert "CORRECTION TYPE:" in user_message
+    assert "AUDIENCE-ADAPTATION" in user_message
+
+
+def test_concept_fresh_generation_brief_is_unchanged_by_the_labelling_fix():
+    """First-time generation (no `existing_spec`) must keep the exact old
+    undifferentiated "VISUAL BRIEF" behaviour - zero behaviour change
+    there, only a correction gets the new labelled split."""
+    from app.services.visual_planner import _concept_user_prompt
+
+    user_message = _concept_user_prompt(
+        purpose="A Java class and its objects", prompt="", caption="", course_title="Test Course",
+    )
+    assert "VISUAL BRIEF" in user_message
+    assert "YOUR CORRECTION REQUEST" not in user_message
+    assert "ORIGINAL BRIEF" not in user_message
+
+
+async def test_a_substantial_concept_correction_that_changed_nothing_is_flagged_as_not_applied(monkeypatch):
+    """The OTHER direction of drift: a correction with a real, specific
+    instruction that comes back byte-identical to the original spec is a
+    measurable sign the instruction was never actually applied."""
+    original_spec = apply_concept_blueprint_defaults(
+        DiagramSpec(
+            kind="concept_experience", concept="java_class_and_object",
+            entities=[
+                VisualEntity(id="t", label="Car (class)", role="template"),
+                VisualEntity(id="a", label="myCar (object)", role="instance", properties={"color": "Red"}),
+            ],
+        )
+    )
+
+    async def fake_plan(self, **kwargs):
+        return original_spec.model_copy(deep=True)  # nothing actually changed
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block(
+        prompt="Change the 'myCar' instance's color property to 'Blue' exactly.",
+        spec=original_spec.model_dump(mode="json"),
+    )
+    ok = await service.generate_for_block(
+        course_id="course_concept_under_correction", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert any(f["type"] == "replace_image_correction_not_applied" for f in findings)
+
+
+async def test_a_trivial_concept_prompt_never_triggers_the_not_applied_check(monkeypatch):
+    original_spec = apply_concept_blueprint_defaults(
+        DiagramSpec(
+            kind="concept_experience", concept="java_class_and_object",
+            entities=[
+                VisualEntity(id="t", label="Car (class)", role="template"),
+                VisualEntity(id="a", label="myCar (object)", role="instance", properties={"color": "Red"}),
+            ],
+        )
+    )
+
+    async def fake_plan(self, **kwargs):
+        return original_spec.model_copy(deep=True)
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block(prompt="ok", spec=original_spec.model_dump(mode="json"))
+    ok = await service.generate_for_block(
+        course_id="course_concept_trivial_prompt", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert not any(f["type"] == "replace_image_correction_not_applied" for f in findings)
+
+
+async def test_a_concept_correction_that_actually_changed_something_is_not_flagged_as_not_applied(monkeypatch):
+    original_spec = apply_concept_blueprint_defaults(
+        DiagramSpec(
+            kind="concept_experience", concept="java_class_and_object",
+            entities=[
+                VisualEntity(id="t", label="Car (class)", role="template"),
+                VisualEntity(id="a", label="myCar (object)", role="instance", properties={"color": "Red"}),
+            ],
+        )
+    )
+
+    async def fake_plan(self, **kwargs):
+        updated = original_spec.model_copy(deep=True)
+        updated.entities[1].properties["color"] = "Blue"
+        return updated
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block(
+        prompt="Change the 'myCar' instance's color property to 'Blue' exactly.",
+        spec=original_spec.model_dump(mode="json"),
+    )
+    ok = await service.generate_for_block(
+        course_id="course_concept_applied_correction", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert not any(f["type"] == "replace_image_correction_not_applied" for f in findings)
+
+
+def test_concept_density_guidance_line_nudges_a_short_brief_smaller():
+    from app.services.visual_planner import _density_guidance_line
+
+    assert "compact visual" in _density_guidance_line("A simple class and one object")
+
+
+def test_concept_density_guidance_line_nudges_a_long_brief_toward_grouping():
+    from app.services.visual_planner import _density_guidance_line
+
+    long_brief = "word " * 95
+    assert "favour grouping" in _density_guidance_line(long_brief)
+
+
+def test_concept_density_guidance_line_is_silent_for_an_ordinary_brief():
+    from app.services.visual_planner import _density_guidance_line
+
+    assert _density_guidance_line("word " * 50) == ""
+
+
+def test_concept_complexity_mismatch_issue_is_none_when_estimate_is_not_simple():
+    from app.services.concept_visual_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(
+        kind="concept_experience",
+        complexity_estimate="complex",
+        entities=[VisualEntity(id=f"e{i}", label=f"Entity {i}") for i in range(10)],
+    )
+    assert _complexity_mismatch_issue(spec) is None
+
+
+def test_concept_complexity_mismatch_issue_is_none_for_a_genuinely_simple_visual():
+    from app.services.concept_visual_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(
+        kind="concept_experience",
+        complexity_estimate="simple",
+        entities=[VisualEntity(id=f"e{i}", label=f"Entity {i}") for i in range(3)],
+    )
+    assert _complexity_mismatch_issue(spec) is None
+
+
+def test_concept_complexity_mismatch_issue_fires_across_entities_steps_and_states_combined():
+    from app.services.concept_visual_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(
+        kind="concept_experience",
+        complexity_estimate="simple",
+        entities=[VisualEntity(id=f"e{i}", label=f"Entity {i}") for i in range(3)],
+        steps=[VisualStep(id=f"s{i}", label=f"Step {i}") for i in range(3)],
+        concept_states=[VisualState(id=f"c{i}", label=f"State {i}") for i in range(3)],
+    )
+    issue = _complexity_mismatch_issue(spec)
+    assert issue is not None
+    assert "estimated as 'simple'" in issue
+    assert "9 entities/steps/states" in issue
+
+
+async def test_concept_visual_with_simple_complexity_mismatch_is_flagged_as_a_finding(monkeypatch):
+    """Pre-generation planning follow-up (diagram quality audit, Phase 2) for
+    the concept_experience pipeline: the model's own `complexity_estimate`
+    disagreeing with what it actually produced is recorded as a visible QA
+    finding - this pipeline has no structural combined retry to fold it
+    into (see `_complexity_mismatch_issue`'s own docstring), unlike the
+    sibling diagram pipeline's retry-triggering version."""
+
+    async def fake_plan(self, **kwargs):
+        return DiagramSpec(
+            kind="concept_experience",
+            concept="java_class_and_object",
+            complexity_estimate="simple",
+            entities=[VisualEntity(id=f"e{i}", label=f"Entity {i}") for i in range(10)],
+        )
+
+    monkeypatch.setattr(VisualPlanner, "plan", fake_plan)
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    block = _concept_block()
+    ok = await service.generate_for_block(
+        course_id="course_concept_complexity_mismatch", block=block, template=load_template("technical"),
+        course_title="Java Basics",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert any(f["type"] == "concept_complexity_mismatch" for f in findings)
+
+
+def test_concept_system_prompt_requires_an_honest_complexity_estimate():
+    from app.services.visual_planner import CONCEPT_SYSTEM
+
+    assert "complexity_estimate" in CONCEPT_SYSTEM
+
+
+async def test_concept_consistency_overrides_icon_across_two_blocks_in_the_same_course(monkeypatch):
+    """Course-wide recurring-concept consistency (diagram quality audit
+    follow-up, Phase 8), concept_experience sibling of DiagramService's
+    identical test: the same labelled entity reused in a LATER visual in
+    the SAME course gets the icon the FIRST visual already assigned it."""
+    course_id = "course_concept_consistency_1"
+
+    async def first_plan(self, **kwargs):
+        return DiagramSpec(
+            kind="concept_experience", concept="java_class_and_object",
+            entities=[VisualEntity(id="a", label="Database", icon="database", role="instance")],
+        )
+
+    monkeypatch.setattr(VisualPlanner, "plan", first_plan)
+    service = ConceptVisualService(ai=MockAIClient(get_settings()))
+    first_block = _concept_block()
+    ok = await service.generate_for_block(
+        course_id=course_id, block=first_block, template=load_template("technical"), course_title="Java Basics",
+    )
+    assert ok is True
+    assert first_block.content["spec"]["entities"][0]["icon"] == "database"
+
+    async def second_plan(self, **kwargs):
+        return DiagramSpec(
+            kind="concept_experience", concept="java_class_and_object",
+            entities=[VisualEntity(id="b", label="Database", icon="server", role="instance")],
+        )
+
+    monkeypatch.setattr(VisualPlanner, "plan", second_plan)
+    second_block = _concept_block()
+    ok2 = await service.generate_for_block(
+        course_id=course_id, block=second_block, template=load_template("technical"), course_title="Java Basics",
+    )
+    assert ok2 is True
+    assert second_block.content["spec"]["entities"][0]["icon"] == "database"
 
 
 async def test_a_fresh_concept_block_with_no_prior_spec_passes_no_existing_spec(monkeypatch):

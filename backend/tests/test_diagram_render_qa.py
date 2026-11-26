@@ -520,6 +520,65 @@ def test_a_label_pill_forced_onto_a_real_node_circle_is_caught():
     assert label_overlaps_node_issues(ET.fromstring(far.encode("utf-8"))) == []
 
 
+def test_er_diagram_label_overlap_check_is_now_turned_on():
+    """Diagram-quality redesign follow-up: `er_diagram`'s relationship-
+    cardinality edge labels (`_layout_er`) previously had NO overlap
+    protection at all - `label_overlaps_node_issues`/`label_overlaps_label_
+    issues` were gated to concept_map/conceptual only, even though both
+    functions are already shape-agnostic (they scan for `class="diagram-
+    edge-label"` elements and generic node shapes, nothing concept_map-
+    specific). This proves the gate at `validate_rendered_svg`'s own call
+    site now includes er_diagram, the same way `test_a_label_pill_forced_
+    onto_a_real_node_circle_is_caught` above proves it for concept_map -
+    the two underlying functions are tested directly elsewhere; this is
+    the integration point (the kind allow-list) that actually changed."""
+    spec = DiagramSpec(
+        kind="er_diagram",
+        nodes=[DiagramNode(id="customer", label="Customer"), DiagramNode(id="ticket", label="Ticket")],
+        edges=[DiagramEdge(source="customer", target="ticket", label="1")],
+    )
+    svg_bytes = _render(spec)
+    root = ET.fromstring(svg_bytes)
+    # Force a label pill squarely onto the first real node box, the same
+    # "hand-craft the violation, don't rely on a layout function happening
+    # to reproduce it" technique the concept_map test above uses.
+    box = next(
+        el for el in root.iter() if el.tag.endswith("rect") and el.get("class") == "diagram-box"
+    )
+    bx, by = float(box.get("x")), float(box.get("y"))
+    forced = svg_bytes.decode("utf-8").replace(
+        "</svg>",
+        f'<rect class="diagram-edge-label" x="{bx + 5:.1f}" y="{by + 5:.1f}" width="40" height="20"/></svg>',
+    )
+    issues = validate_rendered_svg(forced.encode("utf-8"), kind="er_diagram")
+    assert any(issue.kind == "label_overlaps_node" for issue in issues)
+
+
+def test_er_diagram_with_well_placed_labels_stays_clean():
+    """The normal, intended case: a genuine (non-forced) er_diagram render
+    must not pick up a new, spurious label_overlaps_node/label_overlaps_
+    label finding just because the kind gate now includes it - this is the
+    false-positive check the gate's own comment calls for before trusting
+    it on real courses."""
+    nodes = [
+        DiagramNode(id="customer", label="Customer"),
+        DiagramNode(id="ticket", label="Ticket"),
+        DiagramNode(id="product", label="Product"),
+        DiagramNode(id="rel1", label="raised by", shape_role="relationship"),
+        DiagramNode(id="rel2", label="resolved with", shape_role="relationship"),
+    ]
+    edges = [
+        DiagramEdge(source="customer", target="rel1", label="1"),
+        DiagramEdge(source="rel1", target="ticket", label="N"),
+        DiagramEdge(source="ticket", target="rel2", label="1"),
+        DiagramEdge(source="rel2", target="product", label="N"),
+    ]
+    spec = DiagramSpec(kind="er_diagram", nodes=nodes, edges=edges)
+    issues = validate_rendered_svg(_render(spec), kind="er_diagram")
+    overlap_kinds = {issue.kind for issue in issues} & {"label_overlaps_node", "label_overlaps_label"}
+    assert overlap_kinds == set()
+
+
 def test_convergent_satellite_edges_sharing_a_target_render_clean():
     """Root-cause fix (production course audit, doc_49ee6e2b31c4): 2 of 5
     real concept_map diagrams had several satellite-to-satellite edges

@@ -83,6 +83,15 @@ DIAGRAM_KINDS = (
     # (which terminals are actually tied to which node), not a sequence. See
     # its own comment below RELATIONSHIP_KINDS.
     "circuit_schematic",
+    # architecture_diagram: real system/cloud/network architecture with
+    # components GROUPED INSIDE bigger boxes (services inside a VPC inside
+    # an account) - a genuinely different family from every other kind
+    # here, which draw one flat shape per node: this one draws CONTAINERS
+    # that visually hold their own children, via `DiagramNode.parent_id`/
+    # `shape_role == "container"` (see those fields' own docstrings). A
+    # STRUCTURE (which things are grouped where, and how they connect), not
+    # a sequence - joins RELATIONSHIP_KINDS below.
+    "architecture_diagram",
     # periodic_table: the real, fixed 118-element grid (app.render.
     # periodic_table_data) - a REFERENCE, not a structure or a sequence the
     # model authors at all (same reasoning `toc` is never AI-authored -
@@ -212,6 +221,11 @@ RELATIONSHIP_KINDS = (
     # "component A" and "component B" sitting on the same circuit, the same
     # reasoning network_mesh/concept_map already document above.
     "circuit_schematic",
+    # architecture_diagram: containment (what's grouped where) plus
+    # connections between leaf components is a STRUCTURE, same reasoning
+    # er_diagram/network_mesh already document above - not a sequence of
+    # steps that happen one after another in time.
+    "architecture_diagram",
 )
 # "pyramid" deliberately joins neither tuple, the same reasoning "graph"
 # already documents above: its layers have a top-to-bottom ORDER (narrowest
@@ -227,7 +241,15 @@ def max_nodes_for(kind: str) -> int:
     number to tell "too few nodes to be a real diagram" apart from "too many
     nodes, worth a consolidation retry" - see
     DiagramService._exceeds_node_cap) so the two never drift apart."""
-    if kind == "er_diagram":
+    if kind in ("er_diagram", "architecture_diagram"):
+        # architecture_diagram: containers themselves count as nodes too
+        # (unlike most RELATIONSHIP_KINDS members, where every node is a
+        # visible "thing" in its own right) - a realistic architecture
+        # diagram might have 2-4 nested containers plus 10-15 leaf
+        # components, well past the generic ceiling sized for one flat
+        # structure of visible things. Same number er_diagram already
+        # uses for the same "grouping/attribute nodes multiply the count"
+        # reasoning.
         return 24
     if kind == "puzzle_pieces":
         # app.render.diagram_renderer._layout_puzzle_pieces draws a FIXED
@@ -312,6 +334,34 @@ def max_nodes_for(kind: str) -> int:
         return 14
     return 9
 
+
+# Edge-count ceiling - the counterpart `max_nodes_for` never had. A
+# real, confirmed gap: `max_nodes_for` stops a relationship-shaped diagram
+# from accumulating too many NODES, but nothing ever stopped it from wiring
+# an edge between every pair of nodes the model could think to relate -
+# "not every relationship deserves a visible arrow" (the request's own
+# phrasing) had no code backing it at all, only a prompt request for
+# causal_loop specifically to "keep the loop sparse." Scoped to the three
+# kinds whose own prompt sections explicitly invite a RICH web of labelled
+# relationships (concept_map, er_diagram, network_mesh) - every other
+# relationship kind (hierarchy, comparison, venn, fishbone, decision_tree...)
+# is already structurally bounded by its own shape (a tree has at most
+# node_count - 1 edges; a comparison/venn has a small fixed few) and needs
+# no separate ceiling. Scaled to node count rather than a flat number -
+# a 24-node er_diagram legitimately needs more edges than a 4-node one - with
+# a floor so a small diagram still gets room for every relationship it
+# plausibly needs.
+def max_edges_for(kind: str, node_count: int) -> int:
+    """The edge-count ceiling `DiagramService`'s own corrective retry
+    enforces for a given `normalised_kind()` and labelled-node count - see
+    this function's own module-level comment for why only these three
+    kinds get one. `node_count` is the number of LABELLED nodes (same
+    convention `max_nodes_for`'s own caller already uses), not `len(nodes)`."""
+    if kind in ("concept_map", "er_diagram", "network_mesh"):
+        return max(6, round(node_count * 1.5))
+    return 10_000  # effectively unbounded - this kind's own shape already bounds it
+
+
 # The small, topic-agnostic vocabulary of drawable primitives a "schematic"
 # diagram is built from - see SchematicShape. Generic on purpose, and NOT
 # physics-specific: "block" is a magnet, a battery, a beaker, a cell wall or
@@ -389,11 +439,20 @@ class DiagramNode(BaseModel):
     #   `detail` the one-sentence reason why. At most one caption node per
     #   lane is drawn; declare it anywhere in `nodes` - position doesn't
     #   matter, only `lane` grouping does.
+    # architecture_diagram: "container" = a grouping box (an AWS account, a
+    #   VPC, an application tier) that visually holds its own children -
+    #   see `parent_id`. "" (default) = a real leaf component.
     shape_role: str = ""
     # er_diagram only, and only meaningful when shape_role == "attribute":
     # the id of the entity/relationship node this attribute belongs to -
     # positions it orbiting that node instead of taking a place in the main
-    # entity/relationship row. Ignored by every other kind and shape_role.
+    # entity/relationship row.
+    # architecture_diagram: the id of the CONTAINER node (shape_role ==
+    # "container") this node - itself a container or a leaf component - is
+    # nested inside. Blank = a top-level node, drawn directly on the canvas
+    # rather than inside any box. A container may itself set `parent_id` to
+    # an outer container, nesting as deep as the brief needs.
+    # Ignored by every other kind and shape_role.
     parent_id: str = ""
     # swimlane only: which lane/column (a role, actor or system - e.g.
     # "User", "System", "Database") this node belongs to. Lanes are drawn
@@ -440,7 +499,8 @@ class DiagramNode(BaseModel):
     # every other kind.
     gantt_start: float = 0.0
     gantt_duration: float = 1.0
-    # smart_art/chevron_process/funnel/honeycomb/puzzle_pieces only: an
+    # smart_art/chevron_process/funnel/honeycomb/puzzle_pieces/
+    # architecture_diagram (leaf components only, never a "container") -
     # optional small pictogram drawn inside this node's own shape, the same
     # "icon badge" look real presentation-software SmartArt uses (see
     # app.render.diagram_renderer._ICON_DRAWERS for the exact supported
@@ -852,6 +912,23 @@ class DiagramSpec(BaseModel):
 
     kind: str = "flow_chart"
     title: str = ""
+    # Pre-generation planning follow-up (diagram quality audit, Phase 2):
+    # the model's OWN upfront assessment of how much structure this content
+    # genuinely needs - one of "simple" (a handful of nodes, one clear
+    # idea), "moderate", or "complex" (genuinely many interconnected
+    # parts) - filled in BEFORE authoring nodes/edges, the same "plan
+    # before you fill in any field" discipline CONCEPT_SYSTEM already
+    # requires for concept_experience. Deliberately NOT a second AI call -
+    # one more field the SAME single generation call fills in, used
+    # afterwards (see DiagramService.generate_for_block's own
+    # `_complexity_mismatch_issue`) to catch the model's own stated intent
+    # disagreeing with what it actually produced (e.g. "simple" alongside
+    # 14 densely-connected nodes) - a real, checkable signal the retry
+    # feedback can point at directly, not just a decorative label. "" (the
+    # default - a spec built directly, e.g. in a test, without going
+    # through the model) skips this check entirely, never a hard
+    # requirement.
+    complexity_estimate: str = ""
     # Editor-only "increase text size" control (Edit Diagram panel) - never
     # set by the AI writer/planner, always 1.0 for a freshly generated
     # diagram. A real, confirmed complaint: even a diagram that clears the
@@ -1101,6 +1178,16 @@ class DiagramSpec(BaseModel):
             # (level >= 1), the same "don't fake a shape the data doesn't
             # have" reasoning concept_map/swimlane already apply above.
             return any(n.level == 0 for n in self.nodes) and any(n.level >= 1 for n in self.nodes)
+        if kind == "architecture_diagram":
+            # The whole point of this kind is NESTING (a container
+            # genuinely grouping its own children) - a flat list of boxes
+            # with no containment at all isn't an architecture diagram, it's
+            # just `hierarchy`/`smart_art` with unused fields; same "don't
+            # fake a shape the data doesn't have" reasoning concept_map/
+            # swimlane/iceberg already apply above.
+            has_container = any(n.shape_role.strip().lower() == "container" for n in self.nodes)
+            has_nested_child = any(n.parent_id.strip() for n in self.nodes)
+            return has_container and has_nested_child
         if kind in ("feedback_loop_process", "causal_loop"):
             # Both kinds are defined by their edges (the loop-back step for
             # feedback_loop_process, the causal links for causal_loop) -

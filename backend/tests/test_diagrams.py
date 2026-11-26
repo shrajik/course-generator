@@ -37,6 +37,8 @@ from app.schemas.diagram import (
     SchematicRelationship,
     SchematicShape,
     SchematicState,
+    max_edges_for,
+    max_nodes_for,
 )
 from app.schemas.document import CONTENT_WIDTH, Block
 from app.schemas.template import TemplateTheme
@@ -57,7 +59,13 @@ from app.services.diagram_qa import (
     evaluate_blueprint,
     evaluate_schematic,
 )
-from app.services.diagram_service import DiagramService
+from app.services.diagram_service import (
+    DiagramService,
+    _relationship_label_issue,
+    audience_multiplier,
+    edge_label_verbosity_issues,
+    total_text_volume_issue,
+)
 
 # ---------------------------------------------------------------------------
 # schema
@@ -1458,6 +1466,153 @@ async def test_a_fresh_diagram_block_with_no_prior_spec_passes_no_existing_outli
     assert captured.get("existing_outline") is None
 
 
+def test_correction_prompt_is_labelled_and_protected_from_truncation():
+    """Prompt-fidelity fix: on a correction (`existing_outline` set), the
+    user's own live `prompt` text must be labelled distinctly from leftover
+    `purpose`/`caption` context, and must survive in FULL even when a long
+    leftover `purpose` would otherwise have pushed it past the flat
+    `[:MAX_BRIEF_CHARS]` slice the old undifferentiated-brief behaviour used."""
+    from app.services.diagram_service import MAX_BRIEF_CHARS, _diagram_user_prompt
+
+    long_purpose = "Background context. " * 200  # well over MAX_BRIEF_CHARS on its own
+    correction_prompt = "Change the 'Database' node's label to 'Primary Database' exactly."
+    user_message = _diagram_user_prompt(
+        purpose=long_purpose,
+        prompt=correction_prompt,
+        caption="",
+        course_title="Test Course",
+        existing_outline={"kind": "flow_chart", "parts": [], "arrows": []},
+    )
+    assert "YOUR CORRECTION REQUEST" in user_message
+    assert correction_prompt in user_message
+    assert "ORIGINAL BRIEF" in user_message
+
+
+def test_correction_prompt_gets_a_classified_intent_policy_line():
+    """Correction-intent classification (diagram quality audit follow-up,
+    Phase 7): a correction whose text matches a known intent pattern gets
+    an explicit "CORRECTION TYPE:" policy line injected alongside the
+    labelled request - a geometry-sounding fix must never be told it's
+    fine to change content, so this proves the classifier's output
+    actually reaches the final prompt string, not just the standalone
+    classifier function."""
+    from app.services.diagram_service import _diagram_user_prompt
+
+    user_message = _diagram_user_prompt(
+        purpose="", prompt="Fix the overlapping arrow text", caption="", course_title="Test Course",
+        existing_outline={"kind": "flow_chart", "parts": [], "arrows": []},
+    )
+    assert "CORRECTION TYPE:" in user_message
+    assert "PURE layout/geometry fix" in user_message
+
+
+def test_a_correction_with_no_classifiable_intent_gets_no_policy_line():
+    from app.services.diagram_service import _diagram_user_prompt
+
+    user_message = _diagram_user_prompt(
+        purpose="", prompt="ok", caption="", course_title="Test Course",
+        existing_outline={"kind": "flow_chart", "parts": [], "arrows": []},
+    )
+    assert "CORRECTION TYPE:" not in user_message
+
+
+def test_fresh_generation_brief_is_unchanged_by_the_labelling_fix():
+    """First-time generation (no `existing_outline`) must keep the exact
+    old undifferentiated "VISUAL BRIEF" behaviour - zero behaviour change
+    there, only a correction gets the new labelled split."""
+    from app.services.diagram_service import _diagram_user_prompt
+
+    user_message = _diagram_user_prompt(
+        purpose="A simple process", prompt="", caption="", course_title="Test Course",
+    )
+    assert "VISUAL BRIEF" in user_message
+    assert "YOUR CORRECTION REQUEST" not in user_message
+    assert "ORIGINAL BRIEF" not in user_message
+
+
+async def test_a_substantial_correction_that_changed_nothing_is_flagged_as_not_applied(service, monkeypatch):
+    """The OTHER direction of drift: a correction with a real, specific
+    instruction that comes back byte-identical to the original spec is a
+    measurable sign the instruction was never actually applied."""
+    template = load_template("technical")
+    original_spec = DiagramSpec(
+        kind="process",
+        nodes=[DiagramNode(id="a", label="Gather data"), DiagramNode(id="b", label="Analyze results")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    block = _diagram_block(
+        prompt="Rename the 'Analyze results' node to 'Analyze and report results'.",
+        spec=original_spec.model_dump(mode="json"),
+    )
+
+    async def fake_request_spec(self, **kwargs):
+        return original_spec.model_copy(deep=True)  # nothing actually changed
+
+    monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_under_correction", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert any(f["type"] == "replace_image_correction_not_applied" for f in findings)
+
+
+async def test_a_trivial_prompt_never_triggers_the_not_applied_check(service, monkeypatch):
+    """Guard against false positives: a short/trivial prompt (not long
+    enough to reliably judge as "a real ask") must never trigger this
+    finding even when the spec comes back unchanged."""
+    template = load_template("technical")
+    original_spec = DiagramSpec(
+        kind="process",
+        nodes=[DiagramNode(id="a", label="Gather data"), DiagramNode(id="b", label="Analyze results")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    block = _diagram_block(prompt="ok", spec=original_spec.model_dump(mode="json"))
+
+    async def fake_request_spec(self, **kwargs):
+        return original_spec.model_copy(deep=True)
+
+    monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_trivial_prompt", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert not any(f["type"] == "replace_image_correction_not_applied" for f in findings)
+
+
+async def test_a_correction_that_actually_changed_something_is_not_flagged_as_not_applied(service, monkeypatch):
+    template = load_template("technical")
+    original_spec = DiagramSpec(
+        kind="process",
+        nodes=[DiagramNode(id="a", label="Gather data"), DiagramNode(id="b", label="Analyze results")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    block = _diagram_block(
+        prompt="Rename the 'Analyze results' node to 'Analyze and report results'.",
+        spec=original_spec.model_dump(mode="json"),
+    )
+
+    async def fake_request_spec(self, **kwargs):
+        updated = original_spec.model_copy(deep=True)
+        updated.nodes[1].label = "Analyze and report results"
+        return updated
+
+    monkeypatch.setattr(DiagramService, "_request_spec", fake_request_spec)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_applied_correction", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    findings = block.content.get("visual_qa_findings") or []
+    assert not any(f["type"] == "replace_image_correction_not_applied" for f in findings)
+
+
 async def test_illustration_blocks_are_unaffected(service):
     """Regression check: the default (non-diagram) path is untouched."""
     template = load_template("technical")
@@ -1586,7 +1741,12 @@ async def test_diagram_is_withheld_when_consolidation_retry_still_exceeds_the_ca
     """Visual-generation policy fix: when even the consolidation retry still
     exceeds the kind's node cap (`is_usable()` false), the block is withheld
     - never a silently truncated diagram, and never an unrelated AI
-    illustration."""
+    illustration. Multi-diagram splitting (see `_linear_chain_split`) now
+    carves out the ONE case this no longer applies to - a PURE, non-
+    branching chain splits into two linked diagrams instead (see
+    test_oversized_pure_chain_diagram_splits_into_two_linked_blocks_instead_
+    of_withholding above) - so this fixture adds one branching edge to stay
+    a genuine, still-withheld case."""
     template = load_template("technical")
     block = _diagram_block()
     original_structured = service.ai.structured
@@ -1597,7 +1757,8 @@ async def test_diagram_is_withheld_when_consolidation_retry_still_exceeds_the_ca
         return DiagramSpec(
             kind="flow_chart",
             nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(20)],
-            edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(19)],
+            edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(19)]
+            + [DiagramEdge(source="n0", target="n10")],
         )
 
     monkeypatch.setattr(service.ai, "structured", always_too_many)
@@ -1609,6 +1770,807 @@ async def test_diagram_is_withheld_when_consolidation_retry_still_exceeds_the_ca
     assert ok is True  # handled (withheld), not a failure the caller must fall back from
     assert block.content.get("path") is None
     assert block.content.get("omitted_after_qa_failure") is True
+
+
+# ---------------------------------------------------------------------------
+# Relationship-label verbosity (diagram-quality redesign) - the exact,
+# confirmed failure mode: a relationship label built by mechanically
+# concatenating a relationship name with provenance/confidence/metadata
+# markers (e.g. "raised by · prov · conf") instead of one short natural
+# phrase.
+# ---------------------------------------------------------------------------
+
+
+def test_relationship_label_issue_flags_a_delimiter_joined_label():
+    issue = _relationship_label_issue("raised by · prov · conf", owner="Edge label")
+    assert issue is not None
+    assert "delimiter" in issue
+
+
+def test_relationship_label_issue_flags_other_delimiter_styles():
+    for label in ("resolved with | prov | conf", "about :: metadata", "flows into / cached"):
+        assert _relationship_label_issue(label, owner="Edge label") is not None
+
+
+def test_relationship_label_issue_flags_a_field_tag_pattern():
+    issue = _relationship_label_issue("confidence: high", owner="Edge label")
+    assert issue is not None
+    assert "field-name/value tag" in issue
+
+
+def test_relationship_label_issue_never_false_positives_on_a_cardinality_label():
+    """A plain "1:N"/"3:00"-style ratio/time label must never be mistaken
+    for a field-tag pattern - the field-tag regex requires a letter on both
+    sides of the separator specifically to avoid this."""
+    for label in ("1:N", "0..1", "3:00"):
+        assert _relationship_label_issue(label, owner="Edge label") is None
+
+
+def test_relationship_label_issue_flags_an_overlong_label():
+    issue = _relationship_label_issue("depends on the upstream validation service result", owner="Edge label")
+    assert issue is not None
+    assert "words" in issue
+
+
+def test_relationship_label_issue_passes_a_short_natural_phrase():
+    for label in ("depends on", "created by", "belongs to", "flows into", "", "  "):
+        assert _relationship_label_issue(label, owner="Edge label") is None
+
+
+def test_relationship_label_issue_respects_a_tighter_max_words():
+    assert _relationship_label_issue("flows into the queue", owner="Edge label", max_words=4) is None
+    assert _relationship_label_issue("flows into the queue", owner="Edge label", max_words=3) is not None
+
+
+def test_relationship_label_issue_flags_a_single_unbroken_word_too_long_to_wrap():
+    """Diagram-rendering follow-up: a single word this long still
+    truncates with an ellipsis even at the smallest readable font and the
+    most generous extra-line budget `_edge_label`'s own shrink search
+    allows (see `_MAX_LABEL_WORD_CHARS`'s own comment) - caught here,
+    upstream, rather than patched deeper in the renderer."""
+    issue = _relationship_label_issue("pneumonoultramicroscopicsilicovolcanoconiosis", owner="Edge label")
+    assert issue is not None
+    assert "too long to wrap" in issue
+
+
+def test_relationship_label_issue_never_flags_an_ordinary_technical_term():
+    for label in ("multivariable", "nanopublication", "authentication", "depends on"):
+        assert _relationship_label_issue(label, owner="Edge label") is None
+
+
+def test_edge_label_verbosity_issues_checks_edges_and_relationship_nodes():
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[
+            DiagramNode(id="a", label="Customer"),
+            DiagramNode(id="b", label="Ticket"),
+            DiagramNode(id="rel", label="raised by · prov · conf", shape_role="relationship"),
+        ],
+        edges=[DiagramEdge(source="a", target="b", label="about · prov · conf")],
+    )
+    issues = edge_label_verbosity_issues(spec)
+    assert len(issues) == 2  # one from the edge, one from the relationship node's own label
+
+
+def test_edge_label_verbosity_issues_is_clean_for_natural_phrases():
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[DiagramNode(id="a", label="Customer"), DiagramNode(id="b", label="Ticket")],
+        edges=[DiagramEdge(source="a", target="b", label="raised by")],
+    )
+    assert edge_label_verbosity_issues(spec) == []
+
+
+async def test_diagram_with_a_verbose_edge_label_gets_a_rewrite_retry(service, monkeypatch):
+    """The exact, real, confirmed failure mode this whole fix exists for -
+    mirrors test_diagram_with_too_many_nodes_gets_a_consolidation_retry's
+    own shape, for the newest of the five combined structural checks."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A concept map of Customer/Ticket/Product/Article relationships")
+    original_structured = service.ai.structured
+    calls: list[str] = []
+
+    async def sequenced_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        calls.append(kwargs.get("user", ""))
+        if len(calls) == 1:
+            return DiagramSpec(
+                kind="concept_map",
+                nodes=[DiagramNode(id="a", label="Customer"), DiagramNode(id="b", label="Ticket")],
+                edges=[DiagramEdge(source="a", target="b", label="raised by · prov · conf")],
+            )
+        # the label-rewrite retry: a clean, natural-phrase label.
+        return DiagramSpec(
+            kind="concept_map",
+            nodes=[DiagramNode(id="a", label="Customer"), DiagramNode(id="b", label="Ticket")],
+            edges=[DiagramEdge(source="a", target="b", label="raised by")],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", sequenced_structured)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_label_rewrite", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert len(calls) == 2, "expected exactly one label-rewrite retry"
+    assert "metadata-tag cluster" in calls[1] or "natural phrase" in calls[1]
+    svg_text = service.storage.asset_abs_path(
+        "course_diagram_label_rewrite", block.content["path"]
+    ).read_text(encoding="utf-8")
+    assert "prov" not in svg_text.lower()
+
+
+async def test_diagram_with_too_many_edges_gets_a_consolidation_retry(service, monkeypatch):
+    template = load_template("technical")
+    block = _diagram_block(prompt="A concept map relating many ideas")
+    original_structured = service.ai.structured
+    calls: list[str] = []
+
+    def _many_edges_spec(n_nodes: int, n_edges: int) -> DiagramSpec:
+        """Distinct node pairs (never the same pair twice, never a
+        wrap-around that revisits a pair) - a degenerate repeated-pair
+        graph renders with overlapping/duplicate edges that would trip the
+        PRE-EXISTING, unrelated render-QA retry (shared_segment/duplicate_
+        arrowhead) instead of exercising the one this test is actually
+        about."""
+        import itertools
+
+        nodes = [DiagramNode(id=f"n{i}", label=f"Node {i}") for i in range(n_nodes)]
+        pairs = list(itertools.combinations(range(n_nodes), 2))[:n_edges]
+        edges = [DiagramEdge(source=f"n{a}", target=f"n{b}", label="relates to") for a, b in pairs]
+        return DiagramSpec(kind="concept_map", nodes=nodes, edges=edges)
+
+    async def sequenced_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        calls.append(kwargs.get("user", ""))
+        if len(calls) == 1:
+            # 6 nodes -> cap is max(6, round(6*1.5)) == 9; all 15 distinct
+            # pairs among 6 nodes is well over (this spec only ever triggers
+            # the retry, it's discarded and never rendered/QA'd).
+            return _many_edges_spec(6, 20)
+        return _many_edges_spec(6, 8)  # the consolidation retry: within the cap, distinct pairs
+
+    monkeypatch.setattr(service.ai, "structured", sequenced_structured)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_edge_consolidate", block=block, template=template, course_title="Test Course"
+    )
+
+    assert ok is True
+    assert len(calls) == 2, "expected exactly one edge-consolidation retry"
+    assert "Not every relationship deserves a visible arrow" in calls[1]
+
+
+# ---------------------------------------------------------------------------
+# Edge-count ceiling (max_edges_for)
+# ---------------------------------------------------------------------------
+
+
+def test_max_edges_for_scales_with_node_count_for_relationship_heavy_kinds():
+    for kind in ("concept_map", "er_diagram", "network_mesh"):
+        assert max_edges_for(kind, 4) == 6  # floor
+        assert max_edges_for(kind, 10) == 15  # round(10 * 1.5)
+
+
+def test_max_edges_for_is_effectively_unbounded_for_other_kinds():
+    for kind in ("hierarchy", "comparison", "flow_chart", "venn", "fishbone"):
+        assert max_edges_for(kind, 5) >= 1000
+
+
+# ---------------------------------------------------------------------------
+# Audience/template complexity scaling (audience_multiplier)
+# ---------------------------------------------------------------------------
+
+
+def test_audience_multiplier_is_neutral_by_default():
+    assert audience_multiplier("") == 1.0
+    assert audience_multiplier("general adult audience, mixed experience levels") == 1.0
+
+
+def test_audience_multiplier_shrinks_for_young_or_beginner_audiences():
+    assert audience_multiplier("a course for children in elementary school") == 0.6
+    assert audience_multiplier("kindergarten students, ages 4 to 6") == 0.6
+
+
+def test_audience_multiplier_grows_for_advanced_audiences():
+    assert audience_multiplier("advanced PhD researchers and specialists") == 1.15
+
+
+# ---------------------------------------------------------------------------
+# Total-text-volume soft/advisory check
+# ---------------------------------------------------------------------------
+
+
+def test_total_text_volume_issue_is_none_for_a_normal_diagram():
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}", detail="a short detail") for i in range(4)],
+        edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(3)],
+    )
+    assert total_text_volume_issue(spec) is None
+
+
+def test_total_text_volume_issue_fires_for_an_extreme_outlier():
+    long_detail = "word " * 60
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="n0", label="Step 0", detail=long_detail)],
+        edges=[],
+    )
+    issue = total_text_volume_issue(spec)
+    assert issue is not None
+    assert "advisory only" in issue
+
+
+def test_density_guidance_line_nudges_a_short_brief_smaller():
+    from app.services.diagram_service import _density_guidance_line
+
+    assert "compact diagram" in _density_guidance_line("A simple onboarding flow")
+
+
+def test_density_guidance_line_nudges_a_long_brief_toward_grouping():
+    from app.services.diagram_service import _density_guidance_line
+
+    long_brief = "word " * 95
+    assert "favour grouping" in _density_guidance_line(long_brief)
+
+
+def test_density_guidance_line_is_silent_for_an_ordinary_brief():
+    from app.services.diagram_service import _density_guidance_line
+
+    ordinary = "word " * 50
+    assert _density_guidance_line(ordinary) == ""
+
+
+def test_density_guidance_line_is_silent_for_empty_text():
+    from app.services.diagram_service import _density_guidance_line
+
+    assert _density_guidance_line("") == ""
+
+
+def test_needs_density_retry_is_false_for_a_normal_diagram():
+    from app.services.diagram_service import _needs_density_retry
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}", detail="a short detail") for i in range(4)],
+        edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(3)],
+    )
+    assert _needs_density_retry(spec) is False
+
+
+def test_needs_density_retry_requires_a_materially_higher_bar_than_the_advisory_check():
+    """`_needs_density_retry` must NOT fire on every spec that trips the
+    (deliberately looser) advisory-only `total_text_volume_issue` - only a
+    SUBSTANTIALLY excessive case, per `_TEXT_VOLUME_RETRY_MULTIPLIER`'s own
+    reasoning."""
+    from app.services.diagram_service import _needs_density_retry
+
+    # Comfortably over the advisory budget (70 chars/node) but well under
+    # the retry-gating one (70 * 1.6 = 112 chars/node).
+    mild_detail = "A fairly detailed note about this step, a little longer than usual."  # ~69 chars + label
+    spec = DiagramSpec(
+        kind="flow_chart",
+        nodes=[DiagramNode(id="n0", label="Step 0", detail=mild_detail)],
+        edges=[],
+    )
+    assert total_text_volume_issue(spec) is not None  # the looser check does fire
+    assert _needs_density_retry(spec) is False  # but not the stricter, gating one
+
+    extreme_detail = mild_detail * 5
+    extreme_spec = DiagramSpec(kind="flow_chart", nodes=[DiagramNode(id="n0", label="Step 0", detail=extreme_detail)], edges=[])
+    assert _needs_density_retry(extreme_spec) is True
+
+
+async def test_diagram_with_excessive_text_volume_gets_a_density_retry(service, monkeypatch):
+    """Density-management follow-up (Phase 4/6 of the diagram-quality audit):
+    total diagram text SUBSTANTIALLY over the rough per-node guide now
+    triggers a real corrective retry, folded into the same combined
+    mechanism as every other structural check - mirrors test_diagram_with_
+    too_many_edges_gets_a_consolidation_retry's own shape."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A process with heavily annotated steps")
+    original_structured = service.ai.structured
+    calls: list[str] = []
+
+    long_detail = (
+        "This step involves a great deal of detailed explanation that goes on for quite a while. " * 3
+    )
+
+    async def sequenced_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        calls.append(kwargs.get("user", ""))
+        if len(calls) == 1:
+            return DiagramSpec(
+                kind="process",
+                nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}", detail=long_detail) for i in range(3)],
+                edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(2)],
+            )
+        # the density retry: much lighter text.
+        return DiagramSpec(
+            kind="process",
+            nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}", detail="Short note.") for i in range(3)],
+            edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(2)],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", sequenced_structured)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_density_retry", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    assert len(calls) == 2, "expected exactly one density retry"
+    assert "substantially more than one picture can show" in calls[1]
+
+
+def test_complexity_mismatch_issue_is_none_when_estimate_is_not_simple():
+    from app.services.diagram_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        complexity_estimate="complex",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(10)],
+    )
+    assert _complexity_mismatch_issue(spec) is None
+
+
+def test_complexity_mismatch_issue_is_none_when_estimate_is_unset():
+    from app.services.diagram_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(kind="flow_chart", nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(10)])
+    assert _complexity_mismatch_issue(spec) is None
+
+
+def test_complexity_mismatch_issue_is_none_for_a_genuinely_simple_diagram():
+    from app.services.diagram_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        complexity_estimate="simple",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(4)],
+    )
+    assert _complexity_mismatch_issue(spec) is None
+
+
+def test_complexity_mismatch_issue_fires_when_simple_estimate_has_too_many_nodes():
+    from app.services.diagram_service import _complexity_mismatch_issue
+
+    spec = DiagramSpec(
+        kind="flow_chart",
+        complexity_estimate="simple",
+        nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(10)],
+    )
+    issue = _complexity_mismatch_issue(spec)
+    assert issue is not None
+    assert "estimated as 'simple'" in issue
+    assert "10 nodes" in issue
+
+
+async def test_diagram_with_simple_complexity_mismatch_gets_a_retry(service, monkeypatch):
+    """Pre-generation planning follow-up (Phase 2/6 of the diagram-quality
+    audit): the model's own `complexity_estimate` disagreeing with what it
+    actually produced now triggers a real corrective retry, folded into the
+    same combined mechanism as every other structural check - mirrors
+    test_diagram_with_excessive_text_volume_gets_a_density_retry's own
+    shape."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A simple onboarding flow")
+    original_structured = service.ai.structured
+    calls: list[str] = []
+
+    async def sequenced_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        calls.append(kwargs.get("user", ""))
+        if len(calls) == 1:
+            return DiagramSpec(
+                kind="flow_chart",
+                complexity_estimate="simple",
+                nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(10)],
+                edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(9)],
+            )
+        # the complexity-mismatch retry: consolidated down to a genuinely simple shape.
+        return DiagramSpec(
+            kind="flow_chart",
+            complexity_estimate="simple",
+            nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(4)],
+            edges=[DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(3)],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", sequenced_structured)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_complexity_retry", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    assert len(calls) == 2, "expected exactly one complexity-mismatch retry"
+    assert "estimated as 'simple'" in calls[1]
+
+
+def test_diagram_system_prompt_requires_an_honest_complexity_estimate():
+    from app.services.diagram_service import DIAGRAM_SYSTEM
+
+    assert "complexity_estimate" in DIAGRAM_SYSTEM
+
+
+def test_usability_gap_feedback_is_none_when_the_spec_is_already_usable():
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(
+        kind="concept_map",
+        nodes=[DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B")],
+        edges=[DiagramEdge(source="a", target="b", label="relates to")],
+    )
+    assert _usability_gap_feedback(spec) is None
+
+
+def test_usability_gap_feedback_is_none_for_the_node_count_cap_case():
+    """The node-count cap already has its own dedicated retry feedback
+    (`needs_consolidation`) - this function must stay silent for that case
+    specifically, never produce a second, redundant message for it."""
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(kind="flow_chart", nodes=[DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(20)])
+    assert _usability_gap_feedback(spec) is None
+
+
+def test_usability_gap_feedback_flags_a_concept_map_with_no_edges():
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(
+        kind="concept_map", nodes=[DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B")], edges=[],
+    )
+    issue = _usability_gap_feedback(spec)
+    assert issue is not None
+    assert "no real relationships" in issue
+
+
+def test_usability_gap_feedback_flags_an_er_diagram_with_no_edges():
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(
+        kind="er_diagram", nodes=[DiagramNode(id="a", label="Orders"), DiagramNode(id="b", label="Customers")],
+        edges=[],
+    )
+    issue = _usability_gap_feedback(spec)
+    assert issue is not None
+    assert "no `edges`" in issue
+
+
+def test_usability_gap_feedback_flags_a_swimlane_with_too_few_lanes():
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(
+        kind="swimlane",
+        nodes=[DiagramNode(id="a", label="A", lane="Ops"), DiagramNode(id="b", label="B", lane="Ops")],
+        edges=[DiagramEdge(source="a", target="b")],
+    )
+    issue = _usability_gap_feedback(spec)
+    assert issue is not None
+    assert "distinct" in issue
+
+
+def test_usability_gap_feedback_flags_a_venn_with_the_wrong_node_count():
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(
+        kind="venn", nodes=[DiagramNode(id=f"n{i}", label=f"Set {i}") for i in range(4)],
+    )
+    issue = _usability_gap_feedback(spec)
+    assert issue is not None
+    assert "2 or 3" in issue
+
+
+def test_usability_gap_feedback_flags_an_iceberg_with_no_hidden_level():
+    from app.services.diagram_service import _usability_gap_feedback
+
+    spec = DiagramSpec(
+        kind="iceberg",
+        nodes=[DiagramNode(id="a", label="A", level=0), DiagramNode(id="b", label="B", level=0)],
+    )
+    issue = _usability_gap_feedback(spec)
+    assert issue is not None
+    assert "waterline" in issue
+
+
+async def test_concept_map_with_no_edges_gets_a_retry_before_withholding(service, monkeypatch):
+    """Retry-before-withhold follow-up (diagram quality audit): a concept_map
+    that `is_usable()` would reject for having no edges now gets a real,
+    specific retry chance first - the exact gap `_usability_gap_feedback`
+    exists to close - rather than being withheld immediately."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A concept map of REST API components", diagram_kind="concept_map")
+    original_structured = service.ai.structured
+    calls: list[str] = []
+
+    async def sequenced_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        calls.append(kwargs.get("user", ""))
+        if len(calls) == 1:
+            return DiagramSpec(
+                kind="concept_map",
+                nodes=[DiagramNode(id="a", label="Client"), DiagramNode(id="b", label="Server")],
+                edges=[],
+            )
+        # the retry: a real, labelled relationship.
+        return DiagramSpec(
+            kind="concept_map",
+            nodes=[DiagramNode(id="a", label="Client"), DiagramNode(id="b", label="Server")],
+            edges=[DiagramEdge(source="a", target="b", label="sends requests to")],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", sequenced_structured)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_usability_retry", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    assert len(calls) == 2, "expected exactly one usability-gap retry"
+    assert "no real relationships" in calls[1]
+    assert block.content.get("omitted_after_qa_failure") is not True
+    assert len(block.content["spec"]["edges"]) == 1
+
+
+def _pure_chain_flow_chart(n: int) -> DiagramSpec:
+    nodes = [DiagramNode(id=f"n{i}", label=f"Step {i}") for i in range(n)]
+    edges = [DiagramEdge(source=f"n{i}", target=f"n{i + 1}") for i in range(n - 1)]
+    return DiagramSpec(kind="flow_chart", title="A long procedure", nodes=nodes, edges=edges)
+
+
+def test_linear_chain_split_is_none_for_a_normal_sized_chain():
+    from app.services.diagram_service import _linear_chain_split
+
+    assert _linear_chain_split(_pure_chain_flow_chart(10)) is None  # 10 <= cap (14)
+
+
+def test_linear_chain_split_is_none_beyond_the_max_part_count():
+    from app.services.diagram_service import _MAX_SPLIT_PARTS, _linear_chain_split
+
+    # cap=14, _MAX_SPLIT_PARTS=4, so 4 * (14 - 1) + 1 = 53 is the largest a
+    # bounded split can cover - one more than that must not split.
+    assert _MAX_SPLIT_PARTS == 4
+    assert _linear_chain_split(_pure_chain_flow_chart(53)) is not None
+    assert _linear_chain_split(_pure_chain_flow_chart(54)) is None
+
+
+def test_linear_chain_split_uses_more_than_two_parts_when_needed():
+    from app.services.diagram_service import _linear_chain_split
+
+    spec = _pure_chain_flow_chart(30)  # needs 3 parts: 2 * 13 + 1 = 27 < 30
+    parts = _linear_chain_split(spec)
+    assert parts is not None
+    assert len(parts) == 3
+    for part in parts:
+        assert 2 <= len(part.nodes) <= 14
+    # Every adjacent pair shares exactly one boundary node, every original
+    # node/edge appears exactly once (twice for a shared boundary node).
+    for earlier, later in zip(parts, parts[1:]):
+        assert earlier.nodes[-1].id == later.nodes[0].id
+    all_edge_pairs = [pair for part in parts for pair in ((e.source, e.target) for e in part.edges)]
+    assert all_edge_pairs == [(e.source, e.target) for e in spec.edges]
+    assert all(part.title.endswith("of 3)") for part in parts)
+
+
+def test_linear_chain_split_is_none_for_a_non_splittable_kind():
+    from app.services.diagram_service import _linear_chain_split
+
+    spec = _pure_chain_flow_chart(20).model_copy(update={"kind": "hierarchy"})
+    assert _linear_chain_split(spec) is None
+
+
+def test_linear_chain_split_is_none_for_a_branching_diagram():
+    """A real branch (an extra edge beyond the pure consecutive chain) is
+    NOT provably losslessly splittable by node position alone - must bail
+    out rather than silently drop the branching edge."""
+    from app.services.diagram_service import _linear_chain_split
+
+    spec = _pure_chain_flow_chart(20)
+    spec.edges.append(DiagramEdge(source="n0", target="n5"))
+    assert _linear_chain_split(spec) is None
+
+
+def test_linear_chain_split_is_lossless_for_an_oversized_pure_chain():
+    from app.services.diagram_service import _linear_chain_split
+
+    spec = _pure_chain_flow_chart(20)
+    parts = _linear_chain_split(spec)
+    assert parts is not None
+    assert len(parts) == 2
+    part1, part2 = parts
+    assert len(part1.nodes) <= 14
+    assert len(part2.nodes) <= 14
+    # Exactly one shared boundary node - the split reads as continuous.
+    assert part1.nodes[-1].id == part2.nodes[0].id
+    assert part1.nodes[-1].label == part2.nodes[0].label
+    # Every original node appears in at least one half.
+    original_ids = {n.id for n in spec.nodes}
+    split_ids = {n.id for n in part1.nodes} | {n.id for n in part2.nodes}
+    assert split_ids == original_ids
+    # Every original edge appears in exactly one half (none dropped, none duplicated).
+    part1_pairs = [(e.source, e.target) for e in part1.edges]
+    part2_pairs = [(e.source, e.target) for e in part2.edges]
+    assert part1_pairs + part2_pairs == [(e.source, e.target) for e in spec.edges]
+    assert part1.title.endswith("(Part 1 of 2)")
+    assert part2.title.endswith("(Part 2 of 2)")
+
+
+async def test_oversized_pure_chain_diagram_splits_into_two_linked_blocks_instead_of_withholding(service, monkeypatch):
+    """Multi-diagram splitting (diagram quality audit, Phase 2/6 of the
+    "big 5" deferred items): a flow_chart whose content genuinely needs
+    more than the 14-node cap, and which the consolidation retry fails to
+    bring back under it, used to be withheld entirely (falling back to an
+    unrelated AI illustration) - now it splits into two linked diagrams
+    instead, with zero information loss (see _linear_chain_split's own
+    test coverage above for the lossless guarantee)."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A 16-step onboarding procedure")
+    oversized = _pure_chain_flow_chart(16)
+    original_structured = service.ai.structured
+
+    async def always_oversized(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return oversized.model_copy(deep=True)
+
+    monkeypatch.setattr(service.ai, "structured", always_oversized)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_split", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    assert block.content.get("omitted_after_qa_failure") is not True
+    assert block.content.get("path")
+    first_part_nodes = block.content["spec"]["nodes"]
+    assert len(first_part_nodes) <= 14
+    pending = block.content.get("pending_diagram_splits")
+    assert pending is not None
+    assert len(pending) == 1  # a 16-node chain needs exactly one later part
+    assert pending[0]["spec"]["nodes"][0]["id"] == first_part_nodes[-1]["id"]
+    assert len(pending[0]["spec"]["nodes"]) + len(first_part_nodes) == 16 + 1  # shared boundary counted twice
+    assert pending[0]["svg_base64"]
+    import base64
+
+    svg_bytes = base64.b64decode(pending[0]["svg_base64"])
+    assert svg_bytes.startswith(b"<svg")
+
+
+async def test_a_very_long_pure_chain_splits_into_more_than_two_parts(service, monkeypatch):
+    """The N-way generalisation of the split above: a chain long enough to
+    need 3+ parts (not just 2) produces that many `pending_diagram_splits`
+    entries, each already rendered and QA'd."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A 30-step onboarding procedure")
+    oversized = _pure_chain_flow_chart(30)
+    original_structured = service.ai.structured
+
+    async def always_oversized(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return oversized.model_copy(deep=True)
+
+    monkeypatch.setattr(service.ai, "structured", always_oversized)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_split_3way", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    first_part_nodes = block.content["spec"]["nodes"]
+    assert len(first_part_nodes) <= 14
+    pending = block.content.get("pending_diagram_splits")
+    assert len(pending) == 2  # 3 parts total: this block + 2 pending
+    assert pending[0]["spec"]["nodes"][0]["id"] == first_part_nodes[-1]["id"]
+    assert pending[0]["spec"]["nodes"][-1]["id"] == pending[1]["spec"]["nodes"][0]["id"]
+
+
+async def test_oversized_branching_diagram_still_withholds_rather_than_split(service, monkeypatch):
+    """The safety net for when a lossless split ISN'T possible - a
+    genuinely branching oversized diagram must still fall back to today's
+    existing withhold behaviour, never silently drop the branch to force a
+    split through."""
+    template = load_template("technical")
+    block = _diagram_block(prompt="A 16-step procedure with a side branch")
+    oversized = _pure_chain_flow_chart(16)
+    oversized.edges.append(DiagramEdge(source="n0", target="n10"))
+    original_structured = service.ai.structured
+
+    async def always_oversized(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return oversized.model_copy(deep=True)
+
+    monkeypatch.setattr(service.ai, "structured", always_oversized)
+
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_no_split", block=block, template=template, course_title="Test Course",
+    )
+
+    assert ok is True
+    assert block.content.get("omitted_after_qa_failure") is True
+    assert block.content.get("path") is None
+    assert not block.content.get("pending_diagram_splits")
+
+
+async def test_diagram_consistency_overrides_icon_across_two_blocks_in_the_same_course(service, monkeypatch):
+    """Course-wide recurring-concept consistency (diagram quality audit
+    follow-up, Phase 8): the same labelled node reused in a LATER diagram in
+    the SAME course gets the icon the FIRST diagram already assigned it,
+    even when the model independently picks a different one the second
+    time - and the re-rendered SVG actually reflects the corrected choice,
+    not just the stored spec JSON."""
+    template = load_template("technical")
+    course_id = "course_diagram_consistency_1"
+    original_structured = service.ai.structured
+
+    async def first_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[DiagramNode(id="a", label="Database", icon="database"), DiagramNode(id="b", label="Next step")],
+            edges=[DiagramEdge(source="a", target="b")],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", first_structured)
+    first_block = _diagram_block()
+    ok = await service.images.diagrams.generate_for_block(
+        course_id=course_id, block=first_block, template=template, course_title="Test Course",
+    )
+    assert ok is True
+    assert first_block.content["spec"]["nodes"][0]["icon"] == "database"
+
+    async def second_structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[DiagramNode(id="a", label="Database", icon="server"), DiagramNode(id="b", label="Another step")],
+            edges=[DiagramEdge(source="a", target="b")],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", second_structured)
+    second_block = _diagram_block()
+    ok2 = await service.images.diagrams.generate_for_block(
+        course_id=course_id, block=second_block, template=template, course_title="Test Course",
+    )
+    assert ok2 is True
+    assert second_block.content["spec"]["nodes"][0]["icon"] == "database"
+    svg_text = service.storage.asset_abs_path(course_id, second_block.content["path"]).read_text(encoding="utf-8")
+    assert svg_text.startswith("<svg")  # the overridden spec was actually re-rendered, not just stored
+
+
+async def test_diagram_consistency_is_a_no_op_for_a_brand_new_course(service, monkeypatch):
+    """Regression guard: a course this registry has never seen a label for
+    must render exactly as the model requested - no spurious override, no
+    extra re-render."""
+    template = load_template("technical")
+    original_structured = service.ai.structured
+
+    async def structured(*, schema, **kwargs):
+        if schema.__name__ != "DiagramSpec":
+            return await original_structured(schema=schema, **kwargs)
+        return DiagramSpec(
+            kind="flow_chart",
+            nodes=[DiagramNode(id="a", label="Never Seen Before", icon="gear"), DiagramNode(id="b", label="Next")],
+            edges=[DiagramEdge(source="a", target="b")],
+        )
+
+    monkeypatch.setattr(service.ai, "structured", structured)
+    block = _diagram_block()
+    ok = await service.images.diagrams.generate_for_block(
+        course_id="course_diagram_consistency_fresh", block=block, template=template, course_title="Test Course",
+    )
+    assert ok is True
+    assert block.content["spec"]["nodes"][0]["icon"] == "gear"
 
 
 async def test_diagram_generation_can_be_disabled_via_settings(service):
@@ -4045,6 +5007,33 @@ def test_er_diagram_renders_entities_relationship_and_attributes():
     assert width > 0 and height > 0
 
 
+def test_er_diagram_long_edge_label_shrinks_instead_of_truncating():
+    """Label-repair investigation (diagram quality audit follow-up, Phase
+    4): er_diagram's own edge labels now pass `allow_shrink=True` (a real,
+    confirmed gap relative to concept_map, which already did) - a multi-
+    word relationship phrase that would otherwise truncate with an
+    ellipsis at this kind's own narrow 90px label width now renders in
+    full across more lines instead. (A genuinely long label whose
+    individual WORDS themselves don't fit this narrow pill even one word
+    per line is a separate, deeper layout constraint `allow_shrink` alone
+    can't lift - this covers the realistic case, a short, natural
+    relationship phrase of the kind `edge_label_verbosity_issues`
+    elsewhere in this codebase already steers every kind's own labels
+    toward.)"""
+    nodes = [
+        DiagramNode(id="student", label="Student"),
+        DiagramNode(id="course", label="Course"),
+    ]
+    long_label = "enrolled for credit this term"
+    edges = [DiagramEdge(source="student", target="course", label=long_label)]
+    spec = DiagramSpec(kind="er_diagram", title="t", nodes=nodes, edges=edges)
+    svg_bytes, width, height = render_diagram_svg(spec, TemplateTheme())
+    text = svg_bytes.decode("utf-8")
+    assert "…" not in text
+    for word in long_label.split():
+        assert word in text
+
+
 def test_er_diagram_attribute_pointing_at_an_unknown_parent_is_skipped_not_crashed():
     spec = DiagramSpec(
         kind="er_diagram",
@@ -6179,6 +7168,126 @@ def test_org_chart_connects_parent_to_child_with_an_orthogonal_path():
     connectors = [el for el in root.iter() if _local_name(el.tag) == "path"]
     assert len(connectors) == 2  # one orthogonal connector per parent -> child edge
     assert validate_rendered_svg(svg, kind="org_chart") == []
+
+
+# ---------------------------------------------------------------------------
+# architecture_diagram: nested CONTAINER boxes (shape_role="container",
+# parent_id) holding their own leaf components, connected by edges between
+# leaves only - the AWS-account/VPC/subnet/service shape.
+# ---------------------------------------------------------------------------
+
+
+def _architecture_spec(**overrides) -> DiagramSpec:
+    nodes = [
+        DiagramNode(id="account", label="AWS Account", shape_role="container"),
+        DiagramNode(id="vpc", label="VPC", shape_role="container", parent_id="account"),
+        DiagramNode(id="subnet_a", label="Public Subnet", shape_role="container", parent_id="vpc"),
+        DiagramNode(id="subnet_b", label="Private Subnet", shape_role="container", parent_id="vpc"),
+        DiagramNode(id="lb", label="Load Balancer", parent_id="subnet_a"),
+        DiagramNode(id="api1", label="API Service 1", parent_id="subnet_b"),
+        DiagramNode(id="api2", label="API Service 2", parent_id="subnet_b"),
+        DiagramNode(id="db", label="Database", parent_id="subnet_b"),
+        DiagramNode(id="user", label="User", icon="user"),
+    ]
+    edges = [
+        DiagramEdge(source="user", target="lb", label="HTTPS"),
+        DiagramEdge(source="lb", target="api1", label="routes"),
+        DiagramEdge(source="lb", target="api2", label="routes"),
+        DiagramEdge(source="api1", target="db", label="reads/writes"),
+        DiagramEdge(source="api2", target="db", label="reads/writes"),
+    ]
+    defaults = {"kind": "architecture_diagram", "title": "Web App Architecture", "nodes": nodes, "edges": edges}
+    defaults.update(overrides)
+    return DiagramSpec(**defaults)
+
+
+def test_architecture_diagram_is_usable_only_with_a_real_nested_container():
+    assert _architecture_spec().is_usable()
+    # No container at all - just a flat list of boxes - isn't this kind's
+    # shape (see DiagramSpec.is_usable's own architecture_diagram case).
+    flat = DiagramSpec(
+        kind="architecture_diagram", title="t",
+        nodes=[DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B")],
+    )
+    assert not flat.is_usable()
+    # A container exists, but nothing is actually nested inside it.
+    unused_container = DiagramSpec(
+        kind="architecture_diagram", title="t",
+        nodes=[
+            DiagramNode(id="c", label="Container", shape_role="container"),
+            DiagramNode(id="a", label="A"), DiagramNode(id="b", label="B"),
+        ],
+    )
+    assert not unused_container.is_usable()
+
+
+_ARCH_CRITICAL_KINDS = ("edge_crosses_node", "out_of_canvas", "unparseable_svg", "node_overlap")
+
+
+def test_architecture_diagram_renders_nested_containers_and_leaf_components():
+    theme = load_template("technical").theme
+    spec = _architecture_spec()
+    svg, w, h = render_diagram_svg(spec, theme)
+    root = ET.fromstring(svg)
+    containers = [
+        el for el in root.iter()
+        if _local_name(el.tag) == "rect" and "diagram-container" in (el.get("class") or "").split()
+    ]
+    leaves = [
+        el for el in root.iter()
+        if _local_name(el.tag) == "rect" and "diagram-box" in (el.get("class") or "").split()
+    ]
+    assert len(containers) == 4  # account, vpc, subnet_a, subnet_b
+    assert len(leaves) == 5  # lb, api1, api2, db, user
+    text = svg.decode("utf-8")
+    for label in ("AWS Account", "VPC", "Public Subnet", "Private Subnet", "Load Balancer", "Database", "User"):
+        assert label in text
+    issues = validate_rendered_svg(svg, kind="architecture_diagram")
+    assert not any(i.kind in _ARCH_CRITICAL_KINDS for i in issues)
+
+
+def test_architecture_diagram_container_rects_are_excluded_from_node_overlap_checks():
+    """A leaf legitimately drawn INSIDE its own parent container's rect
+    must never register as `node_overlap`/`edge_crosses_node` against that
+    container - see `_layout_architecture_diagram`'s own docstring on why
+    container rects carry a different CSS class (`diagram-container`, never
+    `diagram-box`) specifically to keep this true."""
+    svg, w, h = render_diagram_svg(_architecture_spec(), load_template("technical").theme)
+    issues = validate_rendered_svg(svg, kind="architecture_diagram")
+    assert not any(i.kind in ("node_overlap", "edge_crosses_node") for i in issues)
+
+
+def test_architecture_diagram_fan_out_and_fan_in_never_cross_a_sibling():
+    """Real, confirmed bug this guards against: a straight line from a hub
+    to a sibling that isn't the NEAREST one (a load balancer fanning out to
+    2 parallel services, both services writing to one shared database)
+    used to cut straight through whichever sibling sat in between - fixed
+    by routing a clean fan as one shared trunk-bus-drop (see `_try_bus`),
+    verified before ever committing to it. Only the CRITICAL render-QA
+    kinds are asserted here (never `== []`) - a clean fan can still emit a
+    purely cosmetic `shared_edge_segment`/`duplicate_arrowhead` finding
+    from the accepted "drawn once per member" overlap this bus technique
+    uses (see `_try_bus`'s own docstring)."""
+    svg, w, h = render_diagram_svg(_architecture_spec(), load_template("technical").theme)
+    issues = validate_rendered_svg(svg, kind="architecture_diagram")
+    assert not any(i.kind in _ARCH_CRITICAL_KINDS for i in issues)
+
+
+def test_architecture_diagram_edge_between_far_apart_leaves_is_still_crossing_free():
+    """A single (non-fan) connection whose two ends sit in very different
+    parts of the nested structure, with unrelated leaves physically
+    between them, must still clear every box it isn't connecting -
+    `_route_edge`'s grid-routed detour, not just a straight line."""
+    spec = _architecture_spec(
+        edges=[DiagramEdge(source="user", target="db", label="monitors")],
+    )
+    svg, w, h = render_diagram_svg(spec, load_template("technical").theme)
+    issues = validate_rendered_svg(svg, kind="architecture_diagram")
+    assert not any(i.kind in _ARCH_CRITICAL_KINDS for i in issues)
+
+
+def test_architecture_diagram_respects_the_higher_node_ceiling():
+    assert max_nodes_for("architecture_diagram") > max_nodes_for("concept_map")
 
 
 # ---------------------------------------------------------------------------

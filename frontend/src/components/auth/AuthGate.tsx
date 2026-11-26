@@ -7,7 +7,7 @@ import { Loader2, LogOut, Sparkles, ChevronDown } from "lucide-react";
 import { useAuth } from "@/lib/auth/auth-provider";
 import { CreatorShell } from "@/components/course/CreatorShell";
 
-const PUBLIC_ROUTES = new Set(["/login", "/register"]);
+const PUBLIC_ROUTES = new Set(["/login", "/register", "/forgot-password", "/reset-password"]);
 const APP_ENTRY_ROUTE = "/";
 
 function isAdminRoute(pathname: string): boolean {

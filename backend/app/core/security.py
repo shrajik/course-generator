@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,6 +32,34 @@ def verify_password(password: str, password_hash: str) -> bool:
         return _password_hash.verify(password, password_hash)
     except Exception:  # noqa: BLE001 - malformed hashes should fail closed
         return False
+
+
+def generate_reset_token() -> str:
+    """A high-entropy, single-use opaque token for password reset - never
+    a JWT. Nothing here needs to be self-verifying or stateless; a
+    single-use, server-tracked, revocable token (the same philosophy
+    `AuthSession.refresh_token_hash` already uses for refresh tokens) suits
+    this far better than a signed claim that can't be invalidated early."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_reset_token(token: str) -> str:
+    """SHA-256, deliberately NOT `hash_password` - a real design difference
+    from `AuthSession.refresh_token_hash`'s argon2 pattern, not an
+    oversight. A refresh token's owning user is already known (decoded
+    from its own JWT claims) before its hash is ever checked, so verifying
+    it against that one user's handful of active sessions via slow,
+    salted argon2 is cheap and the right call for a secret that's
+    *compared*, not *looked up*. A password-reset token is a bare opaque
+    string with no embedded user id - finding its owner means looking it
+    up directly by hash, and argon2's whole point (a different salt every
+    call, by design) makes that impossible without scanning every active
+    token for every user in the database. The token itself already
+    carries 256 bits of `secrets.token_urlsafe` entropy, so a fast,
+    deterministic hash loses no real security here - guessing the raw
+    token is already computationally infeasible - while making the lookup
+    a single indexed query instead of an unbounded scan."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def create_access_token(user_id: UUID | str, email: str, role: str) -> str:

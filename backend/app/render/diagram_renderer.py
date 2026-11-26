@@ -12,6 +12,7 @@ import contextvars
 import math
 import re
 import uuid
+from collections import deque
 from typing import Callable
 from xml.sax.saxutils import escape
 
@@ -4233,7 +4234,21 @@ def _layout_er(
         )
         if edge.label.strip():
             mid = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
-            elements.append(_edge_label(mid[0], mid[1] - 10, edge.label, theme, max_width=90.0))
+            # Label-repair investigation (diagram quality audit follow-up,
+            # Phase 4): `allow_shrink=True` is a strict improvement with no
+            # downside for the existing case - it only ever activates when
+            # the text would otherwise be truncated with "…" at this kind's
+            # own narrow `max_width=90.0` (confirmed via `_edge_label_layout`'s
+            # own docstring: shrinks the font, bounded by the same
+            # readability floor `_layout_decision_tree`'s font-shrink loop
+            # uses, never truncates when a smaller-but-legible font would
+            # instead fit the full phrase) - and a smaller resulting pill is
+            # also less likely to overlap a nearby entity/attribute, the
+            # real, confirmed gap this kind had relative to concept_map
+            # (which already passes this). Every other kind's own edge-label
+            # calls are deliberately left unchanged - this is a per-kind,
+            # evidence-based fix, not a generic behaviour change.
+            elements.append(_edge_label(mid[0], mid[1] - 10, edge.label, theme, max_width=90.0, allow_shrink=True))
 
     return elements, canvas_w, main_bottom - top
 
@@ -6992,9 +7007,43 @@ def _layout_decision_tree(
             else _ideal_process_box_size(node, font_size=font_size)
         )
 
+    # The elbow routing below (trunk down, bus across, drop down per child)
+    # draws each child's drop as ONE STRAIGHT LINE from the row right below
+    # its source down to the child's own row, with zero awareness of
+    # whatever else lives in any row it passes through on the way. That is
+    # harmless when every edge steps exactly one level down, but an authored
+    # `level` that SKIPS a row (a model-drawn tree with uneven branch depth
+    # naturally does this - a shallow branch's outcome and a deep branch's
+    # outcome often land on the same author-chosen row) makes that drop run
+    # straight through an unrelated sibling's box in the skipped row, full
+    # height - a real, confirmed `edge_crosses_node` bug (fuzz-tested: 79% of
+    # randomized uneven-depth trees with a skipped level hit it; zero clean
+    # trees that never skip a level did). Recomputing every node's level as
+    # its longest path from a root - rather than trusting the author-supplied
+    # value - guarantees a direct parent never has more than one empty row
+    # between it and that child, the same "treat `level` as advisory, not
+    # literal" philosophy the sibling-column sort just below already uses.
+    _incoming: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.source and edge.target and edge.source != edge.target:
+            _incoming.setdefault(edge.target, []).append(edge.source)
+    _depth_cache: dict[str, int] = {}
+
+    def _longest_path_depth(node_id: str, _path: frozenset[str] = frozenset()) -> int:
+        if node_id in _depth_cache:
+            return _depth_cache[node_id]
+        parents = _incoming.get(node_id) or []
+        if not parents or node_id in _path:
+            depth = 0
+        else:
+            depth = 1 + max(_longest_path_depth(p, _path | {node_id}) for p in parents)
+        _depth_cache[node_id] = depth
+        return depth
+
     rows: dict[int, list[DiagramNode]] = {}
     for node in nodes:
-        rows.setdefault(max(node.level, 0), []).append(node)
+        level = _longest_path_depth(node.id) if node.id else max(node.level, 0)
+        rows.setdefault(level, []).append(node)
     levels = sorted(rows)
 
     # Group every row's nodes so each parent's own children sit in
@@ -8085,6 +8134,473 @@ def _layout_org_chart(
     return elements, (y - row_gap - top), canvas_w
 
 
+_ARCH_LEAF_WIDTH = 190.0
+_ARCH_PAD = 18.0
+_ARCH_HEADER_H = 30.0
+_ARCH_GAP = 30.0
+_ARCH_MAX_ROW_WIDTH = 640.0
+_ARCH_EMPTY_CONTAINER_W = 220.0
+_ARCH_EMPTY_CONTAINER_H = 110.0
+_ARCH_LABEL_SIZE = 13.0
+# Outermost -> innermost container shading - same depth-indexed-palette
+# technique `_HIERARCHY_LEVEL_COLORS` already uses, deliberately subdued
+# (never competing with a leaf component's own accent-coloured box) so
+# nesting reads as "grouping", not another layer of emphasis. Clamped to
+# the last entry for anything deeper, same convention as that palette.
+_ARCH_CONTAINER_LEVEL_COLORS = [
+    ("#f8fafc", "#94a3b8"),
+    ("#f1f5f9", "#64748b"),
+    ("#e2e8f0", "#475569"),
+]
+
+
+def _pack_grid(
+    sizes: list[tuple[float, float]], *, gap: float, max_width: float
+) -> tuple[list[tuple[float, float]], float, float]:
+    """Greedy row-wrap packer - same "wrap once the row would overflow its
+    own width budget" technique _layout_network_mesh/_layout_honeycomb
+    already use for their own grids, just generalised to arbitrary (not
+    uniform) box sizes. Returns each box's own (x, y) top-left offset from
+    the grid's own origin (0, 0), in the same order `sizes` was given, plus
+    the grid's own total (width, height). The first box of a row is always
+    placed regardless of its own width (a single box wider than the whole
+    budget still has to go SOMEWHERE) - every box after it only starts a
+    new row if adding it would overflow."""
+    positions: list[tuple[float, float]] = []
+    x = y = row_h = 0.0
+    max_x = 0.0
+    for w, h in sizes:
+        if x > 0.0 and x + w > max_width:
+            x = 0.0
+            y += row_h + gap
+            row_h = 0.0
+        positions.append((x, y))
+        x += w + gap
+        row_h = max(row_h, h)
+        max_x = max(max_x, x - gap)
+    return positions, max_x, y + row_h
+
+
+def _arch_rect_exit_point(
+    cx: float, cy: float, w: float, h: float, toward_x: float, toward_y: float
+) -> tuple[float, float]:
+    """Where a straight line from (cx, cy) toward (toward_x, toward_y) exits
+    this box's own rectangle boundary - never the box's CENTRE, the same
+    "an edge starting at a node's own centre is - by construction - already
+    inside it" bug `_layout_network_mesh`'s own `_pulled_back` comment
+    documents, just solved exactly (a rectangle's real boundary) instead of
+    approximated (a circle's radius), since architecture_diagram's leaf
+    boxes aren't circles."""
+    dx, dy = toward_x - cx, toward_y - cy
+    if dx == 0 and dy == 0:
+        return cx, cy
+    half_w, half_h = w / 2 - 2.0, h / 2 - 2.0
+    scales = []
+    if dx != 0:
+        scales.append(half_w / abs(dx))
+    if dy != 0:
+        scales.append(half_h / abs(dy))
+    scale = max(0.0, min(scales)) if scales else 0.0
+    return cx + dx * scale, cy + dy * scale
+
+
+def _layout_architecture_diagram(
+    nodes: list[DiagramNode], edges: list[DiagramEdge], *, theme: TemplateTheme, top: float
+) -> tuple[list[str], float, float]:
+    """Nested grouping boxes - an AWS account containing a VPC containing a
+    subnet containing its own services, the real "system architecture
+    diagram" shape - a genuinely different family from every other kind in
+    this module: those draw ONE flat shape per node; this one draws
+    CONTAINERS that visually hold their own children, recursively, via
+    `DiagramNode.parent_id` (reused from er_diagram's attribute-orbiting
+    meaning - see that field's own docstring) and `shape_role == "container"`
+    (reused from data_flow_diagram's entity/store meaning - see that
+    field's own docstring). A plain node (`shape_role` blank) is a leaf
+    component, drawn via `_node_block` - the same icon+label+detail box
+    every list-style kind in this module already uses - so it gets that
+    primitive's own text-fit/icon-badge/tooltip guarantees for free, rather
+    than reinventing them here.
+
+    Sizing is bottom-up (a container's own size is its packed children's
+    bounding box, plus padding and a header strip for its own label),
+    positioning is top-down (each container hands its own content-area
+    origin down to its children) - the standard treemap-style two-pass
+    technique, on a 2D grid instead of the single axis this module's own
+    hierarchy/decision_tree sizing already splits the same way.
+
+    `edges` connect two LEAF node ids only (a container is a grouping,
+    never a thing a connection wires to - an edge naming a container id is
+    silently skipped, the same "ignore what doesn't resolve" rule every
+    other kind's edge-drawing loop already follows) and are drawn LAST,
+    straight from one box's real rectangle BOUNDARY to the other's (see
+    `_arch_rect_exit_point`) rather than centre-to-centre, so a long
+    cross-container connection can never register as crossing its own
+    endpoint.
+
+    Each container's own `<rect>` carries a DIFFERENT CSS class
+    ("diagram-container", never "diagram-box") deliberately - every
+    `diagram_render_qa` check that treats a `diagram-box` as a real node
+    (node_overlap, edge_crosses_node) would otherwise flag a leaf
+    legitimately drawn INSIDE its own parent container as "overlapping"
+    it, which is the entire point of nesting, not a layout bug. Leaf boxes
+    keep the ordinary "diagram-box" class (via `_node_block`, unchanged),
+    so two SIBLING leaves that genuinely collide are still caught."""
+    if not nodes:
+        return [], CANVAS_WIDTH, 0.0
+
+    by_id = {n.id: n for n in nodes if n.id}
+    children_of: dict[str, list[DiagramNode]] = {}
+    roots: list[DiagramNode] = []
+    for node in nodes:
+        parent = node.parent_id.strip()
+        if parent and parent in by_id and parent != node.id:
+            children_of.setdefault(parent, []).append(node)
+        else:
+            roots.append(node)
+    if not roots:
+        # Every node's `parent_id` formed a cycle with no real top-level
+        # entry point - pathological, never trusted blindly (see
+        # `_layout_decision_tree`'s identical "never trust an authored
+        # value blindly" fix for a different field). Render every node
+        # flatly at the top level instead of silently producing an empty
+        # diagram - the same "never a hard failure" contract every other
+        # kind's own defensive fallback in this module already keeps.
+        roots = list(nodes)
+        children_of = {}
+
+    def is_container(node: DiagramNode) -> bool:
+        return node.shape_role.strip().lower() == "container"
+
+    size_cache: dict[str, tuple[float, float]] = {}
+    grid_cache: dict[str, tuple[list[tuple[float, float]], list[DiagramNode]]] = {}
+
+    def compute_size(node: DiagramNode) -> tuple[float, float]:
+        if node.id and node.id in size_cache:
+            return size_cache[node.id]
+        if is_container(node):
+            kids = children_of.get(node.id, []) if node.id else []
+            if kids:
+                kid_sizes = [compute_size(k) for k in kids]
+                positions, content_w, content_h = _pack_grid(
+                    kid_sizes, gap=_ARCH_GAP, max_width=_ARCH_MAX_ROW_WIDTH
+                )
+                grid_cache[node.id] = (positions, kids)
+                size = (content_w + 2 * _ARCH_PAD, content_h + _ARCH_HEADER_H + _ARCH_PAD)
+            else:
+                size = (_ARCH_EMPTY_CONTAINER_W, _ARCH_EMPTY_CONTAINER_H)
+        else:
+            _, height = _node_block(node, x=0.0, y=0.0, width=_ARCH_LEAF_WIDTH, theme=theme, icon_badge=True)
+            size = (_ARCH_LEAF_WIDTH, height)
+        if node.id:
+            size_cache[node.id] = size
+        return size
+
+    elements: list[str] = [_arrow_marker("diagram-arrow", theme.accent_color)]
+    leaf_boxes: dict[str, tuple[float, float, float, float]] = {}  # id -> (cx, cy, w, h)
+
+    def place(node: DiagramNode, *, origin_x: float, origin_y: float, depth: int) -> None:
+        width, height = compute_size(node)
+        if is_container(node):
+            fill, stroke = _ARCH_CONTAINER_LEVEL_COLORS[min(depth, len(_ARCH_CONTAINER_LEVEL_COLORS) - 1)]
+            elements.append(
+                f'<rect class="diagram-container" x="{origin_x:.1f}" y="{origin_y:.1f}" '
+                f'width="{width:.1f}" height="{height:.1f}" rx="12" fill="{fill}" '
+                f'stroke="{stroke}" stroke-width="2" stroke-dasharray="6 4"/>'
+            )
+            label_svg, _ = _text(
+                origin_x + _ARCH_PAD * 0.6, origin_y + _ARCH_HEADER_H * 0.68,
+                [node.label.strip() or node.id], font_size=_scaled_font_size(_ARCH_LABEL_SIZE),
+                weight=700, color=stroke, font_family=theme.font_family, anchor="start",
+            )
+            elements.append(label_svg)
+            if node.id and node.id in grid_cache:
+                positions, kids = grid_cache[node.id]
+                for (rel_x, rel_y), kid in zip(positions, kids):
+                    place(
+                        kid, origin_x=origin_x + _ARCH_PAD + rel_x, origin_y=origin_y + _ARCH_HEADER_H + rel_y,
+                        depth=depth + 1,
+                    )
+            return
+        svg, _ = _node_block(node, x=origin_x, y=origin_y, width=width, theme=theme, icon_badge=True)
+        elements.append(svg)
+        if node.id:
+            leaf_boxes[node.id] = (origin_x + width / 2, origin_y + height / 2, width, height)
+
+    root_sizes = [compute_size(r) for r in roots]
+    root_positions, content_w, content_h = _pack_grid(root_sizes, gap=_ARCH_GAP, max_width=_ARCH_MAX_ROW_WIDTH)
+    canvas_w = max(content_w + 2 * MARGIN, CANVAS_WIDTH)
+    x_offset = MARGIN + max(0.0, (canvas_w - 2 * MARGIN - content_w) / 2)
+    for (rel_x, rel_y), root in zip(root_positions, roots):
+        place(root, origin_x=x_offset + rel_x, origin_y=top + rel_y, depth=0)
+
+    # A direct centre-to-boundary line (below) is only safe when NOTHING
+    # else sits between source and target - true for most cross-container
+    # links, but architecture content routinely fans ONE hub out to (or in
+    # from) several SIBLINGS that share a row (a load balancer to several
+    # parallel services, several services into one shared database) -a
+    # straight line to/from a sibling that isn't the nearest one runs
+    # straight through whichever sibling IS in between, a real, confirmed
+    # `edge_crosses_node` case (reproduced directly: 3 siblings packed into
+    # one row, the first-to-last connection crossed the middle one on every
+    # sample). `_try_bus` below detects exactly this shape (one hub, 2+
+    # edges, every member consistently above/below the hub, or sharing its
+    # own row) and draws it the same trunk-bus-drop way
+    # `_layout_decision_tree`/`_layout_org_chart` already draw one parent's
+    # multiple children - the bus always travels through a row's own GAP
+    # (guaranteed empty by `_pack_grid`'s own row-wrap construction), never
+    # through another box. Only a genuinely mixed/ambiguous direction (some
+    # members above, some below, none sharing the hub's own row) falls
+    # through to the plain direct line.
+    drawn: set[int] = set()
+    by_source: dict[str, list[int]] = {}
+    by_target: dict[str, list[int]] = {}
+    for idx, edge in enumerate(edges):
+        if edge.source in leaf_boxes and edge.target in leaf_boxes and edge.source != edge.target:
+            by_source.setdefault(edge.source, []).append(idx)
+            by_target.setdefault(edge.target, []).append(idx)
+
+    def _point_in_any_leaf(x: float, y: float, exclude: tuple[str, ...]) -> bool:
+        for node_id, (bcx, bcy, bw, bh) in leaf_boxes.items():
+            if node_id in exclude:
+                continue
+            if bcx - bw / 2 < x < bcx + bw / 2 and bcy - bh / 2 < y < bcy + bh / 2:
+                return True
+        return False
+
+    def _polyline_crosses_other_leaf(points: list[tuple[float, float]], exclude: tuple[str, ...]) -> bool:
+        """20-sample probe per segment - cheap and reliable at this
+        module's own box sizes (every leaf is at least ~55px tall/190px
+        wide, far bigger than the resulting ~5% sampling gap could ever
+        skip past undetected)."""
+        for (x1, y1), (x2, y2) in zip(points, points[1:]):
+            for step in range(21):
+                t = step / 20.0
+                if _point_in_any_leaf(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, exclude):
+                    return True
+        return False
+
+    def _try_bus(hub_id: str, member_idxs: list[int], *, hub_is_source: bool) -> bool:
+        if len(member_idxs) < 2:
+            return False
+        hcx, hcy, _hw, hh = leaf_boxes[hub_id]
+        members = [
+            (idx, leaf_boxes[edges[idx].target if hub_is_source else edges[idx].source])
+            for idx in member_idxs
+        ]
+        if all(b[1] > hcy + 1.0 for _, b in members):
+            hub_edge_y = hcy + hh / 2
+            member_edge_y = lambda b: b[1] - b[3] / 2  # noqa: E731
+            bus_y = (hub_edge_y + min(member_edge_y(b) for _, b in members)) / 2
+        elif all(b[1] < hcy - 1.0 for _, b in members):
+            hub_edge_y = hcy - hh / 2
+            member_edge_y = lambda b: b[1] + b[3] / 2  # noqa: E731
+            bus_y = (hub_edge_y + max(member_edge_y(b) for _, b in members)) / 2
+        elif all(abs(b[1] - hcy) < 1.0 for _, b in members):
+            # Hub and every member share one visual row - route via the
+            # gap just below the whole row (every box's own BOTTOM edge)
+            # instead of an above/below split that doesn't exist here.
+            hub_edge_y = hcy + hh / 2
+            member_edge_y = lambda b: b[1] + b[3] / 2  # noqa: E731
+            bus_y = max([hub_edge_y] + [member_edge_y(b) for _, b in members]) + _ARCH_GAP / 2
+        else:
+            return False  # mixed direction - not a clean fan, use direct lines instead
+
+        # Verify every segment this bus WOULD draw actually clears every
+        # OTHER leaf before committing to it - a real, confirmed gap this
+        # closes: the bus's own "the row's gap is empty" assumption only
+        # holds when the hub's and every member's own y-extents are cleanly
+        # separated; a diagonally-staggered layout (common once containers
+        # nest with different header heights) can leave them genuinely
+        # overlapping, so the midpoint bus_y this function picks can fall
+        # INSIDE a member's own box rather than in a real gap - the bus-span
+        # line then cuts straight through it on its way to a DIFFERENT
+        # member. The trunk and bus-span must clear EVERY member (none of
+        # them is the thing being entered YET at that point in the path) -
+        # only each member's own final drop segment is allowed to touch
+        # that one member, never any of the others. A bus that fails this
+        # falls through to the per-edge grid router below instead of
+        # silently shipping a crossing.
+        xs = [hcx] + [b[0] for _, b in members]
+        if _polyline_crosses_other_leaf([(hcx, hub_edge_y), (hcx, bus_y)], (hub_id,)):
+            return False
+        if max(xs) > min(xs) and _polyline_crosses_other_leaf(
+            [(min(xs), bus_y), (max(xs), bus_y)], (hub_id,)
+        ):
+            return False
+        for idx, b in members:
+            mcx, m_edge_y = b[0], member_edge_y(b)
+            target_id = edges[idx].target if hub_is_source else edges[idx].source
+            if _polyline_crosses_other_leaf([(mcx, bus_y), (mcx, m_edge_y)], (hub_id, target_id)):
+                return False
+
+        # Each member gets its OWN complete path from the hub's own edge
+        # point all the way to that member's own entry point (the shared
+        # trunk/bus portion is simply redrawn per member, harmlessly
+        # collinear with the others) rather than one shared trunk/bus
+        # `<line>` plus separate per-member drops. This is deliberate, not
+        # an oversight: render QA's `border_collinear_issues` only exempts
+        # a box an edge's own FIRST or LAST point touches from its "must
+        # clear every unrelated border" check - a SHARED bus-span line's
+        # own two endpoints sit only at the two EXTREME members' x (and,
+        # for a fan-IN, one of those extremes is usually the HUB, not a
+        # member at all), so any member that isn't at an extreme is never
+        # recognised as "its own" box, regardless of gap size, and gets
+        # wrongly flagged for running close to a border it is, in fact,
+        # legitimately about to enter. Giving each member its own full path
+        # makes that path's real first/last points the hub's edge and THAT
+        # member's edge, so both are always correctly recognised - the
+        # resulting duplicate/overlapping shared segments across members
+        # are the accepted, purely cosmetic trade-off (the same "overlap is
+        # legitimate by design" category `_OVERLAP_EXEMPT_KINDS` already
+        # covers for venn/honeycomb/chain_links elsewhere in this module).
+        for idx, b in members:
+            mcx, m_edge_y = b[0], member_edge_y(b)
+            if hub_is_source:
+                d = f"M{hcx:.1f},{hub_edge_y:.1f} L{hcx:.1f},{bus_y:.1f} L{mcx:.1f},{bus_y:.1f} L{mcx:.1f},{m_edge_y:.1f}"
+            else:
+                d = f"M{mcx:.1f},{m_edge_y:.1f} L{mcx:.1f},{bus_y:.1f} L{hcx:.1f},{bus_y:.1f} L{hcx:.1f},{hub_edge_y:.1f}"
+            elements.append(
+                f'<path d="{d}" fill="none" stroke="{theme.accent_color}" stroke-width="2" '
+                f'marker-end="url(#diagram-arrow)"/>'
+            )
+            edge = edges[idx]
+            if edge.label.strip():
+                elements.append(_edge_label(mcx, (bus_y + m_edge_y) / 2, edge.label, theme))
+            drawn.add(idx)
+        return True
+
+    for source_id, idxs in by_source.items():
+        _try_bus(source_id, idxs, hub_is_source=True)
+    for target_id, idxs in by_target.items():
+        remaining = [i for i in idxs if i not in drawn]
+        _try_bus(target_id, remaining, hub_is_source=False)
+
+    def _grid_route(
+        x1: float, y1: float, x2: float, y2: float, obstacles: list[tuple[float, float, float, float]]
+    ) -> list[tuple[float, float]] | None:
+        """An orthogonal (Manhattan) path from (x1, y1) to (x2, y2) that
+        clears every box in `obstacles`, found by BFS over a grid whose
+        lines are exactly the obstacles' own edges (inflated by a small
+        margin) plus the two endpoints - the standard trapezoidal-
+        decomposition technique for rectilinear routing around rectangular
+        obstacles: an optimal orthogonal path around axis-aligned
+        rectangles only ever needs to bend AT one of those coordinates, so
+        this grid (unlike a fixed-step grid) never misses a route that
+        exists, however oddly the boxes are scattered, and never needs more
+        than a handful of coordinates either side. Returns None (never
+        raises) if truly no orthogonal path clears every obstacle - the
+        caller falls back to the direct line in that case."""
+        margin = 4.0
+        xs_set = {x1, x2}
+        ys_set = {y1, y2}
+        for bcx, bcy, bw, bh in obstacles:
+            xs_set.add(bcx - bw / 2 - margin)
+            xs_set.add(bcx + bw / 2 + margin)
+            ys_set.add(bcy - bh / 2 - margin)
+            ys_set.add(bcy + bh / 2 + margin)
+        xs = sorted(xs_set)
+        ys = sorted(ys_set)
+
+        def _blocked_point(x: float, y: float) -> bool:
+            for bcx, bcy, bw, bh in obstacles:
+                if bcx - bw / 2 < x < bcx + bw / 2 and bcy - bh / 2 < y < bcy + bh / 2:
+                    return True
+            return False
+
+        def _blocked_hop(xa: float, ya: float, xb: float, yb: float) -> bool:
+            return (
+                _blocked_point((xa + xb) / 2, (ya + yb) / 2)
+                or _blocked_point(xa, ya)
+                or _blocked_point(xb, yb)
+            )
+
+        xi, yi = {x: i for i, x in enumerate(xs)}, {y: i for i, y in enumerate(ys)}
+        start, goal = (xi[x1], yi[y1]), (xi[x2], yi[y2])
+        prev: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        queue: deque[tuple[int, int]] = deque([start])
+        while queue:
+            cx, cy = queue.popleft()
+            if (cx, cy) == goal:
+                break
+            for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                if 0 <= nx < len(xs) and 0 <= ny < len(ys) and (nx, ny) not in prev:
+                    if not _blocked_hop(xs[cx], ys[cy], xs[nx], ys[ny]):
+                        prev[(nx, ny)] = (cx, cy)
+                        queue.append((nx, ny))
+        if goal not in prev:
+            return None
+        raw: list[tuple[float, float]] = []
+        node: tuple[int, int] | None = goal
+        while node is not None:
+            raw.append((xs[node[0]], ys[node[1]]))
+            node = prev[node]
+        raw.reverse()
+        # Collapse consecutive collinear hops into one straight segment -
+        # the grid's own coordinate resolution otherwise leaves a straight
+        # run broken into several tiny same-direction segments.
+        simplified = raw[:1]
+        for point in raw[1:]:
+            if len(simplified) >= 2 and (
+                (simplified[-2][0] == simplified[-1][0] == point[0])
+                or (simplified[-2][1] == simplified[-1][1] == point[1])
+            ):
+                simplified[-1] = point
+            else:
+                simplified.append(point)
+        return simplified
+
+    def _route_edge(
+        source: tuple[float, float, float, float], target: tuple[float, float, float, float],
+        exclude: tuple[str, ...],
+    ) -> list[tuple[float, float]]:
+        """The points of a path from `source` to `target` that clears every
+        OTHER leaf box: a direct line when nothing is in the way (the
+        common case - most cross-container links), else the grid-routed
+        orthogonal detour above. Falls back to the direct line unverified
+        only if `_grid_route` itself reports no path exists at all (should
+        not happen in practice - the grid always has a route around any
+        finite set of rectangular obstacles - but never leave an edge
+        undrawn over it)."""
+        sx, sy, sw, sh = source
+        tx, ty, tw, th = target
+        x1, y1 = _arch_rect_exit_point(sx, sy, sw, sh, tx, ty)
+        x2, y2 = _arch_rect_exit_point(tx, ty, tw, th, sx, sy)
+        direct = [(x1, y1), (x2, y2)]
+        if not _polyline_crosses_other_leaf(direct, exclude):
+            return direct
+        obstacles = [b for nid, b in leaf_boxes.items() if nid not in exclude]
+        routed = _grid_route(x1, y1, x2, y2, obstacles)
+        return routed if routed is not None else direct
+
+    for idx, edge in enumerate(edges):
+        if idx in drawn:
+            continue
+        source = leaf_boxes.get(edge.source)
+        target = leaf_boxes.get(edge.target)
+        if not source or not target:
+            continue
+        points = _route_edge(source, target, (edge.source, edge.target))
+        if len(points) == 2:
+            (x1, y1), (x2, y2) = points
+            elements.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                f'stroke="{theme.accent_color}" stroke-width="2" marker-end="url(#diagram-arrow)"/>'
+            )
+            label_at = ((x1 + x2) / 2, (y1 + y2) / 2)
+        else:
+            d = " ".join(f'{"M" if i == 0 else "L"}{x:.1f},{y:.1f}' for i, (x, y) in enumerate(points))
+            elements.append(
+                f'<path d="{d}" fill="none" stroke="{theme.accent_color}" stroke-width="2" '
+                f'marker-end="url(#diagram-arrow)"/>'
+            )
+            mid = points[len(points) // 2]
+            label_at = mid
+        if edge.label.strip():
+            elements.append(_edge_label(label_at[0], label_at[1], edge.label, theme))
+
+    return elements, canvas_w, content_h
+
+
 _JOURNEY_LABEL_SIZE = 15.0
 
 
@@ -9039,6 +9555,8 @@ def _render_diagram_svg(spec: DiagramSpec, theme: TemplateTheme, *, gap_scale: f
         elements, canvas_w, content_h = _layout_wavy_journey_path(spec.nodes, theme=theme, top=top)
     elif kind == "org_chart":
         elements, content_h, canvas_w = _layout_org_chart(spec.nodes, spec.edges, theme=theme, top=top)
+    elif kind == "architecture_diagram":
+        elements, canvas_w, content_h = _layout_architecture_diagram(spec.nodes, spec.edges, theme=theme, top=top)
     elif kind == "spectrum":
         elements, canvas_w, content_h = _layout_spectrum(spec, theme=theme, top=top)
     elif kind == "iceberg":

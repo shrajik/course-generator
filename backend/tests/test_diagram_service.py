@@ -18,7 +18,7 @@ from app.schemas.diagram import DIAGRAM_KIND_PROMPT_DRIFT_EXCEPTIONS, DIAGRAM_KI
 from app.schemas.document import Block
 from app.services import diagram_service as diagram_service_module
 from app.services import mock_ai as mock_ai_module
-from app.services.diagram_content_qa import CONTRADICTS_SOURCE_TEXT
+from app.services.diagram_content_qa import CITATION_LEAKED_INTO_LABEL, CONTRADICTS_SOURCE_TEXT
 from app.services.diagram_qa import DiagramQAIssue, DiagramQAResult
 from app.services.diagram_render_qa import RenderQAIssue
 from app.services.diagram_service import (
@@ -466,7 +466,7 @@ async def test_case4_a_confirmed_source_text_contradiction_still_ships_flagged(m
     the image pipeline, where `contradicts_source_text` IS critical. This
     test locks in the current behaviour so a future change to it is a
     deliberate, visible decision, not an accidental side effect."""
-    async def fake_evaluate_content(spec, *, brief, course_title, ai, settings, source_excerpt):
+    async def fake_evaluate_content(spec, *, brief, course_title, ai, settings, source_excerpt, cited_source_titles=(), template_audience=""):
         return DiagramQAResult(issues=[
             DiagramQAIssue(CONTRADICTS_SOURCE_TEXT, "claims something the course text disputes", deterministic=False),
         ])
@@ -570,6 +570,134 @@ async def test_case7_a_critical_and_cosmetic_issue_together_still_withholds(monk
     findings = block.content.get("visual_qa_findings")
     assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
     assert any(f["type"] == "edge_crosses_node" for f in findings)
+
+
+async def test_case8_citation_leaked_into_label_still_withholds(monkeypatch):
+    """A node/edge label carrying a source/knowledge-library citation tag
+    (e.g. "[G2.7]") is a confirmed, deterministic content defect - a real
+    production case - and joins the same hard-blocking set as garbled text,
+    never the "ship anyway, flagged" bucket."""
+    async def fake_evaluate_content(spec, *, brief, course_title, ai, settings, source_excerpt, cited_source_titles=(), template_audience=""):
+        return DiagramQAResult(issues=[
+            DiagramQAIssue(CITATION_LEAKED_INTO_LABEL, "label carries a citation tag [G2.7]", deterministic=True),
+        ])
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(diagram_service_module, "evaluate_content", fake_evaluate_content)
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case8", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
+    findings = block.content.get("visual_qa_findings")
+    types = {f["type"] for f in findings}
+    assert CITATION_LEAKED_INTO_LABEL in types
+    assert "image_withheld_after_qa_failure" in types
+    assert not any(f["resolution"] == "rendered_with_unresolved_issues" for f in findings)
+
+
+async def test_case9_a_persistent_critical_issue_falls_back_to_a_different_kind(monkeypatch):
+    """Universal safety net (not kind-specific): when a diagram kind's OWN
+    layout geometry keeps crossing a node even after the targeted same-kind
+    retry, that's a bug in that kind's own layout code - retrying the SAME
+    kind a third time can't fix it, since the model has no way to predict
+    which structure triggers a specific kind's geometry bug. One more
+    attempt with a DIFFERENT kind, for the exact same content, recovers the
+    block instead of withholding it - here `flow_chart`'s geometry is
+    (simulated as) permanently broken for this content, `hierarchy` renders
+    clean, so the block ships via `hierarchy` instead."""
+    def _flow_chart_then_hierarchy_builder(user: str) -> dict:
+        if "DIFFERENT diagram kind" in user:
+            return {
+                "kind": "hierarchy",
+                "title": "Simple",
+                "nodes": [{"id": f"n{i}", "label": f"Step {i}", "level": 0 if i == 0 else 1} for i in range(4)],
+                "edges": [{"source": "n0", "target": f"n{i}", "label": ""} for i in range(1, 4)],
+            }
+        return _simple_flow_chart_builder(user)
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _flow_chart_then_hierarchy_builder)
+    monkeypatch.setattr(
+        diagram_service_module, "validate_rendered_svg",
+        lambda svg, kind: (
+            [RenderQAIssue("edge_crosses_node", "edge point inside an unrelated node")] if kind == "flow_chart" else []
+        ),
+    )
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case9", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("path") is not None
+    assert block.content.get("omitted_after_qa_failure") is False
+    assert block.content.get("spec", {}).get("kind") == "hierarchy"
+    findings = block.content.get("visual_qa_findings")
+    assert not any(f["type"] == "image_withheld_after_qa_failure" for f in findings)
+
+
+async def test_case10_the_kind_fallback_is_never_trusted_if_it_picks_the_same_kind_again(monkeypatch):
+    """Defensive guard: if the model ignores the "pick a different kind"
+    instruction and returns the SAME kind again, the fallback must never be
+    adopted (it would just reproduce the identical geometry bug) -
+    withholding proceeds exactly as it did before this fallback existed."""
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(
+        diagram_service_module, "validate_rendered_svg",
+        lambda svg, kind: [RenderQAIssue("edge_crosses_node", "edge point inside an unrelated node")],
+    )
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_case10", block=block, template=template, course_title="Biology",
+    )
+    assert ok is True
+    assert block.content.get("path") is None
+    assert block.content.get("omitted_after_qa_failure") is True
+
+
+async def test_cited_source_titles_reach_evaluate_content_unchanged(monkeypatch):
+    """Plumbing check (sources-leaked-into-diagrams follow-up): the chapter's
+    real cited-source titles passed into `generate_for_block` must reach
+    `evaluate_content` unchanged, all the way through the retry loop's own
+    call too - proves the new parameter isn't silently dropped anywhere
+    along this multi-layer call chain."""
+    seen: list[tuple] = []
+
+    async def fake_evaluate_content(spec, *, brief, course_title, ai, settings, source_excerpt, cited_source_titles, template_audience=""):
+        seen.append(tuple(cited_source_titles))
+        return DiagramQAResult()
+
+    monkeypatch.setitem(mock_ai_module._BUILDERS, "DiagramSpec", _simple_flow_chart_builder)
+    monkeypatch.setattr(diagram_service_module, "evaluate_content", fake_evaluate_content)
+
+    settings = get_settings()
+    svc = DiagramService(ai=MockAIClient(settings), settings=settings)
+    block = _diagram_block(purpose="A simple process", diagram_kind="flow_chart")
+    template = load_template("technical")
+
+    ok = await svc.generate_for_block(
+        course_id="course_diagram_cited_titles", block=block, template=template, course_title="Biology",
+        cited_source_titles=["Some Cited Paper Title", "another_source.pdf"],
+    )
+    assert ok is True
+    assert seen, "evaluate_content was never called"
+    assert all(call == ("Some Cited Paper Title", "another_source.pdf") for call in seen)
 
 
 # ---------------------------------------------------------------------------

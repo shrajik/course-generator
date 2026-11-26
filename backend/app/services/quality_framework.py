@@ -435,7 +435,10 @@ _CONNECTIVITY_FINDING_TYPES = frozenset({"flow_chart_connectivity"})
 # (persisted under "fell_back_to_illustration") would be exactly the
 # ambiguous-type case this dispatch exists to avoid, per the comment above.
 _CONTENT_QA_FINDING_TYPES = frozenset(
-    {"off_topic", "generic_content", "missing_key_concept", "structurally_garbled_text", "misspelled_or_garbled_text"}
+    {
+        "off_topic", "generic_content", "missing_key_concept", "structurally_garbled_text",
+        "misspelled_or_garbled_text", "diagram_audience_mismatch", "diagram_unnecessarily_complex",
+    }
 )
 _FORMULA_QA_FINDING_TYPES = frozenset({"malformed_expression", "formula_mismatch"})
 _IMAGE_RELEVANCE_FINDING_TYPES = frozenset({"off_topic_image", "decorative_not_educational"})

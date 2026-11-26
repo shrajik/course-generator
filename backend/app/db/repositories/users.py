@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import AuthSession, User
+from app.db.models import AuthSession, PasswordResetToken, User
 
 
 def normalize_email(email: str) -> str:
@@ -121,3 +121,33 @@ class UserRepository:
         auth_session.revoked_at = datetime.now(timezone.utc)
         await self.session.flush()
         return auth_session
+
+    async def create_password_reset_token(self, token: PasswordResetToken) -> PasswordResetToken:
+        self.session.add(token)
+        await self.session.flush()
+        return token
+
+    async def list_active_password_reset_tokens(self, user_id: uuid.UUID) -> Sequence[PasswordResetToken]:
+        """Unused (not yet expired-filtered - callers compare `expires_at`/
+        `created_at` themselves, same as `list_active_auth_sessions` leaves
+        expiry comparison to its own caller)."""
+        result = await self.session.scalars(
+            select(PasswordResetToken).where(
+                PasswordResetToken.user_id == user_id,
+                PasswordResetToken.used_at.is_(None),
+            )
+        )
+        return result.all()
+
+    async def get_unused_password_reset_token(self, token_hash: str) -> PasswordResetToken | None:
+        return await self.session.scalar(
+            select(PasswordResetToken).where(
+                PasswordResetToken.token_hash == token_hash,
+                PasswordResetToken.used_at.is_(None),
+            )
+        )
+
+    async def mark_password_reset_token_used(self, token: PasswordResetToken) -> PasswordResetToken:
+        token.used_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return token

@@ -965,9 +965,17 @@ def validate_rendered_svg(svg_bytes: bytes, *, kind: str = "") -> list[RenderQAI
         # this fix's own scope to investigate or fix; narrowing here avoids
         # turning on a new failure for a kind nobody has checked against it
         # yet, same reasoning several of this function's other per-kind
-        # exemptions below already use.
-        *(label_overlaps_node_issues(root) if kind in ("concept_map", "conceptual") else []),
-        *(label_overlaps_label_issues(root) if kind in ("concept_map", "conceptual") else []),
+        # exemptions below already use. `er_diagram` added (diagram-quality
+        # redesign follow-up): both functions are already shape-agnostic -
+        # they scan for `class="diagram-edge-label"` text elements and
+        # `_node_shapes`, nothing concept_map-specific - and er_diagram's
+        # relationship-cardinality edge labels (`_layout_er`) had NO
+        # overlap protection at all before this, unlike every other part of
+        # the render-QA gate. Verified clean against `test_diagrams.py`'s
+        # existing er_diagram fixtures plus real rendered-ER screenshots
+        # before trusting it, per this comment's own cautionary note.
+        *(label_overlaps_node_issues(root) if kind in ("concept_map", "conceptual", "er_diagram") else []),
+        *(label_overlaps_label_issues(root) if kind in ("concept_map", "conceptual", "er_diagram") else []),
         # Edge labels can now legitimately shrink their own font below the
         # diagram's main node-label size (see `diagram_renderer._edge_
         # label_layout`'s shrink fallback) - `readability_issues` above
